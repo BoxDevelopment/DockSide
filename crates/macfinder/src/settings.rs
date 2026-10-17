@@ -80,6 +80,8 @@ pub enum Key {
     DockBackdrop,
     DockRunning,
     DockTrash,
+    SpotlightEnabled,
+    SpotlightHotkey,
 }
 
 impl Key {
@@ -109,6 +111,8 @@ impl Key {
             Key::DockBackdrop => ("dock", "backdrop"),
             Key::DockRunning => ("dock", "show_running"),
             Key::DockTrash => ("dock", "show_trash"),
+            Key::SpotlightEnabled => ("spotlight", "enabled"),
+            Key::SpotlightHotkey => ("spotlight", "hotkey"),
         }
     }
 
@@ -269,6 +273,13 @@ impl SettingsWindow {
                     ],
                 },
                 Group {
+                    title: Some("Spotlight"),
+                    rows: vec![
+                        Row::Toggle("Spotlight search", Key::SpotlightEnabled),
+                        Row::Segmented("Keyboard shortcut", Key::SpotlightHotkey),
+                    ],
+                },
+                Group {
                     title: Some("Configuration"),
                     rows: vec![Row::Buttons(
                         "Settings file",
@@ -356,6 +367,7 @@ impl SettingsWindow {
             Key::DockAutohide => d.autohide,
             Key::DockRunning => d.show_running,
             Key::DockTrash => d.show_trash,
+            Key::SpotlightEnabled => cfg.spotlight.enabled,
             _ => false,
         }
     }
@@ -406,6 +418,12 @@ impl SettingsWindow {
                 fixed(&[("Apple", "apple"), ("Windows", "windows")], sel)
             }
             Key::MbClock => fixed(&CLOCKS, CLOCKS.iter().position(|c| c.1 == cfg.menubar.clock_format)),
+            Key::SpotlightHotkey => {
+                const KEYS: [(&str, &str); 3] =
+                    [("Alt+Space", "alt+space"), ("Ctrl+Space", "ctrl+space"), ("Ctrl+Alt+Space", "ctrl+alt+space")];
+                let current = cfg.spotlight.hotkey.to_lowercase().replace(' ', "");
+                fixed(&KEYS, KEYS.iter().position(|k| k.1 == current))
+            }
             Key::DockIconStyle => fixed(
                 &[("Native", "native"), ("Squircle", "squircle")],
                 Some((cfg.dock.icon_style == IconStyle::Squircle) as usize),

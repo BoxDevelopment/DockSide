@@ -36,6 +36,8 @@ pub enum Action {
     OpenSettings(Option<crate::settings::Page>),
     /// Open a Finder window (at a folder, or Home).
     OpenFinder(Option<std::path::PathBuf>),
+    /// Show or hide the Spotlight search panel.
+    ToggleSpotlight,
     /// A command for one Finder window (from its context menu).
     Finder { window: u32, cmd: crate::finder::FinderCmd },
     EmptyTrash,

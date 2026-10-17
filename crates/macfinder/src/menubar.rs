@@ -150,11 +150,12 @@ impl MenuBar {
         }
     }
 
-    pub fn status_action(hit: Hit) -> Option<Action> {
+    pub fn status_action(hit: Hit, spotlight: bool) -> Option<Action> {
         const WIN_S: Shortcut = Shortcut::new("w", b'S' as u16, "S");
         const WIN_A: Shortcut = Shortcut::new("w", b'A' as u16, "A");
         const WIN_N: Shortcut = Shortcut::new("w", b'N' as u16, "N");
         match hit {
+            Hit::Search if spotlight => Some(Action::ToggleSpotlight),
             Hit::Search => Some(Action::Keys(WIN_S)),
             Hit::ControlCenter | Hit::Wifi => Some(Action::Keys(WIN_A)),
             Hit::Clock => Some(Action::Keys(WIN_N)),

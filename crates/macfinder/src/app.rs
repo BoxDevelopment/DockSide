@@ -30,11 +30,12 @@ use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement
 use crate::menubar::{Hit, MenuBar};
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
+use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::theme::Theme;
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
-    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED,
+    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY,
 };
 
 thread_local! {
@@ -43,6 +44,9 @@ thread_local! {
 }
 
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Windows the menu mouse hook must not treat as "outside" clicks.
+static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
+static MENUBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Lives in the (large) Win32_UI_Controls feature; defined here instead.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -52,6 +56,8 @@ const TIMER_REFRESH: usize = 2;
 const TIMER_RELOAD: usize = 3;
 const TIMER_REBUILD: usize = 4;
 const TIMER_FINDER: usize = 5;
+
+const HOTKEY_SPOTLIGHT: i32 = 1;
 
 pub fn run() -> anyhow::Result<()> {
     win::register_class(Some(wndproc))?;
@@ -200,6 +206,9 @@ fn execute(action: Action) {
                 with_app(|app| app.toggle_pin(&path, &name, true));
             }
         }
+        Action::ToggleSpotlight => {
+            with_app(|app| app.toggle_spotlight());
+        }
         Action::OpenSettings(page) => {
             with_app(|app| app.open_settings(page));
         }
@@ -239,6 +248,10 @@ fn execute(action: Action) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_FRAME => FRAME_PENDING.store(false, Ordering::Release),
+        // Spotlight closes as soon as it loses focus (posted: we may be mid-dispatch).
+        WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == SPOTLIGHT_HWND.load(Ordering::Relaxed) => {
+            win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_SPOTLIGHT);
+        }
         // Shell surfaces never take focus; app windows (Finder, Settings) behave normally.
         WM_MOUSEACTIVATE if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW.0 == 0 => {
             return LRESULT(MA_NOACTIVATE as isize)
@@ -280,7 +293,12 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     if code >= 0 && matches!(wp.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
         let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
         let target = WindowFromPoint(info.pt);
-        if apps::window_pid(target) != GetCurrentProcessId() {
+        let root = GetAncestor(target, GA_ROOT).0 as isize;
+        // Close on any click except on the menu itself, or on the menu bar
+        // (which switches between its menus on its own).
+        let keep = root != 0
+            && (root == OPEN_MENU_HWND.load(Ordering::Relaxed) || root == MENUBAR_HWND.load(Ordering::Relaxed));
+        if apps::window_pid(target) != GetCurrentProcessId() || !keep {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_MENU);
         }
     }
@@ -347,6 +365,8 @@ pub struct App {
     kinds: finder::fs::KindCache,
     /// Finder windows whose folder changed on disk (reloaded on a short timer).
     finder_changed: Vec<u32>,
+    spotlight: Option<Spotlight>,
+    index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -414,6 +434,8 @@ impl App {
             loader: finder::loader::IconLoader::new(msg_hwnd.0 as isize, WM_APP_ICONS),
             kinds: finder::fs::KindCache::default(),
             finder_changed: Vec::new(),
+            spotlight: None,
+            index: Default::default(),
             hooks: Vec::new(),
             win_hooks,
             _watcher: watcher,
@@ -436,7 +458,10 @@ impl App {
         }
         if self.cfg.menubar.enabled {
             match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(m) => self.menubar = Some(m),
+                Ok(m) => {
+                    MENUBAR_HWND.store(m.surface.content.0 as isize, Ordering::Relaxed);
+                    self.menubar = Some(m);
+                }
                 Err(e) => log!("menu bar failed: {e}"),
             }
         }
@@ -448,6 +473,10 @@ impl App {
         }
         self.refresh_windows();
         self.flush();
+        self.register_hotkey();
+        if self.index.lock().is_ok_and(|i| i.built.is_none()) {
+            self.rebuild_index();
+        }
         log!("built surfaces (scale {}, font {})", self.monitor.scale, self.theme.font);
     }
 
@@ -478,6 +507,9 @@ impl App {
                 d.dirty = true;
             }
         }
+        if old.spotlight != self.cfg.spotlight {
+            self.register_hotkey();
+        }
         if old.menubar != self.cfg.menubar {
             self.rebuild_menubar();
         }
@@ -502,7 +534,10 @@ impl App {
         self.menubar = None;
         if self.cfg.menubar.enabled {
             match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(m) => self.menubar = Some(m),
+                Ok(m) => {
+                    MENUBAR_HWND.store(m.surface.content.0 as isize, Ordering::Relaxed);
+                    self.menubar = Some(m);
+                }
                 Err(e) => log!("menu bar failed: {e}"),
             }
         }
@@ -653,10 +688,101 @@ impl App {
                 s.render(&self.gfx, &self.theme, &self.cfg, &mut self.icons);
             }
         }
+        if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
+            s.render(&self.gfx, &self.theme, &mut self.loader);
+        }
         for f in self.finders.iter_mut().filter(|f| f.dirty) {
             let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
             f.render(&mut ctx);
         }
+    }
+
+    // --- Spotlight ---------------------------------------------------------
+
+    fn toggle_spotlight(&mut self) {
+        if self.spotlight.take().is_some() || !self.cfg.spotlight.enabled {
+            return;
+        }
+        self.close_menu();
+        let stale = self.index.lock().map(|i| i.built.is_none_or(|t| t.elapsed() > spotlight::index::STALE_AFTER));
+        if stale.unwrap_or(true) {
+            self.rebuild_index();
+        }
+        match Spotlight::new(&self.gfx, &self.theme, &self.cfg, &self.monitor) {
+            Ok(mut s) => {
+                s.render(&self.gfx, &self.theme, &mut self.loader);
+                s.focus();
+                self.spotlight = Some(s);
+            }
+            Err(e) => log!("spotlight failed: {e}"),
+        }
+    }
+
+    /// Re-indexes apps and the user's folders in the background.
+    fn rebuild_index(&self) {
+        let home = finder::fs::home();
+        let roots = finder::fs::favorites().into_iter().map(|p| p.path).filter(|p| *p != home).collect();
+        spotlight::index::rebuild(self.index.clone(), roots, self.msg_hwnd.0 as isize, WM_APP_INDEX_READY);
+    }
+
+    fn register_hotkey(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT};
+        unsafe {
+            let _ = UnregisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT);
+        }
+        if !self.cfg.spotlight.enabled {
+            return;
+        }
+        let spec = &self.cfg.spotlight.hotkey;
+        let Some((mods, vk)) = win::parse_hotkey(spec) else {
+            return log!("spotlight hotkey '{spec}' isn't valid");
+        };
+        if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT, mods | MOD_NOREPEAT, vk) }.is_err() {
+            log!("spotlight hotkey '{spec}' is already used by another app");
+        }
+    }
+
+    fn on_spotlight_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        let s = self.spotlight.as_mut()?;
+        let idx = self.index.lock().ok()?;
+        let (x, y) = mouse_pt(lp, s.surface.scale);
+        let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
+        let event = match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => s.on_key(wp.0 as u16, down(VK_CONTROL), down(VK_SHIFT), &idx),
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    s.on_char(c, &idx);
+                }
+                SpotlightEvent::None
+            }
+            // Swallow Alt+key menu beeps while Alt is still held from the hotkey.
+            WM_SYSCHAR => SpotlightEvent::None,
+            WM_MOUSEMOVE => {
+                if !s.tracking {
+                    s.tracking = true;
+                    track_leave(s.surface.content);
+                }
+                s.on_move(x, y);
+                SpotlightEvent::None
+            }
+            WM_MOUSELEAVE => {
+                s.tracking = false;
+                SpotlightEvent::None
+            }
+            WM_LBUTTONUP => s.on_click(x, y, down(VK_CONTROL)),
+            _ => return None,
+        };
+        drop(idx);
+        match event {
+            SpotlightEvent::None => {}
+            SpotlightEvent::Close => self.spotlight = None,
+            SpotlightEvent::Run(action) => {
+                self.spotlight = None;
+                push(action);
+            }
+        }
+        Some(LRESULT(0))
     }
 
     // --- Finder ------------------------------------------------------------
@@ -797,6 +923,7 @@ impl App {
         match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.monitor, source) {
             Ok(mut m) => {
                 m.render(&self.gfx, &self.theme);
+                OPEN_MENU_HWND.store(m.surface.content.0 as isize, Ordering::Relaxed);
                 self.menu = Some(m);
                 self.install_hooks();
                 match source {
@@ -819,6 +946,7 @@ impl App {
     }
 
     fn close_menu(&mut self) {
+        OPEN_MENU_HWND.store(0, Ordering::Relaxed);
         if self.menu.take().is_none() {
             return;
         }
@@ -938,9 +1066,19 @@ impl App {
                 WM_APP_CLOSE_MENU => self.close_menu(),
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
+                WM_HOTKEY if wp.0 as i32 == HOTKEY_SPOTLIGHT => self.toggle_spotlight(),
+                WM_APP_CLOSE_SPOTLIGHT => self.spotlight = None,
+                WM_APP_INDEX_READY => {
+                    if let (Some(s), Ok(idx)) = (&mut self.spotlight, self.index.lock()) {
+                        s.search(&idx);
+                    }
+                }
                 WM_APP_ICONS => {
                     if self.loader.drain() {
                         self.finders.iter_mut().for_each(|f| f.dirty = true);
+                        if let Some(s) = &mut self.spotlight {
+                            s.dirty = true;
+                        }
                     }
                 }
                 WM_APP_FINDER_CHANGED => {
@@ -984,6 +1122,11 @@ impl App {
 
         if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
             let r = self.on_settings_message(hwnd, msg, wp, lp);
+            self.flush();
+            return r;
+        }
+        if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
+            let r = self.on_spotlight_message(msg, wp, lp);
             self.flush();
             return r;
         }
@@ -1109,7 +1252,7 @@ impl App {
                     if let Some(mb) = &mut self.menubar {
                         mb.set_pressed(Some(h));
                     }
-                    if let Some(a) = MenuBar::status_action(h) {
+                    if let Some(a) = MenuBar::status_action(h, self.cfg.spotlight.enabled) {
                         push(a);
                     }
                 }

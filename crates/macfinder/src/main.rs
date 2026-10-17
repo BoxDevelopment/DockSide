@@ -14,6 +14,7 @@ mod gfx;
 mod menu;
 mod menubar;
 mod settings;
+mod spotlight;
 mod surface;
 mod theme;
 mod win;

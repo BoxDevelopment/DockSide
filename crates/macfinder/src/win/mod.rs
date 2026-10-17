@@ -133,3 +133,48 @@ pub fn class_name(hwnd: HWND) -> String {
     let n = unsafe { GetClassNameW(hwnd, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
+
+/// Spotlight panel lost focus: close it.
+pub const WM_APP_CLOSE_SPOTLIGHT: u32 = WM_APP + 11;
+/// Spotlight's background index finished rebuilding.
+pub const WM_APP_INDEX_READY: u32 = WM_APP + 12;
+
+/// Parses "alt+space", "ctrl+shift+k", "win+f1", ... into RegisterHotKey arguments.
+pub fn parse_hotkey(spec: &str) -> Option<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32)> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let mut mods = HOT_KEY_MODIFIERS(0);
+    let mut key = None;
+    for part in spec.to_lowercase().split('+').map(str::trim) {
+        match part {
+            "ctrl" | "control" => mods |= MOD_CONTROL,
+            "alt" => mods |= MOD_ALT,
+            "shift" => mods |= MOD_SHIFT,
+            "win" | "super" | "cmd" => mods |= MOD_WIN,
+            "space" => key = Some(0x20),
+            "enter" | "return" => key = Some(0x0D),
+            "tab" => key = Some(0x09),
+            p if p.len() == 1 && p.chars().all(|c| c.is_ascii_alphanumeric()) => {
+                key = Some(p.to_ascii_uppercase().as_bytes()[0] as u32)
+            }
+            p if p.starts_with('f') && p[1..].parse::<u32>().is_ok_and(|n| (1..=24).contains(&n)) => {
+                key = Some(0x70 + p[1..].parse::<u32>().unwrap() - 1)
+            }
+            _ => return None,
+        }
+    }
+    key.map(|k| (mods, k))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hotkeys() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::*;
+        assert_eq!(super::parse_hotkey("alt+space"), Some((MOD_ALT, 0x20)));
+        assert_eq!(super::parse_hotkey("Ctrl+Alt+Space"), Some((MOD_CONTROL | MOD_ALT, 0x20)));
+        assert_eq!(super::parse_hotkey("win+f1"), Some((MOD_WIN, 0x70)));
+        assert_eq!(super::parse_hotkey("ctrl+k"), Some((MOD_CONTROL, b'K' as u32)));
+        assert_eq!(super::parse_hotkey("alt+banana"), None);
+        assert_eq!(super::parse_hotkey("alt"), None);
+    }
+}

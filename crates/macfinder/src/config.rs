@@ -13,6 +13,7 @@ pub struct Config {
     pub general: General,
     pub menubar: MenuBarCfg,
     pub dock: DockCfg,
+    pub spotlight: SpotlightCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
 }
@@ -91,6 +92,12 @@ pub struct DockCfg {
     pub reserve_space: bool,
     #[serde(default)]
     pub apps: Vec<DockApp>,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct SpotlightCfg {
+    pub enabled: bool,
+    pub hotkey: String,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]

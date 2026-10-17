@@ -456,15 +456,6 @@ impl FinderWindow {
         self.dirty = true;
     }
 
-    fn end_search(&mut self) {
-        self.search_focus = false;
-        if !self.search.is_empty() {
-            self.search.clear();
-            self.apply_filter();
-        }
-        self.dirty = true;
-    }
-
     fn reselect(&mut self, paths: &[PathBuf]) {
         self.selected = self.entries.iter().enumerate().filter(|(_, e)| paths.contains(&e.path)).map(|(i, _)| i).collect();
         self.anchor = self.selected.iter().next().copied();
@@ -1457,6 +1448,7 @@ impl FinderWindow {
         let title = self.title();
         let preview = self.preview_entry().cloned();
         let column_offset = self.column_offset(vr);
+        let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
 
         let kinds = &mut *ctx.kinds;
         let loader = &mut *ctx.loader;
@@ -1471,7 +1463,6 @@ impl FinderWindow {
         let cwd = &self.cwd;
         let (search, search_focus, drop_hit) = (&self.search, self.search_focus, self.drop_hit);
         let band = self.band.as_ref().map(|b| band_rect(b.x0, b.y0 - scroll, b.x1, b.y1));
-        let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
         let ql = self.quicklook.as_mut().zip(ql_entry);
         let ql_bitmap = &mut self.ql_bitmap;
         let ql_px = ql.as_ref().and_then(|(_, e)| loader.get_large(e));
@@ -1846,12 +1837,13 @@ impl FinderWindow {
                 };
                 // Until the large preview arrives, show the small icon.
                 let image = large.or_else(|| icon_for(p, &e));
-                let info = format!(
-                    "{}  ·  {}{}",
-                    kinds.kind(&e),
-                    if e.is_dir { "--".to_string() } else { fs::format_size(e.size) },
-                    e.modified.map(|m| format!("  ·  Modified {}", fs::format_date(m))).unwrap_or_default()
-                );
+                let mut info = kinds.kind(&e);
+                if !e.is_dir {
+                    info += &format!("  ·  {}", fs::format_size(e.size));
+                }
+                if let Some(m) = e.modified {
+                    info += &format!("  ·  Modified {}", fs::format_date(m));
+                }
                 let style = QlStyle { theme, dark, title: &ql_title, mono: &mono, center: &center, preview_title: &preview_title };
                 quick_look(p, body, ql, &e, image, &info, &style, hover, &mut hits);
             }

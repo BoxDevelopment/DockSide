@@ -92,6 +92,11 @@ name = "System Settings"
 path = "shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
 match = "SystemSettings.exe"
 
+[spotlight]
+enabled = true
+# Global shortcut: "alt+space", "ctrl+space" or "ctrl+alt+space" (any of ctrl/alt/shift/win + a key).
+hotkey = "alt+space"
+
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]
 "explorer.exe" = "Finder"

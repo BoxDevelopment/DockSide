@@ -37,6 +37,14 @@ hidden while MacFinder runs and is always restored when it exits.
   Ctrl+↑ parent, Alt+←/→ back/forward, Enter open, F2 rename, Delete trash, Ctrl+Shift+. hidden files,
   type to select
 
+**Spotlight**
+- Alt+Space (configurable in Settings → General, or `[spotlight] hotkey`) or the menu bar's magnifier
+- Finds every app (desktop and Store) plus files and folders in Desktop, Documents, Downloads,
+  Pictures, Music and Movies (indexed in the background)
+- Ranks exact and prefix matches first, then word starts and initials ("vsc" → Visual Studio Code)
+- Inline calculator ("12*4.5+3" → 57; Enter copies), plus a web-search fallback
+- Enter opens; folders open in Finder; Ctrl+Enter reveals the item in Finder; Esc clears, then closes
+
 **Platform**
 - True rounded acrylic and blur via Windows.UI.Composition (a host backdrop brush with any corner radius), per-monitor DPI and dark/light mode that follows Windows
 - Menu bar and Dock reserve screen space (Win32 AppBars), so maximized windows fit between them
@@ -111,7 +119,8 @@ crates/macfinder/src
 - [x] Dock: drag to reorder, drag out to remove, auto-hide
 - [ ] Dock: minimized windows, a downloads stack, multi-monitor
 - [ ] Real per-app menus via UI Automation, where apps expose them
-- [ ] Spotlight-style launcher, Mission Control / App Exposé, Launchpad
+- [x] Spotlight
+- [ ] Mission Control / App Exposé, Launchpad
 - [x] A System Settings-style GUI for the config, plus Start at login
 
 ## Notes

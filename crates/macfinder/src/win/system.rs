@@ -1,0 +1,194 @@
+//! System state (theme, battery) and system actions (keys, power, URIs).
+
+use std::ffi::c_void;
+
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Power::{GetSystemPowerStatus, SetSuspendState, SYSTEM_POWER_STATUS};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::Shutdown::LockWorkStation;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+pub fn is_dark_mode() -> bool {
+    let mut value: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut value as *mut _ as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    r.is_ok() && value == 0
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Battery {
+    pub percent: u8,
+    pub charging: bool,
+}
+
+pub fn battery() -> Option<Battery> {
+    let mut s = SYSTEM_POWER_STATUS::default();
+    unsafe { GetSystemPowerStatus(&mut s).ok()? };
+    // 128 = no system battery, 255 = unknown
+    if s.BatteryFlag & 128 != 0 || s.BatteryFlag == 255 || s.BatteryLifePercent > 100 {
+        return None;
+    }
+    Some(Battery { percent: s.BatteryLifePercent, charging: s.ACLineStatus == 1 })
+}
+
+/// A key chord. Mac-style display maps Ctrl→⌘, Alt→⌥, Win→⌃.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shortcut {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub win: bool,
+    pub vk: u16,
+    pub key: &'static str,
+}
+
+impl Shortcut {
+    /// `mods` is any of "c" (ctrl), "s" (shift), "a" (alt), "w" (win).
+    pub const fn new(mods: &str, vk: u16, key: &'static str) -> Self {
+        let b = mods.as_bytes();
+        let mut s = Shortcut { ctrl: false, shift: false, alt: false, win: false, vk, key };
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'c' => s.ctrl = true,
+                b's' => s.shift = true,
+                b'a' => s.alt = true,
+                b'w' => s.win = true,
+                _ => {}
+            }
+            i += 1;
+        }
+        s
+    }
+
+    pub fn label(&self, mac: bool) -> String {
+        let mut out = String::new();
+        if mac {
+            if self.win {
+                out.push('⌃');
+            }
+            if self.alt {
+                out.push('⌥');
+            }
+            if self.shift {
+                out.push('⇧');
+            }
+            if self.ctrl {
+                out.push('⌘');
+            }
+            out.push_str(self.key);
+        } else {
+            for (on, name) in [(self.win, "Win+"), (self.ctrl, "Ctrl+"), (self.alt, "Alt+"), (self.shift, "Shift+")] {
+                if on {
+                    out.push_str(name);
+                }
+            }
+            out.push_str(self.key);
+        }
+        out
+    }
+
+    pub fn send(&self) {
+        let mut keys = Vec::new();
+        for (on, vk) in [(self.win, VK_LWIN), (self.ctrl, VK_CONTROL), (self.alt, VK_MENU), (self.shift, VK_SHIFT)] {
+            if on {
+                keys.push(vk);
+            }
+        }
+        keys.push(VIRTUAL_KEY(self.vk));
+        send_keys(&keys);
+    }
+}
+
+fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                wScan: 0,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Presses `keys` in order, then releases them in reverse.
+pub fn send_keys(keys: &[VIRTUAL_KEY]) {
+    let mut inputs: Vec<INPUT> = keys.iter().map(|&k| key_input(k, false)).collect();
+    inputs.extend(keys.iter().rev().map(|&k| key_input(k, true)));
+    unsafe {
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
+}
+
+pub fn open(target: &str) {
+    let t = HSTRING::from(target);
+    unsafe {
+        ShellExecuteW(None, w!("open"), &t, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+pub fn reveal(path: &str) {
+    let args = HSTRING::from(format!("/select,\"{path}\""));
+    unsafe {
+        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &args, PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
+pub fn confirm(title: &str, text: &str) -> bool {
+    let r = unsafe {
+        MessageBoxW(
+            HWND::default(),
+            &HSTRING::from(text),
+            &HSTRING::from(title),
+            MB_OKCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    };
+    r == IDOK
+}
+
+pub fn lock() {
+    unsafe {
+        let _ = LockWorkStation();
+    }
+}
+
+pub fn sleep() {
+    unsafe {
+        let _ = SetSuspendState(false, false, false);
+    }
+}
+
+fn shutdown_exe(args: &[&str]) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("shutdown").args(args).creation_flags(CREATE_NO_WINDOW).spawn();
+}
+
+pub fn restart() {
+    shutdown_exe(&["/r", "/t", "0"]);
+}
+
+pub fn shut_down() {
+    shutdown_exe(&["/s", "/t", "0"]);
+}
+
+pub fn log_out() {
+    shutdown_exe(&["/l"]);
+}

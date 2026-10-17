@@ -1,0 +1,97 @@
+# MacFinder configuration.
+# Changes apply as soon as you save this file. Delete it to restore defaults.
+
+[general]
+# "auto" follows the Windows app theme, or force "light" / "dark".
+appearance = "auto"
+# UI font. Install "SF Pro Text" (or "Inter") for the most faithful look;
+# falls back to "Segoe UI Variable Text" when the font isn't installed.
+font = "SF Pro Text"
+# Highlight color for menus and selections.
+accent = "#007AFF"
+# Hide the Windows taskbar while MacFinder runs (always restored on exit).
+hide_taskbar = true
+# "mac" shows ⌘C-style hints in menus (⌘ = Ctrl, ⌥ = Alt, ⌃ = Win),
+# "windows" shows Ctrl+C.
+shortcut_style = "mac"
+
+[menubar]
+enabled = true
+height = 24
+# "acrylic", "blur" or "none"
+backdrop = "acrylic"
+tint_light = "#F4F4F4B0"
+tint_dark = "#1C1C1EB0"
+# "apple", "windows", or a path to a .png / .ico
+logo = "apple"
+# strftime syntax, see https://docs.rs/chrono/latest/chrono/format/strftime
+clock_format = "%a %b %-d  %-I:%M %p"
+show_battery = true
+show_battery_percent = false
+show_wifi = true
+show_search = true
+show_control_center = true
+# App name shown when the desktop has focus.
+desktop_app_name = "Finder"
+# Keep maximized windows from covering the menu bar.
+reserve_space = true
+
+[dock]
+enabled = true
+tile_size = 48
+magnification = true
+magnified_size = 80
+# Gap between the Dock and the bottom of the screen.
+bottom_margin = 4
+backdrop = "acrylic"
+tint_light = "#F6F6F680"
+tint_dark = "#2A2A2C80"
+# "native" draws Windows icons as-is; "squircle" puts them on a white macOS-style tile.
+icon_style = "native"
+# Show running apps that aren't pinned.
+show_running = true
+show_trash = true
+# Keep maximized windows from covering the Dock.
+reserve_space = true
+
+# Pinned apps, left to right.
+#   path  - .exe, .lnk, folder, URI, or "shell:AppsFolder\<AUMID>" for Store apps
+#   name  - tooltip label (optional)
+#   args  - launch arguments (optional)
+#   icon  - custom .png / .ico, e.g. a macOS-style icon (optional)
+#   match - exe file name used to detect the running app (optional)
+# Environment variables like %LOCALAPPDATA% are expanded.
+
+[[dock.apps]]
+name = "Finder"
+path = "C:\\Windows\\explorer.exe"
+
+[[dock.apps]]
+name = "Microsoft Edge"
+path = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+
+[[dock.apps]]
+name = "Terminal"
+path = "shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"
+match = "WindowsTerminal.exe"
+
+[[dock.apps]]
+name = "Notepad"
+path = "C:\\Windows\\System32\\notepad.exe"
+
+[[dock.apps]]
+name = "Calculator"
+path = "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+match = "CalculatorApp.exe"
+
+[[dock.apps]]
+name = "System Settings"
+path = "shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"
+match = "SystemSettings.exe"
+
+# Display names by exe file name (menu bar + Dock tooltips).
+[app_names]
+"explorer.exe" = "Finder"
+"msedge.exe" = "Microsoft Edge"
+"WindowsTerminal.exe" = "Terminal"
+"Code.exe" = "Visual Studio Code"

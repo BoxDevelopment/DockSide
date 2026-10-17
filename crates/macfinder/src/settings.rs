@@ -12,6 +12,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::chrome::{self, SHADOW};
 use crate::config::{Appearance, Backdrop, Config, ConfigValue, IconStyle, ShortcutStyle};
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
@@ -23,12 +24,10 @@ use crate::win::{self, startup, Monitor};
 /// Lets the shared window procedure let this window activate (all others don't).
 pub static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
-const SHADOW: f32 = 30.0;
 const W: f32 = 780.0;
 const H: f32 = 560.0;
 const SIDEBAR: f32 = 210.0;
 const TITLE_H: f32 = 52.0;
-const RADIUS: f32 = 12.0;
 const ROW_H: f32 = 40.0;
 const CONTENT_PAD: f32 = 24.0;
 
@@ -523,8 +522,6 @@ impl SettingsWindow {
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme, cfg: &Config, icons: &mut IconStore) {
         self.dirty = false;
         let dark = theme.dark;
-        let window_bg = if dark { Color::rgba(30, 30, 30, 1.0) } else { Color::rgba(246, 246, 246, 1.0) };
-        let sidebar_bg = if dark { Color::rgba(40, 40, 40, 1.0) } else { Color::rgba(232, 230, 233, 1.0) };
         let card_bg = if dark { Color::rgba(44, 44, 46, 1.0) } else { Color::WHITE };
         let card_border = if dark { Color::gray(255, 0.07) } else { Color::gray(0, 0.07) };
         let control_bg = if dark { Color::gray(255, 0.1) } else { Color::gray(0, 0.06) };
@@ -574,37 +571,10 @@ impl SettingsWindow {
 
         let r = {
             let draw = |p: &Painter| {
-                // Shadow + window body.
-                for i in 0..14 {
-                    let grow = i as f32 * 1.8;
-                    let a = 0.035 * (14 - i) as f32 / 14.0;
-                    p.fill_round(body.inset(-grow, -grow).offset(0.0, 8.0), RADIUS + grow, theme.shadow.alpha(a));
-                }
-                p.clear_rect(body.inset(4.0, 4.0));
-                p.fill_round(body, RADIUS, sidebar_bg);
-                let content_bg = Rect::new(body.x + SIDEBAR, body.y, body.w - SIDEBAR, body.h);
-                p.fill_round(content_bg, RADIUS, window_bg);
-                p.fill_rect(Rect::new(content_bg.x, body.y, RADIUS, body.h), window_bg);
-                p.line(content_bg.x, body.y, content_bg.x, body.bottom(), card_border, 1.0);
-                p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
-
-                // Traffic lights.
-                let lights = [
-                    (Hit::Close, Color::rgba(255, 95, 87, 1.0), "\u{E8BB}"),
-                    (Hit::Minimize, Color::rgba(254, 188, 46, 1.0), "\u{E921}"),
-                    (Hit::Minimize, Color::gray(128, 0.35), ""),
-                ];
+                chrome::window(p, body, SIDEBAR, theme, &chrome::Palette::new(theme));
                 let group_hover = matches!(hover, Some(Hit::Close | Hit::Minimize));
-                for (i, (hit, color, glyph)) in lights.iter().enumerate() {
-                    let (cx, cy) = (body.x + 20.0 + i as f32 * 20.0, body.y + 20.0);
-                    p.fill_circle(cx, cy, 6.0, *color);
-                    p.stroke_circle(cx, cy, 6.0, Color::gray(0, 0.12), 0.5);
-                    if i < 2 {
-                        hits.push((Rect::new(cx - 8.0, cy - 8.0, 16.0, 16.0), *hit));
-                        if group_hover {
-                            p.text(glyph, &glyph_font, Rect::new(cx - 6.0, cy - 6.5, 12.0, 12.0), Color::gray(0, 0.55));
-                        }
-                    }
+                for (r, light) in chrome::traffic_lights(p, body, group_hover, false) {
+                    hits.push((r, if light == chrome::Light::Close { Hit::Close } else { Hit::Minimize }));
                 }
 
                 // Sidebar.

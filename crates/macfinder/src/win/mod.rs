@@ -22,14 +22,18 @@ pub const WM_APP_MENU_KEY: u32 = WM_APP + 4;
 pub const WM_APP_FOREGROUND: u32 = WM_APP + 5;
 pub const WM_APP_WINDOWS_CHANGED: u32 = WM_APP + 6;
 pub const WM_APP_APPBAR: u32 = WM_APP + 7;
-/// Sent by a second launch to the running instance.
+/// Sent by a second launch to the running instance (wParam 1 = open Finder instead of Settings).
 pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 8;
+/// Finder icon loader has results.
+pub const WM_APP_ICONS: u32 = WM_APP + 9;
+/// A Finder window's folder changed on disk (wParam = window id).
+pub const WM_APP_FINDER_CHANGED: u32 = WM_APP + 10;
 
 /// Asks an already-running instance to show its settings window.
-pub fn signal_running_instance() -> bool {
+pub fn signal_running_instance(finder: bool) -> bool {
     unsafe {
         match FindWindowExW(HWND_MESSAGE, None, CLASS_NAME, None) {
-            Ok(h) => PostMessageW(h, WM_APP_OPEN_SETTINGS, WPARAM(0), LPARAM(0)).is_ok(),
+            Ok(h) => PostMessageW(h, WM_APP_OPEN_SETTINGS, WPARAM(finder as usize), LPARAM(0)).is_ok(),
             Err(_) => false,
         }
     }

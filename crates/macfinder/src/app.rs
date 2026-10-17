@@ -28,12 +28,13 @@ use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
+use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
 use crate::theme::Theme;
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
-    WM_APP_WINDOWS_CHANGED,
+    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED,
 };
 
 thread_local! {
@@ -50,6 +51,7 @@ const TIMER_TICK: usize = 1;
 const TIMER_REFRESH: usize = 2;
 const TIMER_RELOAD: usize = 3;
 const TIMER_REBUILD: usize = 4;
+const TIMER_FINDER: usize = 5;
 
 pub fn run() -> anyhow::Result<()> {
     win::register_class(Some(wndproc))?;
@@ -104,6 +106,15 @@ fn execute(action: Action) {
     log!("action: {action:?}");
     match action {
         Action::Open(target) => system::open(&target),
+        Action::Launch { path, .. } if path == FINDER_PATH => {
+            with_app(|app| app.open_finder(None));
+        }
+        Action::OpenFinder(path) => {
+            with_app(|app| app.open_finder(path));
+        }
+        Action::Finder { window, cmd } => {
+            with_app(|app| app.finder_cmd(window, cmd));
+        }
         Action::Launch { path, args } => {
             with_app(|app| {
                 if app.dock.as_mut().map(|d| d.bounce(&path)).unwrap_or(false) {
@@ -206,8 +217,8 @@ fn execute(action: Action) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_FRAME => FRAME_PENDING.store(false, Ordering::Release),
-        // Shell surfaces never take focus; the settings window is a normal app window.
-        WM_MOUSEACTIVATE if hwnd.0 as isize != SETTINGS_HWND.load(Ordering::Relaxed) => {
+        // Shell surfaces never take focus; app windows (Finder, Settings) behave normally.
+        WM_MOUSEACTIVATE if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW.0 == 0 => {
             return LRESULT(MA_NOACTIVATE as isize)
         }
         WM_ERASEBKGND => return LRESULT(1),
@@ -308,6 +319,12 @@ pub struct App {
     dock: Option<Dock>,
     menu: Option<PopupMenu>,
     settings: Option<SettingsWindow>,
+    finders: Vec<FinderWindow>,
+    next_finder_id: u32,
+    loader: finder::loader::IconLoader,
+    kinds: finder::fs::KindCache,
+    /// Finder windows whose folder changed on disk (reloaded on a short timer).
+    finder_changed: Vec<u32>,
     hooks: Vec<HHOOK>,
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -370,6 +387,11 @@ impl App {
             dock: None,
             menu: None,
             settings: None,
+            finders: Vec::new(),
+            next_finder_id: 1,
+            loader: finder::loader::IconLoader::new(msg_hwnd.0 as isize, WM_APP_ICONS),
+            kinds: finder::fs::KindCache::default(),
+            finder_changed: Vec::new(),
             hooks: Vec::new(),
             win_hooks,
             _watcher: watcher,
@@ -533,7 +555,8 @@ impl App {
     }
 
     fn refresh_windows(&mut self) {
-        let windows = apps::list_windows();
+        let mut windows = apps::list_windows();
+        windows.extend(self.finder_app_windows());
         if let Some(d) = &mut self.dock {
             d.update_running(&windows, &mut self.names, &self.cfg);
         }
@@ -542,6 +565,12 @@ impl App {
 
     fn update_foreground(&mut self) {
         let fg = unsafe { GetForegroundWindow() };
+        if self.finders.iter().any(|f| f.hwnd == fg) {
+            if let Some(mb) = &mut self.menubar {
+                mb.set_app("Finder".into(), fg, Some(FINDER_PATH.to_string()));
+            }
+            return;
+        }
         if self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
             if let Some(mb) = &mut self.menubar {
                 mb.set_app("System Settings".into(), fg, None);
@@ -602,6 +631,138 @@ impl App {
                 s.render(&self.gfx, &self.theme, &self.cfg, &mut self.icons);
             }
         }
+        for f in self.finders.iter_mut().filter(|f| f.dirty) {
+            let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
+            f.render(&mut ctx);
+        }
+    }
+
+    // --- Finder ------------------------------------------------------------
+
+    fn open_finder(&mut self, path: Option<PathBuf>) {
+        let id = self.next_finder_id;
+        self.next_finder_id += 1;
+        let path = path.unwrap_or_else(finder::fs::home);
+        let cascade = self.finders.len() as i32;
+        let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
+        match FinderWindow::new(&mut ctx, &self.monitor, id, path, cascade, self.msg_hwnd.0 as isize, WM_APP_FINDER_CHANGED) {
+            Ok(mut f) => {
+                f.render(&mut ctx);
+                unsafe {
+                    let _ = ShowWindow(f.hwnd, SW_SHOW);
+                    let _ = SetForegroundWindow(f.hwnd);
+                }
+                self.finders.push(f);
+                self.refresh_windows();
+            }
+            Err(e) => log!("finder window failed: {e}"),
+        }
+    }
+
+    fn close_finder(&mut self, id: u32) {
+        self.finders.retain(|f| f.id != id);
+        self.refresh_windows();
+    }
+
+    fn finder_cmd(&mut self, id: u32, cmd: finder::FinderCmd) {
+        if let Some(f) = self.finders.iter_mut().find(|f| f.id == id) {
+            f.command(cmd, &mut self.kinds);
+        }
+        self.flush();
+    }
+
+    /// Our Finder windows, shaped like other apps' windows for the Dock and menus.
+    fn finder_app_windows(&self) -> Vec<apps::AppWindow> {
+        self.finders
+            .iter()
+            .map(|f| apps::AppWindow { hwnd: f.hwnd, exe: FINDER_PATH.to_string(), title: f.title() })
+            .collect()
+    }
+
+    fn on_finder_message(&mut self, idx: usize, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+        let f = &mut self.finders[idx];
+        let scale = f.scale();
+        let (x, y) = mouse_pt(lp, scale);
+        let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
+        let event = match msg {
+            // Client area = whole window; we draw our own frame.
+            WM_NCCALCSIZE if wp.0 != 0 => return Some(LRESULT(0)),
+            WM_NCHITTEST => {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let hit = f.nc_hit((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
+                return Some(LRESULT(hit as isize));
+            }
+            WM_GETMINMAXINFO => {
+                let info = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
+                let (w, h) = f.min_track_size();
+                info.ptMinTrackSize = POINT { x: w, y: h };
+                return Some(LRESULT(0));
+            }
+            WM_WINDOWPOSCHANGED => {
+                f.dirty = true;
+                return None;
+            }
+            WM_ACTIVATE => {
+                f.focused = (wp.0 & 0xFFFF) != 0;
+                f.dirty = true;
+                return None;
+            }
+            WM_MOUSEMOVE => {
+                if !f.tracking {
+                    f.tracking = true;
+                    track_leave(hwnd);
+                }
+                f.on_move(x, y);
+                FinderEvent::None
+            }
+            WM_MOUSELEAVE => {
+                f.on_leave();
+                FinderEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                f.on_down(x, y, down(VK_CONTROL), down(VK_SHIFT), &mut self.kinds);
+                FinderEvent::None
+            }
+            WM_LBUTTONUP => f.on_up(x, y, &mut self.kinds),
+            WM_RBUTTONUP => f.on_right_click(x, y, &mut self.kinds),
+            WM_MOUSEWHEEL => {
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                f.on_wheel((sx - rc.left) as f32 / scale, ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                FinderEvent::None
+            }
+            // Alt+F4 keeps its default meaning (WM_CLOSE).
+            WM_SYSKEYDOWN if wp.0 == 0x73 => return None,
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                f.on_key(wp.0 as u16, down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU), &mut self.kinds)
+            }
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    f.on_char(c);
+                }
+                FinderEvent::None
+            }
+            WM_SYSCHAR => return Some(LRESULT(0)),
+            WM_CLOSE => FinderEvent::Close,
+            _ => return None,
+        };
+        let id = f.id;
+        match event {
+            FinderEvent::None => {}
+            FinderEvent::Close => self.close_finder(id),
+            FinderEvent::NewWindow => self.open_finder(None),
+            FinderEvent::Menu(entries, x, y) => self.open_menu(entries, Placement::Below { x, y }, MenuSource::Window),
+        }
+        Some(LRESULT(0))
     }
 
     // --- menus -------------------------------------------------------------
@@ -628,6 +789,7 @@ impl App {
                             d.dirty = true;
                         }
                     }
+                    MenuSource::Window => {}
                 }
             }
             Err(e) => log!("menu failed: {e}"),
@@ -657,6 +819,7 @@ impl App {
         let app_name = mb.app_name.clone();
         let target = mb.target;
         let app_windows: Vec<apps::AppWindow> = match &exe {
+            Some(exe) if exe == FINDER_PATH => self.finder_app_windows(),
             Some(exe) => apps::list_windows().into_iter().filter(|w| w.exe.eq_ignore_ascii_case(exe)).collect(),
             None => Vec::new(),
         };
@@ -734,6 +897,13 @@ impl App {
                         TIMER_REFRESH => self.refresh_windows(),
                         TIMER_RELOAD => self.reload(),
                         TIMER_REBUILD => self.build(),
+                        TIMER_FINDER => {
+                            for id in std::mem::take(&mut self.finder_changed) {
+                                if let Some(f) = self.finders.iter_mut().find(|f| f.id == id) {
+                                    f.reload(&mut self.kinds);
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -744,7 +914,20 @@ impl App {
                 }
                 WM_APP_WINDOWS_CHANGED => self.timer(TIMER_REFRESH, 150),
                 WM_APP_CLOSE_MENU => self.close_menu(),
+                WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
+                WM_APP_ICONS => {
+                    if self.loader.drain() {
+                        self.finders.iter_mut().for_each(|f| f.dirty = true);
+                    }
+                }
+                WM_APP_FINDER_CHANGED => {
+                    let id = wp.0 as u32;
+                    if !self.finder_changed.contains(&id) {
+                        self.finder_changed.push(id);
+                    }
+                    self.timer(TIMER_FINDER, 200);
+                }
                 WM_APP_MENU_KEY => self.on_menu_key(wp.0 as u16),
                 _ => return None,
             }
@@ -779,6 +962,11 @@ impl App {
 
         if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
             let r = self.on_settings_message(hwnd, msg, wp, lp);
+            self.flush();
+            return r;
+        }
+        if let Some(idx) = self.finders.iter().position(|f| f.hwnd == hwnd) {
+            let r = self.on_finder_message(idx, hwnd, msg, wp, lp);
             self.flush();
             return r;
         }

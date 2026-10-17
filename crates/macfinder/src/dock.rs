@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::anim::approach;
 use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
+use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{IconStore, RECYCLE_BIN};
 use crate::gfx::{Align, Gfx, Weight};
@@ -78,6 +79,7 @@ impl Item {
             .match_exe
             .as_ref()
             .map(|m| m.to_lowercase())
+            .or_else(|| (app.path == FINDER_PATH).then(|| FINDER_PATH.to_string()))
             .or_else(|| lower.ends_with(".exe").then(|| apps::exe_name(&app.path)))
             .or_else(|| {
                 lower.ends_with(".lnk").then(|| apps::resolve_lnk(&app.path)).flatten().map(|t| apps::exe_name(&t))
@@ -90,7 +92,7 @@ impl Item {
             name,
             launch: app.path.clone(),
             args: app.args.clone(),
-            icon_key: app.path.clone(),
+            icon_key: icon_source(&app.path),
             custom_icon: app.icon.clone(),
             match_name,
             pinned: Some(app.clone()),
@@ -105,7 +107,7 @@ impl Item {
             name,
             launch: w.exe.clone(),
             args: None,
-            icon_key: w.exe.clone(),
+            icon_key: icon_source(&w.exe),
             custom_icon: None,
             match_name: Some(w.exe_name()),
             pinned: None,
@@ -248,6 +250,13 @@ pub fn compute_layout(
     let right = items[n - 1].0 + items[n - 1].1 / 2.0 + pad;
     Layout { items, left, right }
 }
+
+/// Finder is our own window, drawn with the File Explorer icon.
+fn icon_source(path: &str) -> String {
+    if path == FINDER_PATH { EXPLORER.to_string() } else { path.to_string() }
+}
+
+const EXPLORER: &str = r"C:\Windows\explorer.exe";
 
 /// Pinned files that no longer exist are skipped (URIs and shell ids always pass).
 fn pin_exists(app: &DockApp) -> bool {
@@ -797,6 +806,10 @@ impl Dock {
                     v.push(Entry::item(w.title.clone(), Action::Activate(w.hwnd)));
                 }
                 if !v.is_empty() {
+                    v.push(Entry::Separator);
+                }
+                if item.launch == FINDER_PATH {
+                    v.push(Entry::item("New Finder Window", Action::OpenFinder(None)));
                     v.push(Entry::Separator);
                 }
                 v.push(

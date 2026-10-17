@@ -34,6 +34,10 @@ pub enum Action {
     /// File picker, then pin the chosen app.
     AddDockApp,
     OpenSettings(Option<crate::settings::Page>),
+    /// Open a Finder window (at a folder, or Home).
+    OpenFinder(Option<std::path::PathBuf>),
+    /// A command for one Finder window (from its context menu).
+    Finder { window: u32, cmd: crate::finder::FinderCmd },
     EmptyTrash,
     Sleep,
     Restart,
@@ -96,6 +100,8 @@ impl Entry {
 pub enum MenuSource {
     MenuBar(crate::menubar::Hit),
     Dock(usize),
+    /// A context menu inside one of our app windows (Finder).
+    Window,
 }
 
 #[derive(Clone, Copy, Debug)]

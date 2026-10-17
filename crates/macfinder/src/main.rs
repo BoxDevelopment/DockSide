@@ -5,8 +5,10 @@ mod log;
 
 mod anim;
 mod app;
+mod chrome;
 mod config;
 mod dock;
+mod finder;
 mod geom;
 mod gfx;
 mod menu;
@@ -35,7 +37,7 @@ fn main() {
         let mutex = CreateMutexW(None, true, w!("Local\\MacFinder.SingleInstance"));
         if mutex.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
             // Relaunching (e.g. from the Start menu) opens Settings, like reopening a Mac app.
-            win::signal_running_instance();
+            win::signal_running_instance(std::env::args().any(|a| a == "--finder"));
             return;
         }
     }

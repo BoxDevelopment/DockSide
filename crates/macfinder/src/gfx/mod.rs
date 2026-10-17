@@ -46,7 +46,7 @@ impl Weight {
     }
 }
 
-type FormatKey = (String, u32, Weight, Align);
+type FormatKey = (String, u32, Weight, Align, bool);
 
 pub struct Gfx {
     pub d2d: ID2D1Factory,
@@ -93,16 +93,25 @@ impl Gfx {
 
     /// Cached single-line text format, vertically centered, trimmed with an ellipsis.
     pub fn format(&self, family: &str, size: f32, weight: Weight, align: Align) -> IDWriteTextFormat {
-        let key = (family.to_string(), (size * 100.0) as u32, weight, align);
+        self.format_ex(family, size, weight, align, false)
+    }
+
+    /// Centered, top-aligned text that wraps onto multiple lines (icon labels).
+    pub fn format_wrapped(&self, family: &str, size: f32) -> IDWriteTextFormat {
+        self.format_ex(family, size, Weight::Regular, Align::Center, true)
+    }
+
+    fn format_ex(&self, family: &str, size: f32, weight: Weight, align: Align, wrap: bool) -> IDWriteTextFormat {
+        let key = (family.to_string(), (size * 100.0) as u32, weight, align, wrap);
         if let Some(f) = self.formats.borrow().get(&key) {
             return f.clone();
         }
-        let f = self.create_format(family, size, weight, align).expect("CreateTextFormat");
+        let f = self.create_format(family, size, weight, align, wrap).expect("CreateTextFormat");
         self.formats.borrow_mut().insert(key, f.clone());
         f
     }
 
-    fn create_format(&self, family: &str, size: f32, weight: Weight, align: Align) -> Result<IDWriteTextFormat> {
+    fn create_format(&self, family: &str, size: f32, weight: Weight, align: Align, wrap: bool) -> Result<IDWriteTextFormat> {
         unsafe {
             let f = self.dwrite.CreateTextFormat(
                 &HSTRING::from(family),
@@ -113,8 +122,8 @@ impl Gfx {
                 size,
                 w!("en-us"),
             )?;
-            f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+            f.SetWordWrapping(if wrap { DWRITE_WORD_WRAPPING_EMERGENCY_BREAK } else { DWRITE_WORD_WRAPPING_NO_WRAP })?;
+            f.SetParagraphAlignment(if wrap { DWRITE_PARAGRAPH_ALIGNMENT_NEAR } else { DWRITE_PARAGRAPH_ALIGNMENT_CENTER })?;
             f.SetTextAlignment(match align {
                 Align::Leading => DWRITE_TEXT_ALIGNMENT_LEADING,
                 Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,

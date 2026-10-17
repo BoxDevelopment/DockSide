@@ -26,6 +26,17 @@ hidden while MacFinder runs and is always restored when it exits.
 - Config changes apply in place: editing pinned apps updates the Dock without redrawing anything else
 - Store apps (`shell:AppsFolder\...`), `.lnk` shortcuts and custom PNG/ICO icons
 
+**Finder**
+- Opens from the Dock's Finder icon (`path = "macfinder:finder"`) or with `macfinder --finder`
+- Sidebar with Favorites (Home, Desktop, Documents, Downloads, Pictures, Music, Movies) and drives
+- Icon, list (sortable Name / Date Modified / Size / Kind) and column views with a preview pane
+- Background icon and thumbnail loading; folders refresh when their contents change on disk
+- Back/forward, resizable window, zoom, inline rename, New Folder, Move to Trash (Recycle Bin)
+- Context menus: Open, Rename, Copy Path, Show in File Explorer, New Terminal at Folder, view and sort options
+- Shortcuts (Ctrl stands in for ⌘): Ctrl+1/2/3 views, Ctrl+N new window, Ctrl+Shift+N new folder,
+  Ctrl+↑ parent, Alt+←/→ back/forward, Enter open, F2 rename, Delete trash, Ctrl+Shift+. hidden files,
+  type to select
+
 **Platform**
 - True rounded acrylic and blur via Windows.UI.Composition (a host backdrop brush with any corner radius), per-monitor DPI and dark/light mode that follows Windows
 - Menu bar and Dock reserve screen space (Win32 AppBars), so maximized windows fit between them
@@ -80,6 +91,9 @@ crates/macfinder/src
 ├── menubar.rs    menu bar layout, vector status glyphs
 ├── dock.rs       dock items, magnification layout (unit-tested), bounce, context menus
 ├── menu.rs       popup menus + the standard menu contents
+├── finder/       Finder window (views, input), filesystem helpers, background icon loader
+├── settings.rs   System Settings window
+├── chrome.rs     shared window chrome: shadow, body, traffic lights
 ├── surface.rs    backdrop (DWM acrylic) window + layered content window pair
 ├── gfx/          Direct2D canvas/painter, DirectWrite text, icon loading (shell + WIC)
 ├── anim.rs       DwmFlush-paced frame clock
@@ -90,7 +104,8 @@ crates/macfinder/src
 
 ## Roadmap
 
-- [ ] Finder: a file manager window (sidebar, icon/list/column views, Quick Look)
+- [x] Finder: sidebar, icon / list / column views, rename, trash, context menus
+- [ ] Finder: drag and drop, Quick Look (Space), tabs, search, sidebar vibrancy
 - [ ] Widgets: a desktop widget layer (clock, weather, calendar, battery, notes)
 - [x] True rounded acrylic via `Windows.UI.Composition` host backdrop
 - [x] Dock: drag to reorder, drag out to remove, auto-hide

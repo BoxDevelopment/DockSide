@@ -57,7 +57,8 @@ autohide = false
 reserve_space = true
 
 # Pinned apps, left to right.
-#   path  - .exe, .lnk, folder, URI, or "shell:AppsFolder\<AUMID>" for Store apps
+#   path  - .exe, .lnk, folder, URI, "shell:AppsFolder\<AUMID>" for Store apps,
+#           or "macfinder:finder" for the built-in Finder
 #   name  - tooltip label (optional)
 #   args  - launch arguments (optional)
 #   icon  - custom .png / .ico, e.g. a macOS-style icon (optional)
@@ -66,7 +67,7 @@ reserve_space = true
 
 [[dock.apps]]
 name = "Finder"
-path = "C:\\Windows\\explorer.exe"
+path = "macfinder:finder"
 
 [[dock.apps]]
 name = "Microsoft Edge"

@@ -72,9 +72,16 @@ impl IconStore {
 }
 
 pub fn load_shell_icon(parse_name: &str) -> Option<IconPixels> {
+    load_shell_image(parse_name, ICON_PX, false)
+}
+
+/// Shell image for `parse_name` at `size` px. With `thumbnail`, images, videos
+/// and documents return a preview of their content instead of a type icon.
+pub fn load_shell_image(parse_name: &str, size: i32, thumbnail: bool) -> Option<IconPixels> {
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(parse_name), None).ok()?;
-        let hbmp = factory.GetImage(SIZE { cx: ICON_PX, cy: ICON_PX }, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK).ok()?;
+        let flags = if thumbnail { SIIGBF_BIGGERSIZEOK } else { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK };
+        let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, flags).ok()?;
         let px = read_hbitmap(hbmp);
         let _ = DeleteObject(hbmp);
         px

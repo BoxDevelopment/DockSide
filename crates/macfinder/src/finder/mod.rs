@@ -83,6 +83,8 @@ pub enum View {
 pub enum FinderCmd {
     Open(PathBuf),
     Reveal(PathBuf),
+    /// Open a folder in File Explorer itself.
+    Explorer(PathBuf),
     CopyPath(Vec<PathBuf>),
     Trash(Vec<PathBuf>),
     NewFolder,
@@ -557,6 +559,7 @@ impl FinderWindow {
                 self.open_path(&p, is_dir, kinds);
             }
             FinderCmd::Reveal(p) => crate::win::system::reveal(&p.to_string_lossy()),
+            FinderCmd::Explorer(p) => crate::win::system::open_in_explorer(&p.to_string_lossy()),
             FinderCmd::CopyPath(paths) => {
                 let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
                 fs::copy_text(&text.join("\r\n"));
@@ -1089,7 +1092,7 @@ impl FinderWindow {
                 Entry::item("New Folder", cmd(FinderCmd::NewFolder)),
                 Entry::Separator,
                 Entry::item("New Terminal at Folder", cmd(FinderCmd::Terminal(dir.clone()))),
-                Entry::item("Open in File Explorer", cmd(FinderCmd::Open(dir.clone()))),
+                Entry::item("Open in File Explorer", cmd(FinderCmd::Explorer(dir.clone()))),
                 Entry::item("Copy Path", cmd(FinderCmd::CopyPath(vec![dir]))),
                 Entry::Separator,
                 view("as Icons", View::Icons),

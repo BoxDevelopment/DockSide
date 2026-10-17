@@ -144,6 +144,17 @@ pub fn open(target: &str) {
     }
 }
 
+/// Opens a folder in File Explorer (not whatever the default folder handler is).
+pub fn open_in_explorer(path: &str) {
+    // A quoted drive root ("C:\") would escape its own closing quote; roots never need quotes.
+    let trimmed = path.trim_end_matches('\\');
+    let arg = if trimmed.len() <= 2 { format!("{trimmed}\\") } else { format!("\"{trimmed}\"") };
+    let args = HSTRING::from(arg);
+    unsafe {
+        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &args, PCWSTR::null(), SW_SHOWNORMAL);
+    }
+}
+
 pub fn reveal(path: &str) {
     let args = HSTRING::from(format!("/select,\"{path}\""));
     unsafe {

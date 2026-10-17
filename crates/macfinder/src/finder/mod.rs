@@ -1,8 +1,10 @@
 //! Finder: a macOS-style file manager window with a sidebar, back/forward,
 //! and icon / list / column views.
 
+pub mod dnd;
 pub mod fs;
 pub mod loader;
+mod text;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -12,11 +14,12 @@ use notify::{RecursiveMode, Watcher};
 use windows::core::{Result, HSTRING};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
-use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use self::fs::{Entry as FileEntry, KindCache, Place, SortKey};
 use self::loader::IconLoader;
+use self::text::{KeyResult, TextField};
 use crate::chrome::{self, Light, SHADOW};
 use crate::geom::{Color, Rect};
 use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
@@ -41,6 +44,28 @@ const CELL_H: f32 = 108.0;
 const ICON: f32 = 64.0;
 const COL_W: f32 = 240.0;
 const PREVIEW_W: f32 = 300.0;
+const SEARCH_W: f32 = 180.0;
+/// Inner padding of the icon grid.
+const GRID_PAD: f32 = 12.0;
+// Virtual-key codes.
+const BACK: u16 = 0x08;
+const TAB: u16 = 0x09;
+const ENTER: u16 = 0x0D;
+const ESC: u16 = 0x1B;
+const SPACE: u16 = 0x20;
+const END: u16 = 0x23;
+const HOME: u16 = 0x24;
+const LEFT: u16 = 0x25;
+const UP: u16 = 0x26;
+const RIGHT: u16 = 0x27;
+const DOWN: u16 = 0x28;
+const DEL: u16 = 0x2E;
+const F2: u16 = 0x71;
+const F5: u16 = 0x74;
+const LBRACKET: u16 = 0xDB;
+const RBRACKET: u16 = 0xDD;
+const PERIOD: u16 = 0xBE;
+
 /// Width of the invisible resize border inside the body edge.
 const EDGE: f32 = 6.0;
 
@@ -62,6 +87,30 @@ pub enum FinderCmd {
     SetView(View),
     Sort(SortKey),
     Terminal(PathBuf),
+    /// Drag the items out with OLE drag and drop (modal).
+    Drag(Vec<PathBuf>),
+    /// Copy or move dropped items into a folder (modal: the shell shows progress).
+    Transfer { paths: Vec<PathBuf>, dest: PathBuf, copy: bool },
+    /// Re-list and reset mouse state, e.g. after a modal drag.
+    Reload,
+}
+
+impl FinderCmd {
+    /// Commands that run a modal loop and so must run outside the App borrow (see [`run_modal`]).
+    pub fn is_modal(&self) -> bool {
+        matches!(self, FinderCmd::Drag(_) | FinderCmd::Transfer { .. })
+    }
+}
+
+/// Runs a modal command for the Finder window `hwnd`; follow up with [`FinderCmd::Reload`].
+pub fn run_modal(hwnd: HWND, cmd: FinderCmd) {
+    match cmd {
+        FinderCmd::Drag(paths) => dnd::drag_out(hwnd, &paths),
+        FinderCmd::Transfer { paths, dest, copy } => {
+            fs::transfer(&paths, &dest, copy, hwnd);
+        }
+        _ => {}
+    }
 }
 
 pub enum FinderEvent {
@@ -70,6 +119,8 @@ pub enum FinderEvent {
     NewWindow,
     /// Context menu entries and the screen point (points) to show them at.
     Menu(Vec<Entry>, f32, f32),
+    /// A modal command to run once the current message is handled.
+    Run(FinderCmd),
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -84,6 +135,13 @@ enum Hit {
     ColumnBg(usize),
     Header(SortKey),
     Content,
+    Search,
+    SearchClear,
+    /// Quick Look: dimmed area around the panel, the panel, and its buttons.
+    QlBackdrop,
+    QlPanel,
+    QlClose,
+    QlOpen,
 }
 
 struct Column {
@@ -94,27 +152,32 @@ struct Column {
     error: Option<String>,
 }
 
-/// Inline rename field. Text is kept as chars so the caret can't split a UTF-8 sequence.
+/// Inline rename field.
 struct Rename {
     target: PathBuf,
-    text: Vec<char>,
-    caret: usize,
-    anchor: usize,
+    field: TextField,
 }
 
-impl Rename {
-    fn range(&self) -> (usize, usize) {
-        (self.caret.min(self.anchor), self.caret.max(self.anchor))
-    }
-    fn insert(&mut self, s: &str) {
-        let (a, b) = self.range();
-        self.text.splice(a..b, s.chars());
-        self.caret = a + s.chars().count();
-        self.anchor = self.caret;
-    }
-    fn string(&self) -> String {
-        self.text.iter().collect()
-    }
+/// Rubber-band selection in icon and list views.
+struct Band {
+    /// Start point in content coordinates (window y + scroll at the time).
+    x0: f32,
+    y0: f32,
+    /// Current mouse point in window coordinates.
+    x1: f32,
+    y1: f32,
+    /// Selection before the drag; Ctrl toggles against it, Shift adds to it.
+    base: BTreeSet<usize>,
+    toggle: bool,
+}
+
+/// Quick Look state: the previewed file's cached text and scroll.
+#[derive(Default)]
+struct QuickLook {
+    path: PathBuf,
+    text: Option<String>,
+    scroll: f32,
+    max_scroll: f32,
 }
 
 /// Per-render context the App lends to a Finder window.
@@ -133,6 +196,8 @@ pub struct FinderWindow {
     cwd: PathBuf,
     history: Vec<PathBuf>,
     hist_pos: usize,
+    /// Everything in the folder; `entries` is this filtered by the search field.
+    listing: Vec<FileEntry>,
     entries: Vec<FileEntry>,
     error: Option<String>,
     free: Option<u64>,
@@ -153,6 +218,20 @@ pub struct FinderWindow {
     pressed: Option<Hit>,
     last_click: Option<(Instant, Hit)>,
     rename: Option<Rename>,
+    search: TextField,
+    search_focus: bool,
+    /// Caret x positions (window points) for each index of the search text, from the last render.
+    search_xs: Vec<f32>,
+    band: Option<Band>,
+    /// Where an item press started, until it turns into a drag or a click.
+    drag_from: Option<(f32, f32)>,
+    /// Plain click on an already-selected item: reduce the selection to it on release
+    /// (not on press, so the whole selection can be dragged).
+    pending_select: Option<usize>,
+    /// What a drag hovering over the window would drop onto.
+    drop_hit: Option<Hit>,
+    quicklook: Option<QuickLook>,
+    ql_bitmap: Option<(String, Option<ID2D1Bitmap>)>,
     typed: String,
     typed_at: Instant,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
@@ -207,6 +286,7 @@ impl FinderWindow {
             cwd: PathBuf::new(),
             history: Vec::new(),
             hist_pos: 0,
+            listing: Vec::new(),
             entries: Vec::new(),
             error: None,
             free: None,
@@ -226,6 +306,15 @@ impl FinderWindow {
             pressed: None,
             last_click: None,
             rename: None,
+            search: TextField::default(),
+            search_focus: false,
+            search_xs: Vec::new(),
+            band: None,
+            drag_from: None,
+            pending_select: None,
+            drop_hit: None,
+            quicklook: None,
+            ql_bitmap: None,
             typed: String::new(),
             typed_at: Instant::now(),
             bitmaps: HashMap::new(),
@@ -239,6 +328,7 @@ impl FinderWindow {
             dirty: true,
         };
         f.navigate(path, true, ctx.kinds);
+        dnd::register(hwnd, id);
         Ok(f)
     }
 
@@ -281,6 +371,7 @@ impl FinderWindow {
         }
         self.free = fs::free_space(&path);
         self.cwd = path;
+        self.listing = entries.clone();
         self.entries = entries;
         self.error = error.clone();
         self.selected.clear();
@@ -288,6 +379,10 @@ impl FinderWindow {
         self.cursor = None;
         self.scroll = 0.0;
         self.rename = None;
+        // Like macOS, going somewhere else ends the search and Quick Look.
+        self.search.clear();
+        self.search_focus = false;
+        self.quicklook = None;
         self.columns = vec![Column {
             dir: self.cwd.clone(),
             entries: self.entries.clone(),
@@ -304,11 +399,9 @@ impl FinderWindow {
 
     /// Re-lists after on-disk changes, keeping selections by path.
     pub fn reload(&mut self, kinds: &mut KindCache) {
-        let keep: Vec<PathBuf> = self.selected.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.path.clone()).collect();
         let (entries, error) = self.list_sorted(&self.cwd.clone(), kinds);
-        self.entries = entries;
+        self.listing = entries;
         self.error = error;
-        self.reselect(&keep);
         for c in 0..self.columns.len() {
             let sel = self.columns[c].selected.and_then(|i| self.columns[c].entries.get(i)).map(|e| e.path.clone());
             let (entries, error) = self.list_sorted(&self.columns[c].dir.clone(), kinds);
@@ -325,7 +418,47 @@ impl FinderWindow {
             self.columns.truncate(cut + 1);
             self.active_col = self.active_col.min(cut);
         }
+        self.apply_filter();
         self.free = fs::free_space(&self.cwd);
+        self.dirty = true;
+    }
+
+    /// Rebuilds `entries` from `listing` and the search text, keeping selections by path.
+    fn apply_filter(&mut self) {
+        let keep: Vec<PathBuf> = self.selected.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.path.clone()).collect();
+        let query = self.search.string().to_lowercase();
+        let query = query.trim();
+        self.entries = if query.is_empty() {
+            self.listing.clone()
+        } else {
+            self.listing.iter().filter(|e| e.name.to_lowercase().contains(query)).cloned().collect()
+        };
+        self.reselect(&keep);
+        // Column view: the root column shows the same results.
+        if let Some(root) = self.columns.first_mut().filter(|c| c.dir == self.cwd) {
+            let sel = root.selected.and_then(|j| root.entries.get(j)).map(|e| e.path.clone());
+            root.entries = self.entries.clone();
+            root.selected = sel.and_then(|p| root.entries.iter().position(|e| e.path == p));
+            if root.selected.is_none() {
+                self.columns.truncate(1);
+                self.active_col = 0;
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn focus_search(&mut self) {
+        self.search_focus = true;
+        self.search.select_all();
+        self.dirty = true;
+    }
+
+    fn end_search(&mut self) {
+        self.search_focus = false;
+        if !self.search.is_empty() {
+            self.search.clear();
+            self.apply_filter();
+        }
         self.dirty = true;
     }
 
@@ -445,8 +578,28 @@ impl FinderWindow {
             FinderCmd::SetView(v) => self.set_view(v),
             FinderCmd::Sort(k) => self.set_sort(k, kinds),
             FinderCmd::Terminal(p) => fs::open_terminal(&p),
+            FinderCmd::Reload => {
+                // A modal drag swallowed the button release.
+                self.end_press();
+                self.drop_hit = None;
+                self.reload(kinds);
+            }
+            FinderCmd::Drag(_) | FinderCmd::Transfer { .. } => {}
         }
         self.dirty = true;
+    }
+
+    /// Forgets the current mouse press (drag candidate, rubber band, capture).
+    fn end_press(&mut self) {
+        self.pressed = None;
+        self.drag_from = None;
+        self.pending_select = None;
+        self.band = None;
+        unsafe {
+            if GetCapture() == self.hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
     }
 
     fn new_folder(&mut self, kinds: &mut KindCache) {
@@ -472,21 +625,25 @@ impl FinderWindow {
 
     fn begin_rename(&mut self) {
         let Some(entry) = self.selection().first().map(|e| (*e).clone()) else { return };
-        let text: Vec<char> = entry.name.chars().collect();
+        let mut field = TextField::new(&entry.name);
         // Like macOS, preselect the name without its extension.
         let stem = if entry.is_dir {
-            text.len()
+            field.text.len()
         } else {
-            entry.name.rfind('.').filter(|&i| i > 0).map(|i| entry.name[..i].chars().count()).unwrap_or(text.len())
+            entry.name.rfind('.').filter(|&i| i > 0).map(|i| entry.name[..i].chars().count()).unwrap_or(field.text.len())
         };
-        self.rename = Some(Rename { target: entry.path, text, caret: stem, anchor: 0 });
+        field.anchor = 0;
+        field.caret = stem;
+        self.quicklook = None;
+        self.search_focus = false;
+        self.rename = Some(Rename { target: entry.path, field });
         self.ensure_visible();
         self.dirty = true;
     }
 
     fn commit_rename(&mut self, kinds: &mut KindCache) {
         let Some(r) = self.rename.take() else { return };
-        let name = r.string();
+        let name = r.field.string();
         match fs::rename(&r.target, &name) {
             Ok(new_path) => {
                 self.reload(kinds);
@@ -580,15 +737,47 @@ impl FinderWindow {
 
     // --- input -------------------------------------------------------------
 
-    pub fn on_move(&mut self, x: f32, y: f32) {
+    pub fn on_move(&mut self, x: f32, y: f32) -> FinderEvent {
         let h = self.hit_at(x, y);
         let interesting = |h: Option<Hit>| {
-            matches!(h, Some(Hit::Light(_) | Hit::Back | Hit::Forward | Hit::ViewBtn(_) | Hit::Place(_) | Hit::Header(_)))
+            matches!(
+                h,
+                Some(
+                    Hit::Light(_)
+                        | Hit::Back
+                        | Hit::Forward
+                        | Hit::ViewBtn(_)
+                        | Hit::Place(_)
+                        | Hit::Header(_)
+                        | Hit::SearchClear
+                        | Hit::QlClose
+                        | Hit::QlOpen
+                )
+            )
         };
         if h != self.hover && (interesting(h) || interesting(self.hover)) {
             self.dirty = true;
         }
         self.hover = h;
+
+        if self.band.is_some() {
+            self.update_band(x, y);
+        } else if self.pressed == Some(Hit::Search) {
+            // Drag-select inside the search field.
+            let i = self.search_index(x);
+            self.search.set_caret(i, true);
+            self.dirty = true;
+        } else if let Some((x0, y0)) = self.drag_from {
+            let (dx, dy) = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+            if (x - x0).abs() * self.scale > dx as f32 || (y - y0).abs() * self.scale > dy as f32 {
+                let paths: Vec<PathBuf> = self.selection().iter().map(|e| e.path.clone()).collect();
+                self.end_press();
+                if !paths.is_empty() {
+                    return FinderEvent::Run(FinderCmd::Drag(paths));
+                }
+            }
+        }
+        FinderEvent::None
     }
 
     pub fn on_leave(&mut self) {
@@ -600,7 +789,9 @@ impl FinderWindow {
 
     pub fn on_wheel(&mut self, x: f32, delta: i32) {
         let amount = delta as f32 / 120.0 * 60.0;
-        if self.view == View::Columns {
+        if let Some(ql) = &mut self.quicklook {
+            ql.scroll = (ql.scroll - amount).clamp(0.0, ql.max_scroll);
+        } else if self.view == View::Columns {
             let vr = self.view_rect();
             let offset = self.column_offset(vr);
             let c = ((x - vr.x + offset) / COL_W).floor().max(0.0) as usize;
@@ -614,8 +805,17 @@ impl FinderWindow {
         self.dirty = true;
     }
 
+    /// Starts tracking a press that may become a drag.
+    fn begin_press(&mut self, x: f32, y: f32) {
+        self.drag_from = Some((x, y));
+        unsafe {
+            SetCapture(self.hwnd);
+        }
+    }
+
     pub fn on_down(&mut self, x: f32, y: f32, ctrl: bool, shift: bool, kinds: &mut KindCache) {
         let hit = self.hit_at(x, y);
+        self.end_press();
         self.pressed = hit;
         let now = Instant::now();
         let dbl = Duration::from_millis(unsafe { GetDoubleClickTime() } as u64);
@@ -624,6 +824,9 @@ impl FinderWindow {
 
         if self.rename.is_some() {
             self.commit_rename(kinds);
+        }
+        if !matches!(hit, Some(Hit::Search | Hit::SearchClear)) {
+            self.search_focus = false;
         }
         match hit {
             Some(Hit::Item(i)) => {
@@ -641,11 +844,16 @@ impl FinderWindow {
                 } else if shift {
                     let a = self.anchor.unwrap_or(i);
                     self.selected = (a.min(i)..=a.max(i)).collect();
+                } else if self.selected.contains(&i) {
+                    self.pending_select = Some(i);
                 } else {
                     self.selected = [i].into();
                     self.anchor = Some(i);
                 }
                 self.cursor = Some(i);
+                if self.selected.contains(&i) {
+                    self.begin_press(x, y);
+                }
             }
             Some(Hit::Column(c, j)) => {
                 let entry = self.columns.get(c).and_then(|col| col.entries.get(j)).cloned();
@@ -656,11 +864,21 @@ impl FinderWindow {
                     return;
                 }
                 self.select_column(c, j, kinds);
+                self.begin_press(x, y);
             }
             Some(Hit::ColumnBg(c)) => {
                 self.columns.truncate(c + 1);
                 self.columns[c].selected = None;
                 self.active_col = c;
+            }
+            Some(Hit::Content) if self.view != View::Columns => {
+                // Rubber band: Ctrl toggles items against the current selection, Shift adds to it.
+                let base = if ctrl || shift { self.selected.clone() } else { BTreeSet::new() };
+                self.selected = base.clone();
+                self.band = Some(Band { x0: x, y0: y + self.scroll, x1: x, y1: y, base, toggle: ctrl });
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
             }
             Some(Hit::Content) => self.selected.clear(),
             Some(Hit::Header(k)) => self.set_sort(k, kinds),
@@ -669,13 +887,38 @@ impl FinderWindow {
                     self.navigate(p.path, true, kinds);
                 }
             }
+            Some(Hit::Search) => {
+                self.search_focus = true;
+                if double {
+                    self.search.select_all();
+                } else {
+                    let i = self.search_index(x);
+                    self.search.set_caret(i, shift);
+                    unsafe {
+                        SetCapture(self.hwnd);
+                    }
+                }
+            }
+            Some(Hit::SearchClear) => {
+                self.search.clear();
+                self.search_focus = true;
+                self.apply_filter();
+            }
+            Some(Hit::QlBackdrop) => self.quicklook = None,
             _ => {}
         }
         self.dirty = true;
     }
 
     pub fn on_up(&mut self, x: f32, y: f32, kinds: &mut KindCache) -> FinderEvent {
-        let pressed = self.pressed.take();
+        let pressed = self.pressed;
+        let pending = self.pending_select;
+        let had_band = self.band.is_some();
+        self.end_press();
+        if had_band {
+            self.dirty = true;
+            return FinderEvent::None;
+        }
         let Some(hit) = self.hit_at(x, y).filter(|h| Some(*h) == pressed) else { return FinderEvent::None };
         match hit {
             Hit::Light(Light::Close) => return FinderEvent::Close,
@@ -686,16 +929,130 @@ impl FinderWindow {
             Hit::Back => self.go_back(kinds),
             Hit::Forward => self.go_forward(kinds),
             Hit::ViewBtn(v) => self.set_view(v),
+            Hit::Item(i) if pending == Some(i) => {
+                self.selected = [i].into();
+                self.anchor = Some(i);
+            }
+            Hit::QlClose => self.quicklook = None,
+            Hit::QlOpen => {
+                if let Some(e) = self.ql_entry().cloned() {
+                    self.quicklook = None;
+                    self.open_path(&e.path, e.is_dir, kinds);
+                }
+            }
             _ => {}
         }
         self.dirty = true;
         FinderEvent::None
     }
 
+    /// Caret index in the search text nearest to window x.
+    fn search_index(&self, x: f32) -> usize {
+        let nearest = self.search_xs.iter().enumerate().min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs()));
+        nearest.map(|(i, _)| i).unwrap_or(0).min(self.search.text.len())
+    }
+
+    /// Item `i`'s hit areas in content coordinates (scroll 0): icon and label, or the row.
+    fn item_rects(&self, i: usize) -> [Rect; 2] {
+        let vr = self.view_rect();
+        if self.view == View::Icons {
+            let cols = self.grid_cols.max(1);
+            let cw = (vr.w - 2.0 * GRID_PAD) / cols as f32;
+            let cell = Rect::new(vr.x + GRID_PAD + (i % cols) as f32 * cw, vr.y + GRID_PAD + (i / cols) as f32 * CELL_H, cw, CELL_H);
+            let icon = Rect::new(cell.cx() - ICON / 2.0, cell.y + 6.0, ICON, ICON);
+            [icon, Rect::new(cell.x + 4.0, icon.bottom() + 6.0, cell.w - 8.0, 32.0)]
+        } else {
+            let row = Rect::new(vr.x + 8.0, vr.y + HEADER + 4.0 + i as f32 * ROW, vr.w - 16.0, ROW);
+            [row, row]
+        }
+    }
+
+    fn update_band(&mut self, x: f32, y: f32) {
+        let vr = self.view_rect();
+        // Auto-scroll while dragging past the top or bottom edge.
+        let top = if self.view == View::List { vr.y + HEADER } else { vr.y };
+        if y < top {
+            self.scroll = (self.scroll - (top - y) * 0.5).max(0.0);
+        } else if y > vr.bottom() {
+            self.scroll = (self.scroll + (y - vr.bottom()) * 0.5).min(self.max_scroll);
+        }
+        let Some(band) = &self.band else { return };
+        let r = band_rect(band.x0, band.y0, x, y + self.scroll);
+        // Only rows the band spans can intersect it.
+        let n = self.entries.len();
+        let (first, last) = if self.view == View::Icons {
+            let cols = self.grid_cols.max(1);
+            let row = |y: f32| ((y - vr.y - GRID_PAD) / CELL_H).floor().max(0.0) as usize;
+            (row(r.y) * cols, ((row(r.bottom()) + 1) * cols).min(n))
+        } else {
+            let row = |y: f32| ((y - vr.y - HEADER - 4.0) / ROW).floor().max(0.0) as usize;
+            (row(r.y), (row(r.bottom()) + 1).min(n))
+        };
+        let hits: BTreeSet<usize> =
+            (first..last.max(first)).filter(|&i| self.item_rects(i).iter().any(|ir| overlaps(ir, &r))).collect();
+        let sel: BTreeSet<usize> =
+            if band.toggle { band.base.symmetric_difference(&hits).copied().collect() } else { band.base.union(&hits).copied().collect() };
+        self.selected = sel;
+        if let Some(&last) = hits.iter().next_back() {
+            self.cursor = Some(last);
+            self.anchor = hits.iter().next().copied();
+        }
+        if let Some(band) = &mut self.band {
+            band.x1 = x;
+            band.y1 = y;
+        }
+        self.dirty = true;
+    }
+
+    /// Drop feedback from [`dnd`]: highlights what's under the point and returns the folder a drop there goes into.
+    pub fn on_drag(&mut self, phase: dnd::Phase, paths: &[PathBuf]) -> Option<PathBuf> {
+        let (sx, sy, dropping) = match phase {
+            dnd::Phase::Leave => {
+                if self.drop_hit.take().is_some() {
+                    self.dirty = true;
+                }
+                return None;
+            }
+            dnd::Phase::Over(x, y) => (x, y, false),
+            dnd::Phase::Drop(x, y) => (x, y, true),
+        };
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rc);
+        }
+        let (x, y) = ((sx - rc.left) as f32 / self.scale, (sy - rc.top) as f32 / self.scale);
+        let hit = self.hit_at(x, y);
+        let last = self.columns.len() - 1;
+        // Folders take the drop; anywhere else in the view drops into the folder on show.
+        let target = match hit {
+            Some(Hit::Item(i)) => self.entries.get(i).filter(|e| e.is_dir).map(|e| (Hit::Item(i), e.path.clone())),
+            Some(Hit::Column(c, j)) => self.columns[c].entries.get(j).filter(|e| e.is_dir).map(|e| (Hit::Column(c, j), e.path.clone())),
+            Some(Hit::Place(i)) => self.favorites.iter().chain(&self.drives).nth(i).map(|p| (Hit::Place(i), p.path.clone())),
+            _ => None,
+        }
+        .or_else(|| match hit {
+            Some(Hit::Item(_) | Hit::Content | Hit::Header(_)) if self.view != View::Columns => Some((Hit::Content, self.cwd.clone())),
+            Some(Hit::Column(c, _) | Hit::ColumnBg(c)) => Some((Hit::ColumnBg(c), self.columns[c].dir.clone())),
+            Some(Hit::Content) => Some((Hit::ColumnBg(last), self.columns[last].dir.clone())),
+            _ => None,
+        })
+        .filter(|(_, dir)| !paths.iter().any(|p| dir.starts_with(p)));
+        let highlight = if dropping { None } else { target.as_ref().map(|t| t.0) };
+        if highlight != self.drop_hit {
+            self.drop_hit = highlight;
+            self.dirty = true;
+        }
+        target.map(|t| t.1)
+    }
+
     pub fn on_right_click(&mut self, x: f32, y: f32, kinds: &mut KindCache) -> FinderEvent {
         if self.rename.is_some() {
             self.commit_rename(kinds);
         }
+        if self.quicklook.is_some() {
+            return FinderEvent::None;
+        }
+        self.search_focus = false;
         let id = self.id;
         let cmd = |c: FinderCmd| Action::Finder { window: id, cmd: c };
         let hit = self.hit_at(x, y);
@@ -760,64 +1117,57 @@ impl FinderWindow {
 
     /// Keyboard shortcuts mirror macOS with Ctrl in place of ⌘.
     pub fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool, kinds: &mut KindCache) -> FinderEvent {
-        const BACK: u16 = 0x08;
-        const ENTER: u16 = 0x0D;
-        const ESC: u16 = 0x1B;
-        const END: u16 = 0x23;
-        const HOME: u16 = 0x24;
-        const LEFT: u16 = 0x25;
-        const UP: u16 = 0x26;
-        const RIGHT: u16 = 0x27;
-        const DOWN: u16 = 0x28;
-        const DEL: u16 = 0x2E;
-        const F2: u16 = 0x71;
-        const F5: u16 = 0x74;
-        const LBRACKET: u16 = 0xDB;
-        const RBRACKET: u16 = 0xDD;
-        const PERIOD: u16 = 0xBE;
-
         self.dirty = true;
         if let Some(r) = &mut self.rename {
-            let len = r.text.len();
             match vk {
                 ENTER => self.commit_rename(kinds),
                 ESC => self.rename = None,
-                BACK | DEL => {
-                    let (a, b) = r.range();
-                    if a != b {
-                        r.insert("");
-                    } else if vk == BACK && a > 0 {
-                        r.text.remove(a - 1);
-                        r.caret = a - 1;
-                        r.anchor = r.caret;
-                    } else if vk == DEL && a < len {
-                        r.text.remove(a);
-                    }
+                _ => {
+                    r.field.on_key(vk, ctrl, shift);
                 }
-                LEFT | RIGHT | HOME | END => {
-                    let (a, b) = r.range();
-                    r.caret = match vk {
-                        LEFT if a != b && !shift => a,
-                        RIGHT if a != b && !shift => b,
-                        LEFT => r.caret.saturating_sub(1),
-                        RIGHT => (r.caret + 1).min(len),
-                        HOME => 0,
-                        _ => len,
-                    };
-                    if !shift {
-                        r.anchor = r.caret;
-                    }
-                }
-                _ if ctrl && vk == b'A' as u16 => {
-                    r.anchor = 0;
-                    r.caret = len;
-                }
-                _ => {}
             }
             return FinderEvent::None;
         }
 
+        if self.search_focus {
+            match vk {
+                // Esc clears the search, then leaves the field.
+                ESC if !self.search.is_empty() => {
+                    self.search.clear();
+                    self.apply_filter();
+                }
+                ESC => self.search_focus = false,
+                // Into the results.
+                ENTER | TAB | DOWN => {
+                    self.search_focus = false;
+                    if self.selected.is_empty() && !self.entries.is_empty() {
+                        self.selected = [0].into();
+                        self.anchor = Some(0);
+                        self.cursor = Some(0);
+                    }
+                }
+                _ => match self.search.on_key(vk, ctrl, shift) {
+                    KeyResult::Edited => self.apply_filter(),
+                    // Unhandled Ctrl shortcuts (close window, views, ...) still work.
+                    KeyResult::Ignored if ctrl => return self.on_shortcut(vk, ctrl, shift, alt, kinds),
+                    _ => {}
+                },
+            }
+            return FinderEvent::None;
+        }
+
+        if self.quicklook.is_some() && matches!(vk, ESC | SPACE) {
+            self.quicklook = None;
+            return FinderEvent::None;
+        }
+        self.on_shortcut(vk, ctrl, shift, alt, kinds)
+    }
+
+    fn on_shortcut(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool, kinds: &mut KindCache) -> FinderEvent {
         match (vk, ctrl, alt) {
+            (SPACE, false, false) => self.toggle_quicklook(),
+            (k, true, false) if k == b'Y' as u16 => self.toggle_quicklook(),
+            (k, true, false) if k == b'F' as u16 => self.focus_search(),
             (k, true, false) if k == b'N' as u16 && shift => self.new_folder(kinds),
             (k, true, false) if k == b'N' as u16 => return FinderEvent::NewWindow,
             (k, true, false) if k == b'W' as u16 => return FinderEvent::Close,
@@ -926,8 +1276,17 @@ impl FinderWindow {
             return;
         }
         if let Some(r) = &mut self.rename {
-            r.insert(&ch.to_string());
+            r.field.insert(&ch.to_string());
             self.dirty = true;
+            return;
+        }
+        if self.search_focus {
+            self.search.insert(&ch.to_string());
+            self.apply_filter();
+            return;
+        }
+        if ch == ' ' {
+            // Space is Quick Look (handled as a key).
             return;
         }
         // Type-to-select.
@@ -987,6 +1346,33 @@ impl FinderWindow {
         (total - vr.w).max(0.0)
     }
 
+    /// The item Quick Look shows: the keyboard cursor if selected, else the first selected item.
+    fn ql_entry(&self) -> Option<&FileEntry> {
+        if self.view == View::Columns {
+            return self.selection().first().copied();
+        }
+        let i = self.cursor.filter(|c| self.selected.contains(c)).or_else(|| self.selected.iter().next().copied())?;
+        self.entries.get(i)
+    }
+
+    fn toggle_quicklook(&mut self) {
+        if self.quicklook.take().is_none() && self.ql_entry().is_some() {
+            self.quicklook = Some(QuickLook::default());
+        }
+        self.dirty = true;
+    }
+
+    /// Follows the selection: loads the text preview when the previewed file changes.
+    fn sync_quicklook(&mut self) {
+        let Some(e) = self.ql_entry().cloned() else {
+            self.quicklook = None;
+            return;
+        };
+        if let Some(ql) = self.quicklook.as_mut().filter(|ql| ql.path != e.path) {
+            *ql = QuickLook { path: e.path.clone(), text: fs::text_preview(&e), scroll: 0.0, max_scroll: 0.0 };
+        }
+    }
+
     fn preview_entry(&self) -> Option<&FileEntry> {
         let last = self.columns.last()?;
         last.selected.and_then(|j| last.entries.get(j)).filter(|e| !e.is_dir)
@@ -1005,6 +1391,9 @@ impl FinderWindow {
         }
         if unsafe { IsIconic(self.hwnd).as_bool() } {
             return;
+        }
+        if self.quicklook.is_some() {
+            self.sync_quicklook();
         }
 
         let (gfx, theme) = (ctx.gfx, ctx.theme);
@@ -1029,10 +1418,12 @@ impl FinderWindow {
         let label_font = gfx.format_wrapped(&theme.font, 12.0);
         let center = gfx.format(&theme.font, 12.0, Weight::Regular, Align::Center);
         let preview_title = gfx.format(&theme.font, 15.0, Weight::Bold, Align::Center);
+        let ql_title = gfx.format(&theme.font, 13.0, Weight::Bold, Align::Center);
+        let mono = gfx.format_wrapped("Consolas", 12.0);
 
         // Grid / scroll metrics for the current view.
         let n = self.entries.len();
-        let pad = 12.0;
+        let pad = GRID_PAD;
         self.grid_cols = (((vr.w - 2.0 * pad) / CELL_W).floor() as usize).max(1);
         let content_h = match self.view {
             View::Icons => n.div_ceil(self.grid_cols) as f32 * CELL_H + 2.0 * pad,
@@ -1075,6 +1466,12 @@ impl FinderWindow {
         let places: Vec<&Place> = self.favorites.iter().chain(&self.drives).collect();
         let fav_count = self.favorites.len();
         let cwd = &self.cwd;
+        let (search, search_focus, drop_hit) = (&self.search, self.search_focus, self.drop_hit);
+        let band = self.band.as_ref().map(|b| band_rect(b.x0, b.y0 - scroll, b.x1, b.y1));
+        let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
+        let ql = self.quicklook.as_mut().zip(ql_entry);
+        let ql_bitmap = &mut self.ql_bitmap;
+        let mut search_xs: Vec<f32> = Vec::new();
 
         let drawn = self.canvas.draw(gfx, |p| {
             let mut icon_for = |p: &Painter, e: &FileEntry| -> Option<ID2D1Bitmap> {
@@ -1097,20 +1494,31 @@ impl FinderWindow {
                     p.bitmap(&b, Rect::new(r.cx() - w / 2.0, r.bottom() - h, w, h), 1.0);
                 }
             };
+            // Editable text in `r` (scrolled to keep the caret visible); returns each caret index's x.
+            let edit_text = |p: &Painter, r: Rect, field: &TextField, focused: bool| -> Vec<f32> {
+                let mut s = String::new();
+                let mut xs = vec![0.0];
+                for c in &field.text {
+                    s.push(*c);
+                    xs.push(p.gfx.measure(&s, &regular));
+                }
+                let shift = (xs[field.caret] - (r.w - 2.0)).max(0.0);
+                let xs: Vec<f32> = xs.iter().map(|x| r.x + x - shift).collect();
+                p.clipped(r.inset(-1.0, 0.0), || {
+                    let (a, b) = field.range();
+                    if a != b {
+                        p.fill_rect(Rect::new(xs[a], r.y + 3.0, xs[b] - xs[a], r.h - 6.0), theme.accent.alpha(0.35));
+                    } else if focused {
+                        p.line(xs[a], r.y + 4.0, xs[a], r.bottom() - 4.0, theme.text, 1.0);
+                    }
+                    p.text(&field.string(), &regular, Rect::new(xs[0], r.y, 10_000.0, r.h), theme.text);
+                });
+                xs
+            };
             let draw_field = |p: &Painter, r: Rect, ren: &Rename| {
                 p.fill_round(r, 3.0, field_bg);
                 p.stroke_round(r, 3.0, theme.accent, 1.5);
-                let text = ren.string();
-                let prefix = |i: usize| -> f32 { p.gfx.measure(&ren.text[..i].iter().collect::<String>(), &regular) };
-                let (a, b) = ren.range();
-                let x0 = r.x + 4.0;
-                if a != b {
-                    p.fill_rect(Rect::new(x0 + prefix(a), r.y + 3.0, prefix(b) - prefix(a), r.h - 6.0), theme.accent.alpha(0.35));
-                } else {
-                    let cx = x0 + prefix(a);
-                    p.line(cx, r.y + 4.0, cx, r.bottom() - 4.0, theme.text, 1.0);
-                }
-                p.text(&text, &regular, Rect::new(x0, r.y, r.w - 8.0, r.h), theme.text);
+                edit_text(p, Rect::new(r.x + 4.0, r.y, r.w - 8.0, r.h), &ren.field, true);
             };
 
             chrome::window(p, body, SIDEBAR, theme, &pal);
@@ -1376,6 +1784,7 @@ impl FinderWindow {
 impl Drop for FinderWindow {
     fn drop(&mut self) {
         self.watcher = None;
+        dnd::revoke(self.hwnd);
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }

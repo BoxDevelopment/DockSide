@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
 use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Shell::*;
@@ -319,6 +319,88 @@ pub fn copy_text(text: &str) {
     }
 }
 
+pub fn paste_text() -> Option<String> {
+    unsafe {
+        OpenClipboard(None).ok()?;
+        let text = GetClipboardData(CF_UNICODETEXT.0 as u32).ok().and_then(|h| {
+            let mem = HGLOBAL(h.0);
+            let src = GlobalLock(mem) as *const u16;
+            if src.is_null() {
+                return None;
+            }
+            let s = PCWSTR(src).to_string().ok();
+            let _ = GlobalUnlock(mem);
+            s
+        });
+        let _ = CloseClipboard();
+        text
+    }
+}
+
+/// True when both paths are on the same drive (so a drag moves instead of copies).
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
+    root(a).is_some() && root(a) == root(b)
+}
+
+fn double_null<P: AsRef<Path>>(paths: &[P]) -> Vec<u16> {
+    let mut out: Vec<u16> = Vec::new();
+    for p in paths {
+        out.extend(p.as_ref().as_os_str().to_string_lossy().encode_utf16());
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
+/// Copies or moves `paths` into `dest` with the shell's progress, conflict and undo
+/// handling. Copies into the items' own folder get "- Copy" names (⌥-drag on macOS).
+pub fn transfer(paths: &[PathBuf], dest: &Path, copy: bool, owner: HWND) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let from = double_null(paths);
+    let to = double_null(&[dest]);
+    let mut flags = FOF_ALLOWUNDO;
+    if copy && paths.iter().all(|p| p.parent() == Some(dest)) {
+        flags |= FOF_RENAMEONCOLLISION;
+    }
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: owner,
+        wFunc: if copy { FO_COPY } else { FO_MOVE },
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR(to.as_ptr()),
+        fFlags: flags.0 as u16,
+        ..Default::default()
+    };
+    unsafe { SHFileOperationW(&mut op) == 0 && !op.fAnyOperationsAborted.as_bool() }
+}
+
+/// Extensions Quick Look shows as plain text.
+const TEXT_EXT: &[&str] = &[
+    "txt", "md", "markdown", "log", "csv", "tsv", "json", "jsonc", "toml", "yaml", "yml", "ini", "cfg", "conf", "xml",
+    "html", "htm", "css", "scss", "js", "mjs", "cjs", "ts", "tsx", "jsx", "rs", "py", "rb", "go", "java", "kt", "swift",
+    "c", "h", "cc", "cpp", "hpp", "cs", "lua", "sh", "bash", "zsh", "ps1", "psm1", "bat", "cmd", "sql", "gitignore",
+    "gitattributes", "editorconfig", "env", "lock", "properties", "gradle", "cmake", "mk", "srt", "reg", "nfo",
+];
+
+/// The start of a text file for Quick Look (None for folders and binary / unknown types).
+pub fn text_preview(e: &Entry) -> Option<String> {
+    use std::io::Read;
+    const MAX: u64 = 32 * 1024;
+    let named = matches!(e.name.to_lowercase().as_str(), "makefile" | "dockerfile" | "license" | "readme");
+    if e.is_dir || !(TEXT_EXT.contains(&e.ext.as_str()) || named) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(&e.path).ok()?.take(MAX).read_to_end(&mut buf).ok()?;
+    if buf.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    Some(text.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\t', "    "))
+}
+
 pub fn open_terminal(dir: &Path) {
     use std::os::windows::process::CommandExt;
     let ok = std::process::Command::new("wt").arg("-d").arg(dir).spawn().is_ok();
@@ -337,6 +419,12 @@ mod tests {
         let mut v = vec!["file 10", "File 2", "file 1", "alpha"];
         v.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(v, vec!["alpha", "file 1", "File 2", "file 10"]);
+    }
+
+    #[test]
+    fn volumes_compare_drive_letters() {
+        assert!(same_volume(Path::new("C:\\Users\\a"), Path::new("c:\\temp")));
+        assert!(!same_volume(Path::new("C:\\Users"), Path::new("D:\\Users")));
     }
 
     #[test]

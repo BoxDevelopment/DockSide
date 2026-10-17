@@ -16,6 +16,7 @@ toml_edit = "0.22"
 [dependencies.windows]
 version = "0.58"
 features = [
+    "implement",
     "Foundation_Numerics",
     "System",
     "UI",
@@ -41,6 +42,7 @@ features = [
     "Win32_System_Power",
     "Win32_System_Registry",
     "Win32_System_Shutdown",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",

@@ -1,5 +1,5 @@
 //! The Dock: pinned + running apps, magnification, launch bounce, running
-//! indicators, tooltips and context menus.
+//! indicators, tooltips, context menus, drag-to-reorder and auto-hide.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -11,7 +11,7 @@ use windows::Win32::UI::Shell::ABE_BOTTOM;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::anim::approach;
-use crate::config::{Config, DockApp, DockCfg, IconStyle};
+use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{IconStore, RECYCLE_BIN};
 use crate::gfx::{Align, Gfx, Weight};
@@ -24,6 +24,12 @@ use crate::win::{appbar, Monitor, WM_APP_APPBAR};
 const BOUNCE_PERIOD: f32 = 0.62;
 const MAX_BOUNCES: f32 = 12.0;
 const LABEL_H: f32 = 24.0;
+/// Pointer travel (points) before a press becomes a drag.
+const DRAG_THRESHOLD: f32 = 5.0;
+/// How long icons ease into new slots after a reorder.
+const EASE_TIME: f32 = 0.35;
+/// Delay before an auto-hiding Dock slides away.
+const HIDE_DELAY: f32 = 0.3;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
@@ -36,6 +42,19 @@ enum Kind {
 struct Bounce {
     t: f32,
     until: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Drag {
+    from: usize,
+    /// Insertion index among the pinned items (excluding the dragged one).
+    to: usize,
+    /// Pointer offset from the icon center when the drag started.
+    grab_dx: f32,
+    x: f32,
+    y: f32,
+    /// Dragged far enough above the Dock to remove it on release.
+    out: bool,
 }
 
 struct Item {
@@ -99,7 +118,7 @@ impl Item {
         Item {
             kind,
             name: if kind == Kind::Trash { "Trash".into() } else { String::new() },
-            launch: if kind == Kind::Trash { "shell:RecycleBinFolder".into() } else { String::new() },
+            launch: if kind == Kind::Trash { "shell:RecycleBinFolder".into() } else { "|separator|".into() },
             args: None,
             icon_key: RECYCLE_BIN.into(),
             custom_icon: None,
@@ -152,7 +171,7 @@ impl Metrics {
     }
 }
 
-/// Result of laying out items for the current hover state.
+/// Result of laying out a row of items for the current hover state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {
     /// (center x, size) per item, window-local points.
@@ -204,7 +223,6 @@ pub fn compute_layout(
         })
         .collect();
 
-    // Magnified positions starting at 0.
     let mut centers = Vec::with_capacity(n);
     let mut x = 0.0;
     for &s in &sizes {
@@ -212,7 +230,7 @@ pub fn compute_layout(
         x += s + gap;
     }
 
-    // Anchor: map mouse position in the base row to the same relative spot in the magnified row.
+    // Anchor: map the mouse position in the base row to the same relative spot in the magnified row.
     let span0 = |i: usize| (centers0[i] - widths[i] / 2.0 - gap / 2.0, widths[i] + gap);
     let span = |i: usize| (centers[i] - sizes[i] / 2.0 - gap / 2.0, sizes[i] + gap);
     let (k, u) = if mouse_x < span0(0).0 {
@@ -223,15 +241,44 @@ pub fn compute_layout(
         let k = (0..n).find(|&i| mouse_x < span0(i).0 + span0(i).1).unwrap_or(n - 1);
         (k, (mouse_x - span0(k).0) / span0(k).1)
     };
-    let mag_point = span(k).0 + u * span(k).1;
-    let base_point = span0(k).0 + u * span0(k).1;
-    // Blend the anchor with the hover amount so t = 0 yields the unmagnified row exactly.
-    let shift = base_point - mag_point;
+    let shift = (span0(k).0 + u * span0(k).1) - (span(k).0 + u * span(k).1);
 
     let items: Vec<(f32, f32)> = centers.iter().zip(&sizes).map(|(c, s)| (c + shift, *s)).collect();
     let left = items[0].0 - items[0].1 / 2.0 - pad;
     let right = items[n - 1].0 + items[n - 1].1 / 2.0 + pad;
     Layout { items, left, right }
+}
+
+/// Pinned files that no longer exist are skipped (URIs and shell ids always pass).
+fn pin_exists(app: &DockApp) -> bool {
+    let p = Path::new(&app.path);
+    !(p.is_absolute() && !app.path.contains("::") && !p.exists())
+}
+
+/// Display order of item indices: the dragged item moves to its drop slot,
+/// or disappears while it's dragged out of the Dock.
+fn display_order(n: usize, drag: Option<&Drag>) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if let Some(d) = drag {
+        order.remove(d.from);
+        if !d.out {
+            order.insert(d.to.min(order.len()), d.from);
+        }
+    }
+    order
+}
+
+/// Layout in display order, mapped back to item indices.
+struct Slots {
+    lay: Layout,
+    /// (center x, size) per item index; `None` for an item dragged out.
+    by_item: Vec<Option<(f32, f32)>>,
+}
+
+impl Slots {
+    fn get(&self, i: usize) -> Option<(f32, f32)> {
+        self.by_item.get(i).copied().flatten()
+    }
 }
 
 pub struct Dock {
@@ -245,6 +292,14 @@ pub struct Dock {
     hovering: bool,
     mouse: (f32, f32),
     pressed: Option<usize>,
+    press_at: (f32, f32),
+    drag: Option<Drag>,
+    /// Eased icon centers (screen points) by launch target, used while slots are moving.
+    eased: HashMap<String, f32>,
+    ease_left: f32,
+    /// 0 = fully shown, 1 = fully hidden (auto-hide).
+    hide_t: f32,
+    idle: f32,
     pub menu_item: Option<usize>,
     pub tracking: bool,
     reserved: bool,
@@ -254,16 +309,7 @@ pub struct Dock {
 impl Dock {
     pub fn new(gfx: &Gfx, theme: &Theme, cfg: &Config, monitor: Monitor) -> Result<Self> {
         let d = &cfg.dock;
-        let mut items: Vec<Item> = d
-            .apps
-            .iter()
-            .filter(|a| {
-                // Skip pinned files that don't exist (URIs and shell ids always pass).
-                let p = Path::new(&a.path);
-                !(p.is_absolute() && !a.path.contains("::") && !p.exists())
-            })
-            .map(Item::pinned)
-            .collect();
+        let mut items: Vec<Item> = d.apps.iter().filter(|a| pin_exists(a)).map(Item::pinned).collect();
         if d.show_trash {
             items.push(Item::special(Kind::Separator));
             items.push(Item::special(Kind::Trash));
@@ -272,7 +318,7 @@ impl Dock {
         let metrics = Metrics::new(d);
         let placeholder = RECT { left: 0, top: 0, right: 1, bottom: 1 };
         let surface = Surface::new(gfx, placeholder, monitor.scale, d.backdrop, theme.dock_tint)?;
-        let reserved = d.reserve_space;
+        let reserved = d.reserve_space && !d.autohide;
         if reserved {
             let thickness = ((metrics.margin + metrics.shelf_h) * monitor.scale).round() as i32;
             appbar::register(surface.content, WM_APP_APPBAR, ABE_BOTTOM, monitor.rect, thickness);
@@ -288,6 +334,12 @@ impl Dock {
             hovering: false,
             mouse: (0.0, 0.0),
             pressed: None,
+            press_at: (0.0, 0.0),
+            drag: None,
+            eased: HashMap::new(),
+            ease_left: 0.0,
+            hide_t: if d.autohide { 1.0 } else { 0.0 },
+            idle: 0.0,
             menu_item: None,
             tracking: false,
             reserved,
@@ -297,19 +349,86 @@ impl Dock {
         Ok(dock)
     }
 
-    fn base_widths(&self) -> (Vec<f32>, Vec<bool>) {
-        let m = &self.metrics;
-        self.items
-            .iter()
-            .map(|i| if i.kind == Kind::Separator { (m.sep_w, false) } else { (m.tile, true) })
-            .unzip()
+    /// Applies a new pinned-app list in place: running windows and bounces are
+    /// kept, and icons slide from where they are now to their new slots.
+    pub fn set_apps(&mut self, apps: &[DockApp]) {
+        self.snapshot_positions();
+        self.cfg.apps = apps.to_vec();
+        self.drag = None;
+        self.pressed = None;
+        self.menu_item = None;
+
+        let mut old: Vec<Item> = std::mem::take(&mut self.items).into_iter().filter(|i| i.kind == Kind::App).collect();
+        let mut items: Vec<Item> = Vec::new();
+        for app in apps.iter().filter(|a| pin_exists(a)) {
+            let mut item = Item::pinned(app);
+            if let Some(pos) = old.iter().position(|o| o.launch.eq_ignore_ascii_case(&app.path)) {
+                let prev = old.remove(pos);
+                item.windows = prev.windows;
+                item.bounce = prev.bounce;
+            }
+            items.push(item);
+        }
+        // Apps that are still running stay in the Dock unpinned.
+        for prev in old.into_iter().filter(|o| !o.windows.is_empty()) {
+            let mut item = Item::running(&prev.windows[0], prev.name.clone());
+            item.windows = prev.windows;
+            items.push(item);
+        }
+        if self.cfg.show_trash {
+            items.push(Item::special(Kind::Separator));
+            items.push(Item::special(Kind::Trash));
+        }
+        self.items = items;
+        if let Err(e) = self.fit_window() {
+            log!("dock resize failed: {e}");
+        }
+        self.ease_left = EASE_TIME;
+        self.dirty = true;
+    }
+
+    /// Records current icon centers as the starting point for easing.
+    fn snapshot_positions(&mut self) {
+        if self.ease_left > 0.0 {
+            return; // already easing from live positions
+        }
+        let slots = self.slots();
+        let left_pt = self.left_pt();
+        // Store in screen points so a window resize doesn't make icons jump.
+        self.eased.clear();
+        for (i, item) in self.items.iter().enumerate() {
+            if let Some((cx, _)) = slots.get(i) {
+                self.eased.insert(item.launch.clone(), left_pt + cx);
+            }
+        }
+    }
+
+    fn left_pt(&self) -> f32 {
+        self.surface.rect.left as f32 / self.surface.scale
+    }
+
+    fn pinned_count(&self) -> usize {
+        self.items.iter().take_while(|i| i.pinned.is_some()).count()
+    }
+
+    pub fn dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    fn width_of(&self, i: usize) -> f32 {
+        if self.items[i].kind == Kind::Separator {
+            self.metrics.sep_w
+        } else {
+            self.metrics.tile
+        }
     }
 
     /// Sizes the window to fit the fully magnified Dock plus tooltip room.
     fn fit_window(&mut self) -> Result<()> {
         let m = self.metrics;
-        let (widths, _) = self.base_widths();
-        let total0 = widths.iter().sum::<f32>() + m.gap * widths.len().saturating_sub(1) as f32 + 2.0 * m.pad;
+        let total0 = (0..self.items.len()).map(|i| self.width_of(i)).sum::<f32>()
+            + m.gap * self.items.len().saturating_sub(1) as f32
+            + 2.0 * m.pad;
         let grow = (m.max - m.tile) * 2.6 * 2.0;
         let width_pt = (total0 + grow + 280.0).min(self.monitor.width_pt());
         let height_pt = m.margin + m.shelf_h + m.max.max(m.tile * 1.55) + LABEL_H + 16.0;
@@ -320,8 +439,13 @@ impl Dock {
         self.surface.set_rect(RECT { left, top: mon.bottom - h, right: left + w, bottom: mon.bottom })
     }
 
+    /// Vertical slide for auto-hide, in points.
+    fn hide_offset(&self) -> f32 {
+        self.hide_t * (self.metrics.shelf_h + self.metrics.margin + 6.0)
+    }
+
     fn shelf_bottom(&self) -> f32 {
-        self.surface.height_pt() - self.metrics.margin
+        self.surface.height_pt() - self.metrics.margin + self.hide_offset()
     }
 
     fn icon_bottom(&self) -> f32 {
@@ -329,10 +453,17 @@ impl Dock {
         self.shelf_bottom() - (m.shelf_h - m.tile) / 2.0 - m.tile * 0.02
     }
 
-    fn layout(&self) -> Layout {
+    fn slots(&self) -> Slots {
         let m = &self.metrics;
-        let (widths, scalable) = self.base_widths();
-        compute_layout(&widths, &scalable, m.max, m.gap, m.pad, self.surface.width_pt(), self.mouse.0, self.hover_t)
+        let order = display_order(self.items.len(), self.drag.as_ref());
+        let widths: Vec<f32> = order.iter().map(|&i| self.width_of(i)).collect();
+        let scalable: Vec<bool> = order.iter().map(|&i| self.items[i].kind != Kind::Separator).collect();
+        let lay = compute_layout(&widths, &scalable, m.max, m.gap, m.pad, self.surface.width_pt(), self.mouse.0, self.hover_t);
+        let mut by_item = vec![None; self.items.len()];
+        for (slot, &i) in order.iter().enumerate() {
+            by_item[i] = Some(lay.items[slot]);
+        }
+        Slots { lay, by_item }
     }
 
     fn shelf_rect(&self, lay: &Layout) -> Rect {
@@ -348,20 +479,33 @@ impl Dock {
         Rect::new(shelf.x, top, shelf.w, shelf.bottom() - top)
     }
 
+    /// The bottom-edge strip that reveals a hidden Dock. It also covers the
+    /// margin under the shelf, so moving between shelf and edge isn't a "leave".
+    fn reveal_rect(&self, lay: &Layout) -> Rect {
+        let h = self.surface.height_pt();
+        let strip = self.metrics.margin + 2.0;
+        Rect::new(lay.left, h - strip, lay.right - lay.left, strip)
+    }
+
     fn item_at(&self, x: f32, y: f32) -> Option<usize> {
-        let lay = self.layout();
-        if !self.hit_rect(&lay).contains(x, y) {
+        let slots = self.slots();
+        if !self.hit_rect(&slots.lay).contains(x, y) {
             return None;
         }
         let gap = self.metrics.gap;
-        lay.items
-            .iter()
-            .position(|(cx, s)| x >= cx - s / 2.0 - gap / 2.0 && x < cx + s / 2.0 + gap / 2.0)
+        (0..self.items.len())
+            .find(|&i| {
+                slots.get(i).is_some_and(|(cx, s)| x >= cx - s / 2.0 - gap / 2.0 && x < cx + s / 2.0 + gap / 2.0)
+            })
             .filter(|&i| self.items[i].kind != Kind::Separator)
     }
 
     /// Attaches the current window list to items, adding/removing running apps.
     pub fn update_running(&mut self, windows: &[AppWindow], names: &mut AppNames, cfg: &Config) {
+        if self.drag.is_some() {
+            return; // indices must stay stable mid-drag
+        }
+        self.snapshot_positions();
         let before: Vec<(String, bool)> = self.items.iter().map(|i| (i.launch.clone(), !i.windows.is_empty())).collect();
         for item in &mut self.items {
             item.windows.clear();
@@ -404,6 +548,7 @@ impl Dock {
             if before.len() != after.len() {
                 self.pressed = None;
                 self.menu_item = None;
+                self.ease_left = EASE_TIME;
                 if let Err(e) = self.fit_window() {
                     log!("dock resize failed: {e}");
                 }
@@ -423,15 +568,17 @@ impl Dock {
         }
     }
 
-    /// Returns true while animating.
+    /// Advances animations; returns true while anything is still moving.
     pub fn tick(&mut self, dt: f32) -> bool {
         let mut animating = false;
-        let target = if self.hovering && self.cfg.magnification { 1.0 } else { 0.0 };
+
+        let target = if self.hovering && self.cfg.magnification && self.drag.is_none() { 1.0 } else { 0.0 };
         if self.hover_t != target {
             self.hover_t = approach(self.hover_t, target, dt, 15.0);
             animating = true;
             self.dirty = true;
         }
+
         for item in &mut self.items {
             if let Some(b) = &mut item.bounce {
                 b.t += dt;
@@ -444,6 +591,43 @@ impl Dock {
                 self.dirty = true;
             }
         }
+
+        if self.cfg.autohide {
+            let wants_shown = self.hovering || self.drag.is_some() || self.menu_item.is_some() || self.pressed.is_some();
+            let target = if wants_shown {
+                self.idle = 0.0;
+                0.0
+            } else {
+                self.idle += dt;
+                if self.idle >= HIDE_DELAY {
+                    1.0
+                } else {
+                    animating = true;
+                    self.hide_t
+                }
+            };
+            if self.hide_t != target {
+                self.hide_t = approach(self.hide_t, target, dt, 11.0);
+                animating = true;
+                self.dirty = true;
+            }
+        }
+
+        if self.ease_left > 0.0 {
+            self.ease_left = (self.ease_left - dt).max(0.0);
+            let slots = self.slots();
+            let left_pt = self.left_pt();
+            for (i, item) in self.items.iter().enumerate() {
+                if let Some((cx, _)) = slots.get(i) {
+                    let cx = left_pt + cx;
+                    let e = self.eased.entry(item.launch.clone()).or_insert(cx);
+                    *e = if self.ease_left == 0.0 { cx } else { approach(*e, cx, dt, 18.0) };
+                }
+            }
+            animating = true;
+            self.dirty = true;
+        }
+
         if self.items.iter().any(|i| i.kind == Kind::App && i.pinned.is_none() && i.windows.is_empty() && i.bounce.is_none()) {
             self.items.retain(|i| i.kind != Kind::App || i.pinned.is_some() || !i.windows.is_empty() || i.bounce.is_some());
             let _ = self.fit_window();
@@ -454,30 +638,100 @@ impl Dock {
     /// Returns true when an animation should start.
     pub fn on_move(&mut self, x: f32, y: f32) -> bool {
         self.mouse = (x, y);
-        let inside = self.hit_rect(&self.layout()).contains(x, y);
+
+        if self.drag.is_none() {
+            if let Some(i) = self.pressed {
+                let (dx, dy) = (x - self.press_at.0, y - self.press_at.1);
+                if self.items[i].pinned.is_some() && (dx * dx + dy * dy).sqrt() > DRAG_THRESHOLD {
+                    let cx = self.slots().get(i).map(|s| s.0).unwrap_or(x);
+                    self.drag = Some(Drag { from: i, to: i, grab_dx: x - cx, x, y, out: false });
+                    self.eased.clear();
+                }
+            }
+        }
+
+        if let Some(mut d) = self.drag {
+            d.x = x;
+            d.y = y;
+            let shelf_top = self.shelf_bottom() - self.metrics.shelf_h;
+            d.out = y < shelf_top - self.metrics.tile * 1.1;
+            // Drop slot: how many other pinned icons sit left of the dragged icon's center.
+            let others = Drag { out: true, ..d };
+            let slots_without = {
+                let saved = self.drag.replace(others);
+                let s = self.slots();
+                self.drag = saved;
+                s
+            };
+            let center = x - d.grab_dx;
+            let pinned = self.pinned_count();
+            d.to = (0..pinned)
+                .filter(|&i| i != d.from)
+                .filter(|&i| slots_without.get(i).is_some_and(|(cx, _)| cx < center))
+                .count()
+                .min(pinned.saturating_sub(1));
+            self.drag = Some(d);
+            self.ease_left = EASE_TIME;
+            self.hovering = true;
+            self.dirty = true;
+            return true;
+        }
+
+        let slots = self.slots();
+        let inside = self.hit_rect(&slots.lay).contains(x, y)
+            || (self.cfg.autohide && self.reveal_rect(&slots.lay).contains(x, y));
         let changed = inside != self.hovering;
         self.hovering = inside;
         self.dirty = true;
-        changed
+        changed || self.cfg.autohide
     }
 
     pub fn on_leave(&mut self) -> bool {
+        if self.drag.is_some() {
+            return false;
+        }
         self.tracking = false;
         self.pressed = None;
         let changed = self.hovering;
         self.hovering = false;
         self.dirty = true;
-        changed
+        changed || self.cfg.autohide
     }
 
     pub fn on_down(&mut self, x: f32, y: f32) {
         self.pressed = self.item_at(x, y);
+        self.press_at = (x, y);
         self.dirty = true;
+    }
+
+    /// Mouse capture was lost mid-drag (e.g. a system dialog): drop the drag.
+    pub fn cancel_drag(&mut self) {
+        if self.drag.take().is_some() {
+            self.pressed = None;
+            self.ease_left = EASE_TIME;
+            self.dirty = true;
+        }
     }
 
     pub fn on_up(&mut self, x: f32, y: f32) -> Option<Action> {
         let pressed = self.pressed.take();
         self.dirty = true;
+
+        if let Some(d) = self.drag.take() {
+            self.ease_left = EASE_TIME;
+            // The dropped icon glides from under the pointer into its slot.
+            let from_x = self.left_pt() + d.x - d.grab_dx;
+            self.eased.insert(self.items[d.from].launch.clone(), from_x);
+            let item = self.items.remove(d.from);
+            if !d.out {
+                self.items.insert(d.to, item);
+            } else {
+                let _ = self.fit_window();
+            }
+            let apps: Vec<DockApp> = self.items.iter().filter_map(|i| i.pinned.clone()).collect();
+            return Some(Action::SetDockApps(apps));
+        }
+
         let idx = self.item_at(x, y).filter(|i| Some(*i) == pressed)?;
         let item = &self.items[idx];
         match item.kind {
@@ -500,8 +754,35 @@ impl Dock {
         }
     }
 
+    /// Right-click on the separator or an empty part of the shelf (like macOS).
+    fn options_menu(&self, x: f32, y: f32) -> Option<(usize, Vec<Entry>, Placement)> {
+        if !self.hit_rect(&self.slots().lay).contains(x, y) {
+            return None;
+        }
+        let (hide, mag) = (self.cfg.autohide, self.cfg.magnification);
+        let entries = vec![
+            Entry::item(
+                if hide { "Turn Hiding Off" } else { "Turn Hiding On" },
+                Action::SetConfig { table: "dock", key: "autohide", value: ConfigValue::Bool(!hide) },
+            ),
+            Entry::item(
+                if mag { "Turn Magnification Off" } else { "Turn Magnification On" },
+                Action::SetConfig { table: "dock", key: "magnification", value: ConfigValue::Bool(!mag) },
+            ),
+            Entry::Separator,
+            Entry::item("Dock Settings…", Action::OpenSettings(Some(crate::settings::Page::Dock))),
+        ];
+        let s = self.surface.scale;
+        let shelf_top = self.shelf_bottom() - self.metrics.shelf_h;
+        let placement = Placement::Above {
+            cx: self.surface.rect.left as f32 / s + x,
+            bottom: self.surface.rect.top as f32 / s + shelf_top.min(y) - 10.0,
+        };
+        Some((usize::MAX, entries, placement))
+    }
+
     pub fn context_menu(&self, x: f32, y: f32) -> Option<(usize, Vec<Entry>, Placement)> {
-        let idx = self.item_at(x, y)?;
+        let Some(idx) = self.item_at(x, y) else { return self.options_menu(x, y) };
         let item = &self.items[idx];
         let entries = match item.kind {
             Kind::Separator => return None,
@@ -537,8 +818,7 @@ impl Dock {
                 v
             }
         };
-        let lay = self.layout();
-        let (cx, size) = lay.items[idx];
+        let (cx, size) = self.slots().get(idx)?;
         let s = self.surface.scale;
         let placement = Placement::Above {
             cx: self.surface.rect.left as f32 / s + cx,
@@ -560,31 +840,75 @@ impl Dock {
             self.bitmaps.insert(item.icon_key.clone(), bmp);
         }
 
-        let lay = self.layout();
-        let shelf = self.shelf_rect(&lay);
-        let hit = self.hit_rect(&lay);
+        let slots = self.slots();
+        let shelf = self.shelf_rect(&slots.lay);
+        let hit = self.hit_rect(&slots.lay);
+        let reveal = self.reveal_rect(&slots.lay);
         let m = self.metrics;
         self.surface.set_backdrop_shape(shelf, m.radius);
 
-        let label = if self.hovering && self.pressed.is_none() && self.menu_item.is_none() {
-            self.item_at(self.mouse.0, self.mouse.1)
+        // Icon centers, eased while slots are moving.
+        let left_pt = self.left_pt();
+        let centers: Vec<Option<(f32, f32)>> = (0..self.items.len())
+            .map(|i| {
+                let (cx, size) = slots.get(i)?;
+                let eased = self.eased.get(&self.items[i].launch).filter(|_| self.ease_left > 0.0);
+                Some((eased.map(|e| e - left_pt).unwrap_or(cx), size))
+            })
+            .collect();
+
+        let drag = self.drag;
+        let label: Option<(usize, String)> = if let Some(d) = drag {
+            d.out.then(|| (d.from, "Remove".to_string()))
+        } else if self.hovering && self.pressed.is_none() && self.menu_item.is_none() && self.hide_t < 0.01 {
+            self.item_at(self.mouse.0, self.mouse.1).map(|i| (i, self.items[i].name.clone()))
         } else {
             None
         };
         let font = gfx.format(&theme.font, 13.0, Weight::Regular, Align::Center);
-        let label_w = label.map(|i| gfx.measure(&self.items[i].name, &font) + 22.0).unwrap_or(0.0);
+        let label_w = label.as_ref().map(|(_, t)| gfx.measure(t, &font) + 22.0).unwrap_or(0.0);
         let icon_bottom = self.icon_bottom();
         let has_backdrop = self.surface.backdrop.is_some();
         let squircle = self.cfg.icon_style == IconStyle::Squircle;
+        let autohide = self.cfg.autohide;
+        let fully_hidden = self.hide_t >= 0.999;
         let win_w = self.surface.width_pt();
         let (items, bitmaps, pressed, menu_item) = (&self.items, &self.bitmaps, self.pressed, self.menu_item);
 
-        let r = self.surface.render(gfx, |p| {
-            p.fill_rect(hit, Color::HIT);
-            p.fill_round(shelf, m.radius, if has_backdrop { theme.dock_tint.alpha(0.0) } else { theme.dock_tint.alpha(1.0) });
-            p.stroke_round(shelf.inset(0.5, 0.5), m.radius - 0.5, theme.dock_border, 1.0);
+        let draw_icon = |p: &crate::gfx::Painter, item: &Item, rect: Rect, opacity: f32, darken: bool| {
+            let Some(Some(bmp)) = bitmaps.get(&item.icon_key) else {
+                p.fill_round(rect.inset(rect.w * 0.08, rect.w * 0.08), rect.w * 0.2, theme.text_disabled);
+                return;
+            };
+            let draw_rect = if squircle && item.custom_icon.is_none() {
+                let tile = rect.inset(rect.w * 0.06, rect.w * 0.06);
+                p.fill_round(tile.offset(0.0, rect.w * 0.01), tile.w * 0.225, Color::gray(0, 0.12 * opacity));
+                p.fill_round(tile, tile.w * 0.225, Color::WHITE.alpha(opacity));
+                tile.inset(tile.w * 0.16, tile.w * 0.16)
+            } else {
+                rect
+            };
+            p.bitmap(bmp, draw_rect, opacity);
+            if darken {
+                p.tint_bitmap(bmp, draw_rect, Color::gray(0, 0.35));
+            }
+        };
 
-            for (i, (item, &(cx, size))) in items.iter().zip(&lay.items).enumerate() {
+        let r = self.surface.render(gfx, |p| {
+            if !fully_hidden {
+                p.fill_rect(hit, Color::HIT);
+                p.fill_round(shelf, m.radius, if has_backdrop { theme.dock_tint.alpha(0.0) } else { theme.dock_tint.alpha(1.0) });
+                p.stroke_round(shelf.inset(0.5, 0.5), m.radius - 0.5, theme.dock_border, 1.0);
+            }
+            if autohide {
+                p.fill_rect(reveal, Color::HIT);
+            }
+
+            for (i, item) in items.iter().enumerate() {
+                let Some((cx, size)) = centers[i] else { continue };
+                if drag.is_some_and(|d| d.from == i) {
+                    continue; // drawn on top, under the pointer
+                }
                 if item.kind == Kind::Separator {
                     let inset = m.shelf_h * 0.2;
                     p.line(cx, shelf.y + inset, cx, shelf.bottom() - inset, theme.dock_separator, 1.0);
@@ -592,36 +916,34 @@ impl Dock {
                 }
                 let lift = item.bounce_height(m.tile);
                 let rect = Rect::new(cx - size / 2.0, icon_bottom - size - lift, size, size);
-                let Some(Some(bmp)) = bitmaps.get(&item.icon_key) else {
-                    p.fill_round(rect.inset(size * 0.08, size * 0.08), size * 0.2, theme.text_disabled);
-                    continue;
-                };
-                let draw_rect = if squircle && item.custom_icon.is_none() {
-                    let tile = rect.inset(size * 0.06, size * 0.06);
-                    p.fill_round(tile.offset(0.0, size * 0.01), tile.w * 0.225, Color::gray(0, 0.12));
-                    p.fill_round(tile, tile.w * 0.225, Color::WHITE);
-                    tile.inset(tile.w * 0.16, tile.w * 0.16)
-                } else {
-                    rect
-                };
-                p.bitmap(bmp, draw_rect, 1.0);
-                if pressed == Some(i) || menu_item == Some(i) {
-                    p.tint_bitmap(bmp, draw_rect, Color::gray(0, 0.35));
-                }
+                draw_icon(p, item, rect, 1.0, pressed == Some(i) || menu_item == Some(i));
                 if !item.windows.is_empty() {
                     let dot = (m.tile / 48.0 * 2.0).max(1.5);
                     p.fill_circle(cx, shelf.bottom() - (m.shelf_h - m.tile) / 4.0 - 0.5, dot, theme.indicator);
                 }
             }
 
-            if let Some(i) = label {
-                let (cx, size) = lay.items[i];
-                let top = icon_bottom - size - items[i].bounce_height(m.tile);
+            let mut label_anchor = None;
+            if let Some(d) = drag {
+                let item = &items[d.from];
+                let size = m.tile;
+                let cx = d.x - d.grab_dx;
+                let top = if d.out { d.y - size / 2.0 } else { icon_bottom - size };
+                let rect = Rect::new(cx - size / 2.0, top, size, size);
+                draw_icon(p, item, rect, if d.out { 0.6 } else { 1.0 }, false);
+                label_anchor = Some((cx, top));
+            } else if let Some((i, _)) = &label {
+                if let Some((cx, size)) = centers[*i] {
+                    label_anchor = Some((cx, icon_bottom - size - items[*i].bounce_height(m.tile)));
+                }
+            }
+
+            if let (Some((_, text)), Some((cx, top))) = (&label, label_anchor) {
                 let x = (cx - label_w / 2.0).clamp(2.0, win_w - label_w - 2.0);
-                let r = Rect::new(x, top - 10.0 - LABEL_H, label_w, LABEL_H);
+                let r = Rect::new(x, (top - 10.0 - LABEL_H).max(0.0), label_w, LABEL_H);
                 p.fill_round(r, 6.0, theme.label_bg);
                 p.stroke_round(r.inset(0.25, 0.25), 6.0, theme.menu_border, 0.5);
-                p.text(&items[i].name, &font, r, theme.label_text);
+                p.text(text, &font, r, theme.label_text);
             }
         });
         if let Err(e) = r {
@@ -673,5 +995,14 @@ mod tests {
         let base = compute_layout(&w, &s, 80.0, 4.0, 5.0, 1000.0, 0.0, 0.0);
         let lay = compute_layout(&w, &s, 80.0, 4.0, 5.0, 1000.0, base.items[1].0, 1.0);
         assert_eq!(lay.items[1].1, 10.0);
+    }
+
+    #[test]
+    fn drag_moves_item_in_display_order() {
+        let d = Drag { from: 0, to: 2, grab_dx: 0.0, x: 0.0, y: 0.0, out: false };
+        assert_eq!(display_order(4, Some(&d)), vec![1, 2, 0, 3]);
+        let out = Drag { out: true, ..d };
+        assert_eq!(display_order(4, Some(&out)), vec![1, 2, 3]);
+        assert_eq!(display_order(3, None), vec![0, 1, 2]);
     }
 }

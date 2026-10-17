@@ -8,7 +8,7 @@ use serde::Deserialize;
 /// Single source of truth for defaults: the user's file is deep-merged over this.
 pub const DEFAULT_TOML: &str = include_str!("../default_config.toml");
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     pub general: General,
     pub menubar: MenuBarCfg,
@@ -17,7 +17,7 @@ pub struct Config {
     pub app_names: BTreeMap<String, String>,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct General {
     pub appearance: Appearance,
     pub font: String,
@@ -56,7 +56,7 @@ pub enum ShortcutStyle {
     Windows,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct MenuBarCfg {
     pub enabled: bool,
     pub height: f32,
@@ -74,7 +74,7 @@ pub struct MenuBarCfg {
     pub reserve_space: bool,
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct DockCfg {
     pub enabled: bool,
     pub tile_size: f32,
@@ -87,6 +87,7 @@ pub struct DockCfg {
     pub icon_style: IconStyle,
     pub show_running: bool,
     pub show_trash: bool,
+    pub autohide: bool,
     pub reserve_space: bool,
     #[serde(default)]
     pub apps: Vec<DockApp>,
@@ -235,6 +236,32 @@ pub fn save_dock_apps(path: &Path, apps: &[DockApp]) -> Result<()> {
         arr.push(t);
     }
     doc["dock"]["apps"] = Item::ArrayOfTables(arr);
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
+/// A scalar setting value written by the settings UI.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfigValue {
+    Bool(bool),
+    Int(i64),
+    Str(String),
+}
+
+/// Sets `[table] key = value`, keeping the rest of the file (and comments) intact.
+pub fn save_value(path: &Path, table: &str, key: &str, value: &ConfigValue) -> Result<()> {
+    use toml_edit::{DocumentMut, Item, Table};
+
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: DocumentMut = text.parse().context("config.toml is not valid TOML")?;
+    if !doc.contains_table(table) {
+        doc[table] = Item::Table(Table::new());
+    }
+    doc[table][key] = match value {
+        ConfigValue::Bool(b) => toml_edit::value(*b),
+        ConfigValue::Int(i) => toml_edit::value(*i),
+        ConfigValue::Str(s) => toml_edit::value(s.as_str()),
+    };
     std::fs::write(path, doc.to_string())?;
     Ok(())
 }

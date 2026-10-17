@@ -51,7 +51,9 @@ icon_style = "native"
 # Show running apps that aren't pinned.
 show_running = true
 show_trash = true
-# Keep maximized windows from covering the Dock.
+# Slide the Dock off-screen until the pointer touches the bottom edge.
+autohide = false
+# Keep maximized windows from covering the Dock (ignored with autohide).
 reserve_space = true
 
 # Pinned apps, left to right.

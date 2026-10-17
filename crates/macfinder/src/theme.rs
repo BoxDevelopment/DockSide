@@ -9,6 +9,7 @@ const FALLBACK_FONT: &str = "Segoe UI Variable Text";
 
 #[derive(Clone, Debug)]
 pub struct Theme {
+    pub dark: bool,
     pub font: String,
     pub accent: Color,
     pub text: Color,
@@ -50,6 +51,7 @@ impl Theme {
 
         if dark {
             Theme {
+                dark,
                 font,
                 accent,
                 text: Color::gray(255, 0.92),
@@ -70,6 +72,7 @@ impl Theme {
             }
         } else {
             Theme {
+                dark,
                 font,
                 accent,
                 text: Color::gray(0, 0.88),

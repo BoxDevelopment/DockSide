@@ -259,6 +259,13 @@ impl Canvas {
         }
     }
 
+    /// Presents without moving the window (for windows the user can drag).
+    pub fn present_in_place(&self, hwnd: HWND) -> Result<()> {
+        let mut rc = RECT::default();
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rc)? };
+        self.present(hwnd, rc.left, rc.top)
+    }
+
     pub fn present(&self, hwnd: HWND, x: i32, y: i32) -> Result<()> {
         unsafe {
             let screen = GetDC(None);
@@ -310,6 +317,15 @@ impl Painter<'_> {
 
     pub fn fill_rect(&self, r: Rect, c: Color) {
         unsafe { self.rt.FillRectangle(&r.d2d(), self.color(c)) }
+    }
+
+    /// Runs `f` with drawing clipped to `r`.
+    pub fn clipped(&self, r: Rect, f: impl FnOnce()) {
+        unsafe {
+            self.rt.PushAxisAlignedClip(&r.d2d(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            f();
+            self.rt.PopAxisAlignedClip();
+        }
     }
 
     /// Resets `r` to fully transparent.

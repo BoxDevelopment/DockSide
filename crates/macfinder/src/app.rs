@@ -15,7 +15,9 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetCapture, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, ABN_FULLSCREENAPP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -26,10 +28,11 @@ use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
+use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
 use crate::theme::Theme;
-use crate::win::{self, apps, system, taskbar, Monitor};
+use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
-    WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
+    WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED,
 };
 
@@ -136,6 +139,45 @@ fn execute(action: Action) {
         Action::TogglePin { path, name, pin } => {
             with_app(|app| app.toggle_pin(&path, &name, pin));
         }
+        Action::SetConfig { table, key, value } => {
+            match config::save_value(&config::path(), table, key, &value) {
+                // Apply right away instead of waiting for the file watcher.
+                Ok(()) => {
+                    with_app(|app| app.reload());
+                }
+                Err(e) => log!("could not update {table}.{key}: {e:#}"),
+            }
+        }
+        Action::SetStartAtLogin(on) => {
+            if let Err(e) = startup::set_enabled(on) {
+                log!("could not change start at login: {e}");
+            }
+            with_app(|app| app.mark_settings_dirty());
+        }
+        Action::AddDockApp => {
+            let owner = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as _);
+            if let Some(path) = system::pick_app(owner) {
+                let name = if path.to_lowercase().ends_with(".exe") {
+                    apps::file_description(&path)
+                } else {
+                    None
+                }
+                .or_else(|| std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| path.clone());
+                with_app(|app| app.toggle_pin(&path, &name, true));
+            }
+        }
+        Action::OpenSettings(page) => {
+            with_app(|app| app.open_settings(page));
+        }
+        Action::SetDockApps(list) => {
+            match config::save_dock_apps(&config::path(), &list) {
+                Ok(()) => {
+                    with_app(|app| app.reload());
+                }
+                Err(e) => log!("could not update dock apps: {e:#}"),
+            }
+        }
         Action::EmptyTrash => unsafe {
             let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), 0);
         },
@@ -164,7 +206,10 @@ fn execute(action: Action) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_FRAME => FRAME_PENDING.store(false, Ordering::Release),
-        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        // Shell surfaces never take focus; the settings window is a normal app window.
+        WM_MOUSEACTIVATE if hwnd.0 as isize != SETTINGS_HWND.load(Ordering::Relaxed) => {
+            return LRESULT(MA_NOACTIVATE as isize)
+        }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
             // Backdrop windows: black is fully transparent under a DWM accent.
@@ -242,6 +287,10 @@ fn track_leave(hwnd: HWND) {
     }
 }
 
+fn dock_eq_except_apps(a: &config::DockCfg, b: &config::DockCfg) -> bool {
+    config::DockCfg { apps: Vec::new(), ..a.clone() } == config::DockCfg { apps: Vec::new(), ..b.clone() }
+}
+
 pub struct App {
     gfx: Gfx,
     cfg: Config,
@@ -258,6 +307,7 @@ pub struct App {
     menubar: Option<MenuBar>,
     dock: Option<Dock>,
     menu: Option<PopupMenu>,
+    settings: Option<SettingsWindow>,
     hooks: Vec<HHOOK>,
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -319,6 +369,7 @@ impl App {
             menubar: None,
             dock: None,
             menu: None,
+            settings: None,
             hooks: Vec::new(),
             win_hooks,
             _watcher: watcher,
@@ -356,13 +407,90 @@ impl App {
         log!("built surfaces (scale {}, font {})", self.monitor.scale, self.theme.font);
     }
 
+    /// Applies a changed config with the least disruption: unchanged surfaces
+    /// stay put, and a pinned-apps change updates the Dock in place.
     fn reload(&mut self) {
-        match config::load(&self.cfg_path) {
-            Ok(cfg) => {
-                self.cfg = cfg;
-                self.build();
+        let cfg = match config::load(&self.cfg_path) {
+            Ok(cfg) => cfg,
+            Err(e) => return log!("config not applied: {e:#}"),
+        };
+        if cfg == self.cfg {
+            return;
+        }
+        let old = std::mem::replace(&mut self.cfg, cfg);
+        self.mark_settings_dirty();
+        let (g0, g1) = (&old.general, &self.cfg.general);
+        if g0.appearance != g1.appearance || g0.hide_taskbar != g1.hide_taskbar {
+            // Backdrop tints depend on light/dark; recreate everything.
+            return self.build();
+        }
+        if g0 != g1 {
+            // Font / accent / shortcut hints: same surfaces, new paint.
+            self.theme = Theme::new(&self.cfg, &self.gfx);
+            if let Some(mb) = &mut self.menubar {
+                mb.dirty = true;
             }
-            Err(e) => log!("config not applied: {e:#}"),
+            if let Some(d) = &mut self.dock {
+                d.dirty = true;
+            }
+        }
+        if old.menubar != self.cfg.menubar {
+            self.rebuild_menubar();
+        }
+        if old.dock != self.cfg.dock {
+            let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock);
+            match &mut self.dock {
+                Some(d) if only_apps => {
+                    d.set_apps(&self.cfg.dock.apps);
+                    self.animate();
+                }
+                _ => self.rebuild_dock(),
+            }
+        }
+        self.refresh_windows();
+        self.flush();
+    }
+
+    fn rebuild_menubar(&mut self) {
+        if self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::MenuBar(_))) {
+            self.close_menu();
+        }
+        self.menubar = None;
+        if self.cfg.menubar.enabled {
+            match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
+                Ok(m) => self.menubar = Some(m),
+                Err(e) => log!("menu bar failed: {e}"),
+            }
+        }
+    }
+
+    fn mark_settings_dirty(&mut self) {
+        if let Some(s) = &mut self.settings {
+            s.dirty = true;
+        }
+    }
+
+    fn open_settings(&mut self, page: Option<Page>) {
+        match &mut self.settings {
+            Some(s) => s.show_page(page),
+            None => match SettingsWindow::new(&self.gfx, &self.monitor, page.unwrap_or(Page::General)) {
+                Ok(s) => self.settings = Some(s),
+                Err(e) => log!("settings window failed: {e}"),
+            },
+        }
+        self.flush();
+    }
+
+    fn rebuild_dock(&mut self) {
+        if self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::Dock(_))) {
+            self.close_menu();
+        }
+        self.dock = None;
+        if self.cfg.dock.enabled {
+            match Dock::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
+                Ok(d) => self.dock = Some(d),
+                Err(e) => log!("dock failed: {e}"),
+            }
         }
     }
 
@@ -414,6 +542,12 @@ impl App {
 
     fn update_foreground(&mut self) {
         let fg = unsafe { GetForegroundWindow() };
+        if self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
+            if let Some(mb) = &mut self.menubar {
+                mb.set_app("System Settings".into(), fg, None);
+            }
+            return;
+        }
         if fg.is_invalid() || apps::window_pid(fg) == self.pid {
             return;
         }
@@ -461,6 +595,11 @@ impl App {
         if let Some(d) = &mut self.dock {
             if d.dirty {
                 d.render(&self.gfx, &self.theme, &mut self.icons);
+            }
+        }
+        if let Some(s) = &mut self.settings {
+            if s.dirty {
+                s.render(&self.gfx, &self.theme, &self.cfg, &mut self.icons);
             }
         }
     }
@@ -605,6 +744,7 @@ impl App {
                 }
                 WM_APP_WINDOWS_CHANGED => self.timer(TIMER_REFRESH, 150),
                 WM_APP_CLOSE_MENU => self.close_menu(),
+                WM_APP_OPEN_SETTINGS => self.open_settings(None),
                 WM_APP_MENU_KEY => self.on_menu_key(wp.0 as u16),
                 _ => return None,
             }
@@ -637,6 +777,12 @@ impl App {
             return Some(LRESULT(0));
         }
 
+        if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
+            let r = self.on_settings_message(hwnd, msg, wp, lp);
+            self.flush();
+            return r;
+        }
+
         let result = if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
             self.on_menu_mouse(hwnd, msg, lp)
         } else if self.menubar.as_ref().is_some_and(|m| m.surface.content == hwnd) {
@@ -648,6 +794,53 @@ impl App {
         };
         self.flush();
         result
+    }
+
+    fn on_settings_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let s = self.settings.as_mut()?;
+        let scale = s.scale();
+        let (x, y) = mouse_pt(lp, scale);
+        match msg {
+            WM_NCHITTEST => {
+                // lParam is in screen coordinates here.
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let (lx, ly) = ((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
+                let hit = if s.is_caption(lx, ly) { HTCAPTION } else { HTCLIENT };
+                return Some(LRESULT(hit as isize));
+            }
+            WM_MOUSEMOVE => {
+                if !s.tracking {
+                    s.tracking = true;
+                    track_leave(hwnd);
+                }
+                s.on_move(x, y);
+            }
+            WM_MOUSELEAVE => s.on_leave(),
+            WM_LBUTTONDOWN => {
+                s.on_down(x, y, &self.cfg);
+                unsafe { SetCapture(hwnd) };
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                match s.on_up(x, y, &self.cfg) {
+                    SettingsEvent::Action(a) => push(a),
+                    SettingsEvent::Close => self.settings = None,
+                    SettingsEvent::None => {}
+                }
+            }
+            WM_MOUSEWHEEL => s.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
+            WM_KEYDOWN if wp.0 == 0x1B => self.settings = None, // Esc
+            WM_CLOSE => self.settings = None,
+            _ => return None,
+        }
+        Some(LRESULT(0))
     }
 
     fn on_menu_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
@@ -729,11 +922,21 @@ impl App {
                     track_leave(hwnd);
                 }
                 animate = d.on_move(x, y);
+                // Keep receiving the pointer while a drag leaves the window.
+                if d.dragging() && unsafe { GetCapture() } != hwnd {
+                    unsafe { SetCapture(hwnd) };
+                }
             }
             WM_MOUSELEAVE => {
                 d.tracking = false;
                 if d.menu_item.is_none() {
                     animate = d.on_leave();
+                }
+            }
+            WM_CAPTURECHANGED => {
+                if lp.0 != hwnd.0 as isize {
+                    d.cancel_drag();
+                    animate = true;
                 }
             }
             WM_LBUTTONDOWN => {
@@ -743,8 +946,15 @@ impl App {
                 }
             }
             WM_LBUTTONUP => {
+                let was_dragging = d.dragging();
                 if let Some(a) = d.on_up(x, y) {
                     push(a);
+                }
+                if was_dragging {
+                    animate = true;
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
                 }
             }
             WM_RBUTTONUP => {

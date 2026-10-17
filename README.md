@@ -20,10 +20,14 @@ hidden while MacFinder runs and is always restored when it exits.
 - macOS-style magnification (cosine falloff, cursor-anchored), a launch bounce and tooltips
 - Click to launch or activate; clicking an app that's already frontmost cycles its windows
 - Context menu: the app's windows, Keep in Dock, Show in Explorer, Open / Quit, Empty Trash
+- Drag icons to reorder them, or drag one up out of the Dock to remove it (both are saved to config)
+- Auto-hide (`autohide = true`): the Dock slides away and returns when the pointer touches the bottom edge
+- Right-click the separator or an empty part of the Dock: Turn Hiding On/Off, Turn Magnification On/Off
+- Config changes apply in place: editing pinned apps updates the Dock without redrawing anything else
 - Store apps (`shell:AppsFolder\...`), `.lnk` shortcuts and custom PNG/ICO icons
 
 **Platform**
-- Acrylic / blur backdrops, per-monitor DPI and dark/light mode that follows Windows
+- True rounded acrylic and blur via Windows.UI.Composition (a host backdrop brush with any corner radius), per-monitor DPI and dark/light mode that follows Windows
 - Menu bar and Dock reserve screen space (Win32 AppBars), so maximized windows fit between them
 - Hides itself for fullscreen apps
 - Rendering uses Direct2D/DirectWrite into layered windows; animations are vsync-paced and the
@@ -43,10 +47,25 @@ Quit from the logo menu (**Quit MacFinder**). If it's ever killed and the taskba
 cargo run --release -- --restore-taskbar
 ```
 
+## Settings
+
+Open **System Settings** from the logo menu (**MacFinder Settings…**), from **Dock Settings…** when
+you right-click the Dock, or by launching MacFinder again while it's running.
+
+- **General:** Start MacFinder at login, hide the Windows taskbar, Mac- or Windows-style shortcut hints
+- **Appearance:** Auto / Light / Dark, accent color, font
+- **Menu Bar:** background, logo, clock format, reserved space, status items
+- **Dock:** size, magnification and magnified size, auto-hide, icon style, background,
+  running apps, Trash, pinned apps (add with a file picker, remove with −)
+
+"Start at login" registers the exe you're running (`HKCU\...\Run`). Use a release build
+(`cargo build --release`) for that, not `target\debug`.
+
 ## Configuration
 
-`%APPDATA%\MacFinder\config.toml` is created on first run, with comments. Changes apply as soon
-as you save the file. Open it from the logo menu: **MacFinder Settings…**.
+Everything Settings changes is stored in `%APPDATA%\MacFinder\config.toml`, which is created on
+first run with comments. Editing it by hand works too: changes apply as soon as you save, and only
+the affected part of the shell redraws.
 
 For the most faithful look, install **SF Pro Text** (or Inter) and set `font`. Give dock apps
 macOS-style icons with `icon = "C:\\path\\to\\icon.png"`.
@@ -73,13 +92,13 @@ crates/macfinder/src
 
 - [ ] Finder: a file manager window (sidebar, icon/list/column views, Quick Look)
 - [ ] Widgets: a desktop widget layer (clock, weather, calendar, battery, notes)
-- [ ] True rounded acrylic via `Windows.UI.Composition` host backdrop (DWM's native corners are 8px)
-- [ ] Dock: drag to reorder, auto-hide, minimized windows, a downloads stack, multi-monitor
+- [x] True rounded acrylic via `Windows.UI.Composition` host backdrop
+- [x] Dock: drag to reorder, drag out to remove, auto-hide
+- [ ] Dock: minimized windows, a downloads stack, multi-monitor
 - [ ] Real per-app menus via UI Automation, where apps expose them
 - [ ] Spotlight-style launcher, Mission Control / App Exposé, Launchpad
-- [ ] A System Settings-style GUI for the config
+- [x] A System Settings-style GUI for the config, plus Start at login
 
-## Known issues
+## Notes
 
-- `backdrop = "blur"` renders an opaque black shelf; use `"acrylic"` (the default) or `"none"`.
-- Corner radius of blurred surfaces is limited to Windows 11's native 8px rounding.
+- Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, MacFinder falls back to a DWM accent with 8px corners.

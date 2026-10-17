@@ -11,6 +11,7 @@ mod geom;
 mod gfx;
 mod menu;
 mod menubar;
+mod settings;
 mod surface;
 mod theme;
 mod win;
@@ -33,12 +34,14 @@ fn main() {
     unsafe {
         let mutex = CreateMutexW(None, true, w!("Local\\MacFinder.SingleInstance"));
         if mutex.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
-            log!("another instance is already running");
+            // Relaunching (e.g. from the Start menu) opens Settings, like reopening a Mac app.
+            win::signal_running_instance();
             return;
         }
     }
 
     log::init();
+    win::startup::refresh();
     std::panic::set_hook(Box::new(|info| {
         win::taskbar::restore();
         log::write(&format!("panic: {info}"));

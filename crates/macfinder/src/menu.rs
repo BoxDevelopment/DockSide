@@ -26,6 +26,14 @@ pub enum Action {
     CloseWindows(Vec<HWND>),
     Reveal(String),
     TogglePin { path: String, name: String, pin: bool },
+    /// Replace the pinned Dock apps (after a drag reorder / removal).
+    SetDockApps(Vec<crate::config::DockApp>),
+    /// Write one setting (`[table] key = value`) and apply it.
+    SetConfig { table: &'static str, key: &'static str, value: crate::config::ConfigValue },
+    SetStartAtLogin(bool),
+    /// File picker, then pin the chosen app.
+    AddDockApp,
+    OpenSettings(Option<crate::settings::Page>),
     EmptyTrash,
     Sleep,
     Restart,
@@ -337,7 +345,7 @@ pub fn apple_menu() -> Vec<Entry> {
         Entry::item("Lock Screen", Action::Lock).shortcut(Shortcut::new("w", ch(b'L'), "L")),
         Entry::item("Log Out…", Action::LogOut),
         Entry::Separator,
-        Entry::item("MacFinder Settings…", Action::OpenConfig),
+        Entry::item("MacFinder Settings…", Action::OpenSettings(None)),
         Entry::item("Quit MacFinder", Action::Quit),
     ]
 }

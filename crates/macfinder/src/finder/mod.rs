@@ -13,7 +13,10 @@ use std::time::{Duration, Instant};
 use notify::{RecursiveMode, Watcher};
 use windows::core::{Result, HSTRING};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
+use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap, D2D1_DRAW_TEXT_OPTIONS_NONE};
+use windows::Win32::Graphics::DirectWrite::{
+    IDWriteTextFormat, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -22,7 +25,7 @@ use self::loader::IconLoader;
 use self::text::{KeyResult, TextField};
 use crate::chrome::{self, Light, SHADOW};
 use crate::geom::{Color, Rect};
-use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
+use crate::gfx::{pt as gfx_pt, Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::{Action, Entry};
 use crate::theme::Theme;
 use crate::win::{self, Monitor};
@@ -1471,6 +1474,7 @@ impl FinderWindow {
         let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
         let ql = self.quicklook.as_mut().zip(ql_entry);
         let ql_bitmap = &mut self.ql_bitmap;
+        let ql_px = ql.as_ref().and_then(|(_, e)| loader.get_large(e));
         let mut search_xs: Vec<f32> = Vec::new();
 
         let drawn = self.canvas.draw(gfx, |p| {
@@ -1496,11 +1500,19 @@ impl FinderWindow {
             };
             // Editable text in `r` (scrolled to keep the caret visible); returns each caret index's x.
             let edit_text = |p: &Painter, r: Rect, field: &TextField, focused: bool| -> Vec<f32> {
-                let mut s = String::new();
-                let mut xs = vec![0.0];
-                for c in &field.text {
-                    s.push(*c);
-                    xs.push(p.gfx.measure(&s, &regular));
+                let s = field.string();
+                let layout = p.gfx.layout(&s, &regular, 100_000.0, r.h);
+                let mut xs = Vec::with_capacity(field.text.len() + 1);
+                let mut utf16 = 0;
+                for i in 0..=field.text.len() {
+                    let (mut x, mut y, mut m) = (0.0, 0.0, DWRITE_HIT_TEST_METRICS::default());
+                    if let Some(l) = &layout {
+                        unsafe {
+                            let _ = l.HitTestTextPosition(utf16, false, &mut x, &mut y, &mut m);
+                        }
+                    }
+                    xs.push(x);
+                    utf16 += field.text.get(i).map_or(0, |c| c.len_utf16() as u32);
                 }
                 let shift = (xs[field.caret] - (r.w - 2.0)).max(0.0);
                 let xs: Vec<f32> = xs.iter().map(|x| r.x + x - shift).collect();
@@ -1511,7 +1523,7 @@ impl FinderWindow {
                     } else if focused {
                         p.line(xs[a], r.y + 4.0, xs[a], r.bottom() - 4.0, theme.text, 1.0);
                     }
-                    p.text(&field.string(), &regular, Rect::new(xs[0], r.y, 10_000.0, r.h), theme.text);
+                    p.text(&s, &regular, Rect::new(xs[0], r.y, 100_000.0, r.h), theme.text);
                 });
                 xs
             };
@@ -1536,6 +1548,10 @@ impl FinderWindow {
                     p.fill_round(row, 6.0, if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.09) });
                 } else if hover == Some(Hit::Place(i)) {
                     p.fill_round(row, 6.0, soft);
+                }
+                if drop_hit == Some(Hit::Place(i)) {
+                    p.fill_round(row, 6.0, theme.accent.alpha(0.3));
+                    p.stroke_round(row, 6.0, theme.accent, 1.5);
                 }
                 let probe = FileEntry {
                     name: place.name.clone(),
@@ -1571,8 +1587,6 @@ impl FinderWindow {
                     hits.push((b, hit));
                 }
             }
-            p.text(&title, &title_font, Rect::new(content_x + 82.0, body.y, content_w - 220.0, TOOLBAR), theme.text);
-
             // View switcher.
             let seg_w = 32.0;
             let outer = Rect::new(content_x + content_w - 16.0 - seg_w * 3.0 - 4.0, body.y + (TOOLBAR - 26.0) / 2.0, seg_w * 3.0 + 4.0, 26.0);
@@ -1605,6 +1619,33 @@ impl FinderWindow {
                 }
                 hits.push((seg, Hit::ViewBtn(v)));
             }
+
+            // Search field, left of the view switcher.
+            let title_x = content_x + 82.0;
+            let sw = SEARCH_W.min(outer.x - 12.0 - title_x - 120.0).max(90.0);
+            let sf = Rect::new(outer.x - 12.0 - sw, outer.y, sw, outer.h);
+            p.fill_round(sf, 7.0, soft);
+            if search_focus {
+                p.stroke_round(sf.inset(-1.5, -1.5), 8.5, theme.accent.alpha(0.6), 3.0);
+            }
+            let (gx, gy) = (sf.x + 13.0, sf.cy() - 1.0);
+            p.stroke_circle(gx, gy, 4.5, theme.text_secondary, 1.4);
+            p.line(gx + 3.3, gy + 3.3, gx + 6.5, gy + 6.5, theme.text_secondary, 1.6);
+            let text_r = Rect::new(sf.x + 25.0, sf.y, sf.w - if search.is_empty() { 31.0 } else { 47.0 }, sf.h);
+            if search.is_empty() {
+                p.text("Search", &regular, text_r, theme.text_secondary);
+            }
+            search_xs = if search_focus || !search.is_empty() { edit_text(p, text_r, search, search_focus) } else { vec![text_r.x] };
+            hits.push((sf, Hit::Search));
+            if !search.is_empty() {
+                let (cx, cy) = (sf.right() - 13.0, sf.cy());
+                let a = if hover == Some(Hit::SearchClear) { 0.85 } else { 0.55 };
+                p.fill_circle(cx, cy, 6.5, theme.text_secondary.alpha(a));
+                p.line(cx - 2.3, cy - 2.3, cx + 2.3, cy + 2.3, field_bg, 1.4);
+                p.line(cx + 2.3, cy - 2.3, cx - 2.3, cy + 2.3, field_bg, 1.4);
+                hits.push((Rect::new(cx - 9.0, cy - 9.0, 18.0, 18.0), Hit::SearchClear));
+            }
+            p.text(&title, &title_font, Rect::new(title_x, body.y, sf.x - 8.0 - title_x, TOOLBAR), theme.text);
             p.line(content_x, body.y + TOOLBAR, body.right(), body.y + TOOLBAR, pal.divider, 1.0);
 
             // Content.
@@ -1620,7 +1661,9 @@ impl FinderWindow {
                         let cell = Rect::new(vr.x + pad + col as f32 * cw, vr.y + pad + row as f32 * CELL_H - scroll, cw, CELL_H);
                         let icon_r = Rect::new(cell.cx() - ICON / 2.0, cell.y + 6.0, ICON, ICON);
                         let sel = selected.contains(&i);
-                        if sel {
+                        if drop_hit == Some(Hit::Item(i)) {
+                            p.fill_round(icon_r.inset(-6.0, -5.0), 6.0, theme.accent.alpha(0.3));
+                        } else if sel {
                             p.fill_round(icon_r.inset(-6.0, -5.0), 6.0, soft);
                         }
                         let bmp = icon_for(p, e);
@@ -1661,6 +1704,9 @@ impl FinderWindow {
                                 p.fill_round(r, 5.0, sel_bg);
                             } else if i % 2 == 1 {
                                 p.fill_round(r, 5.0, stripe);
+                            }
+                            if drop_hit == Some(Hit::Item(i)) {
+                                p.stroke_round(r.inset(1.0, 1.0), 5.0, theme.accent, 2.0);
                             }
                             let tc = if sel { sel_text } else { theme.text };
                             let sc = if sel { sel_text } else { theme.text_secondary };
@@ -1717,6 +1763,9 @@ impl FinderWindow {
                             if sel {
                                 p.fill_round(r, 5.0, if active { sel_bg } else { soft });
                             }
+                            if drop_hit == Some(Hit::Column(c, j)) {
+                                p.stroke_round(r.inset(1.0, 1.0), 5.0, theme.accent, 2.0);
+                            }
                             let tc = if sel && active { sel_text } else { theme.text };
                             let bmp = icon_for(p, e);
                             draw_icon(p, bmp, Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0));
@@ -1733,6 +1782,9 @@ impl FinderWindow {
                             hits.push((r, Hit::Column(c, j)));
                         }
                         p.line(col_r.right(), vr.y, col_r.right(), vr.bottom(), pal.divider, 1.0);
+                        if drop_hit == Some(Hit::ColumnBg(c)) {
+                            p.stroke_round(col_r.inset(2.0, 2.0), 4.0, theme.accent, 2.0);
+                        }
                     }
                     if let Some(e) = &preview {
                         let x = vr.x + columns.len() as f32 * COL_W - column_offset;
@@ -1755,6 +1807,18 @@ impl FinderWindow {
                 p.text(err, &center, vr, theme.text_secondary);
             }
 
+            // Dropping into the folder itself: frame the whole view.
+            if drop_hit == Some(Hit::Content) {
+                p.stroke_round(vr.inset(2.0, 2.0), 4.0, theme.accent, 2.0);
+            }
+            if let Some(b) = band {
+                let top = if view == View::List { vr.y + HEADER } else { vr.y };
+                p.clipped(Rect::new(vr.x, top, vr.w, vr.bottom() - top), || {
+                    p.fill_rect(b, Color::gray(128, 0.18));
+                    p.stroke_round(b, 0.0, Color::gray(128, 0.6), 1.0);
+                });
+            }
+
             // Overlay scrollbar.
             if max_scroll > 0.0 && view != View::Columns {
                 let total = vr.h + max_scroll;
@@ -1768,6 +1832,30 @@ impl FinderWindow {
             p.line(sb.x, sb.y, sb.right(), sb.y, pal.divider, 1.0);
             p.text(&status, &small_center, sb, theme.text_secondary);
 
+            if let Some((ql, e)) = ql {
+                let key = IconLoader::large_key(&e);
+                let large = match ql_bitmap.as_ref().filter(|(k, _)| *k == key) {
+                    Some((_, b)) => b.clone(),
+                    None => {
+                        let b = ql_px.and_then(|px| px.to_bitmap(p.rt));
+                        if b.is_some() {
+                            *ql_bitmap = Some((key, b.clone()));
+                        }
+                        b
+                    }
+                };
+                // Until the large preview arrives, show the small icon.
+                let image = large.or_else(|| icon_for(p, &e));
+                let info = format!(
+                    "{}  ·  {}{}",
+                    kinds.kind(&e),
+                    if e.is_dir { "--".to_string() } else { fs::format_size(e.size) },
+                    e.modified.map(|m| format!("  ·  Modified {}", fs::format_date(m))).unwrap_or_default()
+                );
+                let style = QlStyle { theme, dark, title: &ql_title, mono: &mono, center: &center, preview_title: &preview_title };
+                quick_look(p, body, ql, &e, image, &info, &style, hover, &mut hits);
+            }
+
             // Traffic lights last so they win hit-testing.
             let group_hover = matches!(hover, Some(Hit::Light(_)));
             for (r, light) in chrome::traffic_lights(p, body, group_hover, true) {
@@ -1775,9 +1863,116 @@ impl FinderWindow {
             }
         });
         self.hits = hits;
+        self.search_xs = search_xs;
         if let Err(e) = drawn.and_then(|_| self.canvas.present(self.hwnd, rc.left, rc.top)) {
             log!("finder render failed: {e}");
         }
+    }
+}
+
+/// Normalized rectangle between two corners.
+fn band_rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
+    Rect::new(x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs())
+}
+
+fn overlaps(a: &Rect, b: &Rect) -> bool {
+    a.x < b.right() && b.x < a.right() && a.y < b.bottom() && b.y < a.bottom()
+}
+
+struct QlStyle<'a> {
+    theme: &'a Theme,
+    dark: bool,
+    title: &'a IDWriteTextFormat,
+    mono: &'a IDWriteTextFormat,
+    center: &'a IDWriteTextFormat,
+    preview_title: &'a IDWriteTextFormat,
+}
+
+/// Quick Look: a large preview panel floating over the window. Text files show
+/// their contents, images and videos a big thumbnail, everything else a big icon.
+#[allow(clippy::too_many_arguments)]
+fn quick_look(
+    p: &Painter,
+    body: Rect,
+    ql: &mut QuickLook,
+    e: &FileEntry,
+    image: Option<ID2D1Bitmap>,
+    info: &str,
+    s: &QlStyle,
+    hover: Option<Hit>,
+    hits: &mut Vec<(Rect, Hit)>,
+) {
+    let theme = s.theme;
+    let ink = if s.dark { 255 } else { 0 };
+    p.fill_round(body, chrome::RADIUS, Color::gray(0, 0.22));
+    hits.push((body, Hit::QlBackdrop));
+
+    let w = (body.w - 80.0).min(960.0);
+    let h = body.h - 64.0;
+    let panel = Rect::new(body.cx() - w / 2.0, body.cy() - h / 2.0, w, h);
+    for k in 1..=4 {
+        let d = k as f32 * 3.0;
+        p.fill_round(panel.inset(-d, -d).offset(0.0, d), 12.0 + d, Color::gray(0, 0.045));
+    }
+    p.fill_round(panel, 12.0, if s.dark { Color::rgba(44, 44, 46, 1.0) } else { Color::rgba(246, 246, 246, 1.0) });
+    p.stroke_round(panel, 12.0, Color::gray(ink, 0.12), 1.0);
+    hits.push((panel, Hit::QlPanel));
+
+    // Title bar: close, name, Open.
+    let bar = Rect::new(panel.x, panel.y, panel.w, 40.0);
+    p.text(&e.name, s.title, Rect::new(bar.x + 100.0, bar.y, bar.w - 200.0, bar.h), theme.text);
+    let close = Rect::new(bar.x + 10.0, bar.cy() - 12.0, 24.0, 24.0);
+    if hover == Some(Hit::QlClose) {
+        p.fill_round(close, 6.0, Color::gray(ink, 0.1));
+    }
+    let (cx, cy) = (close.cx(), close.cy());
+    p.line(cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5, theme.text_secondary, 1.6);
+    p.line(cx + 4.5, cy - 4.5, cx - 4.5, cy + 4.5, theme.text_secondary, 1.6);
+    hits.push((close, Hit::QlClose));
+    let open = Rect::new(bar.right() - 74.0, bar.cy() - 12.0, 64.0, 24.0);
+    p.fill_round(open, 6.0, Color::gray(ink, if hover == Some(Hit::QlOpen) { 0.16 } else { 0.08 }));
+    p.text("Open", s.center, open, theme.text);
+    hits.push((open, Hit::QlOpen));
+    p.line(panel.x, bar.bottom(), panel.right(), bar.bottom(), Color::gray(ink, 0.1), 1.0);
+
+    let area = Rect::new(panel.x + 20.0, bar.bottom() + 16.0, panel.w - 40.0, panel.bottom() - bar.bottom() - 32.0);
+    if let Some(text) = &ql.text {
+        p.fill_round(area, 6.0, if s.dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE });
+        let inner = area.inset(14.0, 12.0);
+        let Some(layout) = p.gfx.layout(text, s.mono, inner.w, 1_000_000.0) else { return };
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe {
+            let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            let _ = layout.GetMetrics(&mut m);
+        }
+        ql.max_scroll = (m.height - inner.h).max(0.0);
+        ql.scroll = ql.scroll.min(ql.max_scroll);
+        p.clipped(inner, || unsafe {
+            if let Ok(brush) = p.rt.CreateSolidColorBrush(&theme.text.d2d(), None) {
+                p.rt.DrawTextLayout(gfx_pt(inner.x, inner.y - ql.scroll), &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+            }
+        });
+        return;
+    }
+    ql.max_scroll = 0.0;
+    let thumbnail = IconLoader::key_for(e).1;
+    let Some(b) = image else { return };
+    let size = unsafe { b.GetSize() };
+    let (bw, bh) = (size.width.max(1.0), size.height.max(1.0));
+    if thumbnail {
+        // Fit the preview, never upscaling it.
+        let k = (area.w / bw).min(area.h / bh).min(1.0);
+        let (iw, ih) = (bw * k, bh * k);
+        p.bitmap(&b, Rect::new(area.cx() - iw / 2.0, area.cy() - ih / 2.0, iw, ih), 1.0);
+    } else {
+        // Big icon with the name and details under it.
+        let side = 192.0_f32.min(area.h - 90.0).max(48.0);
+        let top = area.cy() - (side + 70.0) / 2.0;
+        let k = (side / bw).min(side / bh);
+        let (iw, ih) = (bw * k, bh * k);
+        p.bitmap(&b, Rect::new(area.cx() - iw / 2.0, top + side - ih, iw, ih), 1.0);
+        p.text(&e.name, s.preview_title, Rect::new(area.x, top + side + 16.0, area.w, 24.0), theme.text);
+        p.text(info, s.center, Rect::new(area.x, top + side + 42.0, area.w, 20.0), theme.text_secondary);
     }
 }
 

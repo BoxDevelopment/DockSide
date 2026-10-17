@@ -85,6 +85,22 @@ fn push(action: Action) {
     PENDING.with(|p| p.borrow_mut().push(action));
 }
 
+/// Drag-and-drop feedback from a Finder window's OLE drop target: returns the folder a drop would go into.
+pub fn finder_drag(id: u32, phase: finder::dnd::Phase, paths: &[PathBuf]) -> Option<PathBuf> {
+    with_app(|app| {
+        let target = app.finders.iter_mut().find(|f| f.id == id)?.on_drag(phase, paths);
+        app.flush();
+        target
+    })
+    .flatten()
+}
+
+/// Queues the copy / move for a drop; it runs once the drop callback has returned.
+pub fn finder_transfer(id: u32, paths: Vec<PathBuf>, dest: PathBuf, copy: bool) {
+    push(Action::Finder { window: id, cmd: finder::FinderCmd::Transfer { paths, dest, copy } });
+    win::post(MSG_HWND.load(Ordering::Relaxed), WM_NULL);
+}
+
 fn drain_actions() {
     loop {
         // Never run actions from a nested (re-entrant) dispatch.
@@ -111,6 +127,12 @@ fn execute(action: Action) {
         }
         Action::OpenFinder(path) => {
             with_app(|app| app.open_finder(path));
+        }
+        // Drags and file operations run modal loops: keep them outside the App borrow.
+        Action::Finder { window, cmd } if cmd.is_modal() => {
+            let hwnd = with_app(|app| app.finders.iter().find(|f| f.id == window).map(|f| f.hwnd)).flatten();
+            finder::run_modal(hwnd.unwrap_or_default(), cmd);
+            with_app(|app| app.finder_cmd(window, finder::FinderCmd::Reload));
         }
         Action::Finder { window, cmd } => {
             with_app(|app| app.finder_cmd(window, cmd));
@@ -718,8 +740,7 @@ impl App {
                     f.tracking = true;
                     track_leave(hwnd);
                 }
-                f.on_move(x, y);
-                FinderEvent::None
+                f.on_move(x, y)
             }
             WM_MOUSELEAVE => {
                 f.on_leave();
@@ -761,6 +782,7 @@ impl App {
             FinderEvent::Close => self.close_finder(id),
             FinderEvent::NewWindow => self.open_finder(None),
             FinderEvent::Menu(entries, x, y) => self.open_menu(entries, Placement::Below { x, y }, MenuSource::Window),
+            FinderEvent::Run(cmd) => push(Action::Finder { window: id, cmd }),
         }
         Some(LRESULT(0))
     }

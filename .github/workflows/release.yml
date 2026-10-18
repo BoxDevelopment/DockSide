@@ -1,0 +1,71 @@
+name: Build & Release
+
+# Every push to main is built, tested and published as a GitHub Release.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create tags and releases
+
+# Builds run one at a time so releases are created in commit order.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          # Version from [workspace.package] in Cargo.toml, plus the run number.
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $tag = "v$version-build.$env:GITHUB_RUN_NUMBER"
+          $zip = "MacFinder-$tag-windows-x64.zip"
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/macfinder.exe dist/
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath $zip
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MacFinder-${{ steps.package.outputs.tag }}
+          path: dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.package.outputs.tag }}
+          name: MacFinder ${{ steps.package.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          body: |
+            ${{ github.event.head_commit.message }}
+
+            Built from ${{ github.sha }}.
+
+            **Install:** download `macfinder.exe` and run it. If the Windows taskbar ever stays hidden, run `macfinder.exe --restore-taskbar`.
+          files: |
+            dist/macfinder.exe
+            ${{ steps.package.outputs.zip }}

@@ -4,7 +4,7 @@
 pub mod dnd;
 pub mod fs;
 pub mod loader;
-mod text;
+pub mod text;
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};

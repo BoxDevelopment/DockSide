@@ -14,10 +14,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::chrome::{self, SHADOW};
 use crate::config::{Appearance, Backdrop, Config, ConfigValue, IconStyle, ShortcutStyle};
+use crate::finder::text::TextField;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
 use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::Action;
+use crate::spotlight::web;
 use crate::theme::Theme;
 use crate::win::{self, startup, Monitor};
 
@@ -82,6 +84,8 @@ pub enum Key {
     DockTrash,
     SpotlightEnabled,
     SpotlightHotkey,
+    SearchEngine,
+    CustomSearchUrl,
 }
 
 impl Key {
@@ -113,6 +117,8 @@ impl Key {
             Key::DockTrash => ("dock", "show_trash"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
+            Key::SearchEngine => ("spotlight", "search_engine"),
+            Key::CustomSearchUrl => ("spotlight", "custom_search_url"),
         }
     }
 
@@ -135,6 +141,7 @@ enum Hit {
     AddApp,
     OpenConfig,
     OpenLog,
+    Field(Key),
 }
 
 enum Row {
@@ -145,6 +152,8 @@ enum Row {
     App(usize),
     Buttons(&'static str, Vec<(&'static str, Hit)>),
     Info(&'static str, String),
+    /// Label, key, placeholder.
+    Text(&'static str, Key, &'static str),
 }
 
 struct Group {
@@ -156,6 +165,14 @@ pub enum SettingsEvent {
     None,
     Action(Action),
     Close,
+}
+
+/// A text row being edited.
+struct Editing {
+    key: Key,
+    field: TextField,
+    /// Last commit was rejected (shown with a red outline).
+    invalid: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +195,7 @@ pub struct SettingsWindow {
     hover: Option<Hit>,
     pressed: Option<Hit>,
     slider: Option<SliderDrag>,
+    editing: Option<Editing>,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     login: bool,
     fonts: Vec<String>,
@@ -211,6 +229,7 @@ impl SettingsWindow {
             hover: None,
             pressed: None,
             slider: None,
+            editing: None,
             bitmaps: HashMap::new(),
             login: startup::is_enabled(),
             fonts,
@@ -274,10 +293,17 @@ impl SettingsWindow {
                 },
                 Group {
                     title: Some("Spotlight"),
-                    rows: vec![
-                        Row::Toggle("Spotlight search", Key::SpotlightEnabled),
-                        Row::Segmented("Keyboard shortcut", Key::SpotlightHotkey),
-                    ],
+                    rows: {
+                        let mut rows = vec![
+                            Row::Toggle("Spotlight search", Key::SpotlightEnabled),
+                            Row::Segmented("Keyboard shortcut", Key::SpotlightHotkey),
+                            Row::Segmented("Web search", Key::SearchEngine),
+                        ];
+                        if cfg.spotlight.search_engine.eq_ignore_ascii_case("custom") {
+                            rows.push(Row::Text("Search URL", Key::CustomSearchUrl, "https://example.com/search?q=%s"));
+                        }
+                        rows
+                    },
                 },
                 Group {
                     title: Some("Configuration"),
@@ -424,11 +450,76 @@ impl SettingsWindow {
                 let current = cfg.spotlight.hotkey.to_lowercase().replace(' ', "");
                 fixed(&KEYS, KEYS.iter().position(|k| k.1 == current))
             }
+            Key::SearchEngine => {
+                let mut labels: Vec<String> = web::ENGINES.iter().map(|e| e.1.to_string()).collect();
+                let mut values: Vec<String> = web::ENGINES.iter().map(|e| e.0.to_string()).collect();
+                labels.push("Custom".into());
+                values.push("custom".into());
+                let sel = values.iter().position(|v| v.eq_ignore_ascii_case(&cfg.spotlight.search_engine));
+                (labels, values, sel)
+            }
             Key::DockIconStyle => fixed(
                 &[("Native", "native"), ("Squircle", "squircle")],
                 Some((cfg.dock.icon_style == IconStyle::Squircle) as usize),
             ),
             _ => (vec![], vec![], None),
+        }
+    }
+
+    fn text_value(key: Key, cfg: &Config) -> String {
+        match key {
+            Key::CustomSearchUrl => cfg.spotlight.custom_search_url.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Finishes editing a text row: an action when the value changed, nothing
+    /// when unchanged, and keeps editing (marked invalid) when rejected.
+    fn commit(&mut self, cfg: &Config) -> SettingsEvent {
+        let Some(ed) = &mut self.editing else { return SettingsEvent::None };
+        let text = ed.field.string().trim().to_string();
+        if ed.key == Key::CustomSearchUrl && !text.is_empty() && !web::valid_template(&text) {
+            ed.invalid = true;
+            self.dirty = true;
+            return SettingsEvent::None;
+        }
+        let key = ed.key;
+        self.editing = None;
+        self.dirty = true;
+        if text == Self::text_value(key, cfg) {
+            return SettingsEvent::None;
+        }
+        SettingsEvent::Action(key.set(ConfigValue::Str(text)))
+    }
+
+    /// Keyboard input while the window is focused.
+    pub fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool, cfg: &Config) -> SettingsEvent {
+        const ENTER: u16 = 0x0D;
+        const ESC: u16 = 0x1B;
+        let Some(ed) = &mut self.editing else {
+            return if vk == ESC { SettingsEvent::Close } else { SettingsEvent::None };
+        };
+        self.dirty = true;
+        match vk {
+            ENTER => self.commit(cfg),
+            ESC => {
+                self.editing = None;
+                SettingsEvent::None
+            }
+            _ => {
+                if ed.field.on_key(vk, ctrl, shift) == crate::finder::text::KeyResult::Edited {
+                    ed.invalid = false;
+                }
+                SettingsEvent::None
+            }
+        }
+    }
+
+    pub fn on_char(&mut self, c: char) {
+        if let Some(ed) = self.editing.as_mut().filter(|_| !c.is_control()) {
+            ed.field.insert(&c.to_string());
+            ed.invalid = false;
+            self.dirty = true;
         }
     }
 
@@ -491,8 +582,23 @@ impl SettingsWindow {
         if let Some(s) = self.slider.take() {
             return SettingsEvent::Action(s.key.set(ConfigValue::Int(s.value as i64)));
         }
-        let Some(hit) = self.hit_at(x, y).filter(|h| Some(*h) == pressed) else { return SettingsEvent::None };
+        let hit = self.hit_at(x, y).filter(|h| Some(*h) == pressed);
+        // Clicking anywhere outside the field being edited commits it.
+        if let Some(ed) = &self.editing {
+            if hit != Some(Hit::Field(ed.key)) {
+                return self.commit(cfg);
+            }
+        }
+        let Some(hit) = hit else { return SettingsEvent::None };
         let action = match hit {
+            Hit::Field(key) => {
+                if self.editing.is_none() {
+                    let mut field = TextField::new(&Self::text_value(key, cfg));
+                    field.select_all();
+                    self.editing = Some(Editing { key, field, invalid: false });
+                }
+                return SettingsEvent::None;
+            }
             Hit::Close => return SettingsEvent::Close,
             Hit::Minimize => {
                 self.minimize();
@@ -585,7 +691,8 @@ impl SettingsWindow {
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
         let (hover, page, scroll, slider) = (self.hover, self.page, self.scroll, self.slider);
         let page_title = PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("");
-        let (login, fonts, bitmaps) = (self.login, &self.fonts, &self.bitmaps);
+        let (login, fonts, bitmaps, editing) = (self.login, &self.fonts, &self.bitmaps, &self.editing);
+        let field_bg = if dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE };
 
         let r = {
             let draw = |p: &Painter| {
@@ -731,6 +838,42 @@ impl SettingsWindow {
                                         hits.push((b, *hit));
                                         bx -= 8.0;
                                     }
+                                }
+                                Row::Text(label, key, placeholder) => {
+                                    p.text(label, &regular, label_r, theme.text);
+                                    let f = Rect::new(right_edge - 320.0, r.cy() - 12.0, 320.0, 24.0);
+                                    p.fill_round(f, 6.0, field_bg);
+                                    let ed = editing.as_ref().filter(|e| e.key == *key);
+                                    let ring = match ed {
+                                        Some(e) if e.invalid => Color::rgba(255, 69, 58, 1.0),
+                                        Some(_) => theme.accent,
+                                        None => card_border,
+                                    };
+                                    p.stroke_round(f.inset(0.5, 0.5), 6.0, ring, if ed.is_some() { 2.0 } else { 1.0 });
+                                    let tr = Rect::new(f.x + 8.0, f.y, f.w - 16.0, f.h);
+                                    match ed {
+                                        Some(e) => {
+                                            let prefix = |n: usize| p.gfx.measure(&e.field.text[..n].iter().collect::<String>(), &regular);
+                                            let (a, b) = e.field.range();
+                                            if a != b {
+                                                let (x0, x1) = (prefix(a), prefix(b));
+                                                p.fill_rect(Rect::new(tr.x + x0, f.y + 4.0, x1 - x0, f.h - 8.0), theme.accent.alpha(0.35));
+                                            } else {
+                                                let cx = tr.x + prefix(a) + 0.5;
+                                                p.line(cx, f.y + 5.0, cx, f.bottom() - 5.0, theme.text, 1.0);
+                                            }
+                                            p.text(&e.field.string(), &regular, tr, theme.text);
+                                        }
+                                        None => {
+                                            let value = Self::text_value(*key, cfg);
+                                            if value.is_empty() {
+                                                p.text(placeholder, &regular, tr, theme.text_disabled);
+                                            } else {
+                                                p.text(&value, &regular, tr, theme.text);
+                                            }
+                                        }
+                                    }
+                                    hits.push((f, Hit::Field(*key)));
                                 }
                                 Row::Info(label, value) => {
                                     p.text(label, &regular, label_r, theme.text);

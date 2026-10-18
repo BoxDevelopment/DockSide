@@ -99,6 +99,8 @@ pub struct DockCfg {
 pub struct SpotlightCfg {
     pub enabled: bool,
     pub hotkey: String,
+    pub search_engine: String,
+    pub custom_search_url: String,
 }
 
 /// Finder window defaults. View, sort and hidden files are saved whenever they change in a Finder window.

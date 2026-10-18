@@ -3,6 +3,7 @@
 
 pub mod calc;
 pub mod index;
+pub mod web;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,6 +73,8 @@ pub struct Spotlight {
     selected: usize,
     hits: Vec<(Rect, usize)>,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
+    /// Web search engine settings, captured when the panel opens.
+    web: crate::config::SpotlightCfg,
     pub tracking: bool,
     pub dirty: bool,
 }
@@ -91,16 +94,6 @@ fn icon_for(item: &Item) -> (String, String) {
         }
     };
     (key, t.clone())
-}
-
-fn url_encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
-            b' ' => "+".into(),
-            _ => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 /// Text from the clipboard (for Ctrl+V).
@@ -149,6 +142,7 @@ impl Spotlight {
             selected: 0,
             hits: Vec::new(),
             bitmaps: HashMap::new(),
+            web: cfg.spotlight.clone(),
             tracking: false,
             dirty: true,
         })
@@ -236,11 +230,12 @@ impl Spotlight {
         for (_, it) in files.iter().take(MAX_FILES) {
             self.rows.push(row("Folders & Documents", it));
         }
+        let (engine, url) = web::search(&self.web, &raw);
         self.rows.push(Row {
             section: "Web",
-            title: format!("Search the web for \u{201C}{}\u{201D}", raw.trim()),
+            title: format!("Search {engine} for \u{201C}{}\u{201D}", raw.trim()),
             subtitle: String::new(),
-            action: RowAction::Url(format!("https://www.google.com/search?q={}", url_encode(raw.trim()))),
+            action: RowAction::Url(url),
             icon: None,
         });
     }

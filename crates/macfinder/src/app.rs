@@ -1222,7 +1222,20 @@ impl App {
                 }
             }
             WM_MOUSEWHEEL => s.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
-            WM_KEYDOWN if wp.0 == 0x1B => self.settings = None, // Esc
+            WM_KEYDOWN => {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+                let (ctrl, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };
+                match s.on_key(wp.0 as u16, ctrl, shift, &self.cfg) {
+                    SettingsEvent::Action(a) => push(a),
+                    SettingsEvent::Close => self.settings = None,
+                    SettingsEvent::None => {}
+                }
+            }
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    s.on_char(c);
+                }
+            }
             WM_CLOSE => self.settings = None,
             _ => return None,
         }

@@ -897,7 +897,12 @@ impl Dock {
             let draw_rect = if squircle && item.custom_icon.is_none() {
                 let tile = rect.inset(rect.w * 0.06, rect.w * 0.06);
                 p.fill_round(tile.offset(0.0, rect.w * 0.01), tile.w * 0.225, Color::gray(0, 0.12 * opacity));
-                p.fill_round(tile, tile.w * 0.225, Color::WHITE.alpha(opacity));
+                // macOS-style tile: white in light mode, near-black (with a faint edge) in dark mode.
+                let tile_color = if theme.dark { Color::rgba(28, 28, 30, opacity) } else { Color::WHITE.alpha(opacity) };
+                p.fill_round(tile, tile.w * 0.225, tile_color);
+                if theme.dark {
+                    p.stroke_round(tile.inset(0.25, 0.25), tile.w * 0.225, Color::gray(255, 0.14 * opacity), 0.5);
+                }
                 tile.inset(tile.w * 0.16, tile.w * 0.16)
             } else {
                 rect

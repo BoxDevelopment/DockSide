@@ -134,6 +134,7 @@ crates/dockside/src
 - [ ] Real per-app menus via UI Automation, where apps expose them
 - [x] Spotlight
 - [ ] Mission Control / App Exposé, Launchpad
+- [ ] Dynamic Island: a pill at the top of the screen for media, timers, and notifications
 - [x] A System Settings-style GUI for the config, plus Start at login
 
 ## Notes

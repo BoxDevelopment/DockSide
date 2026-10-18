@@ -13,7 +13,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub const CLASS_NAME: PCWSTR = w!("MacFinderSurface");
+pub const CLASS_NAME: PCWSTR = w!("DockSideSurface");
 
 pub const WM_APP_FRAME: u32 = WM_APP + 1;
 pub const WM_APP_RELOAD: u32 = WM_APP + 2;
@@ -77,6 +77,8 @@ pub fn register_class(proc_: WNDPROC) -> Result<()> {
             hInstance: hinstance(),
             lpszClassName: CLASS_NAME,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            // Resource 1 is the app icon embedded by build.rs (Alt-Tab, Settings, Finder).
+            hIcon: LoadIconW(hinstance(), PCWSTR(1 as *const u16)).unwrap_or_default(),
             ..Default::default()
         };
         if RegisterClassExW(&wc) == 0 {

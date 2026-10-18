@@ -1,7 +1,7 @@
 //! Hides the Windows taskbar while we run and guarantees it comes back.
 //!
 //! The taskbar's original auto-hide state is persisted to disk so that even a
-//! hard kill can be undone with `macfinder --restore-taskbar` (or by the next launch).
+//! hard kill can be undone with `dockside --restore-taskbar` (or by the next launch).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

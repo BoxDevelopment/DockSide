@@ -7,7 +7,7 @@ macro_rules! log {
 }
 
 fn path() -> PathBuf {
-    crate::config::dir().join("macfinder.log")
+    crate::config::dir().join("dockside.log")
 }
 
 /// Truncates the log when it grows past 1 MB.

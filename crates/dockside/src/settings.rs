@@ -286,7 +286,7 @@ impl SettingsWindow {
                 Group {
                     title: None,
                     rows: vec![
-                        Row::Toggle("Start MacFinder at login", Key::StartAtLogin),
+                        Row::Toggle("Start DockSide at login", Key::StartAtLogin),
                         Row::Toggle("Hide the Windows taskbar", Key::HideTaskbar),
                         Row::Segmented("Shortcut hints in menus", Key::ShortcutStyle),
                     ],
@@ -635,7 +635,7 @@ impl SettingsWindow {
             }
             Hit::AddApp => Action::AddDockApp,
             Hit::OpenConfig => Action::OpenConfig,
-            Hit::OpenLog => Action::Open(crate::config::dir().join("macfinder.log").display().to_string()),
+            Hit::OpenLog => Action::Open(crate::config::dir().join("dockside.log").display().to_string()),
             Hit::Slider(_) => return SettingsEvent::None,
         };
         SettingsEvent::Action(action)

@@ -1,4 +1,4 @@
-# MacFinder configuration.
+# DockSide configuration.
 # Changes apply as soon as you save this file. Delete it to restore defaults.
 
 [general]
@@ -9,7 +9,7 @@ appearance = "auto"
 font = "SF Pro Text"
 # Highlight color for menus and selections.
 accent = "#007AFF"
-# Hide the Windows taskbar while MacFinder runs (always restored on exit).
+# Hide the Windows taskbar while DockSide runs (always restored on exit).
 hide_taskbar = true
 # "mac" shows ⌘C-style hints in menus (⌘ = Ctrl, ⌥ = Alt, ⌃ = Win),
 # "windows" shows Ctrl+C.
@@ -58,7 +58,7 @@ reserve_space = true
 
 # Pinned apps, left to right.
 #   path  - .exe, .lnk, folder, URI, "shell:AppsFolder\<AUMID>" for Store apps,
-#           or "macfinder:finder" for the built-in Finder
+#           or "dockside:finder" for the built-in Finder
 #   name  - tooltip label (optional)
 #   args  - launch arguments (optional)
 #   icon  - custom .png / .ico, e.g. a macOS-style icon (optional)
@@ -67,7 +67,7 @@ reserve_space = true
 
 [[dock.apps]]
 name = "Finder"
-path = "macfinder:finder"
+path = "dockside:finder"
 
 [[dock.apps]]
 name = "Microsoft Edge"

@@ -1,4 +1,6 @@
-# MacFinder
+<p align="center"><img src="assets/logo-256.png" width="128" alt="DockSide logo"></p>
+
+# DockSide
 
 A fast, open-source macOS-style desktop shell for Windows 11, written in Rust.
 Pretty much 99% vibe-code. Couldn't find a good alternative so I made my own.
@@ -7,7 +9,7 @@ Feel free to contribute.
 Discord: boxeth
 
 It runs **on top of Explorer** (nothing is replaced): the Windows taskbar is
-hidden while MacFinder runs and is always restored when it exits.
+hidden while DockSide runs and is always restored when it exits.
 
 ## Features (milestone 1)
 
@@ -31,7 +33,7 @@ hidden while MacFinder runs and is always restored when it exits.
 - Store apps (`shell:AppsFolder\...`), `.lnk` shortcuts and custom PNG/ICO icons
 
 **Finder**
-- Opens from the Dock's Finder icon (`path = "macfinder:finder"`) or with `macfinder --finder`
+- Opens from the Dock's Finder icon (`path = "dockside:finder"`) or with `dockside --finder`
 - Sidebar with Favorites (Home, Desktop, Documents, Downloads, Pictures, Music, Movies) and drives,
   with macOS-style vibrancy (the desktop blurs through it; `[finder] sidebar_vibrancy`)
 - Icon, list (sortable Name / Date Modified / Size / Kind) and column views with a preview pane;
@@ -71,7 +73,7 @@ Requirements: Rust (stable, MSVC toolchain) and the Visual Studio C++ Build Tool
 cargo run --release
 ```
 
-Quit from the logo menu (**Quit MacFinder**). If it's ever killed and the taskbar stays hidden:
+Quit from the logo menu (**Quit DockSide**). If it's ever killed and the taskbar stays hidden:
 
 ```bash
 cargo run --release -- --restore-taskbar
@@ -79,10 +81,10 @@ cargo run --release -- --restore-taskbar
 
 ## Settings
 
-Open **System Settings** from the logo menu (**MacFinder Settings…**), from **Dock Settings…** when
-you right-click the Dock, or by launching MacFinder again while it's running.
+Open **System Settings** from the logo menu (**DockSide Settings…**), from **Dock Settings…** when
+you right-click the Dock, or by launching DockSide again while it's running.
 
-- **General:** Start MacFinder at login, hide the Windows taskbar, Mac- or Windows-style shortcut hints
+- **General:** Start DockSide at login, hide the Windows taskbar, Mac- or Windows-style shortcut hints
 - **Appearance:** Auto / Light / Dark, accent color, font
 - **Menu Bar:** background, logo, clock format, reserved space, status items
 - **Dock:** size, magnification and magnified size, auto-hide, icon style, background,
@@ -93,19 +95,19 @@ you right-click the Dock, or by launching MacFinder again while it's running.
 
 ## Configuration
 
-Everything Settings changes is stored in `%APPDATA%\MacFinder\config.toml`, which is created on
+Everything Settings changes is stored in `%APPDATA%\DockSide\config.toml`, which is created on
 first run with comments. Editing it by hand works too: changes apply as soon as you save, and only
 the affected part of the shell redraws.
 
 For the most faithful look, install **SF Pro Text** (or Inter) and set `font`. Give dock apps
 macOS-style icons with `icon = "C:\\path\\to\\icon.png"`.
 
-Logs: `%APPDATA%\MacFinder\macfinder.log`.
+Logs: `%APPDATA%\DockSide\dockside.log`.
 
 ## Architecture
 
 ```
-crates/macfinder/src
+crates/dockside/src
 ├── app.rs        event loop, message routing, actions (queued, run outside borrows)
 ├── menubar.rs    menu bar layout, vector status glyphs
 ├── dock.rs       dock items, magnification layout (unit-tested), bounce, context menus
@@ -136,4 +138,4 @@ crates/macfinder/src
 
 ## Notes
 
-- Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, MacFinder falls back to a DWM accent with 8px corners.
+- Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, DockSide falls back to a DWM accent with 8px corners.

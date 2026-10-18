@@ -1,5 +1,5 @@
 [package]
-name = "macfinder"
+name = "dockside"
 description = "A macOS-style desktop shell (menu bar, Dock, ...) for Windows 11"
 version.workspace = true
 edition.workspace = true
@@ -54,3 +54,6 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+[build-dependencies]
+embed-resource = "3.0.12"

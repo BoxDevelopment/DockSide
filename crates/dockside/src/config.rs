@@ -123,9 +123,20 @@ pub struct DockApp {
     pub match_exe: Option<String>,
 }
 
+fn appdata() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into())
+}
+
 pub fn dir() -> PathBuf {
-    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| ".".into());
-    base.join("MacFinder")
+    appdata().join("DockSide")
+}
+
+/// Carries settings over from before the rename to DockSide (`%APPDATA%\MacFinder`).
+pub fn migrate_legacy() {
+    let old = appdata().join("MacFinder");
+    if old.is_dir() && !dir().exists() && std::fs::rename(&old, dir()).is_ok() {
+        let _ = std::fs::rename(dir().join("macfinder.log"), dir().join("dockside.log"));
+    }
 }
 
 pub fn path() -> PathBuf {
@@ -158,6 +169,9 @@ fn parse(user: &str) -> Result<Config> {
     let mut cfg: Config = base.try_into().context("config.toml has an invalid value")?;
     for app in &mut cfg.dock.apps {
         app.path = expand_env(&app.path);
+        if app.path == crate::finder::LEGACY_FINDER_PATH {
+            app.path = crate::finder::FINDER_PATH.to_string();
+        }
         app.icon = app.icon.as_deref().map(expand_env);
     }
     if cfg.menubar.logo.contains('%') {

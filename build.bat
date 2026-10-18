@@ -1,9 +1,9 @@
 @echo off
 setlocal
-rem Builds MacFinder. Usage: build.bat [debug] [run]
-rem   (no args)  release build -> target\release\macfinder.exe
-rem   debug      debug build   -> target\debug\macfinder.exe
-rem   run        launch MacFinder after a successful build
+rem Builds DockSide. Usage: build.bat [debug] [run]
+rem   (no args)  release build -> target\release\dockside.exe
+rem   debug      debug build   -> target\debug\dockside.exe
+rem   run        launch DockSide after a successful build
 
 cd /d "%~dp0"
 
@@ -24,7 +24,7 @@ for %%A in (%*) do (
     if /i "%%~A"=="run" set "RUN=1"
 )
 
-echo [build] Building MacFinder (%PROFILE%)...
+echo [build] Building DockSide (%PROFILE%)...
 cargo build %PROFILE_FLAG%
 if errorlevel 1 (
     echo.
@@ -33,10 +33,10 @@ if errorlevel 1 (
 )
 
 echo.
-echo [build] Done: %~dp0target\%PROFILE%\macfinder.exe
+echo [build] Done: %~dp0target\%PROFILE%\dockside.exe
 
 if defined RUN (
-    start "" "%~dp0target\%PROFILE%\macfinder.exe"
+    start "" "%~dp0target\%PROFILE%\dockside.exe"
     exit /b 0
 )
 

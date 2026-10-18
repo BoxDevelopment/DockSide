@@ -1,4 +1,4 @@
-//! "Start MacFinder at login": a per-user `Run` registry value.
+//! "Start DockSide at login": a per-user `Run` registry value.
 
 use std::ffi::c_void;
 
@@ -8,7 +8,9 @@ use windows::Win32::System::Registry::{
 };
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const VALUE: PCWSTR = w!("MacFinder");
+const VALUE: PCWSTR = w!("DockSide");
+/// The value's name from before the rename to DockSide.
+const LEGACY_VALUE: PCWSTR = w!("MacFinder");
 
 pub fn is_enabled() -> bool {
     let mut size = 0u32;
@@ -34,9 +36,10 @@ pub fn set_enabled(enabled: bool) -> windows::core::Result<()> {
     }
 }
 
-/// Keeps the registered path pointing at this exe if it was moved.
+/// Keeps the registered path pointing at this exe if it was moved (or renamed from MacFinder).
 pub fn refresh() {
-    if is_enabled() {
+    let legacy = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, LEGACY_VALUE).is_ok() };
+    if legacy || is_enabled() {
         let _ = set_enabled(true);
     }
 }

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>DockSide</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5B9BFF"/>
+      <stop offset="1" stop-color="#2F54E0"/>
+    </linearGradient>
+    <clipPath id="screen">
+      <rect x="48" y="48" width="928" height="928" rx="208"/>
+    </clipPath>
+  </defs>
+
+  <!-- Screen -->
+  <rect x="48" y="48" width="928" height="928" rx="208" fill="url(#bg)"/>
+
+  <!-- Menu bar -->
+  <rect x="48" y="48" width="928" height="96" fill="#FFFFFF" fill-opacity="0.18" clip-path="url(#screen)"/>
+
+  <!-- Dock shelf -->
+  <rect x="176" y="600" width="672" height="192" rx="64" fill="#FFFFFF" fill-opacity="0.22"/>
+
+  <!-- Dock tiles; the middle one is magnified under the pointer -->
+  <rect x="212" y="624" width="144" height="144" rx="38" fill="#FFFFFF" fill-opacity="0.72"/>
+  <rect x="396" y="536" width="232" height="232" rx="60" fill="#FFFFFF"/>
+  <rect x="668" y="624" width="144" height="144" rx="38" fill="#FFFFFF" fill-opacity="0.72"/>
+
+  <!-- Running indicator -->
+  <circle cx="512" cy="780" r="9" fill="#FFFFFF"/>
+</svg>

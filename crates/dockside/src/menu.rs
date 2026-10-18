@@ -354,8 +354,8 @@ pub fn apple_menu() -> Vec<Entry> {
         Entry::item("Lock Screen", Action::Lock).shortcut(Shortcut::new("w", ch(b'L'), "L")),
         Entry::item("Log Out…", Action::LogOut),
         Entry::Separator,
-        Entry::item("MacFinder Settings…", Action::OpenSettings(None)),
-        Entry::item("Quit MacFinder", Action::Quit),
+        Entry::item("DockSide Settings…", Action::OpenSettings(None)),
+        Entry::item("Quit DockSide", Action::Quit),
     ]
 }
 

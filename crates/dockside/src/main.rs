@@ -28,14 +28,14 @@ use windows::Win32::UI::HiDpi::{
 };
 
 fn main() {
-    // Emergency escape hatch: `macfinder --restore-taskbar`
+    // Emergency escape hatch: `dockside --restore-taskbar`
     if std::env::args().any(|a| a == "--restore-taskbar") {
         win::taskbar::restore();
         return;
     }
 
     unsafe {
-        let mutex = CreateMutexW(None, true, w!("Local\\MacFinder.SingleInstance"));
+        let mutex = CreateMutexW(None, true, w!("Local\\DockSide.SingleInstance"));
         if mutex.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
             // Relaunching (e.g. from the Start menu) opens Settings, like reopening a Mac app.
             win::signal_running_instance(std::env::args().any(|a| a == "--finder"));
@@ -43,6 +43,7 @@ fn main() {
         }
     }
 
+    config::migrate_legacy();
     log::init();
     win::startup::refresh();
     std::panic::set_hook(Box::new(|info| {

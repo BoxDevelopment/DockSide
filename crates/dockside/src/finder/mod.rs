@@ -32,7 +32,9 @@ use crate::theme::Theme;
 use crate::win::{self, Monitor};
 
 /// Dock path that opens a Finder window instead of launching a program.
-pub const FINDER_PATH: &str = "macfinder:finder";
+pub const FINDER_PATH: &str = "dockside:finder";
+/// Same, as written in configs from before the rename to DockSide.
+pub const LEGACY_FINDER_PATH: &str = "macfinder:finder";
 
 const W: f32 = 940.0;
 const H: f32 = 580.0;

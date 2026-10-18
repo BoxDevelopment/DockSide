@@ -154,6 +154,7 @@ fn execute(action: Action) {
         Action::Keys(sc) => sc.send(),
         Action::Activate(h) => apps::activate(h),
         Action::Minimize(h) => apps::minimize(h),
+        Action::MinimizeWindows(hwnds) => hwnds.into_iter().for_each(apps::minimize),
         Action::Zoom(h) => apps::toggle_zoom(h),
         Action::HideOthers(keep) => {
             let keep_pid = apps::effective_pid(keep);
@@ -255,6 +256,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Shell surfaces never take focus; app windows (Finder, Settings) behave normally.
         WM_MOUSEACTIVATE if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW.0 == 0 => {
             return LRESULT(MA_NOACTIVATE as isize)
+        }
+        // Resizable app windows (Finder) draw their own frame: the client area is the whole
+        // window. Handled here, not in App, because the first one arrives during CreateWindow,
+        // while App is borrowed; DefWindowProc would leave the client inset by the resize border.
+        // (Both forms: leaving the proposed rect untouched makes it the client rect.)
+        WM_NCCALCSIZE if GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0 => {
+            return LRESULT(0)
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
@@ -858,8 +866,6 @@ impl App {
         let (x, y) = mouse_pt(lp, scale);
         let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
         let event = match msg {
-            // Client area = whole window; we draw our own frame.
-            WM_NCCALCSIZE if wp.0 != 0 => return Some(LRESULT(0)),
             WM_NCHITTEST => {
                 let mut rc = RECT::default();
                 unsafe {

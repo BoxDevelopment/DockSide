@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use windows::core::Result;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::Shell::ABE_BOTTOM;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
@@ -751,14 +751,15 @@ impl Dock {
             }
             Kind::App => {
                 let fg = unsafe { GetForegroundWindow() };
-                let owns_fg = item.windows.iter().any(|w| w.hwnd == fg);
-                let hwnd = if owns_fg && item.windows.len() > 1 {
-                    // Already frontmost: cycle to its backmost window.
-                    item.windows.last().unwrap().hwnd
+                let hwnds: Vec<HWND> = item.windows.iter().map(|w| w.hwnd).collect();
+                if hwnds.contains(&fg) && !apps::is_minimized(fg) {
+                    // Already in front: minimize it, like the Windows taskbar.
+                    let open = hwnds.into_iter().filter(|&h| !apps::is_minimized(h)).collect();
+                    Some(Action::MinimizeWindows(open))
                 } else {
-                    item.windows[0].hwnd
-                };
-                Some(Action::Activate(hwnd))
+                    // Behind other windows or minimized: restore and bring all its windows forward.
+                    Some(Action::BringToFront(hwnds))
+                }
             }
         }
     }

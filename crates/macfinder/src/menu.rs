@@ -19,6 +19,7 @@ pub enum Action {
     Keys(Shortcut),
     Activate(HWND),
     Minimize(HWND),
+    MinimizeWindows(Vec<HWND>),
     Zoom(HWND),
     HideOthers(HWND),
     ShowAll,

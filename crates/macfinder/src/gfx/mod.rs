@@ -346,6 +346,19 @@ impl Painter<'_> {
         }
     }
 
+    /// Resets a rounded rect to fully transparent (antialiased edges). Without a
+    /// device context this falls back to clearing the rect inside the corners.
+    pub fn clear_round(&self, r: Rect, radius: f32) {
+        let Some(ctx) = self.ctx else {
+            return self.clear_rect(r.inset(radius * 0.3, radius * 0.3));
+        };
+        unsafe {
+            ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
+            self.fill_round(r, radius, Color::TRANSPARENT);
+            ctx.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_SOURCE_OVER);
+        }
+    }
+
     pub fn fill_round(&self, r: Rect, radius: f32, c: Color) {
         let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
         unsafe { self.rt.FillRoundedRectangle(&rr, self.color(c)) }

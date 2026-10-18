@@ -28,8 +28,15 @@ hidden while MacFinder runs and is always restored when it exits.
 
 **Finder**
 - Opens from the Dock's Finder icon (`path = "macfinder:finder"`) or with `macfinder --finder`
-- Sidebar with Favorites (Home, Desktop, Documents, Downloads, Pictures, Music, Movies) and drives
-- Icon, list (sortable Name / Date Modified / Size / Kind) and column views with a preview pane
+- Sidebar with Favorites (Home, Desktop, Documents, Downloads, Pictures, Music, Movies) and drives,
+  with macOS-style vibrancy (the desktop blurs through it; `[finder] sidebar_vibrancy`)
+- Icon, list (sortable Name / Date Modified / Size / Kind) and column views with a preview pane;
+  the view, sort order and hidden-files choice are remembered for new windows
+- Tabs: Ctrl+T, the tab bar's +, "Open in New Tab" or middle-click a folder; Ctrl+Tab / Ctrl+Shift+Tab
+  (or Ctrl+Shift+[ / ]) switch, Ctrl+W or middle-click closes; drop files on a tab to move them there
+- Search the current folder (Ctrl+F), Quick Look (Space) with text, image and video previews
+- Drag and drop: drag items out to other apps, drop files onto folders, the sidebar or the view.
+  Like macOS, items move on the same drive and copy across drives (Ctrl forces a copy, Shift a move)
 - Background icon and thumbnail loading; folders refresh when their contents change on disk
 - Back/forward, resizable window, zoom, inline rename, New Folder, Move to Trash (Recycle Bin)
 - Context menus: Open, Rename, Copy Path, Show in File Explorer, New Terminal at Folder, view and sort options
@@ -113,7 +120,7 @@ crates/macfinder/src
 ## Roadmap
 
 - [x] Finder: sidebar, icon / list / column views, rename, trash, context menus
-- [ ] Finder: drag and drop, Quick Look (Space), tabs, search, sidebar vibrancy
+- [x] Finder: drag and drop, Quick Look (Space), tabs, search, sidebar vibrancy
 - [ ] Widgets: a desktop widget layer (clock, weather, calendar, battery, notes)
 - [x] True rounded acrylic via `Windows.UI.Composition` host backdrop
 - [x] Dock: drag to reorder, drag out to remove, auto-hide

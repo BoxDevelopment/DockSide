@@ -14,6 +14,7 @@ pub struct Config {
     pub menubar: MenuBarCfg,
     pub dock: DockCfg,
     pub spotlight: SpotlightCfg,
+    pub finder: FinderCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
 }
@@ -98,6 +99,16 @@ pub struct DockCfg {
 pub struct SpotlightCfg {
     pub enabled: bool,
     pub hotkey: String,
+}
+
+/// Finder window defaults. View, sort and hidden files are saved whenever they change in a Finder window.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct FinderCfg {
+    pub view: crate::finder::View,
+    pub sort: crate::finder::fs::SortKey,
+    pub ascending: bool,
+    pub show_hidden: bool,
+    pub sidebar_vibrancy: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -257,6 +268,11 @@ pub enum ConfigValue {
 
 /// Sets `[table] key = value`, keeping the rest of the file (and comments) intact.
 pub fn save_value(path: &Path, table: &str, key: &str, value: &ConfigValue) -> Result<()> {
+    save_values(path, table, &[(key, value.clone())])
+}
+
+/// Sets several keys of one table in a single write.
+pub fn save_values(path: &Path, table: &str, values: &[(&str, ConfigValue)]) -> Result<()> {
     use toml_edit::{DocumentMut, Item, Table};
 
     let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -264,11 +280,13 @@ pub fn save_value(path: &Path, table: &str, key: &str, value: &ConfigValue) -> R
     if !doc.contains_table(table) {
         doc[table] = Item::Table(Table::new());
     }
-    doc[table][key] = match value {
-        ConfigValue::Bool(b) => toml_edit::value(*b),
-        ConfigValue::Int(i) => toml_edit::value(*i),
-        ConfigValue::Str(s) => toml_edit::value(s.as_str()),
-    };
+    for (key, value) in values {
+        doc[table][*key] = match value {
+            ConfigValue::Bool(b) => toml_edit::value(*b),
+            ConfigValue::Int(i) => toml_edit::value(*i),
+            ConfigValue::Str(s) => toml_edit::value(s.as_str()),
+        };
+    }
     std::fs::write(path, doc.to_string())?;
     Ok(())
 }
@@ -290,6 +308,17 @@ mod tests {
         assert_eq!(cfg.dock.tile_size, 64.0);
         assert!(cfg.dock.magnification);
         assert!(!cfg.dock.apps.is_empty());
+    }
+
+    #[test]
+    fn finder_prefs_parse() {
+        let cfg = parse("[finder]
+view = \"columns\"
+sort = \"modified\"
+").unwrap();
+        assert_eq!(cfg.finder.view, crate::finder::View::Columns);
+        assert_eq!(cfg.finder.sort, crate::finder::fs::SortKey::Modified);
+        assert!(cfg.finder.ascending);
     }
 
     #[test]

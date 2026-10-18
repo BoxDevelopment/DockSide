@@ -11,21 +11,30 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub fn is_dark_mode() -> bool {
-    let mut value: u32 = 1;
+fn personalize_dword(name: PCWSTR) -> Option<u32> {
+    let mut value: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
     let r = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("AppsUseLightTheme"),
+            name,
             RRF_RT_REG_DWORD,
             None,
             Some(&mut value as *mut _ as *mut c_void),
             Some(&mut size),
         )
     };
-    r.is_ok() && value == 0
+    r.is_ok().then_some(value)
+}
+
+pub fn is_dark_mode() -> bool {
+    personalize_dword(w!("AppsUseLightTheme")) == Some(0)
+}
+
+/// Settings → Personalization → Colors → Transparency effects (on unless turned off).
+pub fn transparency_enabled() -> bool {
+    personalize_dword(w!("EnableTransparency")) != Some(0)
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

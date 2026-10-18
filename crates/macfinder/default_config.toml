@@ -97,6 +97,15 @@ enabled = true
 # Global shortcut: "alt+space", "ctrl+space" or "ctrl+alt+space" (any of ctrl/alt/shift/win + a key).
 hotkey = "alt+space"
 
+[finder]
+# Saved automatically when you change them in a Finder window.
+view = "icons"          # "icons", "list" or "columns"
+sort = "name"           # "name", "modified", "size" or "kind"
+ascending = true
+show_hidden = false
+# Blur what's behind the window through the sidebar (needs Transparency effects on).
+sidebar_vibrancy = true
+
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]
 "explorer.exe" = "Finder"

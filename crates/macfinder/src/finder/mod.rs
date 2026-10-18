@@ -1,5 +1,5 @@
 //! Finder: a macOS-style file manager window with a sidebar, back/forward,
-//! and icon / list / column views.
+//! tabs, and icon / list / column views.
 
 pub mod dnd;
 pub mod fs;
@@ -23,7 +23,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use self::fs::{Entry as FileEntry, KindCache, Place, SortKey};
 use self::loader::IconLoader;
 use self::text::{KeyResult, TextField};
-use crate::chrome::{self, Light, SHADOW};
+use crate::chrome::{self, Light, SidebarBackdrop, SHADOW};
+use crate::config::FinderCfg;
 use crate::geom::{Color, Rect};
 use crate::gfx::{pt as gfx_pt, Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::{Action, Entry};
@@ -39,6 +40,9 @@ const MIN_W: f32 = 560.0;
 const MIN_H: f32 = 340.0;
 const SIDEBAR: f32 = 190.0;
 const TOOLBAR: f32 = 52.0;
+/// Tab bar under the toolbar, shown while a window has more than one tab.
+const TABBAR: f32 = 28.0;
+const NEW_TAB_W: f32 = 30.0;
 const STATUS: f32 = 26.0;
 const ROW: f32 = 24.0;
 const HEADER: f32 = 26.0;
@@ -72,16 +76,30 @@ const PERIOD: u16 = 0xBE;
 /// Width of the invisible resize border inside the body edge.
 const EDGE: f32 = 6.0;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum View {
     Icons,
     List,
     Columns,
 }
 
+impl View {
+    /// Name used in config.toml.
+    pub fn name(self) -> &'static str {
+        match self {
+            View::Icons => "icons",
+            View::List => "list",
+            View::Columns => "columns",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum FinderCmd {
     Open(PathBuf),
+    /// Open a folder in a new tab of this window.
+    OpenTab(PathBuf),
     Reveal(PathBuf),
     /// Open a folder in File Explorer itself.
     Explorer(PathBuf),
@@ -147,6 +165,9 @@ enum Hit {
     QlPanel,
     QlClose,
     QlOpen,
+    Tab(usize),
+    TabClose(usize),
+    NewTab,
 }
 
 struct Column {
@@ -183,6 +204,27 @@ struct QuickLook {
     text: Option<String>,
     scroll: f32,
     max_scroll: f32,
+}
+
+/// A background tab's folder state, swapped into the window's fields when it's selected.
+struct Tab {
+    cwd: PathBuf,
+    history: Vec<PathBuf>,
+    hist_pos: usize,
+    listing: Vec<FileEntry>,
+    entries: Vec<FileEntry>,
+    error: Option<String>,
+    free: Option<u64>,
+    view: View,
+    sort: SortKey,
+    ascending: bool,
+    selected: BTreeSet<usize>,
+    anchor: Option<usize>,
+    cursor: Option<usize>,
+    columns: Vec<Column>,
+    active_col: usize,
+    scroll: f32,
+    search: TextField,
 }
 
 /// Per-render context the App lends to a Finder window.
@@ -245,6 +287,13 @@ pub struct FinderWindow {
     watcher: Option<notify::RecommendedWatcher>,
     zoom_restore: Option<RECT>,
     show_hidden: bool,
+    /// One slot per tab, in order; the active tab's state lives in the fields above (its slot is `None`).
+    tabs: Vec<Option<Tab>>,
+    active_tab: usize,
+    /// Blurred backdrop behind the translucent sidebar, when vibrancy is on and available.
+    backdrop: Option<SidebarBackdrop>,
+    /// View, sort or hidden files changed: the App saves them as the defaults for new windows.
+    pub prefs_dirty: bool,
     pub focused: bool,
     pub tracking: bool,
     pub dirty: bool,
@@ -252,6 +301,7 @@ pub struct FinderWindow {
 
 impl FinderWindow {
     /// `notify`/`changed_msg`: where to post (with this window's id) when the folder changes on disk.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &mut Ctx,
         monitor: &Monitor,
@@ -260,6 +310,7 @@ impl FinderWindow {
         cascade: i32,
         notify: isize,
         changed_msg: u32,
+        prefs: &FinderCfg,
     ) -> Result<Self> {
         let s = monitor.scale;
         let (w, h) = (((W + 2.0 * SHADOW) * s).round() as i32, ((H + 2.0 * SHADOW) * s).round() as i32);
@@ -295,9 +346,9 @@ impl FinderWindow {
             entries: Vec::new(),
             error: None,
             free: None,
-            view: View::Icons,
-            sort: SortKey::Name,
-            ascending: true,
+            view: prefs.view,
+            sort: prefs.sort,
+            ascending: prefs.ascending,
             selected: BTreeSet::new(),
             anchor: None,
             cursor: None,
@@ -327,7 +378,11 @@ impl FinderWindow {
             drives: fs::drives(),
             watcher,
             zoom_restore: None,
-            show_hidden: false,
+            show_hidden: prefs.show_hidden,
+            tabs: vec![None],
+            active_tab: 0,
+            backdrop: if prefs.sidebar_vibrancy { SidebarBackdrop::new(ctx.theme) } else { None },
+            prefs_dirty: false,
             focused: true,
             tracking: false,
             dirty: true,
@@ -342,10 +397,166 @@ impl FinderWindow {
     }
 
     pub fn title(&self) -> String {
-        if let Some(p) = self.favorites.iter().chain(&self.drives).find(|p| p.path == self.cwd) {
+        self.title_for(&self.cwd)
+    }
+
+    fn title_for(&self, dir: &Path) -> String {
+        if let Some(p) = self.favorites.iter().chain(&self.drives).find(|p| p.path == dir) {
             return p.name.clone();
         }
-        self.cwd.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.cwd.display().to_string())
+        dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string())
+    }
+
+    /// Settings that new windows start with: view, sort key, ascending, hidden files.
+    pub fn prefs(&self) -> (View, SortKey, bool, bool) {
+        (self.view, self.sort, self.ascending, self.show_hidden)
+    }
+
+    /// Keeps the vibrancy backdrop under the sidebar (call when the window moves, resizes or changes z-order).
+    pub fn sync_backdrop(&mut self) {
+        let body = self.body();
+        if let Some(bd) = &mut self.backdrop {
+            // Extends under the content's square left edge, so only the outer corners show rounded.
+            bd.sync(self.hwnd, Rect::new(body.x, body.y, SIDEBAR + chrome::RADIUS, body.h), chrome::RADIUS, self.scale);
+        }
+    }
+
+    // --- tabs --------------------------------------------------------------
+
+    fn tab_h(&self) -> f32 {
+        if self.tabs.len() > 1 {
+            TABBAR
+        } else {
+            0.0
+        }
+    }
+
+    fn tab_dir(&self, i: usize) -> Option<&Path> {
+        if i == self.active_tab {
+            Some(&self.cwd)
+        } else {
+            self.tabs.get(i)?.as_ref().map(|t| t.cwd.as_path())
+        }
+    }
+
+    /// Moves the active tab's state out of the window's fields.
+    fn stash(&mut self) -> Tab {
+        use std::mem::take;
+        Tab {
+            cwd: take(&mut self.cwd),
+            history: take(&mut self.history),
+            hist_pos: self.hist_pos,
+            listing: take(&mut self.listing),
+            entries: take(&mut self.entries),
+            error: self.error.take(),
+            free: self.free,
+            view: self.view,
+            sort: self.sort,
+            ascending: self.ascending,
+            selected: take(&mut self.selected),
+            anchor: self.anchor,
+            cursor: self.cursor,
+            columns: take(&mut self.columns),
+            active_col: self.active_col,
+            scroll: self.scroll,
+            search: take(&mut self.search),
+        }
+    }
+
+    fn restore(&mut self, t: Tab) {
+        self.cwd = t.cwd;
+        self.history = t.history;
+        self.hist_pos = t.hist_pos;
+        self.listing = t.listing;
+        self.entries = t.entries;
+        self.error = t.error;
+        self.free = t.free;
+        self.view = t.view;
+        self.sort = t.sort;
+        self.ascending = t.ascending;
+        self.selected = t.selected;
+        self.anchor = t.anchor;
+        self.cursor = t.cursor;
+        self.columns = t.columns;
+        self.active_col = t.active_col;
+        self.scroll = t.scroll;
+        self.search = t.search;
+    }
+
+    /// Ends per-tab transient state (rename, Quick Look, presses) and stops watching the folder.
+    fn leave_tab(&mut self) {
+        self.end_press();
+        self.rename = None;
+        self.quicklook = None;
+        self.search_focus = false;
+        self.drop_hit = None;
+        if let Some(w) = &mut self.watcher {
+            let _ = w.unwatch(&self.cwd);
+        }
+    }
+
+    /// Makes the stashed tab `i` current, re-listing it in case it changed while in the background.
+    fn enter_tab(&mut self, i: usize, kinds: &mut KindCache) {
+        let Some(t) = self.tabs.get_mut(i).and_then(Option::take) else { return };
+        self.restore(t);
+        self.active_tab = i;
+        if let Some(w) = &mut self.watcher {
+            let _ = w.watch(&self.cwd, RecursiveMode::NonRecursive);
+        }
+        self.reload(kinds);
+        unsafe {
+            let _ = SetWindowTextW(self.hwnd, &HSTRING::from(self.title()));
+        }
+    }
+
+    /// Opens `path` in a new tab after the current one, with the current view and sort.
+    fn new_tab(&mut self, path: PathBuf, kinds: &mut KindCache) {
+        self.leave_tab();
+        let t = self.stash();
+        let (view, sort, ascending) = (t.view, t.sort, t.ascending);
+        self.tabs[self.active_tab] = Some(t);
+        self.active_tab += 1;
+        self.tabs.insert(self.active_tab, None);
+        self.hist_pos = 0;
+        self.view = view;
+        self.sort = sort;
+        self.ascending = ascending;
+        self.navigate(path, true, kinds);
+    }
+
+    fn select_tab(&mut self, i: usize, kinds: &mut KindCache) {
+        if i == self.active_tab || i >= self.tabs.len() {
+            return;
+        }
+        self.leave_tab();
+        self.tabs[self.active_tab] = Some(self.stash());
+        self.enter_tab(i, kinds);
+    }
+
+    /// Next (`+1`) or previous (`-1`) tab, wrapping around.
+    fn cycle_tab(&mut self, step: isize, kinds: &mut KindCache) {
+        let n = self.tabs.len() as isize;
+        let i = (self.active_tab as isize + step).rem_euclid(n) as usize;
+        self.select_tab(i, kinds);
+    }
+
+    /// Closes tab `i`; returns true when it was the last one (so the window should close).
+    fn close_tab(&mut self, i: usize, kinds: &mut KindCache) -> bool {
+        if self.tabs.len() <= 1 {
+            return true;
+        }
+        if i == self.active_tab {
+            self.leave_tab();
+            self.tabs.remove(i);
+            self.enter_tab(i.min(self.tabs.len() - 1), kinds);
+        } else if i < self.tabs.len() {
+            self.tabs.remove(i);
+            if i < self.active_tab {
+                self.active_tab -= 1;
+            }
+        }
+        self.dirty = true;
+        false
     }
 
     // --- navigation & listing ----------------------------------------------
@@ -507,6 +718,7 @@ impl FinderWindow {
             }
             self.view = view;
             self.scroll = 0.0;
+            self.prefs_dirty = true;
             self.dirty = true;
         }
     }
@@ -518,6 +730,7 @@ impl FinderWindow {
             self.sort = key;
             self.ascending = true;
         }
+        self.prefs_dirty = true;
         self.reload(kinds);
     }
 
@@ -558,6 +771,7 @@ impl FinderWindow {
                 let is_dir = p.is_dir();
                 self.open_path(&p, is_dir, kinds);
             }
+            FinderCmd::OpenTab(p) => self.new_tab(p, kinds),
             FinderCmd::Reveal(p) => crate::win::system::reveal(&p.to_string_lossy()),
             FinderCmd::Explorer(p) => crate::win::system::open_in_explorer(&p.to_string_lossy()),
             FinderCmd::CopyPath(paths) => {
@@ -700,7 +914,8 @@ impl FinderWindow {
 
     fn view_rect(&self) -> Rect {
         let b = self.body();
-        Rect::new(b.x + SIDEBAR, b.y + TOOLBAR, b.w - SIDEBAR, b.h - TOOLBAR - STATUS)
+        let top = TOOLBAR + self.tab_h();
+        Rect::new(b.x + SIDEBAR, b.y + top, b.w - SIDEBAR, b.h - top - STATUS)
     }
 
     /// Hit-test result for WM_NCHITTEST, from window-local points.
@@ -749,6 +964,9 @@ impl FinderWindow {
                         | Hit::SearchClear
                         | Hit::QlClose
                         | Hit::QlOpen
+                        | Hit::Tab(_)
+                        | Hit::TabClose(_)
+                        | Hit::NewTab
                 )
             )
         };
@@ -902,9 +1120,43 @@ impl FinderWindow {
                 self.apply_filter();
             }
             Some(Hit::QlBackdrop) => self.quicklook = None,
+            // Tabs switch on press, like macOS.
+            Some(Hit::Tab(i)) => self.select_tab(i, kinds),
             _ => {}
         }
         self.dirty = true;
+    }
+
+    /// Middle click: closes a tab, or opens a folder in a new tab.
+    pub fn on_middle(&mut self, x: f32, y: f32, kinds: &mut KindCache) -> FinderEvent {
+        if self.quicklook.is_some() {
+            return FinderEvent::None;
+        }
+        match self.hit_at(x, y) {
+            Some(Hit::Tab(i) | Hit::TabClose(i)) => {
+                if self.close_tab(i, kinds) {
+                    return FinderEvent::Close;
+                }
+            }
+            Some(Hit::Item(i)) => {
+                if let Some(e) = self.entries.get(i).filter(|e| e.is_dir).cloned() {
+                    self.new_tab(e.path, kinds);
+                }
+            }
+            Some(Hit::Column(c, j)) => {
+                if let Some(e) = self.columns.get(c).and_then(|col| col.entries.get(j)).filter(|e| e.is_dir).cloned() {
+                    self.new_tab(e.path, kinds);
+                }
+            }
+            Some(Hit::Place(i)) => {
+                if let Some(p) = self.favorites.iter().chain(&self.drives).nth(i).cloned() {
+                    self.new_tab(p.path, kinds);
+                }
+            }
+            _ => {}
+        }
+        self.dirty = true;
+        FinderEvent::None
     }
 
     pub fn on_up(&mut self, x: f32, y: f32, kinds: &mut KindCache) -> FinderEvent {
@@ -930,6 +1182,12 @@ impl FinderWindow {
                 self.selected = [i].into();
                 self.anchor = Some(i);
             }
+            Hit::TabClose(i) => {
+                if self.close_tab(i, kinds) {
+                    return FinderEvent::Close;
+                }
+            }
+            Hit::NewTab => self.new_tab(fs::home(), kinds),
             Hit::QlClose => self.quicklook = None,
             Hit::QlOpen => {
                 if let Some(e) = self.ql_entry().cloned() {
@@ -1025,6 +1283,7 @@ impl FinderWindow {
             Some(Hit::Item(i)) => self.entries.get(i).filter(|e| e.is_dir).map(|e| (Hit::Item(i), e.path.clone())),
             Some(Hit::Column(c, j)) => self.columns[c].entries.get(j).filter(|e| e.is_dir).map(|e| (Hit::Column(c, j), e.path.clone())),
             Some(Hit::Place(i)) => self.favorites.iter().chain(&self.drives).nth(i).map(|p| (Hit::Place(i), p.path.clone())),
+            Some(Hit::Tab(i) | Hit::TabClose(i)) => self.tab_dir(i).map(|d| (Hit::Tab(i), d.to_path_buf())),
             _ => None,
         }
         .or_else(|| match hit {
@@ -1080,6 +1339,7 @@ impl FinderWindow {
                 Entry::item("Show in File Explorer", cmd(FinderCmd::Reveal(first.path.clone()))),
             ];
             if first.is_dir {
+                v.insert(1, Entry::item("Open in New Tab", cmd(FinderCmd::OpenTab(first.path.clone()))));
                 v.push(Entry::Separator);
                 v.push(Entry::item("New Terminal at Folder", cmd(FinderCmd::Terminal(first.path.clone()))));
             }
@@ -1135,7 +1395,7 @@ impl FinderWindow {
                 }
                 ESC => self.search_focus = false,
                 // Into the results.
-                ENTER | TAB | DOWN => {
+                ENTER | TAB | DOWN if !ctrl => {
                     self.search_focus = false;
                     if self.selected.is_empty() && !self.entries.is_empty() {
                         self.selected = [0].into();
@@ -1167,7 +1427,16 @@ impl FinderWindow {
             (k, true, false) if k == b'F' as u16 => self.focus_search(),
             (k, true, false) if k == b'N' as u16 && shift => self.new_folder(kinds),
             (k, true, false) if k == b'N' as u16 => return FinderEvent::NewWindow,
-            (k, true, false) if k == b'W' as u16 => return FinderEvent::Close,
+            (k, true, false) if k == b'T' as u16 => self.new_tab(fs::home(), kinds),
+            // Ctrl+W closes the tab, or the window with its last tab.
+            (k, true, false) if k == b'W' as u16 => {
+                if self.close_tab(self.active_tab, kinds) {
+                    return FinderEvent::Close;
+                }
+            }
+            (TAB, true, false) => self.cycle_tab(if shift { -1 } else { 1 }, kinds),
+            (RBRACKET, true, false) if shift => self.cycle_tab(1, kinds),
+            (LBRACKET, true, false) if shift => self.cycle_tab(-1, kinds),
             (k, true, false) if k == b'1' as u16 => self.set_view(View::Icons),
             (k, true, false) if k == b'2' as u16 => self.set_view(View::List),
             (k, true, false) if k == b'3' as u16 => self.set_view(View::Columns),
@@ -1199,6 +1468,7 @@ impl FinderWindow {
             // ⌘⇧. on macOS: toggle hidden files.
             (PERIOD, true, false) if shift => {
                 self.show_hidden = !self.show_hidden;
+                self.prefs_dirty = true;
                 self.reload(kinds);
             }
             (LEFT | RIGHT | UP | DOWN | HOME | END, false, false) => self.move_selection(vk, shift, kinds),
@@ -1394,7 +1664,12 @@ impl FinderWindow {
         }
 
         let (gfx, theme) = (ctx.gfx, ctx.theme);
-        let pal = chrome::Palette::new(theme);
+        let mut pal = chrome::Palette::new(theme);
+        if let Some(bd) = &mut self.backdrop {
+            bd.set_theme(theme);
+            pal.sidebar = SidebarBackdrop::fill();
+        }
+        self.sync_backdrop();
         let dark = theme.dark;
         let body = self.body();
         let vr = self.view_rect();
@@ -1452,6 +1727,12 @@ impl FinderWindow {
         let preview = self.preview_entry().cloned();
         let column_offset = self.column_offset(vr);
         let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
+        let tab_titles: Vec<String> = if self.tabs.len() > 1 {
+            (0..self.tabs.len()).map(|i| self.tab_dir(i).map(|d| self.title_for(d)).unwrap_or_default()).collect()
+        } else {
+            Vec::new()
+        };
+        let active_tab = self.active_tab;
 
         let kinds = &mut *ctx.kinds;
         let loader = &mut *ctx.loader;
@@ -1642,6 +1923,51 @@ impl FinderWindow {
             p.text(&title, &title_font, Rect::new(title_x, body.y, sf.x - 8.0 - title_x, TOOLBAR), theme.text);
             p.line(content_x, body.y + TOOLBAR, body.right(), body.y + TOOLBAR, pal.divider, 1.0);
 
+            // Tab bar: equal-width tabs, a close button on hover, and + at the end.
+            if !tab_titles.is_empty() {
+                let bar = Rect::new(content_x, body.y + TOOLBAR, content_w, TABBAR);
+                let shade = if dark { Color::gray(0, 0.22) } else { Color::gray(0, 0.05) };
+                p.fill_rect(bar, pal.content);
+                let tw = (bar.w - NEW_TAB_W) / tab_titles.len() as f32;
+                for (i, t) in tab_titles.iter().enumerate() {
+                    let r = Rect::new(bar.x + i as f32 * tw, bar.y, tw, TABBAR);
+                    let active = i == active_tab;
+                    if !active {
+                        p.fill_rect(r, shade);
+                        if matches!(hover, Some(Hit::Tab(h) | Hit::TabClose(h)) if h == i) {
+                            p.fill_rect(r, soft);
+                        }
+                    }
+                    if drop_hit == Some(Hit::Tab(i)) {
+                        p.stroke_round(r.inset(2.0, 2.0), 4.0, theme.accent, 2.0);
+                    }
+                    p.line(r.right(), r.y, r.right(), r.bottom(), pal.divider, 1.0);
+                    let tc = if active { theme.text } else { theme.text_secondary };
+                    p.text(t, &center, Rect::new(r.x + 26.0, r.y, r.w - 52.0, r.h), tc);
+                    hits.push((r, Hit::Tab(i)));
+                    let close = Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
+                    if matches!(hover, Some(Hit::Tab(h) | Hit::TabClose(h)) if h == i) {
+                        if hover == Some(Hit::TabClose(i)) {
+                            p.fill_round(close, 4.0, soft);
+                        }
+                        let (cx, cy) = (close.cx(), close.cy());
+                        p.line(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5, theme.text_secondary, 1.3);
+                        p.line(cx + 3.5, cy - 3.5, cx - 3.5, cy + 3.5, theme.text_secondary, 1.3);
+                    }
+                    hits.push((close, Hit::TabClose(i)));
+                }
+                let plus = Rect::new(bar.right() - NEW_TAB_W, bar.y, NEW_TAB_W, TABBAR);
+                p.fill_rect(plus, shade);
+                if hover == Some(Hit::NewTab) {
+                    p.fill_rect(plus, soft);
+                }
+                let (cx, cy) = (plus.cx(), plus.cy());
+                p.line(cx - 5.0, cy, cx + 5.0, cy, theme.text_secondary, 1.4);
+                p.line(cx, cy - 5.0, cx, cy + 5.0, theme.text_secondary, 1.4);
+                hits.push((plus, Hit::NewTab));
+                p.line(bar.x, bar.bottom(), bar.right(), bar.bottom(), pal.divider, 1.0);
+            }
+
             // Content.
             hits.push((vr, Hit::Content));
             p.clipped(vr, || match view {
@@ -1674,7 +2000,7 @@ impl FinderWindow {
                                 p.text(&e.name, &label_font, label, if sel { sel_text } else { theme.text });
                             }
                         }
-                        hits.push((Rect::new(cell.x + 4.0, cell.y, cell.w - 8.0, CELL_H - 4.0), Hit::Item(i)));
+                        hits.extend(intersect(Rect::new(cell.x + 4.0, cell.y, cell.w - 8.0, CELL_H - 4.0), vr).map(|r| (r, Hit::Item(i))));
                     }
                 }
                 View::List => {
@@ -1689,7 +2015,8 @@ impl FinderWindow {
                     let rows_top = vr.y + HEADER;
                     let first = ((scroll) / ROW).floor().max(0.0) as usize;
                     let last = (((scroll + vr.h) / ROW).ceil() as usize + 1).min(n);
-                    p.clipped(Rect::new(vr.x, rows_top, vr.w, vr.h - HEADER), || {
+                    let rows_clip = Rect::new(vr.x, rows_top, vr.w, vr.h - HEADER);
+                    p.clipped(rows_clip, || {
                         for i in first..last {
                             let e = &entries[i];
                             let r = Rect::new(x0, rows_top + 4.0 + i as f32 * ROW - scroll, w, ROW);
@@ -1716,7 +2043,7 @@ impl FinderWindow {
                             let size = if e.is_dir { "--".to_string() } else { fs::format_size(e.size) };
                             p.text(&size, &right, Rect::new(cols[2].2, r.y, cols[2].3 - 14.0, r.h), sc);
                             p.text(&kinds.kind(e), &regular, Rect::new(cols[3].2, r.y, cols[3].3 - 8.0, r.h), sc);
-                            hits.push((r, Hit::Item(i)));
+                            hits.extend(intersect(r, rows_clip).map(|r| (r, Hit::Item(i))));
                         }
                     });
                     // Header (drawn last so rows scroll under it).
@@ -1743,7 +2070,7 @@ impl FinderWindow {
                     for (c, col) in columns.iter().enumerate() {
                         let cx0 = vr.x + c as f32 * COL_W - column_offset;
                         let col_r = Rect::new(cx0, vr.y, COL_W, vr.h);
-                        hits.push((col_r, Hit::ColumnBg(c)));
+                        hits.extend(intersect(col_r, vr).map(|r| (r, Hit::ColumnBg(c))));
                         if let Some(err) = &col.error {
                             p.text(err, &small_center, col_r.inset(10.0, 0.0), theme.text_secondary);
                         }
@@ -1773,7 +2100,7 @@ impl FinderWindow {
                                 p.line(x - 2.0, y - 4.0, x + 2.0, y, tc, 1.4);
                                 p.line(x + 2.0, y, x - 2.0, y + 4.0, tc, 1.4);
                             }
-                            hits.push((r, Hit::Column(c, j)));
+                            hits.extend(intersect(r, vr).map(|r| (r, Hit::Column(c, j))));
                         }
                         p.line(col_r.right(), vr.y, col_r.right(), vr.bottom(), pal.divider, 1.0);
                         if drop_hit == Some(Hit::ColumnBg(c)) {
@@ -1868,6 +2195,14 @@ impl FinderWindow {
 /// Normalized rectangle between two corners.
 fn band_rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Rect {
     Rect::new(x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs())
+}
+
+/// The part of `a` inside `b`, if any. Hit areas use this so rows scrolled out of
+/// the view (under the toolbar, sidebar or header) can't steal clicks.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let (x0, y0) = (a.x.max(b.x), a.y.max(b.y));
+    let (x1, y1) = (a.right().min(b.right()), a.bottom().min(b.bottom()));
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }
 
 fn overlaps(a: &Rect, b: &Rect) -> bool {

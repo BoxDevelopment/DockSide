@@ -52,12 +52,25 @@ pub fn list(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
     Ok(out)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SortKey {
     Name,
     Modified,
     Size,
     Kind,
+}
+
+impl SortKey {
+    /// Name used in config.toml.
+    pub fn name(self) -> &'static str {
+        match self {
+            SortKey::Name => "name",
+            SortKey::Modified => "modified",
+            SortKey::Size => "size",
+            SortKey::Kind => "kind",
+        }
+    }
 }
 
 /// Case-insensitive comparison where digit runs compare numerically ("file 2" < "file 10").

@@ -793,7 +793,8 @@ impl App {
         let path = path.unwrap_or_else(finder::fs::home);
         let cascade = self.finders.len() as i32;
         let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
-        match FinderWindow::new(&mut ctx, &self.monitor, id, path, cascade, self.msg_hwnd.0 as isize, WM_APP_FINDER_CHANGED) {
+        let prefs = &self.cfg.finder;
+        match FinderWindow::new(&mut ctx, &self.monitor, id, path, cascade, self.msg_hwnd.0 as isize, WM_APP_FINDER_CHANGED, prefs) {
             Ok(mut f) => {
                 f.render(&mut ctx);
                 unsafe {
@@ -816,7 +817,30 @@ impl App {
         if let Some(f) = self.finders.iter_mut().find(|f| f.id == id) {
             f.command(cmd, &mut self.kinds);
         }
+        self.save_finder_prefs();
         self.flush();
+    }
+
+    /// Saves a Finder window's changed view / sort / hidden-files choice as the default for new windows.
+    fn save_finder_prefs(&mut self) {
+        use config::ConfigValue::{Bool, Str};
+        let Some(f) = self.finders.iter_mut().find(|f| f.prefs_dirty) else { return };
+        f.prefs_dirty = false;
+        let (view, sort, ascending, show_hidden) = f.prefs();
+        let c = &mut self.cfg.finder;
+        if (c.view, c.sort, c.ascending, c.show_hidden) == (view, sort, ascending, show_hidden) {
+            return;
+        }
+        (c.view, c.sort, c.ascending, c.show_hidden) = (view, sort, ascending, show_hidden);
+        let values = [
+            ("view", Str(view.name().into())),
+            ("sort", Str(sort.name().into())),
+            ("ascending", Bool(ascending)),
+            ("show_hidden", Bool(show_hidden)),
+        ];
+        if let Err(e) = config::save_values(&self.cfg_path, "finder", &values) {
+            log!("could not save Finder settings: {e:#}");
+        }
     }
 
     /// Our Finder windows, shaped like other apps' windows for the Dock and menus.
@@ -853,6 +877,7 @@ impl App {
                 return Some(LRESULT(0));
             }
             WM_WINDOWPOSCHANGED => {
+                f.sync_backdrop();
                 f.dirty = true;
                 return None;
             }
@@ -878,6 +903,7 @@ impl App {
             }
             WM_LBUTTONUP => f.on_up(x, y, &mut self.kinds),
             WM_RBUTTONUP => f.on_right_click(x, y, &mut self.kinds),
+            WM_MBUTTONUP => f.on_middle(x, y, &mut self.kinds),
             WM_MOUSEWHEEL => {
                 let mut rc = RECT::default();
                 unsafe {
@@ -910,6 +936,7 @@ impl App {
             FinderEvent::Menu(entries, x, y) => self.open_menu(entries, Placement::Below { x, y }, MenuSource::Window),
             FinderEvent::Run(cmd) => push(Action::Finder { window: id, cmd }),
         }
+        self.save_finder_prefs();
         Some(LRESULT(0))
     }
 

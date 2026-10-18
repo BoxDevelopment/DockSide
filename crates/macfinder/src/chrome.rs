@@ -1,9 +1,15 @@
 //! Shared macOS window chrome for our app windows (Finder, System Settings):
-//! soft shadow, a rounded body split into sidebar + content, and traffic lights.
+//! soft shadow, a rounded body split into sidebar + content, traffic lights,
+//! and an optional blurred (vibrant) sidebar backdrop.
+
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 use crate::theme::Theme;
+use crate::win::composition::CompositionBackdrop;
+use crate::win::{accent, create_window, system};
 
 /// Margin around the body reserved for the drop shadow, in points.
 pub const SHADOW: f32 = 30.0;
@@ -47,7 +53,12 @@ pub fn window(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Pale
         let a = 0.035 * (14 - i) as f32 / 14.0;
         p.fill_round(body.inset(-grow, -grow).offset(0.0, 8.0), RADIUS + grow, theme.shadow.alpha(a));
     }
-    p.clear_rect(body.inset(4.0, 4.0));
+    if pal.sidebar.a < 1.0 {
+        // A see-through sidebar must not show the shadow under the body.
+        p.clear_round(body, RADIUS);
+    } else {
+        p.clear_rect(body.inset(4.0, 4.0));
+    }
     p.fill_round(body, RADIUS, pal.sidebar);
     let content = Rect::new(body.x + sidebar_w, body.y, body.w - sidebar_w, body.h);
     p.fill_round(content, RADIUS, pal.content);
@@ -91,4 +102,94 @@ pub fn traffic_lights(p: &Painter, body: Rect, hovered: bool, zoom_enabled: bool
         hits.push((Rect::new(cx - 8.0, cy - 8.0, 16.0, 16.0), light));
     }
     hits
+}
+
+/// Sidebar vibrancy: a blurred Composition backdrop window kept directly below
+/// an app window, showing through its translucent sidebar.
+pub struct SidebarBackdrop {
+    hwnd: HWND,
+    composition: CompositionBackdrop,
+    tint: Color,
+    /// Last applied screen rect + radius, to skip redundant updates.
+    placed: Option<[i32; 5]>,
+}
+
+impl SidebarBackdrop {
+    /// Sidebar tint over the blur, like macOS's sidebar material.
+    pub fn tint(theme: &Theme) -> Color {
+        if theme.dark {
+            Color::rgba(40, 40, 42, 0.62)
+        } else {
+            Color::rgba(234, 232, 236, 0.58)
+        }
+    }
+
+    /// The near-transparent sidebar fill to paint over the backdrop: just enough
+    /// alpha that the layered window still receives clicks there.
+    pub fn fill() -> Color {
+        Color::gray(128, 0.012)
+    }
+
+    /// `None` when Transparency effects are off or Composition is unavailable.
+    pub fn new(theme: &Theme) -> Option<Self> {
+        if !system::transparency_enabled() {
+            return None;
+        }
+        let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT;
+        let hwnd = create_window(ex, WS_POPUP, RECT::default(), HWND::default()).ok()?;
+        accent::prepare(hwnd);
+        let tint = Self::tint(theme);
+        match CompositionBackdrop::new(hwnd, tint) {
+            Ok(composition) => Some(Self { hwnd, composition, tint, placed: None }),
+            Err(e) => {
+                log!("sidebar backdrop unavailable: {e}");
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+                None
+            }
+        }
+    }
+
+    pub fn set_theme(&mut self, theme: &Theme) {
+        let tint = Self::tint(theme);
+        if tint != self.tint {
+            self.tint = tint;
+            self.composition.set_tint(tint);
+        }
+    }
+
+    /// Covers `r` (owner-local points) with a rounded backdrop just below `owner`
+    /// in z-order, or hides it while the owner is hidden or minimized.
+    pub fn sync(&mut self, owner: HWND, r: Rect, radius: f32, scale: f32) {
+        unsafe {
+            if !IsWindowVisible(owner).as_bool() || IsIconic(owner).as_bool() {
+                if self.placed.take().is_some() {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+                return;
+            }
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(owner, &mut rc);
+            let x = rc.left + (r.x * scale).round() as i32;
+            let y = rc.top + (r.y * scale).round() as i32;
+            let w = (r.w * scale).round() as i32;
+            let h = (r.h * scale).round() as i32;
+            let key = [x, y, w, h, (radius * scale).round() as i32];
+            if self.placed != Some(key) {
+                self.composition.set_shape(0.0, 0.0, w as f32, h as f32, key[4] as f32);
+            }
+            self.placed = Some(key);
+            // Re-applied every time: the owner may have moved up in z-order.
+            let _ = SetWindowPos(self.hwnd, owner, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+    }
+}
+
+impl Drop for SidebarBackdrop {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyWindow(self.hwnd);
+        }
+    }
 }

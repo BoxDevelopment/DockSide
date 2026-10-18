@@ -51,7 +51,7 @@ pub struct CompositionBackdrop {
     _target: DesktopWindowTarget,
     shape: ContainerVisual,
     geometry: CompositionRoundedRectangleGeometry,
-    _tint: CompositionColorBrush,
+    tint: CompositionColorBrush,
     _layers: (SpriteVisual, SpriteVisual),
 }
 
@@ -96,7 +96,7 @@ impl CompositionBackdrop {
         children.InsertAtTop(&tint_layer)?;
         root.Children()?.InsertAtTop(&shape)?;
 
-        Ok(Self { _target: target, shape, geometry, _tint: tint_brush, _layers: (blur, tint_layer) })
+        Ok(Self { _target: target, shape, geometry, tint: tint_brush, _layers: (blur, tint_layer) })
     }
 
     /// Position, size and corner radius in window-local physical pixels.
@@ -107,6 +107,10 @@ impl CompositionBackdrop {
         let _ = self.shape.SetSize(size);
         let _ = self.geometry.SetSize(size);
         let _ = self.geometry.SetCornerRadius(Vector2 { X: r, Y: r });
+    }
+
+    pub fn set_tint(&self, tint: Color) {
+        let _ = self.tint.SetColor(ui_color(tint));
     }
 
 }

@@ -17,6 +17,8 @@ use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 
 const PAD: f32 = 18.0;
+/// Spacing of the desktop indicator's dots.
+pub const DESK_DOT_GAP: f32 = 14.0;
 
 pub struct View<'a> {
     pub fonts: &'a Fonts,
@@ -30,6 +32,9 @@ pub struct View<'a> {
     pub down: Option<Hit>,
     pub scrub: Option<f32>,
     pub bar_hover: f32,
+    /// Desktop indicator: sliding position (desktop index) and its velocity.
+    pub desk_pos: f32,
+    pub desk_vel: f32,
     pub clock: Option<&'a Clock>,
     pub shelf: &'a [PathBuf],
     pub shelf_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
@@ -201,6 +206,28 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             if matches!(alert, Alert::Volume) {
                 hits.push((bar.inset(-4.0, -8.0), Hit::Slider));
             }
+        }
+        Alert::Desktop { index, count, name, missing } => {
+            g::desktops(p, icon_cx, cy, h * 0.66, WHITE.alpha(a));
+            let n = (*count).clamp(1, super::MAX_DESKTOP_DOTS);
+            let x0 = r.right() - right_inset - (n - 1) as f32 * DESK_DOT_GAP;
+            let label_w = x0 - text_x - 16.0;
+            match missing {
+                Some(num) => p.text(&format!("No Desktop {num}"), &f.alert, Rect::new(text_x, r.y, label_w, r.h), RED.alpha(a)),
+                None => p.text(name, &f.alert, Rect::new(text_x, r.y, label_w, r.h), WHITE.alpha(a)),
+            }
+            for i in 0..n {
+                let on = i == *index;
+                p.fill_circle(x0 + i as f32 * DESK_DOT_GAP, cy, 3.0, Color::gray(255, if on { 0.0 } else { 0.28 * a }));
+            }
+            // The current desktop is a pill that slides between dots and
+            // stretches with its speed, like a drop of liquid.
+            let pos = v.desk_pos.clamp(-0.6, (n - 1) as f32 + 0.6);
+            let stretch = (v.desk_vel.abs() * 1.6).min(12.0);
+            let pw = 9.0 + stretch;
+            let px = x0 + pos * DESK_DOT_GAP;
+            let color = if missing.is_some() { RED } else { WHITE };
+            p.fill_round(Rect::new(px - pw / 2.0, cy - 4.5, pw, 9.0), 4.5, color.alpha(a));
         }
         Alert::Caps(on) => {
             g::caps(p, icon_cx, cy, h * 0.72, WHITE.alpha(a));

@@ -40,14 +40,16 @@ pub enum Page {
     MenuBar,
     Dock,
     Finder,
+    Desktops,
 }
 
-const PAGES: [(Page, &str); 5] = [
+const PAGES: [(Page, &str); 6] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
     (Page::Dock, "Dock"),
     (Page::Finder, "Finder"),
+    (Page::Desktops, "Desktops"),
 ];
 
 /// macOS accent colors: blue, purple, pink, red, orange, yellow, green, graphite.
@@ -73,6 +75,9 @@ pub enum Key {
     FinderSidebar,
     FinderView,
     FinderHidden,
+    DesktopsAlt,
+    DesktopsArrows,
+    DesktopsIsland,
     MbEnabled,
     MbBackdrop,
     MbHeight,
@@ -120,6 +125,9 @@ impl Key {
             Key::FinderSidebar => ("finder", "sidebar"),
             Key::FinderView => ("finder", "view"),
             Key::FinderHidden => ("finder", "show_hidden"),
+            Key::DesktopsAlt => ("desktops", "alt_number"),
+            Key::DesktopsArrows => ("desktops", "replace_windows_switcher"),
+            Key::DesktopsIsland => ("desktops", "island"),
             Key::MbEnabled => ("menubar", "enabled"),
             Key::MbBackdrop => ("menubar", "backdrop"),
             Key::MbHeight => ("menubar", "height"),
@@ -456,6 +464,14 @@ impl SettingsWindow {
                     ],
                 },
             ],
+            Page::Desktops => vec![Group {
+                title: None,
+                rows: vec![
+                    Row::Toggle("Alt+1 … Alt+9 switch desktops", Key::DesktopsAlt),
+                    Row::Toggle("Win+Ctrl+← / → without the Windows popup", Key::DesktopsArrows),
+                    Row::Toggle("Show switches in the Dynamic Island", Key::DesktopsIsland),
+                ],
+            }],
         }
     }
 
@@ -466,6 +482,9 @@ impl SettingsWindow {
             Key::HideTaskbar => g.hide_taskbar,
             Key::GlassRefraction => g.glass_refraction,
             Key::FinderHidden => cfg.finder.show_hidden,
+            Key::DesktopsAlt => cfg.desktops.alt_number,
+            Key::DesktopsArrows => cfg.desktops.replace_windows_switcher,
+            Key::DesktopsIsland => cfg.desktops.island,
             Key::MbEnabled => m.enabled,
             Key::MbReserve => m.reserve_space,
             Key::MbBattery => m.show_battery,
@@ -1071,6 +1090,12 @@ fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &windows::Win32:
             let screen = r.inset(4.0, 5.0);
             p.stroke_round(screen, 1.5, white, 1.2);
             p.fill_round(Rect::new(screen.cx() - 4.0, screen.bottom() - 3.5, 8.0, 2.0), 1.0, white);
+        }
+        Page::Desktops => {
+            p.fill_round(r, 5.0, Color::rgba(88, 86, 214, 1.0));
+            let (w, h) = (r.w * 0.5, r.h * 0.36);
+            p.stroke_round(Rect::new(r.cx() - w / 2.0 + 2.0, r.cy() - h / 2.0 - 2.0, w, h), 1.2, white.alpha(0.6), 1.1);
+            p.fill_round(Rect::new(r.cx() - w / 2.0 - 1.5, r.cy() - h / 2.0 + 1.5, w, h), 1.2, white);
         }
         Page::Finder => {
             // The two-tone Finder face.

@@ -83,6 +83,13 @@ hidden while DockSide runs and is always restored when it exits.
   KaTeX commands with previews; Enter copies the code (for Notion equations), Shift+Enter the symbol
 - Enter opens; folders open in Finder; Ctrl+Enter reveals the item in Finder; Esc clears, then closes
 
+**Desktops**
+- Alt+1 … Alt+9 jump straight to that Windows virtual desktop
+- Win+Ctrl+← / → switch through DockSide, and Windows' desktop-name popup is hidden
+- Every switch (shortcuts, Task View, touchpad gestures) shows in the Dynamic Island with a
+  sliding indicator; focus follows to the new desktop's top window
+- Settings → Desktops, or `[desktops]` (uses Windows 11 24H2+'s internal desktop API)
+
 **Platform**
 - True rounded acrylic, blur and Liquid Glass via Windows.UI.Composition; glass really refracts (screen capture + a GPU bezel/lens shader), with a floating glass Finder sidebar, capsule toolbar and path bar like macOS Tahoe; the menu bar defaults to Tahoe's clear style, picking light or dark text from the wallpaper (a host backdrop brush with any corner radius), per-monitor DPI and dark/light mode that follows Windows
 - Menu bar and Dock reserve screen space (Win32 AppBars), so maximized windows fit between them
@@ -162,6 +169,7 @@ crates/dockside/src
 - [ ] Real per-app menus via UI Automation, where apps expose them
 - [x] Spotlight
 - [ ] Mission Control / App Exposé, Launchpad
+- [x] Virtual desktop shortcuts (Alt+number) with Dynamic Island switch animations
 - [x] Dynamic Island: Now Playing, HUDs, timers, shelf, calendar, notifications, device and status alerts
 - [ ] Dynamic Island: reply to notifications, Live Activities from other apps
 - [x] A System Settings-style GUI for the config, plus Start at login

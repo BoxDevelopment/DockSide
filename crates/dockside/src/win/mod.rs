@@ -5,6 +5,7 @@ pub mod appbar;
 pub mod apps;
 pub mod composition;
 pub mod controls;
+pub mod desktops;
 pub mod glass;
 pub mod startup;
 pub mod system;
@@ -149,6 +150,12 @@ pub const WM_APP_MEDIA: u32 = WM_APP + 13;
 pub const WM_APP_ISLAND: u32 = WM_APP + 14;
 /// A volume key or Caps Lock was pressed (wParam = virtual key).
 pub const WM_APP_ISLAND_KEY: u32 = WM_APP + 15;
+/// A desktop shortcut was pressed (wParam = desktop number 1-9, or DESKTOP_LEFT / DESKTOP_RIGHT).
+pub const WM_APP_DESKTOP_KEY: u32 = WM_APP + 16;
+/// The current virtual desktop changed.
+pub const WM_APP_DESKTOP: u32 = WM_APP + 17;
+pub const DESKTOP_LEFT: usize = 100;
+pub const DESKTOP_RIGHT: usize = 101;
 
 /// Parses "alt+space", "ctrl+shift+k", "win+f1", ... into RegisterHotKey arguments.
 pub fn parse_hotkey(spec: &str) -> Option<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32)> {

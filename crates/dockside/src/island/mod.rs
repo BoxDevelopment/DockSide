@@ -63,6 +63,8 @@ const MARGIN_X: f32 = 28.0;
 const MARGIN_BOTTOM: f32 = 40.0;
 /// Icons inside alerts don't grow past a compact pill's height.
 const COMPACT_MAX: f32 = 30.0;
+/// Most desktops the switch indicator draws dots for.
+const MAX_DESKTOP_DOTS: usize = 9;
 const PANEL_RADIUS: f32 = 36.0;
 /// Extra height at the bottom of a panel for its page dots.
 const DOTS_H: f32 = 16.0;
@@ -134,12 +136,14 @@ pub enum Alert {
     TimerDone,
     ClaudeDone { project: String, secs: f32, tools: u32 },
     ClaudeNeeds { project: String, message: String },
+    /// A virtual desktop switch; `missing` is a desktop number that doesn't exist.
+    Desktop { index: usize, count: usize, name: String, missing: Option<usize> },
 }
 
 impl Alert {
     /// Heads-up displays update in place and show over panels.
     fn is_hud(&self) -> bool {
-        matches!(self, Alert::Volume | Alert::Brightness(_))
+        matches!(self, Alert::Volume | Alert::Brightness(_) | Alert::Desktop { .. })
     }
 
     fn same_kind(&self, other: &Alert) -> bool {
@@ -298,6 +302,9 @@ pub struct Island {
     press: Spring,
     energy: Spring,
     bar_hover: Spring,
+    /// Desktop indicator position (desktop index, sliding).
+    desk: Spring,
+    last_desk: usize,
     /// Page switching: which activity leads, the slide direction and offset.
     preferred: Option<Persist>,
     page_dir: f32,
@@ -398,6 +405,8 @@ impl Island {
             press: Spring::new(0.0, 0.18, 0.8),
             energy: Spring::new(0.0, 0.5, 1.0),
             bar_hover: Spring::new(0.0, 0.22, 1.0),
+            desk: Spring::new(0.0, 0.32, 0.72),
+            last_desk: 0,
             preferred: None,
             page_dir: 0.0,
             slide: Spring::new(0.0, 0.36, 0.86),
@@ -598,6 +607,10 @@ impl Island {
             Content::Alert(id) => match self.alert_by_id(id).map(|s| &s.alert) {
                 Some(Alert::Charging(_) | Alert::LowBattery(_)) => (264.0, ch),
                 Some(Alert::Volume | Alert::Brightness(_)) => (300.0, ch),
+                Some(Alert::Desktop { count, missing, .. }) => {
+                    let dots = (*count).min(MAX_DESKTOP_DOTS) as f32 * views::DESK_DOT_GAP;
+                    ((if missing.is_some() { 178.0 } else { 150.0 }) + dots, ch)
+                }
                 Some(Alert::Caps(_)) => (236.0, ch),
                 Some(Alert::Dnd(_)) => (264.0, ch),
                 Some(Alert::Screenshot(_)) => (320.0, 62.0),
@@ -922,6 +935,25 @@ impl Island {
             self.volume = v;
         }
         self.show_alert(Alert::Volume, 1.6);
+    }
+
+    /// The current virtual desktop changed: the indicator slides from the last one.
+    pub fn on_desktop(&mut self, index: usize, count: usize, name: String) {
+        let showing = matches!(self.alert.as_ref().map(|s| &s.alert), Some(Alert::Desktop { .. }));
+        if !showing {
+            self.desk.snap(self.last_desk.min(count.saturating_sub(1)) as f32);
+        }
+        self.desk.set(index as f32);
+        self.last_desk = index;
+        self.show_alert(Alert::Desktop { index, count, name, missing: None }, 1.4);
+    }
+
+    /// Alt+number for a desktop that doesn't exist: a little shake, and say so.
+    pub fn on_desktop_missing(&mut self, number: usize, current: usize, count: usize) {
+        self.desk.snap(current as f32);
+        self.last_desk = current;
+        self.desk.velocity += 6.0;
+        self.show_alert(Alert::Desktop { index: current, count, name: String::new(), missing: Some(number) }, 1.4);
     }
 
     pub fn on_caps(&mut self) {
@@ -1293,6 +1325,7 @@ impl Island {
             &mut self.art_fade,
             &mut self.slide,
             &mut self.dot_pos,
+            &mut self.desk,
         ] {
             moving |= s.step(dt);
         }
@@ -1397,6 +1430,8 @@ impl Island {
             down: self.down,
             scrub: self.scrub,
             bar_hover: self.bar_hover.value.clamp(0.0, 1.0),
+            desk_pos: self.desk.value,
+            desk_vel: self.desk.velocity,
             clock: self.clock.as_ref(),
             shelf: &self.shelf,
             shelf_icons: &self.shelf_icons,

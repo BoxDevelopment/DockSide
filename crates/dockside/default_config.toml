@@ -122,6 +122,14 @@ show_hidden = false
 # and blur need Transparency effects on.
 sidebar = "glass"
 
+[desktops]
+# Alt+1 ... Alt+9 switch to that virtual desktop (Windows' own desktops).
+alt_number = true
+# Win+Ctrl+Left / Right switch through DockSide instead, without Windows' popup.
+replace_windows_switcher = true
+# Show each switch in the Dynamic Island.
+island = true
+
 [island]
 # A Dynamic Island at the top center of the screen. Click it for the time,
 # your next event and quick timers; right-click for timers and settings; drop

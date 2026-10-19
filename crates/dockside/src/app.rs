@@ -38,7 +38,7 @@ use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
-    WM_APP_ISLAND, WM_APP_ISLAND_KEY,
+    WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT,
 };
 
 thread_local! {
@@ -52,6 +52,9 @@ static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
 static MENUBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Whether the island's keyboard hook swallows volume keys (it shows its own HUD).
 static ISLAND_VOLUME_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Which desktop shortcuts the desktop key hook takes.
+static DESKTOP_ALT_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DESKTOP_ARROW_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Lives in the (large) Win32_UI_Controls feature; defined here instead.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -399,6 +402,44 @@ unsafe extern "system" fn island_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> 
     CallNextHookEx(None, code, wp, lp)
 }
 
+/// Desktop shortcuts: Alt+1…9, and Win+Ctrl+←/→ in place of Windows' own (which
+/// shows a popup). Swallowed, with a masking key so releasing Alt / Win doesn't
+/// open an app's menu or Start.
+unsafe extern "system" fn desktop_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    if code >= 0 {
+        let info = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+        let vk = info.vkCode as u16;
+        // Our own masking key comes back through here; leave it alone.
+        if vk != 0xE8 {
+            let held = |k: VIRTUAL_KEY| GetAsyncKeyState(k.0 as i32) < 0;
+            let (alt, ctrl, shift) = (held(VK_MENU), held(VK_CONTROL), held(VK_SHIFT));
+            let win = held(VK_LWIN) || held(VK_RWIN);
+            let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            let target = if DESKTOP_ALT_KEYS.load(Ordering::Relaxed) && alt && !ctrl && !shift && !win && (0x31..=0x39).contains(&vk) {
+                Some((vk - 0x30) as usize)
+            } else if DESKTOP_ARROW_KEYS.load(Ordering::Relaxed) && win && ctrl && !alt && !shift && (vk == VK_LEFT.0 || vk == VK_RIGHT.0) {
+                Some(if vk == VK_LEFT.0 { DESKTOP_LEFT } else { DESKTOP_RIGHT })
+            } else {
+                None
+            };
+            if let Some(t) = target {
+                if down {
+                    // vkE8 is unassigned: it breaks up the Alt / Win "tap" without doing anything.
+                    let mask = |flags| INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: flags, ..Default::default() } },
+                    };
+                    SendInput(&[mask(KEYBD_EVENT_FLAGS(0)), mask(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32);
+                    win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_DESKTOP_KEY, t);
+                }
+                return LRESULT(1);
+            }
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
+}
+
 /// While a menu is open: arrows / Enter / Esc drive the menu instead of the focused app.
 unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
@@ -487,6 +528,12 @@ pub struct App {
     index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
     island_hook: Option<HHOOK>,
+    /// Alt+number / Win+Ctrl+arrow desktop shortcuts.
+    desktop_hook: Option<HHOOK>,
+    /// Reports desktop switches made anywhere, for the island.
+    desktop_watch: Option<win::desktops::Watcher>,
+    /// Hides Windows' own desktop switch popup.
+    desktop_popup: Option<win::desktops::PopupHider>,
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
     taskbar_created: u32,
@@ -558,6 +605,9 @@ impl App {
             index: Default::default(),
             hooks: Vec::new(),
             island_hook: None,
+            desktop_hook: None,
+            desktop_watch: None,
+            desktop_popup: None,
             win_hooks,
             _watcher: watcher,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
@@ -603,6 +653,7 @@ impl App {
         }
         // After the menu bar, so it stacks above it.
         self.rebuild_island();
+        self.setup_desktops();
         self.refresh_windows();
         self.flush();
         self.register_hotkey();
@@ -655,6 +706,9 @@ impl App {
         }
         if old.spotlight != self.cfg.spotlight {
             self.register_hotkey();
+        }
+        if old.desktops != self.cfg.desktops {
+            self.setup_desktops();
         }
         if old.menubar != self.cfg.menubar {
             self.rebuild_menubar();
@@ -720,6 +774,56 @@ impl App {
             _ => {}
         }
         self.animate();
+    }
+
+    /// Installs or removes the desktop shortcuts and switch watcher to match the config.
+    fn setup_desktops(&mut self) {
+        let d = &self.cfg.desktops;
+        DESKTOP_ALT_KEYS.store(d.alt_number, Ordering::Relaxed);
+        DESKTOP_ARROW_KEYS.store(d.replace_windows_switcher, Ordering::Relaxed);
+        let want_hook = d.alt_number || d.replace_windows_switcher;
+        match (want_hook, self.desktop_hook) {
+            (true, None) => unsafe {
+                match SetWindowsHookExW(WH_KEYBOARD_LL, Some(desktop_key_hook), win::hinstance(), 0) {
+                    Ok(h) => self.desktop_hook = Some(h),
+                    Err(e) => log!("desktop key hook failed: {e}"),
+                }
+            },
+            (false, Some(h)) => unsafe {
+                let _ = UnhookWindowsHookEx(h);
+                self.desktop_hook = None;
+            },
+            _ => {}
+        }
+        // Re-hooked on every build: Explorer may have restarted.
+        self.desktop_popup = None;
+        if d.replace_windows_switcher {
+            self.desktop_popup = win::desktops::hide_switch_popup();
+        }
+        // The watcher also moves focus after a switch, so run it whenever shortcuts are on.
+        if want_hook || d.island {
+            if self.desktop_watch.is_none() {
+                self.desktop_watch = win::desktops::watch(self.msg_hwnd.0 as isize, WM_APP_DESKTOP);
+            }
+        } else {
+            self.desktop_watch = None;
+        self.desktop_popup = None;
+        }
+    }
+
+    /// After any desktop switch: focus that desktop's top window (the internal
+    /// switch leaves focus behind), and show it in the island.
+    fn on_desktop_changed(&mut self) {
+        if let Some(top) = apps::list_windows().first() {
+            push(Action::Activate(top.hwnd));
+        }
+        if !self.cfg.desktops.island {
+            return;
+        }
+        if let (Some(i), Some(info)) = (&mut self.island, win::desktops::current()) {
+            i.on_desktop(info.index, info.count, info.name);
+            self.animate();
+        }
     }
 
     fn mark_settings_dirty(&mut self) {
@@ -1353,6 +1457,19 @@ impl App {
                         self.animate();
                     }
                 }
+                WM_APP_DESKTOP_KEY => match wp.0 {
+                    DESKTOP_LEFT => win::desktops::step(-1),
+                    DESKTOP_RIGHT => win::desktops::step(1),
+                    n => {
+                        if !win::desktops::switch_to(n - 1) {
+                            if let (Some(i), Some(cur)) = (self.island.as_mut().filter(|_| self.cfg.desktops.island), win::desktops::current()) {
+                                i.on_desktop_missing(n, cur.index, cur.count);
+                                self.animate();
+                            }
+                        }
+                    }
+                },
+                WM_APP_DESKTOP => self.on_desktop_changed(),
                 WM_APP_ISLAND_KEY => {
                     if let Some(i) = &mut self.island {
                         match wp.0 as u16 {
@@ -1687,6 +1804,12 @@ impl Drop for App {
                 let _ = UnhookWindowsHookEx(h);
             }
         }
+        if let Some(h) = self.desktop_hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(h);
+            }
+        }
+        self.desktop_watch = None;
         for h in self.win_hooks.drain(..) {
             unsafe {
                 let _ = UnhookWinEvent(h);

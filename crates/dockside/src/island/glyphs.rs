@@ -139,6 +139,15 @@ pub fn speaker(p: &Painter, cx: f32, cy: f32, s: f32, level: f32, muted: bool, c
     }
 }
 
+/// Two overlapping screens: virtual desktops (Spaces).
+pub fn desktops(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let (w, h) = (s * 0.78, s * 0.56);
+    let back = Rect::new(cx - w / 2.0 + s * 0.14, cy - h / 2.0 - s * 0.14, w, h);
+    let front = Rect::new(cx - w / 2.0 - s * 0.1, cy - h / 2.0 + s * 0.1, w, h);
+    p.stroke_round(back, s * 0.09, c.alpha(c.a * 0.55), s * 0.09);
+    p.fill_round(front, s * 0.09, c);
+}
+
 pub fn sun(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
     let k = s / 16.0;
     p.fill_circle(cx, cy, 3.6 * k, c);

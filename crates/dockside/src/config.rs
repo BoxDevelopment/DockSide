@@ -16,6 +16,7 @@ pub struct Config {
     pub spotlight: SpotlightCfg,
     pub finder: FinderCfg,
     pub island: IslandCfg,
+    pub desktops: DesktopsCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
 }
@@ -129,6 +130,17 @@ pub struct FinderCfg {
     pub show_hidden: bool,
     /// Sidebar material. Anything but "none" floats it as a rounded pane, like macOS Tahoe.
     pub sidebar: Backdrop,
+}
+
+/// Virtual desktop shortcuts.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct DesktopsCfg {
+    /// Alt+1…9 switches to that desktop.
+    pub alt_number: bool,
+    /// Win+Ctrl+←/→ switch without Windows' desktop popup.
+    pub replace_windows_switcher: bool,
+    /// Show switches in the Dynamic Island.
+    pub island: bool,
 }
 
 /// The Dynamic Island at the top center of the screen.

@@ -62,6 +62,14 @@ const MARGIN_BOTTOM: f32 = 40.0;
 /// Icons inside alerts don't grow past a compact pill's height.
 const COMPACT_MAX: f32 = 30.0;
 const PANEL_RADIUS: f32 = 36.0;
+/// Extra height at the bottom of a panel for its page dots.
+const DOTS_H: f32 = 16.0;
+/// Horizontal scroll needed for one page (a notch is 120), and the pause after
+/// a switch so one swipe moves one page.
+const SWIPE_STEP: f32 = 90.0;
+const SWIPE_COOLDOWN: Duration = Duration::from_millis(250);
+/// How far content slides when switching pages, in points.
+const SLIDE: f32 = 42.0;
 
 /// Pointer away from an expanded island this long collapses it.
 const COLLAPSE_DELAY: f32 = 0.9;
@@ -171,6 +179,8 @@ pub enum Hit {
     ShelfClear,
     Event(usize),
     AlertBody,
+    /// A page dot under an expanded panel.
+    Page(usize),
 }
 
 /// Commands from menus and Spotlight.
@@ -280,6 +290,13 @@ pub struct Island {
     press: Spring,
     energy: Spring,
     bar_hover: Spring,
+    /// Page switching: which activity leads, the slide direction and offset.
+    preferred: Option<Persist>,
+    page_dir: f32,
+    slide: Spring,
+    dot_pos: Spring,
+    swipe: f32,
+    swipe_at: Instant,
     wave_t: f32,
     time: f32,
     since_draw: f32,
@@ -372,6 +389,12 @@ impl Island {
             press: Spring::new(0.0, 0.18, 0.8),
             energy: Spring::new(0.0, 0.5, 1.0),
             bar_hover: Spring::new(0.0, 0.22, 1.0),
+            preferred: None,
+            page_dir: 0.0,
+            slide: Spring::new(0.0, 0.36, 0.86),
+            dot_pos: Spring::new(0.0, 0.32, 0.78),
+            swipe: 0.0,
+            swipe_at: Instant::now(),
             wave_t: 0.0,
             time: 0.0,
             since_draw: 0.0,
@@ -417,7 +440,71 @@ impl Island {
         })
     }
 
+    /// Running activities with the one you last looked at first.
     fn persistent(&self) -> Vec<Persist> {
+        let mut list = self.natural();
+        if let Some(i) = self.preferred.and_then(|p| list.iter().position(|x| *x == p)) {
+            let p = list.remove(i);
+            list.insert(0, p);
+        }
+        list
+    }
+
+    /// Panels you can page between while expanded, in a stable order.
+    fn pages(&self) -> Vec<Panel> {
+        self.natural().into_iter().filter_map(Self::panel_for).collect()
+    }
+
+    fn dots_for(&self, p: Panel) -> bool {
+        let pages = self.pages();
+        pages.len() > 1 && pages.contains(&p)
+    }
+
+    fn persist_for(p: Panel) -> Option<Persist> {
+        match p {
+            Panel::Media => Some(Persist::Media),
+            Panel::Timer => Some(Persist::Timer),
+            Panel::Shelf => Some(Persist::Shelf),
+            Panel::Calendar => Some(Persist::Calendar),
+            Panel::Home => None,
+        }
+    }
+
+    /// Moves to the next / previous activity: a panel page when expanded, the
+    /// pill's lead activity (swapping with the bubble) when compact.
+    fn switch_page(&mut self, dir: i32) -> bool {
+        match self.wanted().0 {
+            Content::Panel(cur) => {
+                let pages = self.pages();
+                let Some(i) = pages.iter().position(|p| *p == cur).filter(|_| pages.len() > 1) else { return false };
+                let next = pages[(i as i32 + dir).rem_euclid(pages.len() as i32) as usize];
+                self.go_to(next, dir);
+            }
+            Content::Compact(cur) => {
+                let list = self.natural();
+                let Some(i) = list.iter().position(|p| *p == cur).filter(|_| list.len() > 1) else { return false };
+                self.preferred = Some(list[(i as i32 + dir).rem_euclid(list.len() as i32) as usize]);
+                self.page_dir = dir as f32;
+            }
+            _ => return false,
+        }
+        self.retarget();
+        self.dirty = true;
+        true
+    }
+
+    fn go_to(&mut self, panel: Panel, dir: i32) {
+        if self.expanded == Some(panel) {
+            return;
+        }
+        self.page_dir = dir.signum() as f32;
+        self.expanded = Some(panel);
+        // Whatever you looked at last stays in front when the island folds up.
+        self.preferred = Self::persist_for(panel).or(self.preferred);
+        self.leave_at = None;
+    }
+
+    fn natural(&self) -> Vec<Persist> {
         let mut list = Vec::new();
         if self.clock.is_some() {
             list.push(Persist::Timer);
@@ -505,7 +592,15 @@ impl Island {
                 Some(Alert::TimerDone) => (220.0, ch),
                 None => (ch * 3.6, ch),
             },
-            Content::Panel(p) => match p {
+            Content::Panel(p) => {
+                let (w, h) = self.panel_size(p);
+                (w, h + if self.dots_for(p) { DOTS_H } else { 0.0 })
+            }
+        }
+    }
+
+    fn panel_size(&self, p: Panel) -> (f32, f32) {
+        match p {
                 Panel::Media => (372.0, 166.0),
                 Panel::Timer => (340.0, 96.0),
                 Panel::Shelf => (420.0, 140.0),
@@ -514,7 +609,6 @@ impl Island {
                     (360.0, 48.0 + 44.0 * n as f32)
                 }
                 Panel::Home => (372.0, 134.0),
-            },
         }
     }
 
@@ -547,8 +641,20 @@ impl Island {
         // Cross-fade: the old content fades out, then the new one fades in as the pill reaches its size.
         if self.shown != want {
             if self.content.value < 0.05 {
+                // Opening a panel puts the page capsule straight on its dot; paging glides it.
+                if let (false, Content::Panel(p)) = (matches!(self.shown, Content::Panel(_)), want) {
+                    if let Some(i) = self.pages().iter().position(|x| *x == p) {
+                        self.dot_pos.snap(i as f32);
+                    }
+                }
                 self.shown = want;
                 self.content.set(1.0);
+                // A page switch slides the new content in from the side it came from.
+                if self.page_dir != 0.0 {
+                    self.slide.snap(self.page_dir);
+                    self.slide.set(0.0);
+                    self.page_dir = 0.0;
+                }
             } else {
                 self.content.set(0.0);
             }
@@ -572,6 +678,11 @@ impl Island {
         self.press.set(if self.down == Some(Hit::Pill) { 1.0 } else { 0.0 });
         let compact = matches!(want, Content::Idle | Content::Compact(_));
         self.hover.set(if self.inside && compact { 1.0 } else { 0.0 });
+        if let Content::Panel(p) = self.shown {
+            if let Some(i) = self.pages().iter().position(|x| *x == p) {
+                self.dot_pos.set(i as f32);
+            }
+        }
         let bar = matches!(self.hot, Some(Hit::Progress | Hit::Slider)) || self.scrub.is_some() || self.down == Some(Hit::Slider);
         self.bar_hover.set(if bar { 1.0 } else { 0.0 });
     }
@@ -778,6 +889,27 @@ impl Island {
         }
     }
 
+    /// Horizontal scroll (two-finger swipe, tilt wheel, Shift+wheel) pages between activities.
+    pub fn on_hwheel(&mut self, delta: i32) {
+        // One page per gesture: after a switch, wait for the fingers (and any
+        // momentum) to pause before accepting another.
+        let now = Instant::now();
+        if now.saturating_duration_since(self.swipe_at) > SWIPE_COOLDOWN {
+            self.swipe = 0.0;
+        }
+        self.swipe_at = now;
+        if self.swipe == f32::MAX {
+            return;
+        }
+        self.swipe += delta as f32;
+        if self.swipe.abs() >= SWIPE_STEP {
+            let dir = if self.swipe > 0.0 { 1 } else { -1 };
+            // Mark the gesture used up until the fingers pause.
+            self.swipe = f32::MAX;
+            self.switch_page(dir);
+        }
+    }
+
     pub fn on_wheel(&mut self, delta: i32) {
         if !self.cfg.volume_hud {
             return;
@@ -962,7 +1094,10 @@ impl Island {
                 Content::Compact(Persist::Download) => {
                     return sources::downloads_dir().map(|d| IslandEvent::Run(Action::OpenFinder(Some(d))));
                 }
-                Content::Compact(p) => self.expanded = Self::panel_for(p),
+                Content::Compact(p) => {
+                    self.preferred = Some(p);
+                    self.expanded = Self::panel_for(p);
+                }
                 Content::Alert(_) => return self.alert_click(),
                 Content::Panel(_) => self.expanded = None,
             },
@@ -971,7 +1106,15 @@ impl Island {
                     if p == Persist::Download {
                         return sources::downloads_dir().map(|d| IslandEvent::Run(Action::OpenFinder(Some(d))));
                     }
+                    self.preferred = Some(p);
                     self.expanded = Self::panel_for(p);
+                }
+            }
+            Hit::Page(i) => {
+                let pages = self.pages();
+                if let (Some(&next), Content::Panel(cur)) = (pages.get(i), self.shown) {
+                    let from = pages.iter().position(|p| *p == cur).unwrap_or(0);
+                    self.go_to(next, if i > from { 1 } else { -1 });
                 }
             }
             Hit::Art => return self.now.as_ref().map(|n| IslandEvent::OpenApp(n.app_id.clone())),
@@ -1106,6 +1249,8 @@ impl Island {
             &mut self.press,
             &mut self.bar_hover,
             &mut self.art_fade,
+            &mut self.slide,
+            &mut self.dot_pos,
         ] {
             moving |= s.step(dt);
         }
@@ -1231,6 +1376,20 @@ impl Island {
             _ => None,
         };
         let bubble_kind = self.bubble_kind;
+        // Outgoing content drifts away while fading; incoming slides in.
+        let (want_now, _) = self.wanted();
+        let shift = if self.shown != want_now { -self.page_dir * (1.0 - self.content.value) } else { self.slide.value } * SLIDE;
+        let sliding = shift.abs() > 4.0;
+        let pages = self.pages();
+        let dots = match shown {
+            Content::Panel(p) if pages.len() > 1 && pages.contains(&p) => pages.len(),
+            _ => 0,
+        };
+        let dot_pos = self.dot_pos.value;
+        let hot_page = match self.hot {
+            Some(Hit::Page(i)) => Some(i),
+            _ => None,
+        };
         let dot = if !self.privacy.camera.is_empty() { Some(GREEN) } else if !self.privacy.mic.is_empty() { Some(ORANGE) } else { None };
         let mut hits = Vec::new();
         if presence > 0.5 {
@@ -1269,9 +1428,10 @@ impl Island {
                 return;
             }
             let mut content_hits = Vec::new();
+            let body = Rect::new(pill.x, pill.y, pill.w, pill.h - if dots > 0 { DOTS_H } else { 0.0 });
             p.clipped(pill, || match shown {
                 Content::Idle => {}
-                Content::Compact(k) => views::compact(p, pill, k, &view, a, &mut content_hits),
+                Content::Compact(k) => p.transformed(shift, 0.0, 1.0, || views::compact(p, pill, k, &view, a, &mut content_hits)),
                 Content::Alert(_) => {
                     if let Some(al) = alert {
                         views::alert(p, pill, al, &view, a, &mut content_hits);
@@ -1281,20 +1441,37 @@ impl Island {
                     // Panels scale up slightly as they settle in.
                     let s = lerp(0.94, 1.0, fit);
                     let (ax, ay) = (pill.cx(), pill.y);
-                    p.transformed(ax * (1.0 - s), ay * (1.0 - s), s, || match panel {
+                    p.transformed(ax * (1.0 - s) + shift, ay * (1.0 - s), s, || match panel {
                         Panel::Media => {
-                            views::media_panel(p, pill, &view, a, &mut content_hits);
+                            views::media_panel(p, body, &view, a, &mut content_hits);
                         }
-                        Panel::Timer => views::timer_panel(p, pill, &view, a, &mut content_hits),
-                        Panel::Shelf => views::shelf_panel(p, pill, &view, a, &mut content_hits),
-                        Panel::Calendar => views::calendar_panel(p, pill, &view, a, &mut content_hits),
-                        Panel::Home => views::home_panel(p, pill, &view, a, &mut content_hits),
+                        Panel::Timer => views::timer_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Shelf => views::shelf_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Calendar => views::calendar_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Home => views::home_panel(p, body, &view, a, &mut content_hits),
                     });
                 }
             });
-            // Controls only become clickable once they're (nearly) fully in.
-            if a > 0.85 {
+            // Controls only become clickable once they're (nearly) fully in and still.
+            if a > 0.85 && !sliding {
                 hits.extend(content_hits);
+            }
+            // Page dots: dim dots with a white capsule gliding to the current page.
+            if dots > 0 {
+                let da = presence * fit;
+                let (gap, r) = (13.0, 3.2);
+                let cy = pill.bottom() - DOTS_H / 2.0 - 3.0;
+                let x0 = pill.cx() - gap * (dots as f32 - 1.0) / 2.0;
+                for i in 0..dots {
+                    let x = x0 + i as f32 * gap;
+                    let hot = hot_page == Some(i);
+                    p.fill_circle(x, cy, r, Color::gray(255, if hot { 0.5 } else { 0.28 } * da));
+                    hits.push((Rect::new(x - gap / 2.0, cy - 9.0, gap, 18.0), Hit::Page(i)));
+                }
+                let x = x0 + dot_pos.clamp(-0.5, dots as f32 - 0.5) * gap;
+                let stretch = 1.0 + (dot_pos - dot_pos.round()).abs() * 2.4;
+                let cap = Rect::new(x - r * 1.6 * stretch, cy - r, r * 3.2 * stretch, r * 2.0);
+                p.fill_round(cap, r, Color::gray(255, 0.95 * da));
             }
         });
         if let Err(e) = r {

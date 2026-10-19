@@ -1509,7 +1509,17 @@ impl App {
                 }
             }
             WM_MOUSELEAVE => i.on_leave(),
-            WM_MOUSEWHEEL => i.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
+            WM_MOUSEWHEEL => {
+                use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
+                let delta = ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                // Shift+wheel pages like a horizontal swipe (wheel up = previous).
+                if unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0 {
+                    i.on_hwheel(-delta);
+                } else {
+                    i.on_wheel(delta);
+                }
+            }
+            WM_MOUSEHWHEEL => i.on_hwheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
             WM_RBUTTONUP => {
                 let e = i.context_menu();
                 self.island_event(e);

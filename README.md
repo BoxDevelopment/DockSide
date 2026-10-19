@@ -159,7 +159,8 @@ crates/dockside/src
 - [ ] Dynamic Island: reply to notifications, Live Activities from other apps
 - [x] A System Settings-style GUI for the config, plus Start at login
 - [ ] Top Tray thing: Add a tray item that windows has (showing all tray'ed apps)
-
+- [ ] Latex list in spotlight for notion
+- [ ] WIndows commands in Spotlight e.g brightness, low power mode, or just opening every page in the settings app.
 ## Notes
 
 - Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, DockSide falls back to a DWM accent with 8px corners.

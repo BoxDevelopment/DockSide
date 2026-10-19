@@ -158,6 +158,7 @@ crates/dockside/src
 - [x] Dynamic Island: Now Playing, HUDs, timers, shelf, calendar, notifications, device and status alerts
 - [ ] Dynamic Island: reply to notifications, Live Activities from other apps
 - [x] A System Settings-style GUI for the config, plus Start at login
+- [ ] Top Tray thing: Add a tray item that windows has (showing all tray'ed apps)
 
 ## Notes
 

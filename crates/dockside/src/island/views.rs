@@ -35,6 +35,8 @@ pub struct View<'a> {
     /// Desktop indicator: sliding position (desktop index) and its velocity.
     pub desk_pos: f32,
     pub desk_vel: f32,
+    /// Caps Lock switch knob position: 0 off, 1 on (overshoots a little).
+    pub caps_knob: f32,
     pub clock: Option<&'a Clock>,
     pub shelf: &'a [PathBuf],
     pub shelf_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
@@ -157,6 +159,28 @@ pub fn bubble(p: &Painter, c: Rect, which: Persist, v: &View, a: f32) {
 // Alerts
 // ---------------------------------------------------------------------------
 
+/// An iOS-style switch ending at `right`: the track fills with `on_color` and
+/// the knob slides across as `t` goes from 0 (off) to 1 (on).
+fn toggle(p: &Painter, right: f32, cy: f32, t: f32, on_color: Color, a: f32) {
+    const W: f32 = 36.0;
+    const H: f32 = 21.0;
+    let fill = t.clamp(0.0, 1.0);
+    let off = Color::gray(255, 0.22);
+    let mix = |x: f32, y: f32| x + (y - x) * fill;
+    let track = Color {
+        r: mix(off.r, on_color.r),
+        g: mix(off.g, on_color.g),
+        b: mix(off.b, on_color.b),
+        a: mix(off.a, on_color.a),
+    };
+    let r = Rect::new(right - W, cy - H / 2.0, W, H);
+    p.fill_round(r, H / 2.0, track.alpha(track.a * a));
+    let knob_r = H / 2.0 - 2.0;
+    let kx = r.x + H / 2.0 + t.clamp(-0.06, 1.06) * (W - H);
+    p.fill_circle(kx, cy + 0.75, knob_r + 0.5, Color::gray(0, 0.25 * a));
+    p.fill_circle(kx, cy, knob_r, WHITE.alpha(a));
+}
+
 pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut Hits) {
     let h = r.h.min(super::COMPACT_MAX);
     let icon_cx = r.x + h / 2.0 + 4.0;
@@ -229,9 +253,10 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             let color = if missing.is_some() { RED } else { WHITE };
             p.fill_round(Rect::new(px - pw / 2.0, cy - 4.5, pw, 9.0), 4.5, color.alpha(a));
         }
-        Alert::Caps(on) => {
+        Alert::Caps => {
             g::caps(p, icon_cx, cy, h * 0.72, WHITE.alpha(a));
-            pair("Caps Lock", if *on { "On" } else { "Off" }, if *on { GREEN } else { SECONDARY });
+            p.text("Caps Lock", &f.alert, Rect::new(text_x, r.y, r.w * 0.6, r.h), WHITE.alpha(a));
+            toggle(p, r.right() - right_inset, cy, v.caps_knob, GREEN, a);
         }
         Alert::Dnd(on) => {
             g::moon(p, icon_cx, cy, h * 0.66, PURPLE.alpha(a), Color::BLACK);

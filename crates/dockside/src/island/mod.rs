@@ -63,6 +63,8 @@ const MARGIN_X: f32 = 28.0;
 const MARGIN_BOTTOM: f32 = 40.0;
 /// Icons inside alerts don't grow past a compact pill's height.
 const COMPACT_MAX: f32 = 30.0;
+/// How long after the Caps Lock alert appears its switch flips.
+const CAPS_SWITCH_DELAY: f32 = 0.18;
 /// Most desktops the switch indicator draws dots for.
 const MAX_DESKTOP_DOTS: usize = 9;
 const PANEL_RADIUS: f32 = 36.0;
@@ -126,7 +128,7 @@ pub enum Alert {
     /// Reads the live level from the island, so repeated key presses just update it.
     Volume,
     Brightness(u8),
-    Caps(bool),
+    Caps,
     Dnd(bool),
     Screenshot(PathBuf),
     Downloaded(PathBuf),
@@ -305,6 +307,10 @@ pub struct Island {
     /// Desktop indicator position (desktop index, sliding).
     desk: Spring,
     last_desk: usize,
+    /// Caps Lock switch knob: 0 off, 1 on. It starts at the old state and
+    /// slides over once the alert has opened (`caps_delay` seconds).
+    caps_knob: Spring,
+    caps_delay: f32,
     /// Page switching: which activity leads, the slide direction and offset.
     preferred: Option<Persist>,
     page_dir: f32,
@@ -407,6 +413,8 @@ impl Island {
             bar_hover: Spring::new(0.0, 0.22, 1.0),
             desk: Spring::new(0.0, 0.32, 0.72),
             last_desk: 0,
+            caps_knob: Spring::new(0.0, 0.3, 0.8),
+            caps_delay: 0.0,
             preferred: None,
             page_dir: 0.0,
             slide: Spring::new(0.0, 0.36, 0.86),
@@ -611,7 +619,7 @@ impl Island {
                     let dots = (*count).min(MAX_DESKTOP_DOTS) as f32 * views::DESK_DOT_GAP;
                     ((if missing.is_some() { 178.0 } else { 150.0 }) + dots, ch)
                 }
-                Some(Alert::Caps(_)) => (236.0, ch),
+                Some(Alert::Caps) => (236.0, ch),
                 Some(Alert::Dnd(_)) => (264.0, ch),
                 Some(Alert::Screenshot(_)) => (320.0, 62.0),
                 Some(Alert::Downloaded(_)) => (330.0, ch),
@@ -771,14 +779,14 @@ impl Island {
         let until = Instant::now() + Duration::from_secs_f32(secs);
         if let Some(s) = self.alert.as_mut() {
             // Volume / brightness / Caps Lock repeat: update the one on screen.
-            if s.alert.same_kind(&alert) && (alert.is_hud() || matches!(alert, Alert::Caps(_) | Alert::Dnd(_))) {
+            if s.alert.same_kind(&alert) && (alert.is_hud() || matches!(alert, Alert::Caps | Alert::Dnd(_))) {
                 s.alert = alert;
                 s.until = until;
                 self.dirty = true;
                 return;
             }
         }
-        let urgent = alert.is_hud() || matches!(alert, Alert::TimerDone | Alert::Caps(_) | Alert::Dnd(_));
+        let urgent = alert.is_hud() || matches!(alert, Alert::TimerDone | Alert::Caps | Alert::Dnd(_));
         if self.alert.is_some() && !urgent {
             self.queue.push_back((alert, secs));
             return;
@@ -958,8 +966,17 @@ impl Island {
 
     pub fn on_caps(&mut self) {
         self.caps = !self.caps;
+        let on = if self.caps { 1.0 } else { 0.0 };
+        if matches!(self.alert.as_ref().map(|s| &s.alert), Some(Alert::Caps)) {
+            // Already showing: flip the switch right away.
+            self.caps_delay = 0.0;
+            self.caps_knob.set(on);
+        } else {
+            self.caps_knob.snap(1.0 - on);
+            self.caps_delay = CAPS_SWITCH_DELAY;
+        }
         if self.cfg.status_alerts {
-            self.show_alert(Alert::Caps(self.caps), 1.4);
+            self.show_alert(Alert::Caps, 1.4);
         }
     }
 
@@ -1313,6 +1330,13 @@ impl Island {
         self.retarget();
 
         let mut moving = false;
+        if self.caps_delay > 0.0 {
+            self.caps_delay -= dt;
+            if self.caps_delay <= 0.0 {
+                self.caps_knob.set(if self.caps { 1.0 } else { 0.0 });
+            }
+            moving = true;
+        }
         for s in [
             &mut self.w,
             &mut self.h,
@@ -1326,6 +1350,7 @@ impl Island {
             &mut self.slide,
             &mut self.dot_pos,
             &mut self.desk,
+            &mut self.caps_knob,
         ] {
             moving |= s.step(dt);
         }
@@ -1432,6 +1457,7 @@ impl Island {
             bar_hover: self.bar_hover.value.clamp(0.0, 1.0),
             desk_pos: self.desk.value,
             desk_vel: self.desk.velocity,
+            caps_knob: self.caps_knob.value,
             clock: self.clock.as_ref(),
             shelf: &self.shelf,
             shelf_icons: &self.shelf_icons,

@@ -189,7 +189,7 @@ impl PopupMenu {
             bottom: ((y + height + SHADOW) * s).round() as i32,
         };
         let tint = theme.menu_tint;
-        let mut surface = Surface::new(gfx, rect, s, cfg.menubar.backdrop, tint)?;
+        let mut surface = Surface::new(gfx, rect, s, cfg.menubar.backdrop.for_panels(), tint)?;
         let body = Rect::new(SHADOW, SHADOW, width, height);
         surface.set_backdrop_shape(body, RADIUS);
 

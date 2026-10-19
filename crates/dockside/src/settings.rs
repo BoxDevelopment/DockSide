@@ -39,10 +39,16 @@ pub enum Page {
     Appearance,
     MenuBar,
     Dock,
+    Finder,
 }
 
-const PAGES: [(Page, &str); 4] =
-    [(Page::General, "General"), (Page::Appearance, "Appearance"), (Page::MenuBar, "Menu Bar"), (Page::Dock, "Dock")];
+const PAGES: [(Page, &str); 5] = [
+    (Page::General, "General"),
+    (Page::Appearance, "Appearance"),
+    (Page::MenuBar, "Menu Bar"),
+    (Page::Dock, "Dock"),
+    (Page::Finder, "Finder"),
+];
 
 /// macOS accent colors: blue, purple, pink, red, orange, yellow, green, graphite.
 const ACCENTS: [&str; 8] = ["#007AFF", "#A550A7", "#F74F9E", "#FF5257", "#F7821B", "#FFC600", "#62BA46", "#8C8C8C"];
@@ -63,8 +69,13 @@ pub enum Key {
     ShortcutStyle,
     Appearance,
     Font,
+    GlassRefraction,
+    FinderSidebar,
+    FinderView,
+    FinderHidden,
     MbEnabled,
     MbBackdrop,
+    MbHeight,
     MbLogo,
     MbClock,
     MbReserve,
@@ -104,8 +115,13 @@ impl Key {
             Key::ShortcutStyle => ("general", "shortcut_style"),
             Key::Appearance => ("general", "appearance"),
             Key::Font => ("general", "font"),
+            Key::GlassRefraction => ("general", "glass_refraction"),
+            Key::FinderSidebar => ("finder", "sidebar"),
+            Key::FinderView => ("finder", "view"),
+            Key::FinderHidden => ("finder", "show_hidden"),
             Key::MbEnabled => ("menubar", "enabled"),
             Key::MbBackdrop => ("menubar", "backdrop"),
+            Key::MbHeight => ("menubar", "height"),
             Key::MbLogo => ("menubar", "logo"),
             Key::MbClock => ("menubar", "clock_format"),
             Key::MbReserve => ("menubar", "reserve_space"),
@@ -337,20 +353,30 @@ impl SettingsWindow {
                     ],
                 },
             ],
-            Page::Appearance => vec![Group {
-                title: None,
-                rows: vec![
-                    Row::Segmented("Appearance", Key::Appearance),
-                    Row::Swatches("Accent color"),
-                    Row::Segmented("Font", Key::Font),
-                ],
-            }],
+            Page::Appearance => vec![
+                Group {
+                    title: None,
+                    rows: vec![
+                        Row::Segmented("Appearance", Key::Appearance),
+                        Row::Swatches("Accent color"),
+                        Row::Segmented("Font", Key::Font),
+                    ],
+                },
+                Group {
+                    title: Some("Liquid Glass"),
+                    rows: vec![
+                        // Refraction hides glass surfaces from screenshots and screen sharing.
+                        Row::Toggle("Refraction (hidden from screenshots)", Key::GlassRefraction),
+                    ],
+                },
+            ],
             Page::MenuBar => vec![
                 Group {
                     title: None,
                     rows: vec![
                         Row::Toggle("Show menu bar", Key::MbEnabled),
                         Row::Segmented("Background", Key::MbBackdrop),
+                        Row::Slider("Size", Key::MbHeight),
                         Row::Segmented("Logo", Key::MbLogo),
                         Row::Segmented("Clock", Key::MbClock),
                         Row::Toggle("Keep windows below the menu bar", Key::MbReserve),
@@ -417,6 +443,16 @@ impl SettingsWindow {
                         .collect(),
                 },
             ],
+            Page::Finder => vec![
+                Group {
+                    title: None,
+                    rows: vec![
+                        Row::Segmented("Sidebar", Key::FinderSidebar),
+                        Row::Segmented("New windows open in", Key::FinderView),
+                        Row::Toggle("Show hidden files", Key::FinderHidden),
+                    ],
+                },
+            ],
         }
     }
 
@@ -425,6 +461,8 @@ impl SettingsWindow {
         match key {
             Key::StartAtLogin => login,
             Key::HideTaskbar => g.hide_taskbar,
+            Key::GlassRefraction => g.glass_refraction,
+            Key::FinderHidden => cfg.finder.show_hidden,
             Key::MbEnabled => m.enabled,
             Key::MbReserve => m.reserve_space,
             Key::MbBattery => m.show_battery,
@@ -454,12 +492,17 @@ impl SettingsWindow {
         let backdrop = |b: Backdrop| match b {
             Backdrop::Acrylic => 0,
             Backdrop::Blur => 1,
-            Backdrop::None => 2,
+            Backdrop::Glass => 2,
+            Backdrop::None => 3,
+            Backdrop::Clear => 4,
         };
         let fixed = |pairs: &[(&str, &str)], sel: Option<usize>| {
             (pairs.iter().map(|p| p.0.to_string()).collect(), pairs.iter().map(|p| p.1.to_string()).collect(), sel)
         };
-        const BACKDROPS: [(&str, &str); 3] = [("Acrylic", "acrylic"), ("Blur", "blur"), ("None", "none")];
+        const BACKDROPS: [(&str, &str); 4] =
+            [("Acrylic", "acrylic"), ("Blur", "blur"), ("Glass", "glass"), ("None", "none")];
+        const MB_BACKDROPS: [(&str, &str); 5] =
+            [("Acrylic", "acrylic"), ("Blur", "blur"), ("Glass", "glass"), ("None", "none"), ("Clear", "clear")];
         match key {
             Key::ShortcutStyle => fixed(
                 &[("Mac  ⌘C", "mac"), ("Windows  Ctrl+C", "windows")],
@@ -484,8 +527,25 @@ impl SettingsWindow {
                 let sel = values.iter().position(|f| *f == cfg.general.font);
                 (labels, values, sel)
             }
-            Key::MbBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.menubar.backdrop))),
-            Key::DockBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.dock.backdrop))),
+            Key::FinderSidebar => fixed(
+                &[("Glass", "glass"), ("Acrylic", "acrylic"), ("Blur", "blur"), ("Solid", "none")],
+                Some(match cfg.finder.sidebar {
+                    Backdrop::Glass => 0,
+                    Backdrop::Acrylic => 1,
+                    Backdrop::Blur => 2,
+                    Backdrop::None | Backdrop::Clear => 3,
+                }),
+            ),
+            Key::FinderView => fixed(
+                &[("Icons", "icons"), ("List", "list"), ("Columns", "columns")],
+                Some(match cfg.finder.view {
+                    crate::finder::View::Icons => 0,
+                    crate::finder::View::List => 1,
+                    crate::finder::View::Columns => 2,
+                }),
+            ),
+            Key::MbBackdrop => fixed(&MB_BACKDROPS, Some(backdrop(cfg.menubar.backdrop))),
+            Key::DockBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.dock.backdrop)).filter(|&i| i < BACKDROPS.len())),
             Key::MbLogo => {
                 let sel = match cfg.menubar.logo.to_lowercase().as_str() {
                     "apple" => Some(0),
@@ -579,6 +639,7 @@ impl SettingsWindow {
     fn slider_spec(key: Key, cfg: &Config) -> (f32, f32, f32) {
         match key {
             Key::DockSize => (cfg.dock.tile_size, 24.0, 96.0),
+            Key::MbHeight => (cfg.menubar.height, 22.0, 40.0),
             Key::DockMagSize => (cfg.dock.magnified_size, 48.0, 160.0),
             _ => (0.0, 0.0, 1.0),
         }
@@ -1006,6 +1067,16 @@ fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &windows::Win32:
             let screen = r.inset(4.0, 5.0);
             p.stroke_round(screen, 1.5, white, 1.2);
             p.fill_round(Rect::new(screen.cx() - 4.0, screen.bottom() - 3.5, 8.0, 2.0), 1.0, white);
+        }
+        Page::Finder => {
+            // The two-tone Finder face.
+            p.fill_round(r, 5.0, Color::rgba(30, 150, 255, 1.0));
+            p.clipped(Rect::new(r.x, r.y, r.w * 0.5, r.h), || p.fill_round(r, 5.0, Color::rgba(120, 205, 255, 1.0)));
+            let ink = Color::rgba(20, 40, 70, 1.0);
+            p.line(r.x + r.w * 0.36, r.y + r.h * 0.3, r.x + r.w * 0.36, r.y + r.h * 0.45, ink, 1.3);
+            p.line(r.x + r.w * 0.68, r.y + r.h * 0.3, r.x + r.w * 0.68, r.y + r.h * 0.45, ink, 1.3);
+            p.line(r.x + r.w * 0.3, r.y + r.h * 0.66, r.x + r.w * 0.5, r.y + r.h * 0.72, ink, 1.2);
+            p.line(r.x + r.w * 0.5, r.y + r.h * 0.72, r.x + r.w * 0.72, r.y + r.h * 0.64, ink, 1.2);
         }
     }
 }

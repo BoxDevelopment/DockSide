@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::UI::Shell::ABE_TOP;
 
-use crate::config::{Config, MenuBarCfg};
+use crate::config::{Backdrop, Config, MenuBarCfg};
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
 use crate::gfx::{pt, Align, Gfx, Painter, Weight};
@@ -45,6 +45,8 @@ impl Hit {
 }
 
 const FONT_SIZE: f32 = 13.0;
+/// The bar is laid out at this height and scaled up to the configured one.
+const DESIGN_H: f32 = 24.0;
 
 pub struct MenuBar {
     pub surface: Surface,
@@ -60,6 +62,8 @@ pub struct MenuBar {
     pressed: Option<Hit>,
     logo: Option<ID2D1Bitmap>,
     reserved: bool,
+    /// With a clear bar: whether the wallpaper under it is dark (light text).
+    on_dark: Option<bool>,
     pub dirty: bool,
 }
 
@@ -91,6 +95,7 @@ impl MenuBar {
             pressed: None,
             logo: None,
             reserved: m.reserve_space,
+            on_dark: (m.backdrop == Backdrop::Clear).then(|| wallpaper_top_is_dark(gfx).unwrap_or(theme.dark)),
             dirty: true,
         };
         bar.tick();
@@ -123,15 +128,21 @@ impl MenuBar {
         }
     }
 
+    /// Content scale: a taller bar draws everything proportionally bigger.
+    fn zoom(&self) -> f32 {
+        (self.surface.height_pt() / DESIGN_H).max(0.75)
+    }
+
     pub fn hit_at(&self, x: f32, y: f32) -> Option<Hit> {
-        self.hits.iter().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h)
+        let k = self.zoom();
+        self.hits.iter().find(|(r, _)| r.contains(x / k, y / k)).map(|(_, h)| *h)
     }
 
     pub fn menu_placement(&self, hit: Hit) -> Option<Placement> {
         let (r, _) = self.hits.iter().find(|(_, h)| *h == hit)?;
         let s = self.monitor.scale;
         Some(Placement::Below {
-            x: self.monitor.rect.left as f32 / s + r.x,
+            x: self.monitor.rect.left as f32 / s + r.x * self.zoom(),
             y: self.monitor.rect.top as f32 / s + self.surface.height_pt(),
         })
     }
@@ -165,13 +176,14 @@ impl MenuBar {
     }
 
     fn layout(&mut self, gfx: &Gfx, theme: &Theme) {
-        let h = self.surface.height_pt();
-        let w = self.surface.width_pt();
+        let k = self.zoom();
+        let h = self.surface.height_pt() / k;
+        let w = self.surface.width_pt() / k;
         let regular = gfx.format(&theme.font, FONT_SIZE, Weight::Regular, Align::Center);
         let bold = gfx.format(&theme.font, FONT_SIZE, Weight::Bold, Align::Center);
         let mut hits = Vec::new();
 
-        let mut x = 8.0;
+        let mut x = 10.0;
         hits.push((Rect::new(x, 0.0, 34.0, h), Hit::Logo));
         x += 34.0;
         let aw = gfx.measure(&self.app_name, &bold) + 20.0;
@@ -222,21 +234,30 @@ impl MenuBar {
         let regular = gfx.format(&theme.font, FONT_SIZE, Weight::Regular, Align::Center);
         let bold = gfx.format(&theme.font, FONT_SIZE, Weight::Bold, Align::Center);
         let trailing = gfx.format(&theme.font, FONT_SIZE, Weight::Regular, Align::Trailing);
-        let w = self.surface.width_pt();
-        let h = self.surface.height_pt();
+        let k = self.zoom();
+        let w = self.surface.width_pt() / k;
+        let h = self.surface.height_pt() / k;
         let has_backdrop = self.surface.backdrop.is_some();
+        let clear = self.on_dark.is_some();
         let (hits, open, pressed) = (&self.hits, self.open, self.pressed);
         let (app_name, clock, battery, logo) = (&self.app_name, &self.clock, self.battery, &self.logo);
         let show_pct = self.cfg.show_battery_percent;
-        let c = theme.text;
+        // A clear bar takes its colours from the wallpaper, not the app theme.
+        let (c, highlight) = match self.on_dark {
+            Some(true) => (Color::gray(255, 0.96), Color::gray(255, 0.22)),
+            Some(false) => (Color::gray(0, 0.86), Color::gray(0, 0.10)),
+            None => (theme.text, theme.menubar_highlight),
+        };
 
-        let r = self.surface.render(gfx, |p| {
+        let r = self.surface.render(gfx, |p| p.transformed(0.0, 0.0, k, || {
             // Paint every pixel so the whole bar hit-tests.
-            p.fill_rect(Rect::new(0.0, 0.0, w, h), if has_backdrop { Color::HIT } else { theme.menubar_tint.alpha(1.0) });
+            p.fill_rect(Rect::new(0.0, 0.0, w, h), if has_backdrop || clear { Color::HIT } else { theme.menubar_tint.alpha(1.0) });
 
             for &(r, hit) in hits {
                 if open == Some(hit) || pressed == Some(hit) {
-                    p.fill_round(r.inset(0.0, 2.0), 5.0, theme.menubar_highlight);
+                    // Tahoe highlights with a capsule.
+                    let pill = r.inset(0.0, 2.5);
+                    p.fill_round(pill, pill.h / 2.0, highlight);
                 }
                 match hit {
                     Hit::Logo => match (logo_kind.as_str(), logo) {
@@ -261,7 +282,7 @@ impl MenuBar {
                     }
                 }
             }
-        });
+        }));
         if let Err(e) = r {
             log!("menubar render failed: {e}");
         }
@@ -274,6 +295,33 @@ impl Drop for MenuBar {
             appbar::remove(self.surface.content);
         }
     }
+}
+
+/// Whether the top strip of the desktop wallpaper is dark, from its average
+/// luminance. `None` without a readable wallpaper image.
+fn wallpaper_top_is_dark(gfx: &Gfx) -> Option<bool> {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETDESKWALLPAPER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+    let mut buf = [0u16; 520];
+    unsafe {
+        SystemParametersInfoW(SPI_GETDESKWALLPAPER, buf.len() as u32, Some(buf.as_mut_ptr() as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).ok()?;
+    }
+    let path = crate::win::from_wide(&buf);
+    if path.is_empty() {
+        return None;
+    }
+    let img = crate::gfx::icons::load_image_file(&gfx.wic, &path)?;
+    let (w, h) = (img.width as usize, img.height as usize);
+    let rows = (h / 16).max(1);
+    let (mut sum, mut n) = (0.0f64, 0u32);
+    for y in (0..rows).step_by((rows / 24).max(1)) {
+        for x in (0..w).step_by((w / 96).max(1)) {
+            let i = (y * w + x) * 4;
+            let (b, g, r) = (img.data[i] as f64, img.data[i + 1] as f64, img.data[i + 2] as f64);
+            sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            n += 1;
+        }
+    }
+    Some(n > 0 && sum / (n as f64) < 150.0)
 }
 
 // ---------------------------------------------------------------------------

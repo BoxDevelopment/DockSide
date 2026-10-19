@@ -46,8 +46,8 @@ fn set_wca() -> Option<SetWca> {
 pub fn apply(hwnd: HWND, backdrop: Backdrop, tint: Color) {
     let state = match backdrop {
         Backdrop::Acrylic => ACCENT_ENABLE_ACRYLICBLURBEHIND,
-        Backdrop::Blur => ACCENT_ENABLE_BLURBEHIND,
-        Backdrop::None => ACCENT_DISABLED,
+        Backdrop::Blur | Backdrop::Glass => ACCENT_ENABLE_BLURBEHIND,
+        Backdrop::Clear | Backdrop::None => ACCENT_DISABLED,
     };
     // Acrylic misbehaves with a fully transparent gradient.
     let tint = if tint.a < 0.01 { tint.alpha(0.01) } else { tint };

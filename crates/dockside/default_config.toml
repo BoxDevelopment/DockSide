@@ -14,12 +14,19 @@ hide_taskbar = true
 # "mac" shows ⌘C-style hints in menus (⌘ = Ctrl, ⌥ = Alt, ⌃ = Win),
 # "windows" shows Ctrl+C.
 shortcut_style = "mac"
+# "glass" backgrounds (and the glass Finder sidebar) bend and magnify what's
+# behind them like Apple's Liquid Glass. This captures the screen, so glass
+# surfaces are hidden from screenshots and screen sharing; turn it off to keep
+# a non-bending glass that shows up in captures.
+glass_refraction = true
 
 [menubar]
 enabled = true
+# Bar height in points (22-40); text and icons scale with it.
 height = 24
-# "acrylic", "blur" or "none"
-backdrop = "acrylic"
+# "clear" (no bar, like macOS Tahoe: text sits on the wallpaper and turns
+# light or dark to match it), "acrylic", "blur", "glass" (Liquid Glass) or "none"
+backdrop = "clear"
 tint_light = "#F4F4F4B0"
 tint_dark = "#1C1C1EB0"
 # "apple", "windows", or a path to a .png / .ico
@@ -108,8 +115,10 @@ view = "icons"          # "icons", "list" or "columns"
 sort = "name"           # "name", "modified", "size" or "kind"
 ascending = true
 show_hidden = false
-# Blur what's behind the window through the sidebar (needs Transparency effects on).
-sidebar_vibrancy = true
+# Sidebar material: "glass" (Liquid Glass), "acrylic", "blur" or "none" (solid).
+# All but "none" float the sidebar as a rounded pane, like macOS Tahoe; acrylic
+# and blur need Transparency effects on.
+sidebar = "glass"
 
 [island]
 # A Dynamic Island at the top center of the screen. Click it for the time,

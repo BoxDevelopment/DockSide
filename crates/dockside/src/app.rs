@@ -560,6 +560,7 @@ impl App {
 
     /// (Re)creates every surface from the current config.
     fn build(&mut self) {
+        crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
         self.close_menu();
         self.island = None;
         self.dock = None;
@@ -611,11 +612,25 @@ impl App {
         let old = std::mem::replace(&mut self.cfg, cfg);
         self.mark_settings_dirty();
         let (g0, g1) = (&old.general, &self.cfg.general);
-        if g0.appearance != g1.appearance || g0.hide_taskbar != g1.hide_taskbar {
-            // Backdrop tints depend on light/dark; recreate everything.
-            return self.build();
+        let rebuild = g0.appearance != g1.appearance || g0.hide_taskbar != g1.hide_taskbar
+            || g0.glass_refraction != g1.glass_refraction;
+        let sidebar_changed = g0.appearance != g1.appearance
+            || g0.glass_refraction != g1.glass_refraction
+            || old.finder.sidebar != self.cfg.finder.sidebar;
+        let general_changed = g0 != g1;
+        if rebuild {
+            // Backdrop tints depend on light/dark, and glass on refraction; recreate everything.
+            self.build();
         }
-        if g0 != g1 {
+        if sidebar_changed {
+            for f in &mut self.finders {
+                f.set_sidebar(&self.cfg.finder, &self.theme);
+            }
+        }
+        if rebuild {
+            return;
+        }
+        if general_changed {
             // Font / accent / shortcut hints: same surfaces, new paint.
             self.theme = Theme::new(&self.cfg, &self.gfx);
             if let Some(mb) = &mut self.menubar {

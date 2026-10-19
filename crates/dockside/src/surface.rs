@@ -16,7 +16,7 @@ use crate::config::Backdrop;
 use crate::geom::{Color, Rect};
 use crate::gfx::{Canvas, Gfx, Painter};
 use crate::win::composition::CompositionBackdrop;
-use crate::win::{accent, create_window};
+use crate::win::{accent, create_window, glass};
 
 pub struct Surface {
     pub content: HWND,
@@ -32,10 +32,12 @@ pub struct Surface {
     hidden: bool,
 }
 
-/// "blur" is the same blurred backdrop with a much lighter tint.
+/// "blur" is the same blurred backdrop with a much lighter tint; "glass" is
+/// lighter still, leaving the sheen and rim to define the surface.
 fn effective_tint(kind: Backdrop, tint: Color) -> Color {
     match kind {
         Backdrop::Blur => tint.alpha(tint.a * 0.35),
+        Backdrop::Glass => tint.alpha(tint.a * 0.25),
         _ => tint,
     }
 }
@@ -47,12 +49,12 @@ impl Surface {
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
 
         let mut composition = None;
-        let backdrop = if kind == Backdrop::None {
+        let backdrop = if matches!(kind, Backdrop::None | Backdrop::Clear) {
             None
         } else {
             let hwnd = create_window(ex | WS_EX_NOREDIRECTIONBITMAP, WS_POPUP, rect, HWND::default())?;
             accent::prepare(hwnd);
-            match CompositionBackdrop::new(hwnd, tint) {
+            match CompositionBackdrop::new(hwnd, tint, (kind == Backdrop::Glass).then_some(glass::Style::Bold)) {
                 Ok(c) => {
                     c.set_shape(0.0, 0.0, w as f32, h as f32, 0.0);
                     composition = Some(c);
@@ -65,13 +67,17 @@ impl Surface {
                     }
                     let hwnd = create_window(ex, WS_POPUP, rect, HWND::default())?;
                     accent::prepare(hwnd);
-                    accent::apply(hwnd, Backdrop::Acrylic, tint);
+                    accent::apply(hwnd, if kind == Backdrop::Glass { Backdrop::Blur } else { Backdrop::Acrylic }, tint);
                     Some(hwnd)
                 }
             }
         };
         let content = create_window(ex | WS_EX_LAYERED, WS_POPUP, rect, backdrop.unwrap_or_default())?;
         accent::prepare(content);
+        if composition.as_ref().is_some_and(|c| c.refracts()) {
+            // Refracting glass samples the screen, so it mustn't see its own content.
+            glass::exclude_from_capture(content, true);
+        }
         let canvas = Canvas::new(gfx, w, h, scale)?;
         Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false })
     }
@@ -95,6 +101,7 @@ impl Surface {
                 unsafe { SetWindowPos(bd, None, rect.left, rect.top, w, h, SWP_NOACTIVATE | SWP_NOZORDER)? };
                 if let Some(c) = &self.composition {
                     c.set_shape(0.0, 0.0, w as f32, h as f32, 0.0);
+                    c.refresh();
                 }
             }
             // Shaped backdrops are positioned relative to the surface; force re-apply.
@@ -135,6 +142,9 @@ impl Surface {
         let visible_h = (self.rect.bottom.min(key[3]) - key[1]).max(0);
         unsafe {
             let _ = SetWindowPos(bd, None, key[0], key[1], w, visible_h, SWP_NOACTIVATE | SWP_NOZORDER);
+        }
+        if let Some(c) = &self.composition {
+            c.refresh();
         }
     }
 

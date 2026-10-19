@@ -1,19 +1,20 @@
 //! Shared macOS window chrome for our app windows (Finder, System Settings):
 //! soft shadow, a rounded body split into sidebar + content, traffic lights,
-//! and an optional blurred (vibrant) sidebar backdrop.
+//! and an optional blurred (vibrant) or floating Liquid Glass sidebar backdrop.
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::config::Backdrop;
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 use crate::theme::Theme;
 use crate::win::composition::CompositionBackdrop;
-use crate::win::{accent, create_window, system};
+use crate::win::{accent, create_window, glass, system};
 
 /// Margin around the body reserved for the drop shadow, in points.
 pub const SHADOW: f32 = 30.0;
-pub const RADIUS: f32 = 12.0;
+pub const RADIUS: f32 = 18.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Light {
@@ -67,6 +68,31 @@ pub fn window(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Pale
     p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
 }
 
+/// Inset of the floating glass sidebar from the body's edges, and its corner radius.
+pub const PANE_INSET: f32 = 8.0;
+pub const PANE_RADIUS: f32 = 12.0;
+
+/// The floating sidebar pane for a body whose sidebar column is `sidebar_w` wide.
+pub fn sidebar_pane(body: Rect, sidebar_w: f32) -> Rect {
+    Rect::new(body.x + PANE_INSET, body.y + PANE_INSET, sidebar_w - PANE_INSET - 2.0, body.h - 2.0 * PANE_INSET)
+}
+
+/// Shadow and body with a see-through floating sidebar pane (macOS Tahoe):
+/// the window background runs edge to edge and the pane is cut out of it.
+pub fn window_floating(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette) {
+    for i in 0..14 {
+        let grow = i as f32 * 1.8;
+        let a = 0.035 * (14 - i) as f32 / 14.0;
+        p.fill_round(body.inset(-grow, -grow).offset(0.0, 8.0), RADIUS + grow, theme.shadow.alpha(a));
+    }
+    p.clear_rect(body.inset(4.0, 4.0));
+    p.fill_round(body, RADIUS, pal.content);
+    let pane = sidebar_pane(body, sidebar_w);
+    p.clear_round(pane, PANE_RADIUS);
+    p.fill_round(pane, PANE_RADIUS, SidebarBackdrop::fill());
+    p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
+}
+
 /// Draws close / minimize / zoom at the body's top-left. Glyphs appear while
 /// the pointer is over the group, like macOS. Returns hit rects.
 pub fn traffic_lights(p: &Painter, body: Rect, hovered: bool, zoom_enabled: bool) -> Vec<(Rect, Light)> {
@@ -108,20 +134,24 @@ pub fn traffic_lights(p: &Painter, body: Rect, hovered: bool, zoom_enabled: bool
 /// an app window, showing through its translucent sidebar.
 pub struct SidebarBackdrop {
     hwnd: HWND,
+    owner: HWND,
     composition: CompositionBackdrop,
     tint: Color,
+    kind: Backdrop,
     /// Last applied screen rect + radius, to skip redundant updates.
     placed: Option<[i32; 5]>,
 }
 
 impl SidebarBackdrop {
     /// Sidebar tint over the blur, like macOS's sidebar material.
-    pub fn tint(theme: &Theme) -> Color {
-        if theme.dark {
-            Color::rgba(40, 40, 42, 0.62)
-        } else {
-            Color::rgba(234, 232, 236, 0.58)
+    pub fn tint(theme: &Theme, kind: Backdrop) -> Color {
+        if kind == Backdrop::Glass {
+            // Mostly frosted white (or graphite), like Tahoe's sidebar: the desktop only tints it.
+            return if theme.dark { Color::rgba(38, 38, 40, 0.74) } else { Color::rgba(250, 250, 252, 0.74) };
         }
+        let acrylic = if theme.dark { Color::rgba(40, 40, 42, 0.62) } else { Color::rgba(234, 232, 236, 0.58) };
+        // Blur: the same backdrop with a much lighter tint, as for bars.
+        if kind == Backdrop::Blur { acrylic.alpha(acrylic.a * 0.35) } else { acrylic }
     }
 
     /// The near-transparent sidebar fill to paint over the backdrop: just enough
@@ -130,17 +160,26 @@ impl SidebarBackdrop {
         Color::gray(128, 0.012)
     }
 
-    /// `None` when Transparency effects are off or Composition is unavailable.
-    pub fn new(theme: &Theme) -> Option<Self> {
-        if !system::transparency_enabled() {
+    /// A see-through backdrop for `owner`'s sidebar pane. `None` for a solid
+    /// sidebar, when Composition is unavailable, or when Transparency effects
+    /// are off and nothing would refract.
+    pub fn new(theme: &Theme, owner: HWND, kind: Backdrop) -> Option<Self> {
+        let glass = kind == Backdrop::Glass;
+        if matches!(kind, Backdrop::None | Backdrop::Clear) || (!system::transparency_enabled() && !(glass && glass::enabled())) {
             return None;
         }
         let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT;
         let hwnd = create_window(ex, WS_POPUP, RECT::default(), HWND::default()).ok()?;
         accent::prepare(hwnd);
-        let tint = Self::tint(theme);
-        match CompositionBackdrop::new(hwnd, tint) {
-            Ok(composition) => Some(Self { hwnd, composition, tint, placed: None }),
+        let tint = Self::tint(theme, kind);
+        match CompositionBackdrop::new(hwnd, tint, glass.then_some(glass::Style::Subtle)) {
+            Ok(composition) => {
+                if composition.refracts() {
+                    // The pane shows through the owner, so the owner mustn't be captured either.
+                    glass::exclude_from_capture(owner, true);
+                }
+                Some(Self { hwnd, owner, composition, tint, kind, placed: None })
+            }
             Err(e) => {
                 log!("sidebar backdrop unavailable: {e}");
                 unsafe {
@@ -152,7 +191,7 @@ impl SidebarBackdrop {
     }
 
     pub fn set_theme(&mut self, theme: &Theme) {
-        let tint = Self::tint(theme);
+        let tint = Self::tint(theme, self.kind);
         if tint != self.tint {
             self.tint = tint;
             self.composition.set_tint(tint);
@@ -183,11 +222,15 @@ impl SidebarBackdrop {
             // Re-applied every time: the owner may have moved up in z-order.
             let _ = SetWindowPos(self.hwnd, owner, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
+        self.composition.refresh();
     }
 }
 
 impl Drop for SidebarBackdrop {
     fn drop(&mut self) {
+        if self.composition.refracts() {
+            glass::exclude_from_capture(self.owner, false);
+        }
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }

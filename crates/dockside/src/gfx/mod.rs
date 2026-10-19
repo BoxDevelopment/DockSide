@@ -482,12 +482,22 @@ impl Painter<'_> {
     }
 
     /// Runs `f` with a translate + uniform scale transform applied.
+    /// Draws `f` translated then scaled, on top of any transform already in effect.
     pub fn transformed(&self, x: f32, y: f32, scale: f32, f: impl FnOnce()) {
-        let m = Matrix3x2 { M11: scale, M12: 0.0, M21: 0.0, M22: scale, M31: x, M32: y };
         unsafe {
+            let mut outer = Matrix3x2::default();
+            self.rt.GetTransform(&mut outer);
+            let m = Matrix3x2 {
+                M11: scale * outer.M11,
+                M12: scale * outer.M12,
+                M21: scale * outer.M21,
+                M22: scale * outer.M22,
+                M31: x * outer.M11 + y * outer.M21 + outer.M31,
+                M32: x * outer.M12 + y * outer.M22 + outer.M32,
+            };
             self.rt.SetTransform(&m);
             f();
-            self.rt.SetTransform(&Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 });
+            self.rt.SetTransform(&outer);
         }
     }
 }

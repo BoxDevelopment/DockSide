@@ -4,6 +4,7 @@ pub mod accent;
 pub mod appbar;
 pub mod apps;
 pub mod composition;
+pub mod glass;
 pub mod startup;
 pub mod system;
 pub mod taskbar;

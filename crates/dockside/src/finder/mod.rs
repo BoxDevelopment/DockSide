@@ -3,6 +3,7 @@
 
 pub mod dnd;
 pub mod fs;
+mod glyphs;
 pub mod loader;
 pub mod text;
 
@@ -41,11 +42,15 @@ const H: f32 = 580.0;
 const MIN_W: f32 = 560.0;
 const MIN_H: f32 = 340.0;
 const SIDEBAR: f32 = 190.0;
-const TOOLBAR: f32 = 52.0;
+const TOOLBAR: f32 = 56.0;
 /// Tab bar under the toolbar, shown while a window has more than one tab.
 const TABBAR: f32 = 28.0;
 const NEW_TAB_W: f32 = 30.0;
-const STATUS: f32 = 26.0;
+const STATUS: f32 = 24.0;
+const PATHBAR: f32 = 24.0;
+/// Toolbar controls: height, and their vertical centre (lined up with the traffic lights).
+const CONTROL_H: f32 = 34.0;
+const CONTROL_CY: f32 = 28.0;
 const ROW: f32 = 24.0;
 const HEADER: f32 = 26.0;
 const CELL_W: f32 = 104.0;
@@ -172,6 +177,8 @@ enum Hit {
     Tab(usize),
     TabClose(usize),
     NewTab,
+    /// Path bar segment: the cwd ancestor at this depth (0 = root).
+    Crumb(usize),
 }
 
 struct Column {
@@ -385,7 +392,7 @@ impl FinderWindow {
             show_hidden: prefs.show_hidden,
             tabs: vec![None],
             active_tab: 0,
-            backdrop: if prefs.sidebar_vibrancy { SidebarBackdrop::new(ctx.theme) } else { None },
+            backdrop: Self::new_backdrop(hwnd, prefs, ctx.theme),
             prefs_dirty: false,
             focused: true,
             tracking: false,
@@ -416,12 +423,22 @@ impl FinderWindow {
         (self.view, self.sort, self.ascending, self.show_hidden)
     }
 
-    /// Keeps the vibrancy backdrop under the sidebar (call when the window moves, resizes or changes z-order).
+    fn new_backdrop(hwnd: HWND, prefs: &crate::config::FinderCfg, theme: &Theme) -> Option<SidebarBackdrop> {
+        SidebarBackdrop::new(theme, hwnd, prefs.sidebar)
+    }
+
+    /// Recreates the sidebar backdrop after its settings changed.
+    pub fn set_sidebar(&mut self, prefs: &crate::config::FinderCfg, theme: &Theme) {
+        self.backdrop = None;
+        self.backdrop = Self::new_backdrop(self.hwnd, prefs, theme);
+        self.dirty = true;
+    }
+
+    /// Keeps the sidebar backdrop under the sidebar (call when the window moves, resizes or changes z-order).
     pub fn sync_backdrop(&mut self) {
         let body = self.body();
         if let Some(bd) = &mut self.backdrop {
-            // Extends under the content's square left edge, so only the outer corners show rounded.
-            bd.sync(self.hwnd, Rect::new(body.x, body.y, SIDEBAR + chrome::RADIUS, body.h), chrome::RADIUS, self.scale);
+            bd.sync(self.hwnd, chrome::sidebar_pane(body, SIDEBAR), chrome::PANE_RADIUS, self.scale);
         }
     }
 
@@ -919,7 +936,7 @@ impl FinderWindow {
     fn view_rect(&self) -> Rect {
         let b = self.body();
         let top = TOOLBAR + self.tab_h();
-        Rect::new(b.x + SIDEBAR, b.y + top, b.w - SIDEBAR, b.h - top - STATUS)
+        Rect::new(b.x + SIDEBAR, b.y + top, b.w - SIDEBAR, b.h - top - STATUS - PATHBAR)
     }
 
     /// Hit-test result for WM_NCHITTEST, from window-local points.
@@ -1122,6 +1139,12 @@ impl FinderWindow {
                 self.search.clear();
                 self.search_focus = true;
                 self.apply_filter();
+            }
+            Some(Hit::Crumb(depth)) => {
+                let target = crumbs(&self.cwd).into_iter().nth(depth);
+                if let Some(dir) = target.filter(|d| *d != self.cwd) {
+                    self.navigate(dir, true, kinds);
+                }
             }
             Some(Hit::QlBackdrop) => self.quicklook = None,
             // Tabs switch on press, like macOS.
@@ -1674,6 +1697,7 @@ impl FinderWindow {
             pal.sidebar = SidebarBackdrop::fill();
         }
         self.sync_backdrop();
+        let floating = self.backdrop.is_some();
         let dark = theme.dark;
         let body = self.body();
         let vr = self.view_rect();
@@ -1682,7 +1706,7 @@ impl FinderWindow {
         let sel_bg = if self.focused { theme.accent } else if dark { Color::gray(255, 0.18) } else { Color::gray(0, 0.12) };
         let sel_text = if self.focused { Color::WHITE } else { theme.text };
         let soft = if dark { Color::gray(255, 0.08) } else { Color::gray(0, 0.06) };
-        let stripe = if dark { Color::gray(255, 0.03) } else { Color::gray(0, 0.025) };
+        let stripe = if dark { Color::gray(255, 0.035) } else { Color::gray(0, 0.035) };
         let field_bg = if dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE };
 
         let regular = gfx.format(&theme.font, 13.0, Weight::Regular, Align::Leading);
@@ -1728,6 +1752,7 @@ impl FinderWindow {
             }
         };
         let title = self.title();
+        let path_names: Vec<String> = crumbs(&self.cwd).iter().map(|d| self.title_for(d)).collect();
         let preview = self.preview_entry().cloned();
         let column_offset = self.column_offset(vr);
         let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
@@ -1812,120 +1837,128 @@ impl FinderWindow {
                 edit_text(p, Rect::new(r.x + 4.0, r.y, r.w - 8.0, r.h), &ren.field, true);
             };
 
-            chrome::window(p, body, SIDEBAR, theme, &pal);
+            if floating {
+                chrome::window_floating(p, body, SIDEBAR, theme, &pal);
+            } else {
+                chrome::window(p, body, SIDEBAR, theme, &pal);
+            }
 
-            // Sidebar.
-            let mut y = body.y + 52.0;
+            // Sidebar: monochrome glyphs and rounded selection, inside the floating pane.
+            let side = if floating { chrome::sidebar_pane(body, SIDEBAR) } else { Rect::new(body.x, body.y, SIDEBAR, body.h) };
+            let glyph_c = if dark { Color::gray(255, 0.78) } else { Color::gray(0, 0.72) };
+            let mut y = side.y + 46.0;
             for (i, place) in places.iter().enumerate() {
                 if i == 0 || i == fav_count {
                     let header = if i == 0 { "Favorites" } else { "Locations" };
-                    p.text(header, &small_bold, Rect::new(body.x + 18.0, y, SIDEBAR - 30.0, 22.0), theme.text_secondary);
-                    y += 22.0;
+                    p.text(header, &small_bold, Rect::new(side.x + 14.0, y, side.w - 24.0, 24.0), theme.text_secondary);
+                    y += 24.0;
                 }
-                let row = Rect::new(body.x + 10.0, y, SIDEBAR - 20.0, 26.0);
+                let row = Rect::new(side.x + 6.0, y, side.w - 12.0, 28.0);
                 if place.path == *cwd {
-                    p.fill_round(row, 6.0, if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.09) });
+                    p.fill_round(row, 8.0, if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.075) });
                 } else if hover == Some(Hit::Place(i)) {
-                    p.fill_round(row, 6.0, soft);
+                    p.fill_round(row, 8.0, soft);
                 }
                 if drop_hit == Some(Hit::Place(i)) {
-                    p.fill_round(row, 6.0, theme.accent.alpha(0.3));
-                    p.stroke_round(row, 6.0, theme.accent, 1.5);
+                    p.fill_round(row, 8.0, theme.accent.alpha(0.3));
+                    p.stroke_round(row, 8.0, theme.accent, 1.5);
                 }
-                let probe = FileEntry {
-                    name: place.name.clone(),
-                    path: place.path.clone(),
-                    is_dir: true,
-                    size: 0,
-                    modified: None,
-                    ext: String::new(),
-                };
-                let bmp = icon_for(p, &probe);
-                draw_icon(p, bmp, Rect::new(row.x + 8.0, row.cy() - 8.0, 16.0, 16.0));
+                let glyph = glyphs::Glyph::for_place(i, &place.name, i >= fav_count);
+                let gc = if place.path == *cwd { theme.accent } else { glyph_c };
+                glyphs::draw(p, glyph, row.x + 16.0, row.cy(), gc);
                 p.text(&place.name, &regular, Rect::new(row.x + 32.0, row.y, row.w - 36.0, row.h), theme.text);
                 hits.push((row, Hit::Place(i)));
-                y += 26.0;
+                y += 28.0;
                 if i + 1 == fav_count {
-                    y += 8.0;
+                    y += 10.0;
                 }
             }
 
-            // Toolbar.
-            let ty = body.y + (TOOLBAR - 28.0) / 2.0;
+            // Toolbar: glass capsules floating over the content, lined up with the traffic lights.
+            let cy = body.y + CONTROL_CY;
+            let ty = cy - CONTROL_H / 2.0;
+            let nav = Rect::new(content_x + 12.0, ty, 76.0, CONTROL_H);
+            glyphs::capsule(p, nav, dark, false);
+            p.line(nav.cx(), nav.y + 9.0, nav.cx(), nav.bottom() - 9.0, pal.divider, 1.0);
             for (k, (hit, enabled)) in [(Hit::Back, can_back), (Hit::Forward, can_fwd)].into_iter().enumerate() {
-                let b = Rect::new(content_x + 12.0 + k as f32 * 30.0, ty, 28.0, 28.0);
+                let b = Rect::new(nav.x + k as f32 * nav.w / 2.0, nav.y, nav.w / 2.0, nav.h);
                 if enabled && hover == Some(hit) {
-                    p.fill_round(b, 6.0, soft);
+                    p.fill_round(b.inset(3.0, 3.0), (b.h - 6.0) / 2.0, soft);
                 }
-                let c = if enabled { theme.text_secondary } else { theme.text_disabled };
-                let (cx, cy) = (b.cx(), b.cy());
-                let d = if hit == Hit::Back { 1.0 } else { -1.0 };
-                p.line(cx + 2.5 * d, cy - 6.0, cx - 3.5 * d, cy, c, 1.8);
-                p.line(cx - 3.5 * d, cy, cx + 2.5 * d, cy + 6.0, c, 1.8);
+                let c = if enabled { theme.text } else { theme.text_disabled };
+                glyphs::chevron(p, b.cx(), b.cy(), hit == Hit::Back, 5.5, c, 1.7);
                 if enabled {
                     hits.push((b, hit));
                 }
             }
-            // View switcher.
-            let seg_w = 32.0;
-            let outer = Rect::new(content_x + content_w - 16.0 - seg_w * 3.0 - 4.0, body.y + (TOOLBAR - 26.0) / 2.0, seg_w * 3.0 + 4.0, 26.0);
-            p.fill_round(outer, 7.0, soft);
-            for (k, v) in [View::Icons, View::List, View::Columns].into_iter().enumerate() {
-                let seg = Rect::new(outer.x + 2.0 + k as f32 * seg_w, outer.y + 2.0, seg_w, 22.0);
-                if v == view {
-                    p.fill_round(seg, 5.0, if dark { Color::gray(255, 0.2) } else { Color::WHITE });
+
+            // Search: a circle that expands into a field while in use.
+            let right_edge = content_x + content_w - 14.0;
+            let expanded = search_focus || !search.is_empty();
+            let sw = if expanded { SEARCH_W.min(content_w * 0.35).max(120.0) } else { CONTROL_H };
+            let sf = Rect::new(right_edge - sw, ty, sw, CONTROL_H);
+            glyphs::capsule(p, sf, dark, !expanded && hover == Some(Hit::Search));
+            if expanded {
+                if search_focus {
+                    p.stroke_round(sf.inset(-2.0, -2.0), sf.h / 2.0 + 2.0, theme.accent.alpha(0.55), 3.0);
                 }
-                let c = theme.text_secondary;
+                glyphs::magnifier(p, sf.x + 17.0, sf.cy(), theme.text_secondary);
+                let text_r = Rect::new(sf.x + 30.0, sf.y, sf.w - if search.is_empty() { 40.0 } else { 54.0 }, sf.h);
+                if search.is_empty() {
+                    p.text("Search", &regular, text_r, theme.text_secondary);
+                }
+                search_xs = edit_text(p, text_r, search, search_focus);
+                if !search.is_empty() {
+                    let (cx, cy) = (sf.right() - 16.0, sf.cy());
+                    let a = if hover == Some(Hit::SearchClear) { 0.85 } else { 0.55 };
+                    p.fill_circle(cx, cy, 6.5, theme.text_secondary.alpha(a));
+                    p.line(cx - 2.3, cy - 2.3, cx + 2.3, cy + 2.3, field_bg, 1.4);
+                    p.line(cx + 2.3, cy - 2.3, cx - 2.3, cy + 2.3, field_bg, 1.4);
+                    hits.push((Rect::new(cx - 9.0, cy - 9.0, 18.0, 18.0), Hit::SearchClear));
+                }
+            } else {
+                glyphs::magnifier(p, sf.cx(), sf.cy(), theme.text);
+                search_xs = vec![sf.x + 30.0];
+            }
+            hits.push((sf, Hit::Search));
+
+            // View switcher capsule, the current view on a darker pill.
+            let seg_w = 40.0;
+            let outer = Rect::new(sf.x - 10.0 - seg_w * 3.0 - 8.0, ty, seg_w * 3.0 + 8.0, CONTROL_H);
+            glyphs::capsule(p, outer, dark, false);
+            for (k, v) in [View::Icons, View::List, View::Columns].into_iter().enumerate() {
+                let seg = Rect::new(outer.x + 4.0 + k as f32 * seg_w, outer.y + 4.0, seg_w, outer.h - 8.0);
+                if v == view {
+                    p.fill_round(seg, seg.h / 2.0, if dark { Color::gray(255, 0.16) } else { Color::gray(0, 0.08) });
+                } else if hover == Some(Hit::ViewBtn(v)) {
+                    p.fill_round(seg, seg.h / 2.0, soft);
+                }
+                let c = theme.text;
                 let (cx, cy) = (seg.cx(), seg.cy());
                 match v {
                     View::Icons => {
                         for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                            p.fill_round(Rect::new(cx + dx * 3.2 - 2.5, cy + dy * 3.2 - 2.5, 5.0, 5.0), 1.0, c);
+                            p.stroke_round(Rect::new(cx + dx * 3.6 - 2.6, cy + dy * 3.6 - 2.6, 5.2, 5.2), 1.3, c, 1.1);
                         }
                     }
                     View::List => {
-                        for dy in [-4.0, 0.0, 4.0] {
-                            p.fill_circle(cx - 5.0, cy + dy, 1.0, c);
-                            p.line(cx - 2.5, cy + dy, cx + 6.0, cy + dy, c, 1.4);
+                        for dy in [-4.5, 0.0, 4.5] {
+                            p.fill_circle(cx - 6.0, cy + dy, 1.1, c);
+                            p.line(cx - 3.0, cy + dy, cx + 7.0, cy + dy, c, 1.4);
                         }
                     }
                     View::Columns => {
-                        let r = Rect::new(cx - 7.0, cy - 5.5, 14.0, 11.0);
-                        p.stroke_round(r, 2.0, c, 1.2);
-                        p.line(cx - 2.3, r.y, cx - 2.3, r.bottom(), c, 1.2);
-                        p.line(cx + 2.3, r.y, cx + 2.3, r.bottom(), c, 1.2);
+                        let r = Rect::new(cx - 8.0, cy - 6.0, 16.0, 12.0);
+                        p.stroke_round(r, 2.2, c, 1.3);
+                        p.line(cx - 2.7, r.y, cx - 2.7, r.bottom(), c, 1.2);
+                        p.line(cx + 2.7, r.y, cx + 2.7, r.bottom(), c, 1.2);
                     }
                 }
                 hits.push((seg, Hit::ViewBtn(v)));
             }
 
-            // Search field, left of the view switcher.
-            let title_x = content_x + 82.0;
-            let sw = SEARCH_W.min(outer.x - 12.0 - title_x - 120.0).max(90.0);
-            let sf = Rect::new(outer.x - 12.0 - sw, outer.y, sw, outer.h);
-            p.fill_round(sf, 7.0, soft);
-            if search_focus {
-                p.stroke_round(sf.inset(-1.5, -1.5), 8.5, theme.accent.alpha(0.6), 3.0);
-            }
-            let (gx, gy) = (sf.x + 13.0, sf.cy() - 1.0);
-            p.stroke_circle(gx, gy, 4.5, theme.text_secondary, 1.4);
-            p.line(gx + 3.3, gy + 3.3, gx + 6.5, gy + 6.5, theme.text_secondary, 1.6);
-            let text_r = Rect::new(sf.x + 25.0, sf.y, sf.w - if search.is_empty() { 31.0 } else { 47.0 }, sf.h);
-            if search.is_empty() {
-                p.text("Search", &regular, text_r, theme.text_secondary);
-            }
-            search_xs = if search_focus || !search.is_empty() { edit_text(p, text_r, search, search_focus) } else { vec![text_r.x] };
-            hits.push((sf, Hit::Search));
-            if !search.is_empty() {
-                let (cx, cy) = (sf.right() - 13.0, sf.cy());
-                let a = if hover == Some(Hit::SearchClear) { 0.85 } else { 0.55 };
-                p.fill_circle(cx, cy, 6.5, theme.text_secondary.alpha(a));
-                p.line(cx - 2.3, cy - 2.3, cx + 2.3, cy + 2.3, field_bg, 1.4);
-                p.line(cx + 2.3, cy - 2.3, cx - 2.3, cy + 2.3, field_bg, 1.4);
-                hits.push((Rect::new(cx - 9.0, cy - 9.0, 18.0, 18.0), Hit::SearchClear));
-            }
-            p.text(&title, &title_font, Rect::new(title_x, body.y, sf.x - 8.0 - title_x, TOOLBAR), theme.text);
-            p.line(content_x, body.y + TOOLBAR, body.right(), body.y + TOOLBAR, pal.divider, 1.0);
+            let title_x = nav.right() + 14.0;
+            p.text(&title, &title_font, Rect::new(title_x, ty, (outer.x - 10.0 - title_x).max(0.0), CONTROL_H), theme.text);
 
             // Tab bar: equal-width tabs, a close button on hover, and + at the end.
             if !tab_titles.is_empty() {
@@ -2026,9 +2059,9 @@ impl FinderWindow {
                             let r = Rect::new(x0, rows_top + 4.0 + i as f32 * ROW - scroll, w, ROW);
                             let sel = selected.contains(&i);
                             if sel {
-                                p.fill_round(r, 5.0, sel_bg);
+                                p.fill_round(r, 7.0, sel_bg);
                             } else if i % 2 == 1 {
-                                p.fill_round(r, 5.0, stripe);
+                                p.fill_round(r, 7.0, stripe);
                             }
                             if drop_hit == Some(Hit::Item(i)) {
                                 p.stroke_round(r.inset(1.0, 1.0), 5.0, theme.accent, 2.0);
@@ -2152,6 +2185,31 @@ impl FinderWindow {
                 p.fill_round(Rect::new(vr.right() - 8.0, ty + 2.0, 5.0, th - 4.0), 2.5, Color::gray(128, 0.45));
             }
 
+            // Path bar: breadcrumbs from the root, trimmed from the left to fit.
+            let pb = Rect::new(content_x, body.bottom() - STATUS - PATHBAR, content_w, PATHBAR);
+            p.line(pb.x, pb.y, pb.right(), pb.y, pal.divider, 1.0);
+            let widths: Vec<f32> = path_names.iter().map(|n| p.gfx.measure(n, &small) + 36.0).collect();
+            let mut first = 0;
+            while first + 1 < widths.len() && widths[first..].iter().sum::<f32>() > pb.w - 20.0 {
+                first += 1;
+            }
+            let mut x = pb.x + 10.0;
+            for (depth, name) in path_names.iter().enumerate().skip(first) {
+                let w = widths[depth] - 14.0;
+                let seg = Rect::new(x, pb.y + 2.0, w, pb.h - 4.0);
+                if hover == Some(Hit::Crumb(depth)) {
+                    p.fill_round(seg, 5.0, soft);
+                }
+                glyphs::folder(p, seg.x + 10.0, seg.cy(), 0.72, theme.accent);
+                p.text(name, &small, Rect::new(seg.x + 20.0, seg.y, seg.w - 20.0, seg.h), theme.text_secondary);
+                hits.push((seg, Hit::Crumb(depth)));
+                x += w;
+                if depth + 1 < path_names.len() {
+                    glyphs::chevron(p, x + 7.0, pb.cy(), false, 3.0, theme.text_disabled, 1.1);
+                    x += 14.0;
+                }
+            }
+
             // Status bar.
             let sb = Rect::new(content_x, body.bottom() - STATUS, content_w, STATUS);
             p.line(sb.x, sb.y, sb.right(), sb.y, pal.divider, 1.0);
@@ -2184,7 +2242,9 @@ impl FinderWindow {
 
             // Traffic lights last so they win hit-testing.
             let group_hover = matches!(hover, Some(Hit::Light(_)));
-            for (r, light) in chrome::traffic_lights(p, body, group_hover, true) {
+            // Lights sit inside the pane, centred on the toolbar row.
+            let lights = Rect::new(body.x + 4.0, body.y + CONTROL_CY - 20.0, body.w, body.h);
+            for (r, light) in chrome::traffic_lights(p, lights, group_hover, true) {
                 hits.push((r, Hit::Light(light)));
             }
         });
@@ -2318,4 +2378,11 @@ impl Drop for FinderWindow {
             let _ = DestroyWindow(self.hwnd);
         }
     }
+}
+
+/// `dir` and its ancestors, root first.
+fn crumbs(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
+    v.reverse();
+    v
 }

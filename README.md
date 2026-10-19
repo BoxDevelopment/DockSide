@@ -78,7 +78,7 @@ hidden while DockSide runs and is always restored when it exits.
 - Enter opens; folders open in Finder; Ctrl+Enter reveals the item in Finder; Esc clears, then closes
 
 **Platform**
-- True rounded acrylic and blur via Windows.UI.Composition (a host backdrop brush with any corner radius), per-monitor DPI and dark/light mode that follows Windows
+- True rounded acrylic, blur and Liquid Glass via Windows.UI.Composition; glass really refracts (screen capture + a GPU bezel/lens shader), with a floating glass Finder sidebar, capsule toolbar and path bar like macOS Tahoe; the menu bar defaults to Tahoe's clear style, picking light or dark text from the wallpaper (a host backdrop brush with any corner radius), per-monitor DPI and dark/light mode that follows Windows
 - Menu bar and Dock reserve screen space (Win32 AppBars), so maximized windows fit between them
 - Hides itself for fullscreen apps
 - Rendering uses Direct2D/DirectWrite into layered windows; animations are vsync-paced and the
@@ -137,6 +137,7 @@ crates/dockside/src
 │                 bluetooth and system sources feed it from background threads
 ├── chrome.rs     shared window chrome: shadow, body, traffic lights
 ├── surface.rs    backdrop (DWM acrylic) window + layered content window pair
+│   (win/glass.rs: Liquid Glass refraction engine)
 ├── gfx/          Direct2D canvas/painter, DirectWrite text, icon loading (shell + WIC)
 ├── anim.rs       DwmFlush-paced frame clock, damped springs
 ├── config.rs     TOML config: defaults merged under the user file, hot reload, toml_edit writes
@@ -163,4 +164,5 @@ crates/dockside/src
 - [ ] WIndows commands in Spotlight e.g brightness, low power mode, or just opening every page in the settings app.
 ## Notes
 
+- Liquid Glass refraction (`[general] glass_refraction`) hides glass surfaces, and Finder windows with a glass sidebar, from screenshots and screen sharing; turn it off in Settings → Appearance to fall back to non-bending glass.
 - Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, DockSide falls back to a DWM accent with 8px corners.

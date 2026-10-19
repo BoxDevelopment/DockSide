@@ -4,6 +4,12 @@
 //! a host-backdrop brush (DWM's blurred view of what's behind the window,
 //! the same source WinUI's Acrylic uses) under a tint layer, both clipped to
 //! an antialiased rounded rectangle of any radius.
+//!
+//! Liquid Glass adds two layers on top: a soft vertical sheen and a specular
+//! rim whose brightness sweeps around the edge, as if lit from the top-left.
+//! When refraction is available (see `glass`), a swap chain rendered by its
+//! shader covers all of that; the layers below stay as the fallback until the
+//! first frame arrives.
 
 use std::ffi::c_void;
 
@@ -12,16 +18,18 @@ use windows::Foundation::Numerics::{Vector2, Vector3};
 use windows::System::DispatcherQueueController;
 use windows::Win32::Foundation::{BOOL, HWND};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH};
-use windows::Win32::System::WinRT::Composition::ICompositorDesktopInterop;
+use windows::Win32::System::WinRT::Composition::{ICompositorDesktopInterop, ICompositorInterop};
 use windows::Win32::System::WinRT::{
     CreateDispatcherQueueController, DispatcherQueueOptions, DQTAT_COM_NONE, DQTYPE_THREAD_CURRENT,
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    CompositionColorBrush, CompositionRoundedRectangleGeometry, Compositor, ContainerVisual, SpriteVisual,
+    CompositionColorBrush, CompositionLinearGradientBrush, CompositionRoundedRectangleGeometry, Compositor,
+    ContainerVisual, ShapeVisual, SpriteVisual,
 };
 
 use crate::geom::Color;
+use crate::win::glass::{Pane, Style};
 
 struct Shared {
     compositor: Compositor,
@@ -47,17 +55,72 @@ fn ui_color(c: Color) -> windows::UI::Color {
     windows::UI::Color { A: b(c.a), R: b(c.r), G: b(c.g), B: b(c.b) }
 }
 
+fn gradient(compositor: &Compositor, from: Vector2, to: Vector2, stops: &[(f32, Color)]) -> Result<CompositionLinearGradientBrush> {
+    let brush = compositor.CreateLinearGradientBrush()?;
+    brush.SetStartPoint(from)?;
+    brush.SetEndPoint(to)?;
+    let collection = brush.ColorStops()?;
+    for &(offset, color) in stops {
+        collection.Append(&compositor.CreateColorGradientStopWithOffsetAndColor(offset, ui_color(color))?)?;
+    }
+    Ok(brush)
+}
+
+/// Rim width in physical pixels.
+const RIM: f32 = 1.25;
+
+/// The Liquid Glass sheen and rim.
+struct Glass {
+    rim: CompositionRoundedRectangleGeometry,
+    _layers: (SpriteVisual, ShapeVisual),
+}
+
+impl Glass {
+    fn new(compositor: &Compositor, dark: bool, style: Style) -> Result<Self> {
+        let white = |a: f32| Color::rgba(255, 255, 255, a);
+        // Dark glass catches less light; subtle glass less still.
+        let k = if dark { 0.6 } else { 1.0 } * if style == Style::Subtle { 0.45 } else { 1.0 };
+
+        let sheen = compositor.CreateSpriteVisual()?;
+        sheen.SetBrush(&gradient(
+            compositor,
+            Vector2 { X: 0.5, Y: 0.0 },
+            Vector2 { X: 0.5, Y: 1.0 },
+            &[(0.0, white(0.20 * k)), (0.45, white(0.03 * k)), (0.8, white(0.0)), (1.0, white(0.07 * k))],
+        )?)?;
+        sheen.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+
+        let rim = compositor.CreateRoundedRectangleGeometry()?;
+        let stroke = compositor.CreateSpriteShapeWithGeometry(&rim)?;
+        stroke.SetStrokeThickness(RIM)?;
+        stroke.SetStrokeBrush(&gradient(
+            compositor,
+            Vector2 { X: 0.0, Y: 0.0 },
+            Vector2 { X: 1.0, Y: 1.0 },
+            &[(0.0, white(0.75 * k)), (0.3, white(0.22 * k)), (0.6, white(0.10 * k)), (1.0, white(0.45 * k))],
+        )?)?;
+        let rim_layer = compositor.CreateShapeVisual()?;
+        rim_layer.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+        rim_layer.Shapes()?.Append(&stroke)?;
+
+        Ok(Self { rim, _layers: (sheen, rim_layer) })
+    }
+}
+
 pub struct CompositionBackdrop {
     _target: DesktopWindowTarget,
     shape: ContainerVisual,
     geometry: CompositionRoundedRectangleGeometry,
     tint: CompositionColorBrush,
+    glass: Option<Glass>,
+    refraction: Option<(Pane, SpriteVisual)>,
     _layers: (SpriteVisual, SpriteVisual),
 }
 
 impl CompositionBackdrop {
-    /// `hwnd` should be created with `WS_EX_NOREDIRECTIONBITMAP`.
-    pub fn new(hwnd: HWND, tint: Color) -> Result<Self> {
+    /// `hwnd` should be created with `WS_EX_NOREDIRECTIONBITMAP`. `glass` adds
+    /// Liquid Glass over the tint: refraction when available, else sheen and rim.
+    pub fn new(hwnd: HWND, tint: Color, glass: Option<Style>) -> Result<Self> {
         let compositor = SHARED.with(|s| s.as_ref().map(|s| s.compositor.clone()));
         let Some(compositor) = compositor else {
             return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL));
@@ -94,9 +157,34 @@ impl CompositionBackdrop {
         let children = shape.Children()?;
         children.InsertAtTop(&blur)?;
         children.InsertAtTop(&tint_layer)?;
+        let style = glass;
+        let glass = if let Some(style) = style {
+            let g = Glass::new(&compositor, tint.r + tint.g + tint.b < 1.5, style)?;
+            children.InsertAtTop(&g._layers.0)?;
+            children.InsertAtTop(&g._layers.1)?;
+            Some(g)
+        } else {
+            None
+        };
+        let refraction = if let Some(style) = style.filter(|_| crate::win::glass::enabled()) {
+            Pane::new(hwnd, tint, style).and_then(|(pane, swapchain)| {
+                let layer = (|| -> Result<SpriteVisual> {
+                    let interop: ICompositorInterop = compositor.cast()?;
+                    let surface = unsafe { interop.CreateCompositionSurfaceForSwapChain(&swapchain)? };
+                    let layer = compositor.CreateSpriteVisual()?;
+                    layer.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&surface)?)?;
+                    layer.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+                    children.InsertAtTop(&layer)?;
+                    Ok(layer)
+                })();
+                layer.map_err(|e| log!("glass layer failed: {e}")).ok().map(|l| (pane, l))
+            })
+        } else {
+            None
+        };
         root.Children()?.InsertAtTop(&shape)?;
 
-        Ok(Self { _target: target, shape, geometry, tint: tint_brush, _layers: (blur, tint_layer) })
+        Ok(Self { _target: target, shape, geometry, tint: tint_brush, glass, refraction, _layers: (blur, tint_layer) })
     }
 
     /// Position, size and corner radius in window-local physical pixels.
@@ -107,10 +195,37 @@ impl CompositionBackdrop {
         let _ = self.shape.SetSize(size);
         let _ = self.geometry.SetSize(size);
         let _ = self.geometry.SetCornerRadius(Vector2 { X: r, Y: r });
+        if let Some(g) = &self.glass {
+            // Inset by half the stroke so the whole rim sits inside the clip.
+            // Square shapes (the full-width menu bar) get no rim, like macOS.
+            let h = RIM / 2.0;
+            let rim = if r > 0.0 { Vector2 { X: (size.X - RIM).max(0.0), Y: (size.Y - RIM).max(0.0) } } else { Vector2 { X: 0.0, Y: 0.0 } };
+            let _ = g.rim.SetOffset(Vector2 { X: h, Y: h });
+            let _ = g.rim.SetSize(rim);
+            let _ = g.rim.SetCornerRadius(Vector2 { X: (r - h).max(0.0), Y: (r - h).max(0.0) });
+        }
+        if let Some((pane, _)) = &self.refraction {
+            pane.set_shape(size.X, size.Y, r);
+        }
     }
 
     pub fn set_tint(&self, tint: Color) {
         let _ = self.tint.SetColor(ui_color(tint));
+        if let Some((pane, _)) = &self.refraction {
+            pane.set_tint(tint);
+        }
+    }
+
+    /// True when a refracting pane covers this backdrop (its window is hidden from capture).
+    pub fn refracts(&self) -> bool {
+        self.refraction.is_some()
+    }
+
+    /// Re-renders the refraction after the window moved or reshaped.
+    pub fn refresh(&self) {
+        if let Some((pane, _)) = &self.refraction {
+            pane.render();
+        }
     }
 
 }

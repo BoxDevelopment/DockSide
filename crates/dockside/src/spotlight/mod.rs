@@ -148,7 +148,7 @@ impl Spotlight {
         let left = mon.left + (mon.right - mon.left - w) / 2;
         let top = mon.top + ((mon.bottom - mon.top) as f32 * 0.2) as i32 - (SHADOW * s) as i32;
         let rect = RECT { left, top, right: left + w, bottom: top + h };
-        let surface = Surface::new(gfx, rect, s, cfg.menubar.backdrop, theme.menu_tint)?;
+        let surface = Surface::new(gfx, rect, s, cfg.menubar.backdrop.for_panels(), theme.menu_tint)?;
         SPOTLIGHT_HWND.store(surface.content.0 as isize, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             surface,

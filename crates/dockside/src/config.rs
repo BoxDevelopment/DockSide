@@ -27,6 +27,8 @@ pub struct General {
     pub accent: String,
     pub hide_taskbar: bool,
     pub shortcut_style: ShortcutStyle,
+    /// "glass" backdrops bend what's behind them (hides them from screen capture).
+    pub glass_refraction: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -42,7 +44,19 @@ pub enum Appearance {
 pub enum Backdrop {
     Acrylic,
     Blur,
+    /// Liquid Glass: a clear, lightly tinted blur with a sheen and specular rim.
+    Glass,
+    /// No bar at all (menu bar only): text straight on the wallpaper, like macOS Tahoe.
+    Clear,
     None,
+}
+
+impl Backdrop {
+    /// The material for menus and Spotlight, which follow the menu bar's
+    /// setting but always need a body: a clear bar's panels are glass.
+    pub fn for_panels(self) -> Backdrop {
+        if self == Backdrop::Clear { Backdrop::Glass } else { self }
+    }
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -111,7 +125,8 @@ pub struct FinderCfg {
     pub sort: crate::finder::fs::SortKey,
     pub ascending: bool,
     pub show_hidden: bool,
-    pub sidebar_vibrancy: bool,
+    /// Sidebar material. Anything but "none" floats it as a rounded pane, like macOS Tahoe.
+    pub sidebar: Backdrop,
 }
 
 /// The Dynamic Island at the top center of the screen.
@@ -193,7 +208,8 @@ pub fn load(path: &Path) -> Result<Config> {
 
 fn parse(user: &str) -> Result<Config> {
     let mut base: toml::Value = toml::from_str(DEFAULT_TOML)?;
-    let over: toml::Value = toml::from_str(user).context("config.toml is not valid TOML")?;
+    let mut over: toml::Value = toml::from_str(user).context("config.toml is not valid TOML")?;
+    migrate_sidebar(&mut over);
     merge(&mut base, over);
     let mut cfg: Config = base.try_into().context("config.toml has an invalid value")?;
     for app in &mut cfg.dock.apps {
@@ -207,6 +223,16 @@ fn parse(user: &str) -> Result<Config> {
         cfg.menubar.logo = expand_env(&cfg.menubar.logo);
     }
     Ok(cfg)
+}
+
+/// `sidebar_vibrancy = false` (before `sidebar` existed) meant a solid sidebar.
+fn migrate_sidebar(over: &mut toml::Value) {
+    let Some(finder) = over.get_mut("finder").and_then(|f| f.as_table_mut()) else { return };
+    if let Some(v) = finder.remove("sidebar_vibrancy") {
+        if v.as_bool() == Some(false) && !finder.contains_key("sidebar") {
+            finder.insert("sidebar".into(), toml::Value::String("none".into()));
+        }
+    }
 }
 
 /// Tables merge recursively; everything else (including arrays) is replaced.
@@ -365,6 +391,14 @@ sort = \"modified\"
         assert_eq!(cfg.finder.view, crate::finder::View::Columns);
         assert_eq!(cfg.finder.sort, crate::finder::fs::SortKey::Modified);
         assert!(cfg.finder.ascending);
+    }
+
+    #[test]
+    fn sidebar_vibrancy_migrates() {
+        assert_eq!(parse("[finder]\nsidebar_vibrancy = false\n").unwrap().finder.sidebar, Backdrop::None);
+        assert_eq!(parse("[finder]\nsidebar_vibrancy = true\n").unwrap().finder.sidebar, Backdrop::Glass);
+        let cfg = parse("[finder]\nsidebar_vibrancy = false\nsidebar = \"acrylic\"\n").unwrap();
+        assert_eq!(cfg.finder.sidebar, Backdrop::Acrylic);
     }
 
     #[test]

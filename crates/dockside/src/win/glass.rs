@@ -516,6 +516,23 @@ impl Engine {
     }
 }
 
+/// Stops every screen capture and releases the GPU device. Called on quit,
+/// while the UI thread still runs: left to process exit, open capture
+/// sessions can hang the process in the graphics driver for good.
+pub fn shutdown() {
+    // Nothing may start the engine again.
+    FAILED.with(|f| f.set(true));
+    let Some(engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
+    for m in &engine.monitors {
+        let _ = m.session.Close();
+        let _ = m.pool.Close();
+    }
+    unsafe {
+        engine.context.ClearState();
+        engine.context.Flush();
+    }
+}
+
 fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
     ENGINE.with(|e| {
         let mut e = e.try_borrow_mut().ok()?;

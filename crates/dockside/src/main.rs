@@ -44,8 +44,22 @@ fn main() {
         let mutex = CreateMutexW(None, true, w!("Local\\DockSide.SingleInstance"));
         if mutex.is_err() || GetLastError() == ERROR_ALREADY_EXISTS {
             // Relaunching (e.g. from the Start menu) opens Settings, like reopening a Mac app.
-            win::signal_running_instance(std::env::args().any(|a| a == "--finder"));
-            return;
+            // An instance that's still starting has no window yet, so give it a moment.
+            let finder = std::env::args().any(|a| a == "--finder");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let signalled = loop {
+                if win::signal_running_instance(finder) {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            // Otherwise the lock outlived its instance (stuck exiting): start anyway.
+            if signalled {
+                return;
+            }
         }
     }
 
@@ -66,4 +80,5 @@ fn main() {
         log!("fatal: {e:?}");
     }
     win::taskbar::restore();
+    log!("quit: done");
 }

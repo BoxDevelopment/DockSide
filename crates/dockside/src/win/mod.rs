@@ -36,10 +36,15 @@ pub const WM_APP_FINDER_CHANGED: u32 = WM_APP + 10;
 /// Asks an already-running instance to show its settings window.
 pub fn signal_running_instance(finder: bool) -> bool {
     unsafe {
-        match FindWindowExW(HWND_MESSAGE, None, CLASS_NAME, None) {
-            Ok(h) => PostMessageW(h, WM_APP_OPEN_SETTINGS, WPARAM(finder as usize), LPARAM(0)).is_ok(),
-            Err(_) => false,
+        let Ok(h) = FindWindowExW(HWND_MESSAGE, None, CLASS_NAME, None) else { return false };
+        // An instance stuck exiting keeps its window, and Windows still answers
+        // generic messages for it, so ask for a reply only DockSide gives.
+        let mut result = 0usize;
+        let sent = SendMessageTimeoutW(h, WM_APP_PING, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, 1000, Some(&mut result));
+        if sent.0 == 0 || result != PING_REPLY {
+            return false;
         }
+        PostMessageW(h, WM_APP_OPEN_SETTINGS, WPARAM(finder as usize), LPARAM(0)).is_ok()
     }
 }
 
@@ -154,6 +159,9 @@ pub const WM_APP_ISLAND_KEY: u32 = WM_APP + 15;
 pub const WM_APP_DESKTOP_KEY: u32 = WM_APP + 16;
 /// The current virtual desktop changed.
 pub const WM_APP_DESKTOP: u32 = WM_APP + 17;
+/// A relaunch checking the running instance is alive; answered with `PING_REPLY`.
+pub const WM_APP_PING: u32 = WM_APP + 18;
+pub const PING_REPLY: usize = 0x444F_434B; // "DOCK"
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
 

@@ -11,6 +11,7 @@
 //! shader covers all of that; the layers below stay as the fallback until the
 //! first frame arrives.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 
 use windows::core::{Interface, Result};
@@ -38,9 +39,39 @@ struct Shared {
 
 thread_local! {
     static SHARED: Option<Shared> = init().map_err(|e| log!("composition unavailable: {e}")).ok();
+    /// Whether `SHARED` was ever touched, so `shutdown` doesn't start it.
+    static STARTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Closes the compositor and its dispatcher queue on quit, pumping messages
+/// until the queue has drained. Left to process exit, they're torn down after
+/// the UI thread is gone, which can hang the process.
+pub fn shutdown() {
+    use windows::Foundation::AsyncStatus;
+    use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
+    if !STARTED.with(|s| s.get()) {
+        return;
+    }
+    SHARED.with(|shared| {
+        let Some(shared) = shared else { return };
+        let _ = shared.compositor.Close();
+        let Ok(op) = shared._queue.ShutdownQueueAsync() else { return };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while op.Status().is_ok_and(|s| s == AsyncStatus::Started) && std::time::Instant::now() < deadline {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
 }
 
 fn init() -> Result<Shared> {
+    STARTED.with(|s| s.set(true));
     let options = DispatcherQueueOptions {
         dwSize: std::mem::size_of::<DispatcherQueueOptions>() as u32,
         threadType: DQTYPE_THREAD_CURRENT,

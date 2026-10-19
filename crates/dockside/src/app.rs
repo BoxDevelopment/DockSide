@@ -38,7 +38,7 @@ use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
-    WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT,
+    WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
 };
 
 thread_local! {
@@ -88,6 +88,12 @@ pub fn run() -> anyhow::Result<()> {
     // Drop outside the borrow: destroying windows dispatches messages.
     let app = APP.with(|a| a.borrow_mut().take());
     drop(app);
+    log!("quit: surfaces closed");
+    // Graphics last, once nothing draws with them.
+    crate::win::glass::shutdown();
+    log!("quit: glass stopped");
+    crate::win::composition::shutdown();
+    log!("quit: composition stopped");
     Ok(())
 }
 
@@ -308,6 +314,7 @@ fn execute(action: Action) {
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_APP_FRAME => FRAME_PENDING.store(false, Ordering::Release),
+        WM_APP_PING => return LRESULT(win::PING_REPLY as isize),
         // Spotlight closes as soon as it loses focus (posted: we may be mid-dispatch).
         WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == SPOTLIGHT_HWND.load(Ordering::Relaxed) => {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_SPOTLIGHT);

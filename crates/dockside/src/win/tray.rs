@@ -165,6 +165,24 @@ pub fn keep_on_top() {
     }
 }
 
+/// Runs `f` with Explorer's tray in front of ours, so `SHAppBarMessage` calls
+/// in it reach Explorer directly. Explorer accepts appbar messages we forward
+/// but doesn't reserve their space, so DockSide's own appbars go around us.
+pub fn explorer_first<R>(f: impl FnOnce() -> R) -> R {
+    let hwnd = HOST.with(|h| h.borrow().as_ref().map(|h| h.hwnd));
+    if let Some(hwnd) = hwnd {
+        unsafe {
+            let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+    let r = f();
+    if hwnd.is_some() {
+        keep_on_top();
+    }
+    r
+}
+
 /// Visible icons, in the order they were added: (id, tooltip, pixels).
 pub fn icons(size: i32) -> Vec<(IconId, String, Option<IconPixels>)> {
     HOST.with(|h| {

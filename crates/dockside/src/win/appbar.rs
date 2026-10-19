@@ -9,7 +9,7 @@ fn data(hwnd: HWND) -> APPBARDATA {
 
 /// Reserves `thickness` physical pixels along `edge` (ABE_TOP / ABE_BOTTOM) of `monitor`.
 pub fn register(hwnd: HWND, callback: u32, edge: u32, monitor: RECT, thickness: i32) {
-    unsafe {
+    super::tray::explorer_first(|| unsafe {
         let mut abd = data(hwnd);
         abd.uCallbackMessage = callback;
         SHAppBarMessage(ABM_NEW, &mut abd);
@@ -23,12 +23,12 @@ pub fn register(hwnd: HWND, callback: u32, edge: u32, monitor: RECT, thickness: 
             abd.rc.top = abd.rc.bottom - thickness;
         }
         SHAppBarMessage(ABM_SETPOS, &mut abd);
-    }
+    });
 }
 
 pub fn remove(hwnd: HWND) {
-    unsafe {
+    super::tray::explorer_first(|| unsafe {
         let mut abd = data(hwnd);
         SHAppBarMessage(ABM_REMOVE, &mut abd);
-    }
+    });
 }

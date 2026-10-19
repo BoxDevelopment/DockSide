@@ -38,7 +38,7 @@ fn appbar_state(tray: HWND) -> u32 {
         hWnd: tray,
         ..Default::default()
     };
-    unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) as u32 }
+    super::tray::explorer_first(|| unsafe { SHAppBarMessage(ABM_GETSTATE, &mut abd) as u32 })
 }
 
 fn set_appbar_state(tray: HWND, state: u32) {
@@ -48,9 +48,9 @@ fn set_appbar_state(tray: HWND, state: u32) {
         lParam: LPARAM(state as isize),
         ..Default::default()
     };
-    unsafe {
+    super::tray::explorer_first(|| unsafe {
         SHAppBarMessage(ABM_SETSTATE, &mut abd);
-    }
+    });
 }
 
 pub fn hide() {

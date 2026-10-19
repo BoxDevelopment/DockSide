@@ -152,23 +152,40 @@ pub struct IslandCfg {
     pub expand_on_hover: bool,
     /// Seconds paused media stays in the island (0 = until the app ends its session).
     pub hide_paused_after: u32,
-    pub battery_alerts: bool,
-    /// Replace the Windows volume / brightness popups.
-    pub volume_hud: bool,
-    pub privacy_indicators: bool,
-    pub notifications: bool,
+
+    // Activities: things that stay in the island while they're happening.
+    /// Media playing in any app.
+    pub now_playing: bool,
+    /// Timers and the stopwatch (the home panel's buttons and the right-click menu).
+    pub timers: bool,
+    /// Browser downloads in progress.
+    pub downloads: bool,
     pub calendar: bool,
     /// Minutes before a meeting that it appears in the island.
     pub calendar_lead: u32,
     /// Subscribed calendar links (.ics / webcal), separated by spaces or commas.
     pub calendar_ics: String,
-    pub bluetooth: bool,
-    pub screenshots: bool,
-    pub downloads: bool,
-    /// Caps Lock and Do Not Disturb changes.
-    pub status_alerts: bool,
     /// Show what Claude Code is doing (needs "Connect Claude Code" in Settings).
     pub claude_code: bool,
+    /// Files dropped on the island are held on a shelf.
+    pub shelf: bool,
+
+    // Alerts: brief pop-ups when something changes.
+    /// Volume keys and scrolling over the island, instead of the Windows popup.
+    pub volume: bool,
+    /// Brightness changes, instead of the Windows popup.
+    pub brightness: bool,
+    pub charging: bool,
+    pub low_battery: bool,
+    pub caps_lock: bool,
+    pub do_not_disturb: bool,
+    pub notifications: bool,
+    pub bluetooth: bool,
+    /// An app starting to use the camera or microphone.
+    pub privacy_indicators: bool,
+    pub screenshots: bool,
+    /// A browser download finishing.
+    pub download_alerts: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -224,6 +241,7 @@ fn parse(user: &str) -> Result<Config> {
     let mut base: toml::Value = toml::from_str(DEFAULT_TOML)?;
     let mut over: toml::Value = toml::from_str(user).context("config.toml is not valid TOML")?;
     migrate_sidebar(&mut over);
+    migrate_island(&mut over);
     merge(&mut base, over);
     let mut cfg: Config = base.try_into().context("config.toml has an invalid value")?;
     for app in &mut cfg.dock.apps {
@@ -245,6 +263,32 @@ fn migrate_sidebar(over: &mut toml::Value) {
     if let Some(v) = finder.remove("sidebar_vibrancy") {
         if v.as_bool() == Some(false) && !finder.contains_key("sidebar") {
             finder.insert("sidebar".into(), toml::Value::String("none".into()));
+        }
+    }
+}
+
+/// Island switches that used to be shared now come in pairs: each half
+/// starts from the old shared value.
+fn migrate_island(over: &mut toml::Value) {
+    let Some(island) = over.get_mut("island").and_then(|i| i.as_table_mut()) else { return };
+    let splits = [
+        ("volume_hud", ["volume", "brightness"]),
+        ("battery_alerts", ["charging", "low_battery"]),
+        ("status_alerts", ["caps_lock", "do_not_disturb"]),
+    ];
+    for (old, new) in splits {
+        if let Some(v) = island.remove(old) {
+            for key in new {
+                if !island.contains_key(key) {
+                    island.insert(key.into(), v.clone());
+                }
+            }
+        }
+    }
+    // `downloads` covered the finished-download alert too.
+    if let Some(v) = island.get("downloads").cloned() {
+        if !island.contains_key("download_alerts") {
+            island.insert("download_alerts".into(), v);
         }
     }
 }
@@ -386,6 +430,17 @@ mod tests {
         assert!(cfg.dock.apps.len() >= 3);
         assert_eq!(cfg.menubar.height, 24.0);
         assert!(cfg.island.enabled);
+    }
+
+    #[test]
+    fn old_island_switches_split() {
+        let cfg = parse("[island]\nvolume_hud = false\nstatus_alerts = false\ndownloads = false\ncaps_lock = true\n").unwrap();
+        let i = &cfg.island;
+        assert!(!i.volume && !i.brightness);
+        // A new key already set wins over the old shared one.
+        assert!(i.caps_lock && !i.do_not_disturb);
+        assert!(!i.downloads && !i.download_alerts);
+        assert!(i.charging && i.low_battery);
     }
 
     #[test]

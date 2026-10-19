@@ -765,7 +765,7 @@ impl App {
             }
         }
         // One low-level hook for volume keys and Caps Lock while the island runs.
-        ISLAND_VOLUME_KEYS.store(self.island.is_some() && self.cfg.island.volume_hud, Ordering::Relaxed);
+        ISLAND_VOLUME_KEYS.store(self.island.is_some() && self.cfg.island.volume, Ordering::Relaxed);
         let want = self.island.is_some();
         match (want, self.island_hook) {
             (true, None) => unsafe {

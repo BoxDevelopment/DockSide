@@ -350,8 +350,9 @@ impl Island {
         let ic = &cfg.island;
         let inbox = Inbox::new(hwnd, msg_signal);
         let stop = Stop::default();
-        let watcher = if ic.screenshots || ic.downloads { sources::watch_folders(inbox.clone()) } else { None };
-        if ic.volume_hud {
+        let watcher =
+            if ic.screenshots || ic.downloads || ic.download_alerts { sources::watch_folders(inbox.clone()) } else { None };
+        if ic.brightness {
             sources::watch_brightness(inbox.clone(), stop.clone());
         }
         if ic.calendar {
@@ -446,6 +447,9 @@ impl Island {
     // --- what to show --------------------------------------------------------
 
     fn media_visible(&self) -> bool {
+        if !self.cfg.now_playing {
+            return false;
+        }
         let Some(now) = &self.now else { return false };
         if now.playing || self.cfg.hide_paused_after == 0 {
             return true;
@@ -533,7 +537,7 @@ impl Island {
 
     fn natural(&self) -> Vec<Persist> {
         let mut list = Vec::new();
-        if self.clock.is_some() {
+        if self.cfg.timers && self.clock.is_some() {
             list.push(Persist::Timer);
         }
         if self.cfg.claude_code && self.claude.current().is_some() {
@@ -542,13 +546,13 @@ impl Island {
         if self.media_visible() {
             list.push(Persist::Media);
         }
-        if !self.downloads.is_empty() {
+        if self.cfg.downloads && !self.downloads.is_empty() {
             list.push(Persist::Download);
         }
         if self.event_soon() {
             list.push(Persist::Calendar);
         }
-        if !self.shelf.is_empty() {
+        if self.cfg.shelf && !self.shelf.is_empty() {
             list.push(Persist::Shelf);
         }
         list
@@ -558,8 +562,10 @@ impl Island {
         match p {
             Panel::Media => self.media_visible(),
             Panel::Claude => self.claude.current().is_some(),
-            Panel::Timer => self.clock.is_some(),
-            Panel::Home | Panel::Shelf | Panel::Calendar => true,
+            Panel::Timer => self.cfg.timers && self.clock.is_some(),
+            Panel::Shelf => self.cfg.shelf,
+            Panel::Calendar => self.cfg.calendar,
+            Panel::Home => true,
         }
     }
 
@@ -648,7 +654,7 @@ impl Island {
                     let n = self.events.iter().filter(|e| e.end > calendar::unix_now()).take(3).count().max(1);
                     (360.0, 48.0 + 44.0 * n as f32)
                 }
-                Panel::Home => (372.0, 134.0),
+                Panel::Home => (372.0, if self.cfg.timers { 134.0 } else { 92.0 }),
         }
     }
 
@@ -840,15 +846,25 @@ impl Island {
     pub fn on_signals(&mut self) {
         for s in self.inbox.drain() {
             match s {
-                Signal::Brightness(b) => self.show_alert(Alert::Brightness(b), 1.6),
-                Signal::Screenshot(p) => self.show_alert(Alert::Screenshot(p), 4.5),
+                Signal::Brightness(b) => {
+                    if self.cfg.brightness {
+                        self.show_alert(Alert::Brightness(b), 1.6);
+                    }
+                }
+                Signal::Screenshot(p) => {
+                    if self.cfg.screenshots {
+                        self.show_alert(Alert::Screenshot(p), 4.5);
+                    }
+                }
                 Signal::DownloadActive(p) => {
                     let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                     match self.downloads.iter_mut().find(|d| d.path == p) {
                         Some(d) => d.size = size,
                         None => {
                             self.downloads.push(Download { path: p, size });
-                            self.nudge();
+                            if self.cfg.downloads {
+                                self.nudge();
+                            }
                         }
                     }
                 }
@@ -856,7 +872,7 @@ impl Island {
                     let had = self.downloads.iter().any(|d| d.path == p);
                     self.downloads.retain(|d| d.path != p);
                     let done = sources::finished_name(&p);
-                    if had && done.is_file() && !sources::is_partial(&done) {
+                    if had && self.cfg.download_alerts && done.is_file() && !sources::is_partial(&done) {
                         self.show_alert(Alert::Downloaded(done), 4.0);
                     }
                 }
@@ -879,10 +895,12 @@ impl Island {
     /// Called every second: battery, mic / camera, Do Not Disturb, download sizes.
     pub fn on_tick(&mut self, b: Option<Battery>) -> bool {
         let prev = std::mem::replace(&mut self.battery, b);
-        if let (true, Some(prev), Some(b)) = (self.cfg.battery_alerts, prev, b) {
+        if let (Some(prev), Some(b)) = (prev, b) {
             if b.charging && !prev.charging {
-                self.show_alert(Alert::Charging(b.percent), 3.2);
-            } else if !b.charging && b.percent < prev.percent && (b.percent == 20 || b.percent == 10) {
+                if self.cfg.charging {
+                    self.show_alert(Alert::Charging(b.percent), 3.2);
+                }
+            } else if self.cfg.low_battery && !b.charging && b.percent < prev.percent && (b.percent == 20 || b.percent == 10) {
                 self.show_alert(Alert::LowBattery(b.percent), 3.2);
             }
         }
@@ -896,7 +914,7 @@ impl Island {
                 self.show_alert(Alert::Privacy { camera: false, app: app.clone() }, 3.0);
             }
         }
-        if self.cfg.status_alerts {
+        if self.cfg.do_not_disturb {
             let d = sources::do_not_disturb();
             if let (Some(old), Some(new)) = (self.dnd, d) {
                 if old != new {
@@ -975,7 +993,7 @@ impl Island {
             self.caps_knob.snap(1.0 - on);
             self.caps_delay = CAPS_SWITCH_DELAY;
         }
-        if self.cfg.status_alerts {
+        if self.cfg.caps_lock {
             self.show_alert(Alert::Caps, 1.4);
         }
     }
@@ -1002,7 +1020,7 @@ impl Island {
     }
 
     pub fn on_wheel(&mut self, delta: i32) {
-        if !self.cfg.volume_hud {
+        if !self.cfg.volume {
             return;
         }
         self.on_volume_key(if delta > 0 { VolumeKey::Up } else { VolumeKey::Down });
@@ -1030,7 +1048,7 @@ impl Island {
 
     /// A file drag over the island (OLE drop target). Returns whether it's accepted.
     pub fn on_drag(&mut self, phase: Phase, paths: &[PathBuf]) -> bool {
-        if self.dragging_out {
+        if self.dragging_out || !self.cfg.shelf {
             return false;
         }
         match phase {
@@ -1261,22 +1279,28 @@ impl Island {
     /// Right-click: timers, the shelf and settings.
     pub fn context_menu(&self) -> IslandEvent {
         let mut entries = Vec::new();
-        for (secs, label) in [(60, "1 Minute"), (300, "5 Minutes"), (600, "10 Minutes"), (1500, "25 Minutes"), (3600, "1 Hour")] {
-            entries.push(Entry::item(format!("Timer: {label}"), Action::Island(IslandCmd::Timer(secs))));
+        if self.cfg.timers {
+            for (secs, label) in [(60, "1 Minute"), (300, "5 Minutes"), (600, "10 Minutes"), (1500, "25 Minutes"), (3600, "1 Hour")] {
+                entries.push(Entry::item(format!("Timer: {label}"), Action::Island(IslandCmd::Timer(secs))));
+            }
+            entries.push(Entry::item("Start Stopwatch", Action::Island(IslandCmd::Stopwatch)));
         }
-        entries.push(Entry::item("Start Stopwatch", Action::Island(IslandCmd::Stopwatch)));
-        if let Some(c) = &self.clock {
+        if let Some(c) = self.clock.as_ref().filter(|_| self.cfg.timers) {
             entries.push(Entry::Separator);
             entries.push(Entry::item(if c.running { "Pause" } else { "Resume" }, Action::Island(IslandCmd::ToggleClock)));
             let cancel = if c.is_timer() { "Cancel Timer" } else { "Reset Stopwatch" };
             entries.push(Entry::item(cancel, Action::Island(IslandCmd::CancelClock)));
         }
-        if !self.shelf.is_empty() {
-            entries.push(Entry::Separator);
+        if self.cfg.shelf && !self.shelf.is_empty() {
+            if !entries.is_empty() {
+                entries.push(Entry::Separator);
+            }
             entries.push(Entry::item("Clear Shelf", Action::Island(IslandCmd::ClearShelf)));
         }
-        entries.push(Entry::Separator);
-        entries.push(Entry::item("Dynamic Island Settings…", Action::OpenSettings(Some(crate::settings::Page::MenuBar))));
+        if !entries.is_empty() {
+            entries.push(Entry::Separator);
+        }
+        entries.push(Entry::item("Dynamic Island Settings…", Action::OpenSettings(Some(crate::settings::Page::Island))));
         entries.push(Entry::item(
             "Hide Dynamic Island",
             Action::SetConfig { table: "island", key: "enabled", value: ConfigValue::Bool(false) },
@@ -1458,6 +1482,8 @@ impl Island {
             desk_pos: self.desk.value,
             desk_vel: self.desk.velocity,
             caps_knob: self.caps_knob.value,
+            home_timers: self.cfg.timers,
+            home_events: self.cfg.calendar,
             clock: self.clock.as_ref(),
             shelf: &self.shelf,
             shelf_icons: &self.shelf_icons,

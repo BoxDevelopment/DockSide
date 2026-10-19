@@ -41,12 +41,14 @@ pub enum Page {
     Dock,
     Finder,
     Desktops,
+    Island,
 }
 
-const PAGES: [(Page, &str); 6] = [
+const PAGES: [(Page, &str); 7] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
+    (Page::Island, "Dynamic Island"),
     (Page::Dock, "Dock"),
     (Page::Finder, "Finder"),
     (Page::Desktops, "Desktops"),
@@ -54,6 +56,33 @@ const PAGES: [(Page, &str); 6] = [
 
 /// macOS accent colors: blue, purple, pink, red, orange, yellow, green, graphite.
 const ACCENTS: [&str; 8] = ["#007AFF", "#A550A7", "#F74F9E", "#FF5257", "#F7821B", "#FFC600", "#62BA46", "#8C8C8C"];
+
+/// The `[island]` on/off setting called `name`.
+fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
+    match name {
+        "enabled" => c.enabled,
+        "always_show" => c.always_show,
+        "expand_on_hover" => c.expand_on_hover,
+        "now_playing" => c.now_playing,
+        "timers" => c.timers,
+        "downloads" => c.downloads,
+        "calendar" => c.calendar,
+        "claude_code" => c.claude_code,
+        "shelf" => c.shelf,
+        "volume" => c.volume,
+        "brightness" => c.brightness,
+        "charging" => c.charging,
+        "low_battery" => c.low_battery,
+        "caps_lock" => c.caps_lock,
+        "do_not_disturb" => c.do_not_disturb,
+        "notifications" => c.notifications,
+        "bluetooth" => c.bluetooth,
+        "privacy_indicators" => c.privacy_indicators,
+        "screenshots" => c.screenshots,
+        "download_alerts" => c.download_alerts,
+        _ => false,
+    }
+}
 
 const CLOCKS: [(&str, &str); 4] = [
     ("9:41 AM", "%-I:%M %p"),
@@ -90,13 +119,8 @@ pub enum Key {
     MbSearch,
     MbControlCenter,
     MbTray,
-    IslandEnabled,
-    IslandAlways,
-    IslandHover,
-    IslandBattery,
-    IslandVolume,
-    IslandNotes,
-    IslandCalendar,
+    /// An on/off setting in `[island]`, by name.
+    Island(&'static str),
     IslandIcs,
     DockEnabled,
     DockSize,
@@ -140,13 +164,7 @@ impl Key {
             Key::MbSearch => ("menubar", "show_search"),
             Key::MbControlCenter => ("menubar", "show_control_center"),
             Key::MbTray => ("menubar", "show_tray"),
-            Key::IslandEnabled => ("island", "enabled"),
-            Key::IslandAlways => ("island", "always_show"),
-            Key::IslandHover => ("island", "expand_on_hover"),
-            Key::IslandBattery => ("island", "battery_alerts"),
-            Key::IslandVolume => ("island", "volume_hud"),
-            Key::IslandNotes => ("island", "notifications"),
-            Key::IslandCalendar => ("island", "calendar"),
+            Key::Island(name) => ("island", name),
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::DockEnabled => ("dock", "enabled"),
             Key::DockSize => ("dock", "tile_size"),
@@ -403,17 +421,43 @@ impl SettingsWindow {
                         Row::Toggle("Tray icons", Key::MbTray),
                     ],
                 },
+            ],
+            Page::Island => vec![
                 Group {
-                    title: Some("Dynamic Island"),
+                    title: None,
                     rows: vec![
-                        Row::Toggle("Show Dynamic Island", Key::IslandEnabled),
-                        Row::Toggle("Always show the island", Key::IslandAlways),
-                        Row::Toggle("Expand when hovered", Key::IslandHover),
-                        Row::Toggle("Volume and brightness", Key::IslandVolume),
-                        Row::Toggle("Notifications", Key::IslandNotes),
-                        Row::Toggle("Upcoming meetings", Key::IslandCalendar),
+                        Row::Toggle("Show Dynamic Island", Key::Island("enabled")),
+                        Row::Toggle("Always show the island", Key::Island("always_show")),
+                        Row::Toggle("Expand when hovered", Key::Island("expand_on_hover")),
+                    ],
+                },
+                Group {
+                    title: Some("Activities"),
+                    rows: vec![
+                        Row::Toggle("Now Playing", Key::Island("now_playing")),
+                        Row::Toggle("Timers and stopwatch", Key::Island("timers")),
+                        Row::Toggle("Downloads in progress", Key::Island("downloads")),
+                        Row::Toggle("Upcoming meetings", Key::Island("calendar")),
                         Row::Text("Calendar link", Key::IslandIcs, "https://…/basic.ics or webcal://…"),
-                        Row::Toggle("Charging and low battery alerts", Key::IslandBattery),
+                        Row::Toggle("Claude Code", Key::Island("claude_code")),
+                        Row::Toggle("File shelf", Key::Island("shelf")),
+                    ],
+                },
+                Group {
+                    title: Some("Alerts"),
+                    rows: vec![
+                        Row::Toggle("Volume", Key::Island("volume")),
+                        Row::Toggle("Brightness", Key::Island("brightness")),
+                        Row::Toggle("Charging", Key::Island("charging")),
+                        Row::Toggle("Low battery", Key::Island("low_battery")),
+                        Row::Toggle("Caps Lock", Key::Island("caps_lock")),
+                        Row::Toggle("Do Not Disturb", Key::Island("do_not_disturb")),
+                        Row::Toggle("Notifications", Key::Island("notifications")),
+                        Row::Toggle("Bluetooth devices", Key::Island("bluetooth")),
+                        Row::Toggle("Camera and microphone", Key::Island("privacy_indicators")),
+                        Row::Toggle("Screenshots", Key::Island("screenshots")),
+                        Row::Toggle("Finished downloads", Key::Island("download_alerts")),
+                        Row::Toggle("Desktop switches", Key::DesktopsIsland),
                     ],
                 },
                 Group {
@@ -493,13 +537,7 @@ impl SettingsWindow {
             Key::MbSearch => m.show_search,
             Key::MbControlCenter => m.show_control_center,
             Key::MbTray => m.show_tray,
-            Key::IslandEnabled => cfg.island.enabled,
-            Key::IslandAlways => cfg.island.always_show,
-            Key::IslandHover => cfg.island.expand_on_hover,
-            Key::IslandBattery => cfg.island.battery_alerts,
-            Key::IslandVolume => cfg.island.volume_hud,
-            Key::IslandNotes => cfg.island.notifications,
-            Key::IslandCalendar => cfg.island.calendar,
+            Key::Island(name) => island_flag(&cfg.island, name),
             Key::DockEnabled => d.enabled,
             Key::DockMag => d.magnification,
             Key::DockAutohide => d.autohide,
@@ -1084,6 +1122,13 @@ fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &windows::Win32:
             let screen = r.inset(4.0, 5.0);
             p.stroke_round(screen, 1.5, white, 1.2);
             p.fill_rect(Rect::new(screen.x, screen.y, screen.w, 2.5), white);
+        }
+        Page::Island => {
+            p.fill_round(r, 5.0, Color::rgba(28, 28, 30, 1.0));
+            let pill = Rect::new(r.cx() - r.w * 0.3, r.y + r.h * 0.3, r.w * 0.6, r.h * 0.22);
+            p.fill_round(pill, pill.h / 2.0, Color::rgba(0, 0, 0, 1.0));
+            p.stroke_round(pill, pill.h / 2.0, white.alpha(0.55), 1.0);
+            p.fill_circle(pill.right() - pill.h * 0.7, pill.cy(), pill.h * 0.22, Color::rgba(48, 209, 88, 1.0));
         }
         Page::Dock => {
             p.fill_round(r, 5.0, Color::rgba(28, 28, 30, 1.0));

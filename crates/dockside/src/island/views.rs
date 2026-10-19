@@ -37,6 +37,9 @@ pub struct View<'a> {
     pub desk_vel: f32,
     /// Caps Lock switch knob position: 0 off, 1 on (overshoots a little).
     pub caps_knob: f32,
+    /// What the home panel shows: quick timer buttons and the next event.
+    pub home_timers: bool,
+    pub home_events: bool,
     pub clock: Option<&'a Clock>,
     pub shelf: &'a [PathBuf],
     pub shelf_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
@@ -579,19 +582,11 @@ pub fn home_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     p.text(&now.format("%A, %b %-d").to_string(), &f.body, Rect::new(r.x + 24.0, r.y + 54.0, 160.0, 18.0), SECONDARY.alpha(a));
 
     // Next event on the right.
-    let card = Rect::new(r.x + r.w * 0.5, r.y + 18.0, r.w * 0.5 - 20.0, 50.0);
-    g::calendar(p, card.x + 10.0, card.y + 12.0, 16.0, WHITE.alpha(a), RED.alpha(a));
-    let unix = super::calendar::unix_now();
-    match v.events.iter().find(|e| e.end > unix) {
-        Some(e) => {
-            p.text(&e.title, &f.alert_title, Rect::new(card.x + 24.0, card.y + 2.0, card.w - 24.0, 20.0), WHITE.alpha(a));
-            let when = if e.ongoing() { "Now".to_string() } else { format!("{} · {}", e.when(), e.clock()) };
-            p.text(&when, &f.small_l, Rect::new(card.x + 24.0, card.y + 22.0, card.w - 24.0, 16.0), SECONDARY.alpha(a));
-            hits.push((card, Hit::Event(0)));
-        }
-        None => {
-            p.text("No more events", &f.body, Rect::new(card.x + 24.0, card.y + 2.0, card.w - 24.0, 20.0), SECONDARY.alpha(a));
-        }
+    if v.home_events {
+        next_event_card(p, r, v, a, hits);
+    }
+    if !v.home_timers {
+        return;
     }
 
     // Quick timers.
@@ -605,6 +600,24 @@ pub fn home_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         p.fill_round(chip, 14.0, Color::gray(255, bg * a));
         p.text(label, &f.chip, chip, if *secs == 0 { WHITE } else { ORANGE }.alpha(a));
         hits.push((chip, Hit::Chip(*secs)));
+    }
+}
+
+fn next_event_card(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let f = v.fonts;
+    let card = Rect::new(r.x + r.w * 0.5, r.y + 18.0, r.w * 0.5 - 20.0, 50.0);
+    g::calendar(p, card.x + 10.0, card.y + 12.0, 16.0, WHITE.alpha(a), RED.alpha(a));
+    let unix = super::calendar::unix_now();
+    match v.events.iter().find(|e| e.end > unix) {
+        Some(e) => {
+            p.text(&e.title, &f.alert_title, Rect::new(card.x + 24.0, card.y + 2.0, card.w - 24.0, 20.0), WHITE.alpha(a));
+            let when = if e.ongoing() { "Now".to_string() } else { format!("{} · {}", e.when(), e.clock()) };
+            p.text(&when, &f.small_l, Rect::new(card.x + 24.0, card.y + 22.0, card.w - 24.0, 16.0), SECONDARY.alpha(a));
+            hits.push((card, Hit::Event(0)));
+        }
+        None => {
+            p.text("No more events", &f.body, Rect::new(card.x + 24.0, card.y + 2.0, card.w - 24.0, 20.0), SECONDARY.alpha(a));
+        }
     }
 }
 

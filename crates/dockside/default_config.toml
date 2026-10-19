@@ -141,16 +141,14 @@ always_show = true
 expand_on_hover = false
 # Seconds paused media stays in the island; 0 keeps it until the app closes.
 hide_paused_after = 60
-# "Charging" and "Low Battery" alerts.
-battery_alerts = true
-# Show volume (media keys, or scroll over the island) and brightness in the
-# island instead of the Windows popup.
-volume_hud = true
-# A green / orange dot while an app uses the camera / microphone.
-privacy_indicators = true
-# Show new Windows notifications as banners from the island. Tip: turn off
-# "Show notification banners" in Windows Settings to avoid seeing them twice.
-notifications = true
+
+# Activities: these stay in the island while they're happening.
+# Media playing in any app.
+now_playing = true
+# Timers and the stopwatch (the home panel's buttons and the right-click menu).
+timers = true
+# Browser downloads in progress.
+downloads = true
 # Upcoming meetings from the Windows calendar (Calendar / Outlook accounts).
 calendar = true
 # Minutes before a meeting that it appears in the island.
@@ -159,16 +157,33 @@ calendar_lead = 10
 # Google Calendar's "Secret address in iCal format". Keep these private:
 # anyone with the link can read your calendar.
 calendar_ics = ""
+# Show what Claude Code is doing, and when it finishes or needs you. Click
+# "Connect Claude Code" in System Settings > Dynamic Island to add its hooks.
+claude_code = true
+# Drop files on the island to hold them on a shelf.
+shelf = true
+
+# Alerts: brief pop-ups when something changes.
+# Volume (media keys, or scroll over the island) and brightness, shown in the
+# island instead of the Windows popup.
+volume = true
+brightness = true
+charging = true
+low_battery = true
+caps_lock = true
+do_not_disturb = true
+# New Windows notifications as banners. Tip: turn off "Show notification
+# banners" in Windows Settings to avoid seeing them twice.
+notifications = true
 # Bluetooth devices connecting, with their battery level.
 bluetooth = true
-# New screenshots (Win+PrtScn, Snipping Tool) and finished browser downloads.
+# A green / orange dot while an app starts using the camera / microphone.
+privacy_indicators = true
+# New screenshots (Win+PrtScn, Snipping Tool).
 screenshots = true
-downloads = true
-# Caps Lock and Do Not Disturb changes.
-status_alerts = true
-# Show what Claude Code is doing, and when it finishes or needs you. Click
-# "Connect Claude Code" in System Settings > Menu Bar to add its hooks.
-claude_code = true
+# A browser download finishing.
+download_alerts = true
+# (Virtual desktop switches: `island` under [desktops].)
 
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]

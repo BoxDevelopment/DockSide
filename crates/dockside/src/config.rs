@@ -87,6 +87,8 @@ pub struct MenuBarCfg {
     pub show_wifi: bool,
     pub show_search: bool,
     pub show_control_center: bool,
+    /// An item listing every app's notification-area (tray) icon.
+    pub show_tray: bool,
     pub desktop_app_name: String,
     pub reserve_space: bool,
 }

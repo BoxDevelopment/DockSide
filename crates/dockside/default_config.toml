@@ -38,6 +38,8 @@ show_battery_percent = false
 show_wifi = true
 show_search = true
 show_control_center = true
+# Lists every app's tray icon (left click = click it, right click = its menu).
+show_tray = true
 # App name shown when the desktop has focus.
 desktop_app_name = "Finder"
 # Keep maximized windows from covering the menu bar.

@@ -28,11 +28,13 @@ pub enum Hit {
     Search,
     ControlCenter,
     Clock,
+    /// Every app's notification-area icon, in a menu.
+    Tray,
 }
 
 impl Hit {
     pub fn opens_menu(self) -> bool {
-        matches!(self, Hit::Logo | Hit::AppName | Hit::Title(_))
+        matches!(self, Hit::Logo | Hit::AppName | Hit::Title(_) | Hit::Tray)
     }
 
     /// The neighbouring menu for Left/Right arrow navigation.
@@ -217,6 +219,10 @@ impl MenuBar {
             rx -= bw;
             hits.push((Rect::new(rx, 0.0, bw, h), Hit::Battery));
         }
+        if self.cfg.show_tray {
+            rx -= 30.0;
+            hits.push((Rect::new(rx, 0.0, 30.0, h), Hit::Tray));
+        }
         self.hits = hits;
     }
 
@@ -270,6 +276,7 @@ impl MenuBar {
                     Hit::Title(i) => p.text(MENU_TITLES[i], &regular, r, c),
                     Hit::Clock => p.text(clock, &regular, r, c),
                     Hit::ControlCenter => draw_control_center(p, r, c),
+                    Hit::Tray => draw_tray(p, r, c),
                     Hit::Search => draw_search(p, r, c),
                     Hit::Wifi => draw_wifi(p, r, c),
                     Hit::Battery => {
@@ -399,6 +406,13 @@ fn draw_search(p: &Painter, r: Rect, c: Color) {
     let (cx, cy) = (r.cx() - 1.2, r.cy() - 1.2);
     p.stroke_circle(cx, cy, 4.6, c, 1.6);
     p.line(cx + 3.4, cy + 3.4, cx + 6.6, cy + 6.6, c, 1.8);
+}
+
+/// The Windows "show hidden icons" chevron.
+fn draw_tray(p: &Painter, r: Rect, c: Color) {
+    let (cx, cy) = (r.cx(), r.cy() + 1.5);
+    p.line(cx - 5.0, cy, cx, cy - 5.0, c, 1.6);
+    p.line(cx, cy - 5.0, cx + 5.0, cy, c, 1.6);
 }
 
 fn draw_control_center(p: &Painter, r: Rect, c: Color) {

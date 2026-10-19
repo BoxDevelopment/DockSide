@@ -187,6 +187,11 @@ pub fn score(item: &Item, q: &str) -> Option<i32> {
     Some(base - item.depth as i32 * 4)
 }
 
+/// Match quality of plain text (lower case) for query `q`, scored like an item name.
+pub fn score_text(text: &str, q: &str) -> Option<i32> {
+    score(&Item::new(text.to_string(), String::new(), Kind::App, 0), q)
+}
+
 /// All query chars appear in order, starting at a word, without big gaps
 /// ("clc" -> "Calculator", but not "calc" -> "VLC ... reset ... cache").
 fn fuzzy(name: &str, q: &str) -> Option<i32> {

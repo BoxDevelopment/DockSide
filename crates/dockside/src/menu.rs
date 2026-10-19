@@ -54,6 +54,10 @@ pub enum Action {
     IslandDrag(Vec<std::path::PathBuf>),
     /// Add / remove the island's hooks in Claude Code's settings.
     ConnectClaude(bool),
+    /// Switch Windows (and DockSide) to dark or light mode.
+    SetDarkMode(bool),
+    /// Click an app's notification-area icon.
+    TrayClick(crate::win::tray::IconId, crate::win::tray::Button),
     Quit,
 }
 
@@ -63,6 +67,16 @@ pub struct MenuItem {
     pub shortcut: Option<Shortcut>,
     pub action: Option<Action>,
     pub checked: bool,
+    /// A small icon before the label.
+    pub icon: Option<std::rc::Rc<crate::gfx::icons::IconPixels>>,
+    /// What a right click does instead (tray icons open their own menu).
+    pub alt_action: Option<Action>,
+}
+
+impl MenuItem {
+    fn new(label: String, shortcut: Option<Shortcut>, action: Option<Action>) -> Self {
+        MenuItem { label, shortcut, action, checked: false, icon: None, alt_action: None }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -73,16 +87,29 @@ pub enum Entry {
 
 impl Entry {
     pub fn item(label: impl Into<String>, action: Action) -> Entry {
-        Entry::Item(MenuItem { label: label.into(), shortcut: None, action: Some(action), checked: false })
+        Entry::Item(MenuItem::new(label.into(), None, Some(action)))
+    }
+
+    /// An item with an icon, and a separate right-click action.
+    pub fn with_icon(
+        label: impl Into<String>,
+        icon: Option<crate::gfx::icons::IconPixels>,
+        action: Action,
+        alt_action: Action,
+    ) -> Entry {
+        let mut item = MenuItem::new(label.into(), None, Some(action));
+        item.icon = icon.map(std::rc::Rc::new);
+        item.alt_action = Some(alt_action);
+        Entry::Item(item)
     }
 
     /// An item that sends `sc` to the focused app.
     pub fn keys(label: impl Into<String>, sc: Shortcut) -> Entry {
-        Entry::Item(MenuItem { label: label.into(), shortcut: Some(sc), action: Some(Action::Keys(sc)), checked: false })
+        Entry::Item(MenuItem::new(label.into(), Some(sc), Some(Action::Keys(sc))))
     }
 
     pub fn disabled(label: impl Into<String>) -> Entry {
-        Entry::Item(MenuItem { label: label.into(), shortcut: None, action: None, checked: false })
+        Entry::Item(MenuItem::new(label.into(), None, None))
     }
 
     pub fn shortcut(mut self, sc: Shortcut) -> Entry {
@@ -131,6 +158,8 @@ pub enum MenuEvent {
 
 const SHADOW: f32 = 20.0;
 const ITEM_H: f32 = 22.0;
+/// Item icon size (tray icons), in points.
+const ICON: f32 = 16.0;
 const SEP_H: f32 = 11.0;
 const PAD_Y: f32 = 5.0;
 const RADIUS: f32 = 7.0;
@@ -162,7 +191,8 @@ impl PopupMenu {
         let mut short_w: f32 = 0.0;
         for e in &entries {
             if let Entry::Item(i) = e {
-                label_w = label_w.max(gfx.measure(&i.label, &font));
+                let icon_w = if i.icon.is_some() { ICON + 6.0 } else { 0.0 };
+                label_w = label_w.max(gfx.measure(&i.label, &font) + icon_w);
                 if let Some(sc) = &i.shortcut {
                     short_w = short_w.max(gfx.measure(&sc.label(mac), &font));
                 }
@@ -244,7 +274,14 @@ impl PopupMenu {
                         if item.checked {
                             p.text("✓", &font, Rect::new(r.x + 8.0, r.y, 14.0, r.h), color);
                         }
-                        p.text(&item.label, &font, Rect::new(r.x + 22.0, r.y, r.w - 40.0, r.h), color);
+                        let mut lx = r.x + 22.0;
+                        if let Some(px) = &item.icon {
+                            if let Some(b) = px.to_bitmap(p.rt) {
+                                p.bitmap(&b, Rect::new(lx, r.cy() - ICON / 2.0, ICON, ICON), 1.0);
+                            }
+                            lx += ICON + 6.0;
+                        }
+                        p.text(&item.label, &font, Rect::new(lx, r.y, r.right() - 18.0 - lx, r.h), color);
                         if let Some(sc) = &item.shortcut {
                             let c = if selected { Color::WHITE } else { theme.text_secondary };
                             p.text(&sc.label(mac), &font_right, Rect::new(r.x, r.y, r.w - 16.0, r.h), c);
@@ -276,11 +313,13 @@ impl PopupMenu {
         changed
     }
 
-    pub fn on_click(&mut self, x: f32, y: f32) -> MenuEvent {
+    /// `right`: a right click, which runs an item's `alt_action` when it has one.
+    pub fn on_click(&mut self, x: f32, y: f32, right: bool) -> MenuEvent {
         if !self.body.contains(x, y) {
             return MenuEvent::Close;
         }
         match self.index_at(x, y).map(|i| &self.entries[i]) {
+            Some(Entry::Item(MenuItem { alt_action: Some(a), .. })) if right => MenuEvent::Activate(a.clone()),
             Some(Entry::Item(MenuItem { action: Some(a), .. })) => MenuEvent::Activate(a.clone()),
             _ => MenuEvent::None,
         }

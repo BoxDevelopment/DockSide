@@ -26,6 +26,12 @@ pub struct IconPixels {
     pub data: Vec<u8>,
 }
 
+impl std::fmt::Debug for IconPixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IconPixels({}x{})", self.width, self.height)
+    }
+}
+
 impl IconPixels {
     pub fn to_bitmap(&self, rt: &ID2D1RenderTarget) -> Option<ID2D1Bitmap> {
         let props = D2D1_BITMAP_PROPERTIES {

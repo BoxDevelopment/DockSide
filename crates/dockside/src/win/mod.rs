@@ -4,10 +4,12 @@ pub mod accent;
 pub mod appbar;
 pub mod apps;
 pub mod composition;
+pub mod controls;
 pub mod glass;
 pub mod startup;
 pub mod system;
 pub mod taskbar;
+pub mod tray;
 
 use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::*;

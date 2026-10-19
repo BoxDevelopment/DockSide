@@ -1,8 +1,11 @@
 //! Spotlight: a floating search panel (Alt+Space by default) for apps, files,
-//! folders, quick arithmetic and a web search fallback.
+//! folders, quick arithmetic, Windows commands and Settings pages, LaTeX
+//! symbols, and a web search fallback.
 
 pub mod calc;
+pub mod commands;
 pub mod index;
+pub mod latex;
 pub mod web;
 
 use std::collections::HashMap;
@@ -35,8 +38,14 @@ const HEADER_H: f32 = 24.0;
 const RADIUS: f32 = 14.0;
 const MAX_APPS: usize = 5;
 const MAX_FILES: usize = 7;
-/// Tallest the panel can get (search field + 12 rows + 4 headers + padding).
-const MAX_H: f32 = SEARCH_H + 12.0 * ROW_H + 4.0 * HEADER_H + 24.0;
+/// Tallest the panel can get (search field + 12 rows + 6 headers + padding).
+const MAX_H: f32 = SEARCH_H + 12.0 * ROW_H + 6.0 * HEADER_H + 24.0;
+const MAX_COMMANDS: usize = 3;
+const MAX_SETTINGS: usize = 3;
+const MAX_LATEX: usize = 12;
+/// Commands and Settings pages need a word-start match to show up.
+const MIN_COMMAND_SCORE: i32 = 640;
+const SETTINGS_APP: &str = "shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
 const ICON_PX: i32 = 64;
 
 #[derive(Clone, Debug)]
@@ -47,6 +56,20 @@ enum RowAction {
     Copy(String),
     Url(String),
     Run(Action),
+    Command(commands::Command),
+    /// Enter copies the code, Shift+Enter the symbol.
+    Latex { code: &'static str, symbol: &'static str },
+}
+
+/// What to draw in place of a file icon.
+#[derive(Clone, Debug)]
+enum Badge {
+    Calculator,
+    Web,
+    /// A Segoe Fluent Icons glyph on a coloured tile.
+    Glyph(char, Color),
+    /// A LaTeX symbol preview.
+    Symbol(&'static str),
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +80,7 @@ struct Row {
     action: RowAction,
     /// Icon loader key and source path.
     icon: Option<(String, String)>,
+    badge: Option<Badge>,
 }
 
 pub enum SpotlightEvent {
@@ -217,8 +241,22 @@ impl Spotlight {
                     RowAction::OpenFile(it.target.clone()),
                 ),
             };
-            Row { section, title: it.name.clone(), subtitle, action, icon: Some(icon_for(it)) }
+            Row { section, title: it.name.clone(), subtitle, action, icon: Some(icon_for(it)), badge: None }
         };
+
+        if let Some(lq) = latex::query(&raw) {
+            for (code, symbol, _) in latex::search(lq, MAX_LATEX) {
+                self.rows.push(Row {
+                    section: "LaTeX",
+                    title: code.to_string(),
+                    subtitle: "Enter copies LaTeX, Shift+Enter the symbol".into(),
+                    action: RowAction::Latex { code, symbol },
+                    icon: None,
+                    badge: Some(Badge::Symbol(symbol)),
+                });
+            }
+            return;
+        }
 
         if let Some(cmd) = crate::island::timer::parse_command(&raw) {
             use crate::island::{timer::Command, IslandCmd};
@@ -232,6 +270,7 @@ impl Spotlight {
                 subtitle: "Runs in the Dynamic Island".into(),
                 action: RowAction::Run(Action::Island(cmd)),
                 icon: None,
+                badge: Some(Badge::Glyph('\u{E916}', Color::rgba(255, 149, 0, 1.0))),
             });
         }
         if let Some(v) = calc::eval(&raw) {
@@ -242,8 +281,25 @@ impl Spotlight {
                 subtitle: "Press Enter to copy".into(),
                 action: RowAction::Copy(result),
                 icon: None,
+                badge: Some(Badge::Calculator),
             });
         }
+        for c in commands::search(&raw, crate::win::controls::low_power_mode(), crate::win::system::is_dark_mode())
+            .into_iter()
+            .filter(|c| c.score >= MIN_COMMAND_SCORE)
+            .take(MAX_COMMANDS)
+        {
+            self.rows.push(Row {
+                section: "Commands",
+                title: c.title,
+                subtitle: c.subtitle.into(),
+                action: RowAction::Command(c.command),
+                icon: None,
+                badge: Some(Badge::Glyph(c.glyph, Color::rgba(99, 99, 102, 1.0))),
+            });
+        }
+        let settings: Vec<_> =
+            commands::settings_pages(&raw).into_iter().filter(|s| s.0 >= MIN_COMMAND_SCORE).take(MAX_SETTINGS).collect();
 
         // Top Hit: a strong app match, else a near-exact file match.
         let best_app = apps.first().map(|a| a.0).unwrap_or(i32::MIN);
@@ -258,6 +314,16 @@ impl Spotlight {
         for (_, it) in apps.iter().take(MAX_APPS) {
             self.rows.push(row("Applications", it));
         }
+        for (_, title, uri) in settings {
+            self.rows.push(Row {
+                section: "System Settings",
+                title: title.to_string(),
+                subtitle: "System Settings".into(),
+                action: RowAction::Url(uri.to_string()),
+                icon: Some((format!("app:{SETTINGS_APP}"), SETTINGS_APP.to_string())),
+                badge: None,
+            });
+        }
         for (_, it) in files.iter().take(MAX_FILES) {
             self.rows.push(row("Folders & Documents", it));
         }
@@ -268,10 +334,11 @@ impl Spotlight {
             subtitle: String::new(),
             action: RowAction::Url(url),
             icon: None,
+            badge: Some(Badge::Web),
         });
     }
 
-    fn run(&self, i: usize, reveal: bool) -> SpotlightEvent {
+    fn run(&self, i: usize, reveal: bool, shift: bool) -> SpotlightEvent {
         let Some(row) = self.rows.get(i) else { return SpotlightEvent::None };
         let action = match &row.action {
             RowAction::OpenFile(p) | RowAction::OpenFolder(p) if reveal => {
@@ -286,6 +353,14 @@ impl Spotlight {
                 crate::finder::fs::copy_text(text);
                 return SpotlightEvent::Close;
             }
+            RowAction::Latex { code, symbol } => {
+                crate::finder::fs::copy_text(if shift { symbol } else { code });
+                return SpotlightEvent::Close;
+            }
+            RowAction::Command(c) => match command_action(*c) {
+                Some(a) => a,
+                None => return SpotlightEvent::Close,
+            },
         };
         SpotlightEvent::Run(action)
     }
@@ -319,7 +394,7 @@ impl Spotlight {
                 self.search(index);
             }
             ESC => return SpotlightEvent::Close,
-            ENTER => return self.run(self.selected, ctrl),
+            ENTER => return self.run(self.selected, ctrl, shift),
             UP => self.selected = self.selected.saturating_sub(1),
             DOWN => self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1)),
             BACK | DEL => {
@@ -385,7 +460,7 @@ impl Spotlight {
 
     pub fn on_click(&mut self, x: f32, y: f32, ctrl: bool) -> SpotlightEvent {
         match self.hits.iter().find(|(r, _)| r.contains(x, y)) {
-            Some(&(_, i)) => self.run(i, ctrl),
+            Some(&(_, i)) => self.run(i, ctrl, false),
             None => SpotlightEvent::None,
         }
     }
@@ -411,6 +486,9 @@ impl Spotlight {
         let title_font = gfx.format(&theme.font, 14.0, Weight::Regular, Align::Leading);
         let sub_font = gfx.format(&theme.font, 12.0, Weight::Regular, Align::Trailing);
         let header_font = gfx.format(&theme.font, 11.0, Weight::Bold, Align::Leading);
+        let glyph_font = gfx.format("Segoe Fluent Icons", 14.0, Weight::Regular, Align::Center);
+        let symbol_font = gfx.format("Cambria Math", 15.0, Weight::Regular, Align::Center);
+        let symbol_small = gfx.format("Cambria Math", 10.0, Weight::Regular, Align::Center);
         let has_backdrop = self.surface.backdrop.is_some();
 
         let query = self.query();
@@ -490,18 +568,34 @@ impl Spotlight {
                             p.bitmap(&b, icon_r, 1.0);
                         }
                     }
-                    None if row.section == "Calculator" => {
+                    None => match &row.badge {
+                    Some(Badge::Calculator) => {
                         p.fill_round(icon_r.inset(1.0, 1.0), 5.0, Color::rgba(255, 149, 0, 1.0));
                         p.line(icon_r.cx() - 5.0, icon_r.cy() - 2.5, icon_r.cx() + 5.0, icon_r.cy() - 2.5, Color::WHITE, 1.8);
                         p.line(icon_r.cx() - 5.0, icon_r.cy() + 2.5, icon_r.cx() + 5.0, icon_r.cy() + 2.5, Color::WHITE, 1.8);
                     }
-                    None => {
+                    Some(Badge::Glyph(g, bg)) => {
+                        p.fill_round(icon_r.inset(1.0, 1.0), 6.0, *bg);
+                        p.text(&g.to_string(), &glyph_font, icon_r, Color::WHITE);
+                    }
+                    Some(Badge::Symbol(sym)) => {
+                        let tile = if sel { Color::gray(255, 0.92) } else if theme.dark { Color::gray(255, 0.12) } else { Color::WHITE };
+                        p.fill_round(icon_r.inset(0.0, 0.0), 6.0, tile);
+                        if !sel && !theme.dark {
+                            p.stroke_round(icon_r.inset(0.25, 0.25), 6.0, Color::gray(0, 0.12), 0.5);
+                        }
+                        let ink = if sel || !theme.dark { Color::gray(0, 0.88) } else { Color::WHITE };
+                        let font = if sym.chars().count() > 2 { &symbol_small } else { &symbol_font };
+                        p.text(sym, font, icon_r.inset(-6.0, 0.0), ink);
+                    }
+                    Some(Badge::Web) | None => {
                         // Web: a globe.
                         let (cx, cy) = (icon_r.cx(), icon_r.cy());
                         p.stroke_circle(cx, cy, 10.0, if sel { Color::WHITE } else { theme.accent }, 1.6);
                         p.line(cx - 10.0, cy, cx + 10.0, cy, if sel { Color::WHITE } else { theme.accent }, 1.2);
                         p.line(cx, cy - 10.0, cx, cy + 10.0, if sel { Color::WHITE } else { theme.accent }, 1.2);
                     }
+                    },
                 }
                 let title_w = if row.subtitle.is_empty() { r.w - 60.0 } else { r.w * 0.55 };
                 p.text(&row.title, &title_font, Rect::new(icon_r.right() + 12.0, r.y, title_w, r.h), tc);
@@ -518,6 +612,64 @@ impl Spotlight {
             log!("spotlight render failed: {e}");
         }
     }
+}
+
+/// Runs a command: an app `Action` for the shell-level ones, the rest directly.
+fn command_action(c: commands::Command) -> Option<Action> {
+    use crate::win::controls;
+    use crate::win::system::Shortcut;
+    use commands::{Command, PowerMode};
+    const WIN_D: Shortcut = Shortcut::new("w", b'D' as u16, "D");
+    const WIN_SHIFT_S: Shortcut = Shortcut::new("ws", b'S' as u16, "S");
+    let volume = |level: f32| {
+        let _ = crate::island::sources::set_volume(level);
+    };
+    Some(match c {
+        Command::Lock => Action::Lock,
+        Command::Sleep => Action::Sleep,
+        Command::Restart => Action::Restart,
+        Command::ShutDown => Action::ShutDown,
+        Command::LogOut => Action::LogOut,
+        Command::EmptyTrash => Action::EmptyTrash,
+        Command::ShowDesktop => Action::Keys(WIN_D),
+        Command::Screenshot => Action::Keys(WIN_SHIFT_S),
+        Command::TaskManager => Action::Launch { path: "taskmgr.exe".into(), args: None },
+        Command::ControlPanel => Action::Launch { path: "control.exe".into(), args: None },
+        Command::DockSideSettings => Action::OpenSettings(None),
+        Command::LowPowerMode(on) => {
+            controls::set_power_mode(if on { PowerMode::Efficiency } else { PowerMode::Balanced });
+            return None;
+        }
+        Command::PowerMode(m) => {
+            controls::set_power_mode(m);
+            return None;
+        }
+        Command::DarkMode(dark) => Action::SetDarkMode(dark),
+        Command::Mute(mute) => {
+            use crate::island::sources::{press_volume, volume as current, VolumeKey};
+            if current().is_some_and(|(_, muted)| muted != mute) {
+                let _ = press_volume(VolumeKey::Mute);
+            }
+            return None;
+        }
+        Command::Volume(n) => {
+            volume(n as f32 / 100.0);
+            return None;
+        }
+        Command::VolumeStep(d) => {
+            let now = crate::island::sources::volume().map(|v| v.0).unwrap_or(0.5);
+            volume(now + d as f32 / 100.0);
+            return None;
+        }
+        Command::Brightness(n) => {
+            controls::brightness(Some(n), 0);
+            return None;
+        }
+        Command::BrightnessStep(d) => {
+            controls::brightness(None, d);
+            return None;
+        }
+    })
 }
 
 impl Drop for Spotlight {

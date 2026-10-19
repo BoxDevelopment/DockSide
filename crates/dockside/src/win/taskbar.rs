@@ -19,7 +19,8 @@ fn state_file() -> std::path::PathBuf {
 fn tray_windows() -> Vec<HWND> {
     let mut out = Vec::new();
     unsafe {
-        if let Ok(h) = FindWindowW(w!("Shell_TrayWnd"), None) {
+        // Not FindWindow: DockSide's own tray host shares the class.
+        if let Some(h) = crate::win::tray::explorer_tray() {
             out.push(h);
         }
         let mut after = HWND::default();

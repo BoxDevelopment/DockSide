@@ -17,6 +17,8 @@ hidden while DockSide runs and is always restored when it exits.
 - Logo menu: About, System Settings, App Store, Force Quit, Sleep / Restart / Shut Down, Lock, Log Out
 - Bold name of the focused app, plus File / Edit / View / Window / Help menus that drive the
   focused app (Copy, Paste, New Window, Minimize, Zoom, tiling, a window list, and so on)
+- A tray item (the Windows "^" chevron) listing every app's notification-area icon: left click
+  clicks it, right click opens the app's own tray menu
 - Status items: battery, Wi-Fi, Search, Control Center and a clock, mapped to the Windows
   equivalents (Win+A, Win+S, Win+N)
 - Slide across titles with a menu open, or use the arrow keys, Enter and Esc
@@ -75,6 +77,10 @@ hidden while DockSide runs and is always restored when it exits.
   Pictures, Music and Movies (indexed in the background)
 - Ranks exact and prefix matches first, then word starts and initials ("vsc" → Visual Studio Code)
 - Inline calculator ("12*4.5+3" → 57; Enter copies), plus a web-search fallback
+- Commands: "brightness 60", "volume 30", "mute", "low power mode", "dark mode", "lock", "sleep",
+  "screenshot", "task manager"… and every Windows Settings page ("bluetooth", "wallpaper", "windows update")
+- LaTeX: start with `\`, "tex " or "latex " ("\alpha", "tex arrow", "latex matrix") to search ~200
+  KaTeX commands with previews; Enter copies the code (for Notion equations), Shift+Enter the symbol
 - Enter opens; folders open in Finder; Ctrl+Enter reveals the item in Finder; Esc clears, then closes
 
 **Platform**
@@ -159,9 +165,9 @@ crates/dockside/src
 - [x] Dynamic Island: Now Playing, HUDs, timers, shelf, calendar, notifications, device and status alerts
 - [ ] Dynamic Island: reply to notifications, Live Activities from other apps
 - [x] A System Settings-style GUI for the config, plus Start at login
-- [ ] Top Tray thing: Add a tray item that windows has (showing all tray'ed apps)
-- [ ] Latex list in spotlight for notion
-- [ ] WIndows commands in Spotlight e.g brightness, low power mode, or just opening every page in the settings app.
+- [x] Menu bar tray item listing every app's notification-area icon
+- [x] Spotlight: LaTeX symbol lookup (for Notion equations)
+- [x] Spotlight: Windows commands (brightness, volume, Low Power Mode, dark mode, lock…) and every Settings page
 ## Notes
 
 - Liquid Glass refraction (`[general] glass_refraction`) hides glass surfaces, and Finder windows with a glass sidebar, from screenshots and screen sharing; turn it off in Settings → Appearance to fall back to non-bending glass.

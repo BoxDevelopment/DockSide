@@ -246,6 +246,12 @@ fn execute(action: Action) {
             }
         }
         Action::Lock => system::lock(),
+        Action::TrayClick(id, button) => crate::win::tray::click(id, button),
+        Action::SetDarkMode(dark) => {
+            crate::win::controls::set_dark_mode(dark);
+            // Don't wait for the system-wide broadcast to come back around.
+            with_app(|app| app.timer(TIMER_REBUILD, 50));
+        }
         Action::OpenConfig => system::open(&config::path().to_string_lossy()),
         Action::ConnectClaude(on) => {
             use crate::island::claude;
@@ -573,6 +579,13 @@ impl App {
         } else {
             taskbar::restore();
         }
+        if self.cfg.menubar.enabled && self.cfg.menubar.show_tray {
+            if let Err(e) = crate::win::tray::start() {
+                log!("tray host failed: {e}");
+            }
+        } else {
+            crate::win::tray::stop();
+        }
         if self.cfg.menubar.enabled {
             match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
                 Ok(m) => {
@@ -774,6 +787,7 @@ impl App {
         if let Some(mb) = &mut self.menubar {
             mb.tick();
         }
+        crate::win::tray::keep_on_top();
         if self.island.as_mut().is_some_and(|i| i.on_tick(system::battery())) {
             self.animate();
         }
@@ -1195,6 +1209,21 @@ impl App {
             Hit::Logo => menu::apple_menu(),
             Hit::AppName => menu::app_menu(&ctx),
             Hit::Title(i) => menu::title_menu(i, &ctx),
+            Hit::Tray => {
+                use crate::win::tray::{self, Button};
+                let px = (16.0 * self.monitor.scale).round() as i32;
+                let icons = tray::icons(px);
+                if icons.is_empty() {
+                    vec![Entry::disabled("No tray icons")]
+                } else {
+                    icons
+                        .into_iter()
+                        .map(|(id, tip, pixels)| {
+                            Entry::with_icon(tip, pixels, Action::TrayClick(id, Button::Left), Action::TrayClick(id, Button::Right))
+                        })
+                        .collect()
+                }
+            }
             _ => return,
         };
         self.open_menu(entries, placement, MenuSource::MenuBar(hit));
@@ -1476,7 +1505,7 @@ impl App {
                     m.render(&self.gfx, &self.theme);
                 }
             }
-            WM_LBUTTONUP | WM_RBUTTONUP => match m.on_click(x, y) {
+            WM_LBUTTONUP | WM_RBUTTONUP => match m.on_click(x, y, msg == WM_RBUTTONUP) {
                 MenuEvent::Activate(a) => {
                     self.close_menu();
                     push(a);
@@ -1667,6 +1696,7 @@ impl Drop for App {
         self.island = None;
         self.dock = None;
         self.menubar = None;
+        crate::win::tray::stop();
         taskbar::restore();
     }
 }

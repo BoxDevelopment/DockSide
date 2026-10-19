@@ -11,6 +11,7 @@ pub mod web;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicIsize;
+use std::sync::{Arc, OnceLock};
 
 use windows::core::Result;
 use windows::Win32::Foundation::RECT;
@@ -100,6 +101,9 @@ pub struct Spotlight {
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     /// Web search engine settings, captured when the panel opens.
     web: crate::config::SpotlightCfg,
+    /// Whether low power mode is on, read in the background when the panel
+    /// opens: asking Windows takes ~90ms, far too slow to do per keystroke.
+    low_power: Arc<OnceLock<bool>>,
     pub tracking: bool,
     pub dirty: bool,
 }
@@ -174,6 +178,11 @@ impl Spotlight {
         let rect = RECT { left, top, right: left + w, bottom: top + h };
         let surface = Surface::new(gfx, rect, s, cfg.menubar.backdrop.for_panels(), theme.menu_tint)?;
         SPOTLIGHT_HWND.store(surface.content.0 as isize, std::sync::atomic::Ordering::Relaxed);
+        let low_power = Arc::new(OnceLock::new());
+        let slot = low_power.clone();
+        std::thread::spawn(move || {
+            let _ = slot.set(crate::win::controls::low_power_mode());
+        });
         Ok(Self {
             surface,
             text: Vec::new(),
@@ -184,6 +193,7 @@ impl Spotlight {
             hits: Vec::new(),
             bitmaps: HashMap::new(),
             web: cfg.spotlight.clone(),
+            low_power,
             tracking: false,
             dirty: true,
         })
@@ -284,7 +294,8 @@ impl Spotlight {
                 badge: Some(Badge::Calculator),
             });
         }
-        for c in commands::search(&raw, crate::win::controls::low_power_mode(), crate::win::system::is_dark_mode())
+        let low_power = self.low_power.get().copied().unwrap_or(false);
+        for c in commands::search(&raw, low_power, crate::win::system::is_dark_mode())
             .into_iter()
             .filter(|c| c.score >= MIN_COMMAND_SCORE)
             .take(MAX_COMMANDS)

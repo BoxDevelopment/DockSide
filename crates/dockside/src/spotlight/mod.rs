@@ -14,9 +14,9 @@ use std::sync::atomic::AtomicIsize;
 use std::sync::{Arc, OnceLock};
 
 use windows::core::Result;
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
-use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetForegroundWindow};
 
 use self::index::{Index, Item, Kind};
 use crate::chrome::SHADOW;
@@ -104,8 +104,19 @@ pub struct Spotlight {
     /// Whether low power mode is on, read in the background when the panel
     /// opens: asking Windows takes ~90ms, far too slow to do per keystroke.
     low_power: Arc<OnceLock<bool>>,
+    /// Where the cursor last was, in screen pixels. Windows sends mouse moves
+    /// when results appear under a still cursor; only real moves pick a row.
+    cursor: POINT,
     pub tracking: bool,
     pub dirty: bool,
+}
+
+fn cursor_pos() -> POINT {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    pt
 }
 
 fn icon_for(item: &Item) -> (String, String) {
@@ -194,6 +205,7 @@ impl Spotlight {
             bitmaps: HashMap::new(),
             web: cfg.spotlight.clone(),
             low_power,
+            cursor: cursor_pos(),
             tracking: false,
             dirty: true,
         })
@@ -461,6 +473,11 @@ impl Spotlight {
     }
 
     pub fn on_move(&mut self, x: f32, y: f32) {
+        let pos = cursor_pos();
+        if pos == self.cursor {
+            return;
+        }
+        self.cursor = pos;
         if let Some(&(_, i)) = self.hits.iter().find(|(r, _)| r.contains(x, y)) {
             if i != self.selected {
                 self.selected = i;

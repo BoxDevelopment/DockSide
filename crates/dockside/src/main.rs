@@ -34,6 +34,11 @@ fn main() {
         win::taskbar::restore();
         return;
     }
+    // Run by Claude Code's hooks: hand the event to the running instance and exit.
+    if std::env::args().any(|a| a == "--claude-hook") {
+        island::claude::relay();
+        return;
+    }
 
     unsafe {
         let mutex = CreateMutexW(None, true, w!("Local\\DockSide.SingleInstance"));

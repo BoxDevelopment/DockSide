@@ -8,10 +8,11 @@ use std::path::PathBuf;
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 
 use super::calendar::CalEvent;
+use super::claude::{Session, State};
 use super::glyphs as g;
 use super::media::NowPlaying;
 use super::timer::Clock;
-use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, Persist, BLUE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
+use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, Persist, BLUE, CLAUDE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 
@@ -39,6 +40,16 @@ pub struct View<'a> {
     pub alert_img: Option<&'a ID2D1Bitmap>,
     pub accent: Color,
     pub time: f32,
+    pub claude: Option<&'a Session>,
+    pub claude_more: usize,
+}
+
+/// The spark turns while Claude works and holds still while it waits on you.
+fn spark_angle(v: &View) -> f32 {
+    match v.claude.map(|s| &s.state) {
+        Some(State::Waiting(_)) | None => 0.0,
+        _ => v.time * 1.6,
+    }
 }
 
 type Hits = Vec<(Rect, Hit)>;
@@ -84,6 +95,16 @@ pub fn compact(p: &Painter, r: Rect, which: Persist, v: &View, a: f32, hits: &mu
             let tr = Rect::new(r.x, r.y, r.w - h * 0.5 - 2.0, h);
             p.text(&when, &v.fonts.alert_r, tr, if e.starts_in() <= 300 { ORANGE } else { SECONDARY }.alpha(a));
         }
+        Persist::Claude => {
+            let Some(s) = v.claude else { return };
+            let waiting = matches!(s.state, State::Waiting(_));
+            g::spark(p, icon_cx, r.cy(), h * 0.72, spark_angle(v), CLAUDE.alpha(a));
+            let time = fmt_time(s.elapsed());
+            let tw = p.gfx.measure(&time, &v.fonts.small_r) + 6.0;
+            let color = if waiting { ORANGE } else { WHITE };
+            p.text(&s.status(), &v.fonts.alert, Rect::new(inner.x, r.y, r.w - (inner.x - r.x) - tw - h * 0.5, h), color.alpha(a));
+            p.text_tabular(&time, &v.fonts.small_r, Rect::new(r.x, r.y, r.w - h * 0.5 - 2.0, h), SECONDARY.alpha(a));
+        }
         Persist::Shelf => {
             g::tray(p, icon_cx, r.cy(), h * 0.68, WHITE.alpha(a));
             let n = v.shelf.len();
@@ -123,6 +144,7 @@ pub fn bubble(p: &Painter, c: Rect, which: Persist, v: &View, a: f32) {
         Persist::Download => spinner(p, cx, cy, d * 0.22, v.time, BLUE.alpha(a)),
         Persist::Calendar => g::calendar(p, cx, cy, d * 0.6, WHITE.alpha(a), RED.alpha(a)),
         Persist::Shelf => g::tray(p, cx, cy, d * 0.6, WHITE.alpha(a)),
+        Persist::Claude => g::spark(p, cx, cy, d * 0.62, spark_angle(v), CLAUDE.alpha(a)),
     }
 }
 
@@ -255,6 +277,22 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             if !n.body.is_empty() {
                 p.text(&n.body, &f.alert, Rect::new(tx, cy + 7.0, tw, 18.0), Color::gray(255, 0.75 * a));
             }
+            hits.push((r, Hit::AlertBody));
+        }
+        Alert::ClaudeDone { project, secs, tools } => {
+            g::spark(p, icon_cx, cy, h * 0.72, 0.0, CLAUDE.alpha(a));
+            let what = if project.is_empty() { "Claude finished".to_string() } else { format!("{project} is done") };
+            p.text(&what, &f.alert, Rect::new(text_x, r.y, r.w - (text_x - r.x) - 110.0, r.h), WHITE.alpha(a));
+            let stat = if *tools > 0 { format!("{} · {} tools", fmt_time(*secs), tools) } else { fmt_time(*secs) };
+            p.text_tabular(&stat, &f.alert_b, Rect::new(r.x, r.y, r.w - right_inset, r.h), GREEN.alpha(a));
+            hits.push((r, Hit::AlertBody));
+        }
+        Alert::ClaudeNeeds { project, message } => {
+            g::spark(p, icon_cx, cy, h * 0.72, 0.0, ORANGE.alpha(a));
+            let msg = if message.is_empty() { "Claude needs your input" } else { message };
+            let pw = if project.is_empty() { 0.0 } else { p.gfx.measure(project, &f.alert_r) + 10.0 };
+            p.text(msg, &f.alert, Rect::new(text_x, r.y, r.w - (text_x - r.x) - pw - right_inset, r.h), WHITE.alpha(a));
+            p.text(project, &f.alert_r, Rect::new(r.x, r.y, r.w - right_inset, r.h), SECONDARY.alpha(a));
             hits.push((r, Hit::AlertBody));
         }
         Alert::TimerDone => {
@@ -437,6 +475,46 @@ pub fn calendar_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         let sub = if e.location.is_empty() { e.span() } else { format!("{} · {}", e.span(), e.location) };
         p.text(&sub, &f.small_l, Rect::new(tx, row.y + 21.0, row.w - 32.0, 15.0), SECONDARY.alpha(a));
         hits.push((row, Hit::Event(i)));
+    }
+}
+
+pub fn claude_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let _ = hits;
+    let Some(s) = v.claude else { return };
+    let f = v.fonts;
+    let waiting = matches!(s.state, State::Waiting(_));
+    g::spark(p, r.x + 30.0, r.y + 26.0, 18.0, spark_angle(v), CLAUDE.alpha(a));
+    p.text("Claude Code", &f.header, Rect::new(r.x + 46.0, r.y + 17.0, 120.0, 18.0), WHITE.alpha(a));
+    let more = if v.claude_more > 0 { format!("  +{} more", v.claude_more) } else { String::new() };
+    p.text(&format!("{}{more}", s.project), &f.small_r, Rect::new(r.x, r.y + 18.0, r.w - 22.0, 16.0), SECONDARY.alpha(a));
+
+    // What it's doing now.
+    let (line, color) = match &s.state {
+        State::Waiting(m) => (if m.is_empty() { "Needs your input".to_string() } else { m.clone() }, ORANGE),
+        _ => (s.status(), WHITE),
+    };
+    p.text(&line, &f.title, Rect::new(r.x + 22.0, r.y + 46.0, r.w - 44.0, 22.0), color.alpha(a));
+    if !s.prompt.is_empty() {
+        let quoted = format!("\u{201C}{}\u{201D}", s.prompt);
+        p.text(&quoted, &f.body, Rect::new(r.x + 22.0, r.y + 70.0, r.w - 44.0, 18.0), SECONDARY.alpha(a));
+    }
+
+    // Elapsed and tool count, with a shimmer bar while it works.
+    let y = r.bottom() - 26.0;
+    let stat = format!("{} · {} tool{}", fmt_time(s.elapsed()), s.tools, if s.tools == 1 { "" } else { "s" });
+    p.text_tabular(&stat, &f.small_l, Rect::new(r.x + 22.0, y - 8.0, 140.0, 16.0), SECONDARY.alpha(a));
+    let bar = Rect::new(r.x + 150.0, y - 2.0, r.w - 172.0, 4.0);
+    p.fill_round(bar, 2.0, Color::gray(255, 0.12 * a));
+    if !waiting {
+        let t = (v.time * 0.6).fract();
+        let w = bar.w * 0.28;
+        let x = bar.x - w + (bar.w + w) * t;
+        let seg = Rect::new(x.max(bar.x), bar.y, (x + w).min(bar.right()) - x.max(bar.x), bar.h);
+        if seg.w > 0.0 {
+            p.fill_round(seg, 2.0, CLAUDE.alpha(0.9 * a));
+        }
+    } else {
+        p.fill_round(bar, 2.0, ORANGE.alpha(0.6 * a));
     }
 }
 

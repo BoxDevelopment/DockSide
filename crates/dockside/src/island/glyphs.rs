@@ -310,6 +310,19 @@ pub fn bell(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
     p.fill_circle(cx, cy + 6.2 * k, 1.8 * k, c);
 }
 
+/// A starburst of rounded rays (Claude Code), turned by `angle` radians.
+pub fn spark(p: &Painter, cx: f32, cy: f32, s: f32, angle: f32, c: Color) {
+    const RAYS: usize = 10;
+    let r = s * 0.5;
+    for i in 0..RAYS {
+        let a = angle + i as f32 * std::f32::consts::TAU / RAYS as f32;
+        // Uneven rays give it a hand-drawn feel.
+        let len = r * [1.0, 0.78, 0.92, 0.72, 0.96][i % 5];
+        let (sx, sy) = (a.sin(), -a.cos());
+        p.line(cx + sx * r * 0.22, cy + sy * r * 0.22, cx + sx * len, cy + sy * len, c, (s * 0.13).max(1.2));
+    }
+}
+
 /// A battery outline filled to `pct`.
 pub fn battery(p: &Painter, right: f32, cy: f32, pct: u8, c: Color, a: f32) {
     let bw = 25.0;

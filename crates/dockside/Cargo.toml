@@ -10,6 +10,8 @@ anyhow = "1"
 chrono = "0.4"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
+# Claude Code hook events and its settings.json (key order kept when editing).
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 toml_edit = "0.22"
 # Needed by windows-rs `#[implement]` (Finder drop target).
@@ -28,6 +30,8 @@ features = [
     "System",
     "UI",
     "UI_Notifications",
+    "Web",
+    "Web_Http",
     "UI_Notifications_Management",
     "UI_Composition",
     "UI_Composition_Desktop",

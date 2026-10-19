@@ -136,6 +136,10 @@ notifications = true
 calendar = true
 # Minutes before a meeting that it appears in the island.
 calendar_lead = 10
+# Calendar links to subscribe to (.ics or webcal://), separated by spaces, e.g.
+# Google Calendar's "Secret address in iCal format". Keep these private:
+# anyone with the link can read your calendar.
+calendar_ics = ""
 # Bluetooth devices connecting, with their battery level.
 bluetooth = true
 # New screenshots (Win+PrtScn, Snipping Tool) and finished browser downloads.
@@ -143,6 +147,9 @@ screenshots = true
 downloads = true
 # Caps Lock and Do Not Disturb changes.
 status_alerts = true
+# Show what Claude Code is doing, and when it finishes or needs you. Click
+# "Connect Claude Code" in System Settings > Menu Bar to add its hooks.
+claude_code = true
 
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]

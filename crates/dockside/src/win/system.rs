@@ -205,6 +205,12 @@ pub fn confirm(title: &str, text: &str) -> bool {
     r == IDOK
 }
 
+pub fn notice(title: &str, text: &str) {
+    unsafe {
+        MessageBoxW(HWND::default(), &HSTRING::from(text), &HSTRING::from(title), MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    }
+}
+
 pub fn lock() {
     unsafe {
         let _ = LockWorkStation();

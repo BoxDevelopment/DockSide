@@ -247,6 +247,31 @@ fn execute(action: Action) {
         }
         Action::Lock => system::lock(),
         Action::OpenConfig => system::open(&config::path().to_string_lossy()),
+        Action::ConnectClaude(on) => {
+            use crate::island::claude;
+            let path = claude::settings_path();
+            if on {
+                let ask = format!(
+                    "DockSide will add hooks to {} so the Dynamic Island can show what Claude Code is doing.\n\n\
+                     Each step Claude takes runs DockSide briefly to pass the event along. Your other settings are kept, \
+                     and a backup is saved next to the file.",
+                    path.display()
+                );
+                if system::confirm("Connect Claude Code", &ask) {
+                    let exe = std::env::current_exe().unwrap_or_default();
+                    match claude::connect(&exe) {
+                        Ok(_) => system::notice(
+                            "Claude Code connected",
+                            "New Claude Code sessions will show up in the Dynamic Island. Sessions that are already open pick it up after a restart.",
+                        ),
+                        Err(e) => system::notice("Couldn't connect Claude Code", &format!("{e:#}")),
+                    }
+                }
+            } else if let Err(e) = claude::disconnect() {
+                system::notice("Couldn't disconnect Claude Code", &format!("{e:#}"));
+            }
+            with_app(|app| app.mark_settings_dirty());
+        }
         Action::Island(cmd) => {
             with_app(|app| {
                 if let Some(i) = &mut app.island {
@@ -1211,6 +1236,12 @@ impl App {
     fn on_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         if hwnd == self.msg_hwnd {
             match msg {
+                WM_COPYDATA => {
+                    if let (Some(i), Some(json)) = (self.island.as_mut(), crate::island::claude::receive(lp)) {
+                        i.on_claude(&json);
+                        self.animate();
+                    }
+                }
                 WM_APP_FRAME => self.on_frame(),
                 WM_TIMER => {
                     let id = wp.0;

@@ -80,6 +80,7 @@ pub enum Key {
     IslandVolume,
     IslandNotes,
     IslandCalendar,
+    IslandIcs,
     DockEnabled,
     DockSize,
     DockMag,
@@ -120,6 +121,7 @@ impl Key {
             Key::IslandVolume => ("island", "volume_hud"),
             Key::IslandNotes => ("island", "notifications"),
             Key::IslandCalendar => ("island", "calendar"),
+            Key::IslandIcs => ("island", "calendar_ics"),
             Key::DockEnabled => ("dock", "enabled"),
             Key::DockSize => ("dock", "tile_size"),
             Key::DockMag => ("dock", "magnification"),
@@ -156,6 +158,7 @@ enum Hit {
     OpenConfig,
     OpenLog,
     Field(Key),
+    ConnectClaude(bool),
 }
 
 enum Row {
@@ -372,8 +375,23 @@ impl SettingsWindow {
                         Row::Toggle("Volume and brightness", Key::IslandVolume),
                         Row::Toggle("Notifications", Key::IslandNotes),
                         Row::Toggle("Upcoming meetings", Key::IslandCalendar),
+                        Row::Text("Calendar link", Key::IslandIcs, "https://…/basic.ics or webcal://…"),
                         Row::Toggle("Charging and low battery alerts", Key::IslandBattery),
                     ],
+                },
+                Group {
+                    title: Some("Claude Code"),
+                    rows: if crate::island::claude::connected() {
+                        vec![
+                            Row::Info("Status", "Connected: sessions show in the island".to_string()),
+                            Row::Buttons("", vec![("Disconnect", Hit::ConnectClaude(false)), ("Reconnect", Hit::ConnectClaude(true))]),
+                        ]
+                    } else {
+                        vec![
+                            Row::Info("Status", "Not connected".to_string()),
+                            Row::Buttons("", vec![("Connect Claude Code", Hit::ConnectClaude(true))]),
+                        ]
+                    },
                 },
             ],
             Page::Dock => vec![
@@ -502,6 +520,7 @@ impl SettingsWindow {
     fn text_value(key: Key, cfg: &Config) -> String {
         match key {
             Key::CustomSearchUrl => cfg.spotlight.custom_search_url.clone(),
+            Key::IslandIcs => cfg.island.calendar_ics.clone(),
             _ => String::new(),
         }
     }
@@ -511,7 +530,8 @@ impl SettingsWindow {
     fn commit(&mut self, cfg: &Config) -> SettingsEvent {
         let Some(ed) = &mut self.editing else { return SettingsEvent::None };
         let text = ed.field.string().trim().to_string();
-        if ed.key == Key::CustomSearchUrl && !text.is_empty() && !web::valid_template(&text) {
+        let bad_link = ed.key == Key::IslandIcs && !crate::island::calendar_links_valid(&text);
+        if bad_link || ed.key == Key::CustomSearchUrl && !text.is_empty() && !web::valid_template(&text) {
             ed.invalid = true;
             self.dirty = true;
             return SettingsEvent::None;
@@ -669,6 +689,7 @@ impl SettingsWindow {
             Hit::AddApp => Action::AddDockApp,
             Hit::OpenConfig => Action::OpenConfig,
             Hit::OpenLog => Action::Open(crate::config::dir().join("dockside.log").display().to_string()),
+            Hit::ConnectClaude(on) => Action::ConnectClaude(on),
             Hit::Slider(_) => return SettingsEvent::None,
         };
         SettingsEvent::Action(action)
@@ -898,7 +919,11 @@ impl SettingsWindow {
                                             p.text(&e.field.string(), &regular, tr, theme.text);
                                         }
                                         None => {
-                                            let value = Self::text_value(*key, cfg);
+                                            let mut value = Self::text_value(*key, cfg);
+                                            // A calendar link is a secret: show where it points, not the link.
+                                            if *key == Key::IslandIcs && !value.is_empty() {
+                                                value = crate::island::calendar_links_summary(&value);
+                                            }
                                             if value.is_empty() {
                                                 p.text(placeholder, &regular, tr, theme.text_disabled);
                                             } else {

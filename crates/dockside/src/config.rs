@@ -131,11 +131,15 @@ pub struct IslandCfg {
     pub calendar: bool,
     /// Minutes before a meeting that it appears in the island.
     pub calendar_lead: u32,
+    /// Subscribed calendar links (.ics / webcal), separated by spaces or commas.
+    pub calendar_ics: String,
     pub bluetooth: bool,
     pub screenshots: bool,
     pub downloads: bool,
     /// Caps Lock and Do Not Disturb changes.
     pub status_alerts: bool,
+    /// Show what Claude Code is doing (needs "Connect Claude Code" in Settings).
+    pub claude_code: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]

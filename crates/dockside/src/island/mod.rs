@@ -18,7 +18,9 @@
 
 mod bluetooth;
 mod calendar;
+pub mod claude;
 mod glyphs;
+mod ics;
 pub mod media;
 mod notifications;
 mod shelf;
@@ -83,6 +85,7 @@ const RED: Color = Color::rgba(255, 69, 58, 1.0);
 const ORANGE: Color = Color::rgba(255, 159, 10, 1.0);
 const BLUE: Color = Color::rgba(10, 132, 255, 1.0);
 const PURPLE: Color = Color::rgba(125, 122, 255, 1.0);
+const CLAUDE: Color = Color::rgba(217, 119, 87, 1.0);
 const WHITE: Color = Color::gray(255, 0.96);
 const SECONDARY: Color = Color::gray(255, 0.55);
 
@@ -90,6 +93,7 @@ const SECONDARY: Color = Color::gray(255, 0.55);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Persist {
     Timer,
+    Claude,
     Media,
     Download,
     Calendar,
@@ -99,6 +103,7 @@ pub enum Persist {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Panel {
     Home,
+    Claude,
     Media,
     Timer,
     Shelf,
@@ -127,6 +132,8 @@ pub enum Alert {
     Privacy { camera: bool, app: String },
     Note(Note),
     TimerDone,
+    ClaudeDone { project: String, secs: f32, tools: u32 },
+    ClaudeNeeds { project: String, message: String },
 }
 
 impl Alert {
@@ -268,6 +275,7 @@ pub struct Island {
     caps: bool,
     dnd: Option<bool>,
     last_bt: Option<(String, Instant)>,
+    claude: claude::Claude,
 
     // Alerts.
     alert: Option<Showing>,
@@ -334,7 +342,7 @@ impl Island {
             sources::watch_brightness(inbox.clone(), stop.clone());
         }
         if ic.calendar {
-            calendar::watch(inbox.clone(), stop.clone());
+            calendar::watch(inbox.clone(), stop.clone(), calendar::links(&ic.calendar_ics));
         }
         if ic.notifications {
             notifications::watch(inbox.clone(), stop.clone());
@@ -371,6 +379,7 @@ impl Island {
             caps: sources::caps_lock(),
             dnd: sources::do_not_disturb(),
             last_bt: None,
+            claude: claude::Claude::default(),
             alert: None,
             prev_alert: None,
             queue: VecDeque::new(),
@@ -463,6 +472,7 @@ impl Island {
     fn persist_for(p: Panel) -> Option<Persist> {
         match p {
             Panel::Media => Some(Persist::Media),
+            Panel::Claude => Some(Persist::Claude),
             Panel::Timer => Some(Persist::Timer),
             Panel::Shelf => Some(Persist::Shelf),
             Panel::Calendar => Some(Persist::Calendar),
@@ -509,6 +519,9 @@ impl Island {
         if self.clock.is_some() {
             list.push(Persist::Timer);
         }
+        if self.cfg.claude_code && self.claude.current().is_some() {
+            list.push(Persist::Claude);
+        }
         if self.media_visible() {
             list.push(Persist::Media);
         }
@@ -527,6 +540,7 @@ impl Island {
     fn panel_valid(&self, p: Panel) -> bool {
         match p {
             Panel::Media => self.media_visible(),
+            Panel::Claude => self.claude.current().is_some(),
             Panel::Timer => self.clock.is_some(),
             Panel::Home | Panel::Shelf | Panel::Calendar => true,
         }
@@ -535,6 +549,7 @@ impl Island {
     fn panel_for(p: Persist) -> Option<Panel> {
         match p {
             Persist::Timer => Some(Panel::Timer),
+            Persist::Claude => Some(Panel::Claude),
             Persist::Media => Some(Panel::Media),
             Persist::Calendar => Some(Panel::Calendar),
             Persist::Shelf => Some(Panel::Shelf),
@@ -575,6 +590,7 @@ impl Island {
             Content::Compact(p) => match p {
                 Persist::Media => (196.0, ch),
                 Persist::Timer => (176.0, ch),
+                Persist::Claude => (264.0, ch),
                 Persist::Download => (240.0, ch),
                 Persist::Calendar => (276.0, ch),
                 Persist::Shelf => (152.0, ch),
@@ -590,6 +606,8 @@ impl Island {
                 Some(Alert::Privacy { .. }) => (272.0, ch),
                 Some(Alert::Note(_)) => (380.0, 74.0),
                 Some(Alert::TimerDone) => (220.0, ch),
+                Some(Alert::ClaudeDone { .. }) => (330.0, ch),
+                Some(Alert::ClaudeNeeds { .. }) => (400.0, ch),
                 None => (ch * 3.6, ch),
             },
             Content::Panel(p) => {
@@ -602,6 +620,7 @@ impl Island {
     fn panel_size(&self, p: Panel) -> (f32, f32) {
         match p {
                 Panel::Media => (372.0, 166.0),
+                Panel::Claude => (372.0, 126.0),
                 Panel::Timer => (340.0, 96.0),
                 Panel::Shelf => (420.0, 140.0),
                 Panel::Calendar => {
@@ -868,11 +887,34 @@ impl Island {
         for d in &mut self.downloads {
             d.size = std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(d.size);
         }
+        self.claude.prune();
         // A missed rename event must not leave a download spinning forever.
         self.downloads.retain(|d| d.path.exists());
         self.retarget();
         self.dirty = true;
         self.presence.value > 0.0
+    }
+
+    /// A Claude Code hook event relayed by `dockside --claude-hook`.
+    pub fn on_claude(&mut self, json: &str) {
+        if !self.cfg.claude_code {
+            return;
+        }
+        let was = self.claude.current().is_some();
+        match self.claude.handle(json) {
+            Some(claude::Event::Finished { project, secs, tools }) => {
+                self.show_alert(Alert::ClaudeDone { project, secs, tools }, 4.0);
+            }
+            Some(claude::Event::Needs { project, message }) => {
+                self.show_alert(Alert::ClaudeNeeds { project, message }, 6.0);
+            }
+            None => {}
+        }
+        if !was && self.claude.current().is_some() {
+            self.nudge();
+        }
+        self.retarget();
+        self.dirty = true;
     }
 
     pub fn on_volume_key(&mut self, key: VolumeKey) {
@@ -1265,7 +1307,8 @@ impl Island {
 
         // Periodic redraws for things that change by themselves, throttled.
         let ticking = self.clock.is_some_and(|c| c.running) || !self.downloads.is_empty();
-        let period = if waving { Some(1.0 / 30.0) } else if ticking { Some(0.1) } else { None };
+        let spinning = self.claude.current().is_some();
+        let period = if waving || spinning { Some(1.0 / 30.0) } else if ticking { Some(0.1) } else { None };
         self.since_draw += dt;
         if moving || period.is_some_and(|p| visible && self.since_draw >= p) {
             self.dirty = true;
@@ -1369,6 +1412,8 @@ impl Island {
             },
             accent: self.accent,
             time: self.time,
+            claude: self.claude.current(),
+            claude_more: self.claude.others(),
         };
         let shown = self.shown;
         let alert = match shown {
@@ -1446,6 +1491,7 @@ impl Island {
                             views::media_panel(p, body, &view, a, &mut content_hits);
                         }
                         Panel::Timer => views::timer_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Claude => views::claude_panel(p, body, &view, a, &mut content_hits),
                         Panel::Shelf => views::shelf_panel(p, body, &view, a, &mut content_hits),
                         Panel::Calendar => views::calendar_panel(p, body, &view, a, &mut content_hits),
                         Panel::Home => views::home_panel(p, body, &view, a, &mut content_hits),
@@ -1485,6 +1531,21 @@ impl Drop for Island {
     fn drop(&mut self) {
         self.stop.stop();
         shelf::revoke(self.surface.content);
+    }
+}
+
+/// Whether a `calendar_ics` setting holds only web links (empty is fine).
+pub fn calendar_links_valid(setting: &str) -> bool {
+    calendar::valid_links(setting)
+}
+
+/// "calendar.google.com" (or "2 calendars") for showing a secret link without revealing it.
+pub fn calendar_links_summary(setting: &str) -> String {
+    let links = calendar::links(setting);
+    match links.as_slice() {
+        [] => String::new(),
+        [one] => format!("Subscribed: {}", one.split("://").nth(1).and_then(|r| r.split('/').next()).unwrap_or("calendar")),
+        many => format!("{} calendars subscribed", many.len()),
     }
 }
 

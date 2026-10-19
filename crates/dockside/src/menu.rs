@@ -52,6 +52,8 @@ pub enum Action {
     Island(crate::island::IslandCmd),
     /// Drag files out of the Dynamic Island (modal).
     IslandDrag(Vec<std::path::PathBuf>),
+    /// Add / remove the island's hooks in Claude Code's settings.
+    ConnectClaude(bool),
     Quit,
 }
 

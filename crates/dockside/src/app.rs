@@ -26,6 +26,8 @@ use crate::config::{self, Config, DockApp};
 use crate::dock::Dock;
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
+use crate::island::sources::VolumeKey;
+use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
@@ -35,7 +37,8 @@ use crate::theme::Theme;
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
-    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY,
+    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
+    WM_APP_ISLAND, WM_APP_ISLAND_KEY,
 };
 
 thread_local! {
@@ -47,6 +50,8 @@ static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Windows the menu mouse hook must not treat as "outside" clicks.
 static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
 static MENUBAR_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Whether the island's keyboard hook swallows volume keys (it shows its own HUD).
+static ISLAND_VOLUME_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Lives in the (large) Win32_UI_Controls feature; defined here instead.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -242,6 +247,26 @@ fn execute(action: Action) {
         }
         Action::Lock => system::lock(),
         Action::OpenConfig => system::open(&config::path().to_string_lossy()),
+        Action::Island(cmd) => {
+            with_app(|app| {
+                if let Some(i) = &mut app.island {
+                    i.command(cmd);
+                    app.animate();
+                }
+            });
+        }
+        // Modal drag loop: outside the App borrow.
+        Action::IslandDrag(paths) => {
+            let hwnd = with_app(|app| app.island.as_ref().map(|i| i.surface.content)).flatten();
+            let dropped = hwnd.is_some_and(|h| finder::dnd::drag_out(h, &paths));
+            with_app(|app| {
+                if let Some(i) = &mut app.island {
+                    i.drag_done(&paths, dropped);
+                    app.animate();
+                }
+                app.flush();
+            });
+        }
         Action::Quit => unsafe { PostQuitMessage(0) },
     }
 }
@@ -313,6 +338,36 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
     CallNextHookEx(None, code, wp, lp)
 }
 
+/// While the island runs: volume keys become the island's HUD (swallowed so the
+/// Windows flyout stays away), and Caps Lock presses are reported.
+unsafe extern "system" fn island_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    const VK_VOLUME_MUTE: u16 = 0xAD;
+    const VK_VOLUME_UP: u16 = 0xAF;
+    const VK_CAPITAL: u16 = 0x14;
+    if code >= 0 {
+        let info = &*(lp.0 as *const KBDLLHOOKSTRUCT);
+        let vk = info.vkCode as u16;
+        let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let injected = info.flags.0 & LLKHF_INJECTED.0 != 0;
+        if (VK_VOLUME_MUTE..=VK_VOLUME_UP).contains(&vk) && ISLAND_VOLUME_KEYS.load(Ordering::Relaxed) && !injected {
+            if down {
+                win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_ISLAND_KEY, vk as usize);
+            }
+            return LRESULT(1);
+        }
+        // Key repeat sends more key-downs; only the first press of a hold toggles Caps Lock.
+        static CAPS_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if vk == VK_CAPITAL {
+            if down && !CAPS_HELD.swap(true, Ordering::Relaxed) {
+                win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_ISLAND_KEY, vk as usize);
+            } else if !down {
+                CAPS_HELD.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
+}
+
 /// While a menu is open: arrows / Enter / Esc drive the menu instead of the focused app.
 unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
@@ -346,6 +401,29 @@ fn track_leave(hwnd: HWND) {
     }
 }
 
+/// File drag feedback for the island's shelf (OLE drop target).
+pub fn island_drag(phase: finder::dnd::Phase, paths: &[PathBuf]) -> bool {
+    with_app(|app| {
+        let ok = app.island.as_mut().is_some_and(|i| i.on_drag(phase, paths));
+        app.animate();
+        app.flush();
+        ok
+    })
+    .unwrap_or(false)
+}
+
+/// Brings the app behind a media session forward: a running window of that exe,
+/// otherwise the app by its AppUserModelID (Store apps, browsers).
+fn open_media_app(app_id: &str) -> Action {
+    let exe = app_id.to_lowercase();
+    if exe.ends_with(".exe") {
+        if let Some(w) = apps::list_windows().into_iter().find(|w| w.exe_name() == exe) {
+            return Action::Activate(w.hwnd);
+        }
+    }
+    Action::Open(format!("shell:AppsFolder\\{app_id}"))
+}
+
 fn dock_eq_except_apps(a: &config::DockCfg, b: &config::DockCfg) -> bool {
     config::DockCfg { apps: Vec::new(), ..a.clone() } == config::DockCfg { apps: Vec::new(), ..b.clone() }
 }
@@ -365,6 +443,7 @@ pub struct App {
     names: apps::AppNames,
     menubar: Option<MenuBar>,
     dock: Option<Dock>,
+    island: Option<Island>,
     menu: Option<PopupMenu>,
     settings: Option<SettingsWindow>,
     finders: Vec<FinderWindow>,
@@ -376,6 +455,7 @@ pub struct App {
     spotlight: Option<Spotlight>,
     index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
+    island_hook: Option<HHOOK>,
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
     taskbar_created: u32,
@@ -435,6 +515,7 @@ impl App {
             names: apps::AppNames::default(),
             menubar: None,
             dock: None,
+            island: None,
             menu: None,
             settings: None,
             finders: Vec::new(),
@@ -445,6 +526,7 @@ impl App {
             spotlight: None,
             index: Default::default(),
             hooks: Vec::new(),
+            island_hook: None,
             win_hooks,
             _watcher: watcher,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
@@ -454,6 +536,7 @@ impl App {
     /// (Re)creates every surface from the current config.
     fn build(&mut self) {
         self.close_menu();
+        self.island = None;
         self.dock = None;
         self.menubar = None;
         self.theme = Theme::new(&self.cfg, &self.gfx);
@@ -479,6 +562,8 @@ impl App {
                 Err(e) => log!("dock failed: {e}"),
             }
         }
+        // After the menu bar, so it stacks above it.
+        self.rebuild_island();
         self.refresh_windows();
         self.flush();
         self.register_hotkey();
@@ -521,6 +606,11 @@ impl App {
         if old.menubar != self.cfg.menubar {
             self.rebuild_menubar();
         }
+        if old.island != self.cfg.island || old.menubar.enabled != self.cfg.menubar.enabled
+            || old.menubar.height != self.cfg.menubar.height
+        {
+            self.rebuild_island();
+        }
         if old.dock != self.cfg.dock {
             let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock);
             match &mut self.dock {
@@ -549,6 +639,34 @@ impl App {
                 Err(e) => log!("menu bar failed: {e}"),
             }
         }
+    }
+
+    fn rebuild_island(&mut self) {
+        self.island = None;
+        if self.cfg.island.enabled {
+            let hwnd = self.msg_hwnd.0 as isize;
+            match Island::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_MEDIA, WM_APP_ISLAND) {
+                Ok(i) => self.island = Some(i),
+                Err(e) => log!("island failed: {e}"),
+            }
+        }
+        // One low-level hook for volume keys and Caps Lock while the island runs.
+        ISLAND_VOLUME_KEYS.store(self.island.is_some() && self.cfg.island.volume_hud, Ordering::Relaxed);
+        let want = self.island.is_some();
+        match (want, self.island_hook) {
+            (true, None) => unsafe {
+                match SetWindowsHookExW(WH_KEYBOARD_LL, Some(island_key_hook), win::hinstance(), 0) {
+                    Ok(h) => self.island_hook = Some(h),
+                    Err(e) => log!("island key hook failed: {e}"),
+                }
+            },
+            (false, Some(h)) => unsafe {
+                let _ = UnhookWindowsHookEx(h);
+                self.island_hook = None;
+            },
+            _ => {}
+        }
+        self.animate();
     }
 
     fn mark_settings_dirty(&mut self) {
@@ -603,6 +721,9 @@ impl App {
         if let Some(d) = &mut self.dock {
             still |= d.tick(dt);
         }
+        if let Some(i) = &mut self.island {
+            still |= i.tick(dt);
+        }
         if !still {
             self.animating = false;
             self.clock.stop();
@@ -612,6 +733,9 @@ impl App {
     fn on_tick(&mut self) {
         if let Some(mb) = &mut self.menubar {
             mb.tick();
+        }
+        if self.island.as_mut().is_some_and(|i| i.on_tick(system::battery())) {
+            self.animate();
         }
         if self.cfg.general.hide_taskbar {
             taskbar::reapply();
@@ -628,7 +752,24 @@ impl App {
         self.update_foreground();
     }
 
+    /// Keeps the shell above app windows: Windows may lift a newly focused,
+    /// maximized window over the topmost band. Raised bottom to top, so the
+    /// island sits above the menu bar and an open menu / Spotlight above both.
+    fn raise_surfaces(&self) {
+        let surfaces = [
+            self.dock.as_ref().map(|d| &d.surface),
+            self.menubar.as_ref().map(|m| &m.surface),
+            self.island.as_ref().map(|i| &i.surface),
+            self.menu.as_ref().map(|m| &m.surface),
+            self.spotlight.as_ref().map(|s| &s.surface),
+        ];
+        for s in surfaces.into_iter().flatten() {
+            s.raise();
+        }
+    }
+
     fn update_foreground(&mut self) {
+        self.raise_surfaces();
         let fg = unsafe { GetForegroundWindow() };
         if self.finders.iter().any(|f| f.hwnd == fg) {
             if let Some(mb) = &mut self.menubar {
@@ -690,6 +831,9 @@ impl App {
             if d.dirty {
                 d.render(&self.gfx, &self.theme, &mut self.icons);
             }
+        }
+        if let Some(i) = self.island.as_mut().filter(|i| i.dirty) {
+            i.render(&self.gfx, &self.theme);
         }
         if let Some(s) = &mut self.settings {
             if s.dirty {
@@ -1122,6 +1266,29 @@ impl App {
                     self.timer(TIMER_FINDER, 200);
                 }
                 WM_APP_MENU_KEY => self.on_menu_key(wp.0 as u16),
+                WM_APP_MEDIA => {
+                    if let Some(i) = &mut self.island {
+                        i.on_media();
+                        self.animate();
+                    }
+                }
+                WM_APP_ISLAND => {
+                    if let Some(i) = &mut self.island {
+                        i.on_signals();
+                        self.animate();
+                    }
+                }
+                WM_APP_ISLAND_KEY => {
+                    if let Some(i) = &mut self.island {
+                        match wp.0 as u16 {
+                            0x14 => i.on_caps(),
+                            0xAD => i.on_volume_key(VolumeKey::Mute),
+                            0xAE => i.on_volume_key(VolumeKey::Down),
+                            _ => i.on_volume_key(VolumeKey::Up),
+                        }
+                        self.animate();
+                    }
+                }
                 _ => return None,
             }
             self.flush();
@@ -1149,6 +1316,10 @@ impl App {
                 if let Some(d) = &mut self.dock {
                     d.surface.set_hidden(hide);
                 }
+                if let Some(i) = &mut self.island {
+                    i.set_fullscreen(hide);
+                }
+                self.flush();
             }
             return Some(LRESULT(0));
         }
@@ -1175,6 +1346,8 @@ impl App {
             self.on_menubar_mouse(hwnd, msg, lp)
         } else if self.dock.as_ref().is_some_and(|d| d.surface.content == hwnd) {
             self.on_dock_mouse(hwnd, msg, lp)
+        } else if self.island.as_ref().is_some_and(|i| i.surface.content == hwnd) {
+            self.on_island_mouse(hwnd, msg, wp, lp)
         } else {
             None
         };
@@ -1310,6 +1483,57 @@ impl App {
         Some(LRESULT(0))
     }
 
+    fn island_event(&mut self, e: IslandEvent) {
+        match e {
+            IslandEvent::OpenApp(id) => push(open_media_app(&id)),
+            IslandEvent::Run(a) => push(a),
+            IslandEvent::Menu(entries, placement) => self.open_menu(entries, placement, MenuSource::Window),
+            IslandEvent::DragOut(paths) => push(Action::IslandDrag(paths)),
+        }
+    }
+
+    fn on_island_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let i = self.island.as_mut()?;
+        let (x, y) = mouse_pt(lp, i.surface.scale);
+        match msg {
+            WM_MOUSEMOVE => {
+                if !i.tracking {
+                    i.tracking = true;
+                    track_leave(hwnd);
+                }
+                if let Some(e) = i.on_move(x, y) {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    self.island_event(e);
+                }
+            }
+            WM_MOUSELEAVE => i.on_leave(),
+            WM_MOUSEWHEEL => i.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
+            WM_RBUTTONUP => {
+                let e = i.context_menu();
+                self.island_event(e);
+            }
+            WM_LBUTTONDOWN => {
+                i.on_down(x, y);
+                // Keep scrubbing when the pointer leaves the island.
+                unsafe { SetCapture(hwnd) };
+                self.close_menu();
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if let Some(e) = i.on_up(x, y) {
+                    self.island_event(e);
+                }
+            }
+            _ => return None,
+        }
+        self.animate();
+        Some(LRESULT(0))
+    }
+
     fn on_dock_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
         let d = self.dock.as_mut()?;
         let (x, y) = mouse_pt(lp, d.surface.scale);
@@ -1373,12 +1597,18 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.remove_hooks();
+        if let Some(h) = self.island_hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(h);
+            }
+        }
         for h in self.win_hooks.drain(..) {
             unsafe {
                 let _ = UnhookWinEvent(h);
             }
         }
         self.menu = None;
+        self.island = None;
         self.dock = None;
         self.menubar = None;
         taskbar::restore();

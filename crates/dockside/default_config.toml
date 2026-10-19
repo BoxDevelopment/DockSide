@@ -111,6 +111,39 @@ show_hidden = false
 # Blur what's behind the window through the sidebar (needs Transparency effects on).
 sidebar_vibrancy = true
 
+[island]
+# A Dynamic Island at the top center of the screen. Click it for the time,
+# your next event and quick timers; right-click for timers and settings; drop
+# files on it to hold them on the shelf.
+enabled = true
+# Keep the small pill visible when nothing is happening.
+always_show = true
+# Expand an activity when the pointer rests on it (otherwise click).
+expand_on_hover = false
+# Seconds paused media stays in the island; 0 keeps it until the app closes.
+hide_paused_after = 60
+# "Charging" and "Low Battery" alerts.
+battery_alerts = true
+# Show volume (media keys, or scroll over the island) and brightness in the
+# island instead of the Windows popup.
+volume_hud = true
+# A green / orange dot while an app uses the camera / microphone.
+privacy_indicators = true
+# Show new Windows notifications as banners from the island. Tip: turn off
+# "Show notification banners" in Windows Settings to avoid seeing them twice.
+notifications = true
+# Upcoming meetings from the Windows calendar (Calendar / Outlook accounts).
+calendar = true
+# Minutes before a meeting that it appears in the island.
+calendar_lead = 10
+# Bluetooth devices connecting, with their battery level.
+bluetooth = true
+# New screenshots (Win+PrtScn, Snipping Tool) and finished browser downloads.
+screenshots = true
+downloads = true
+# Caps Lock and Do Not Disturb changes.
+status_alerts = true
+
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]
 "explorer.exe" = "Finder"

@@ -205,7 +205,7 @@ pub struct Place {
     pub path: PathBuf,
 }
 
-fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
+pub fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
     unsafe {
         let p = SHGetKnownFolderPath(id, KNOWN_FOLDER_FLAG(0), HANDLE::default()).ok()?;
         let s = p.to_string().ok();

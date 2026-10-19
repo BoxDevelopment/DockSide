@@ -140,6 +140,12 @@ pub fn class_name(hwnd: HWND) -> String {
 pub const WM_APP_CLOSE_SPOTLIGHT: u32 = WM_APP + 11;
 /// Spotlight's background index finished rebuilding.
 pub const WM_APP_INDEX_READY: u32 = WM_APP + 12;
+/// The media worker has a new Now Playing snapshot for the Dynamic Island.
+pub const WM_APP_MEDIA: u32 = WM_APP + 13;
+/// Dynamic Island background sources have signals queued.
+pub const WM_APP_ISLAND: u32 = WM_APP + 14;
+/// A volume key or Caps Lock was pressed (wParam = virtual key).
+pub const WM_APP_ISLAND_KEY: u32 = WM_APP + 15;
 
 /// Parses "alt+space", "ctrl+shift+k", "win+f1", ... into RegisterHotKey arguments.
 pub fn parse_hotkey(spec: &str) -> Option<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32)> {

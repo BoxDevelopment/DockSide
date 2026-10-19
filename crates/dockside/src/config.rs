@@ -15,6 +15,7 @@ pub struct Config {
     pub dock: DockCfg,
     pub spotlight: SpotlightCfg,
     pub finder: FinderCfg,
+    pub island: IslandCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
 }
@@ -111,6 +112,30 @@ pub struct FinderCfg {
     pub ascending: bool,
     pub show_hidden: bool,
     pub sidebar_vibrancy: bool,
+}
+
+/// The Dynamic Island at the top center of the screen.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct IslandCfg {
+    pub enabled: bool,
+    /// Keep the idle pill visible when nothing is happening.
+    pub always_show: bool,
+    pub expand_on_hover: bool,
+    /// Seconds paused media stays in the island (0 = until the app ends its session).
+    pub hide_paused_after: u32,
+    pub battery_alerts: bool,
+    /// Replace the Windows volume / brightness popups.
+    pub volume_hud: bool,
+    pub privacy_indicators: bool,
+    pub notifications: bool,
+    pub calendar: bool,
+    /// Minutes before a meeting that it appears in the island.
+    pub calendar_lead: u32,
+    pub bluetooth: bool,
+    pub screenshots: bool,
+    pub downloads: bool,
+    /// Caps Lock and Do Not Disturb changes.
+    pub status_alerts: bool,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -316,6 +341,7 @@ mod tests {
         let cfg = defaults();
         assert!(cfg.dock.apps.len() >= 3);
         assert_eq!(cfg.menubar.height, 24.0);
+        assert!(cfg.island.enabled);
     }
 
     #[test]

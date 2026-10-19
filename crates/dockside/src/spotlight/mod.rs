@@ -46,6 +46,7 @@ enum RowAction {
     OpenFolder(String),
     Copy(String),
     Url(String),
+    Run(Action),
 }
 
 #[derive(Clone, Debug)]
@@ -94,6 +95,22 @@ fn icon_for(item: &Item) -> (String, String) {
         }
     };
     (key, t.clone())
+}
+
+/// "10 minute", "1 hour 30 minute", "45 second".
+fn describe(secs: u32) -> String {
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    let mut parts = Vec::new();
+    if h > 0 {
+        parts.push(format!("{h} hour"));
+    }
+    if m > 0 {
+        parts.push(format!("{m} minute"));
+    }
+    if s > 0 {
+        parts.push(format!("{s} second"));
+    }
+    parts.join(" ")
 }
 
 /// Text from the clipboard (for Ctrl+V).
@@ -203,6 +220,20 @@ impl Spotlight {
             Row { section, title: it.name.clone(), subtitle, action, icon: Some(icon_for(it)) }
         };
 
+        if let Some(cmd) = crate::island::timer::parse_command(&raw) {
+            use crate::island::{timer::Command, IslandCmd};
+            let (title, cmd) = match cmd {
+                Command::Timer(secs) => (format!("Start a {} timer", describe(secs)), IslandCmd::Timer(secs)),
+                Command::Stopwatch => ("Start a stopwatch".to_string(), IslandCmd::Stopwatch),
+            };
+            self.rows.push(Row {
+                section: "Dynamic Island",
+                title,
+                subtitle: "Runs in the Dynamic Island".into(),
+                action: RowAction::Run(Action::Island(cmd)),
+                icon: None,
+            });
+        }
         if let Some(v) = calc::eval(&raw) {
             let result = calc::format(v);
             self.rows.push(Row {
@@ -250,6 +281,7 @@ impl Spotlight {
             RowAction::OpenFile(p) => Action::Open(p.clone()),
             RowAction::OpenFolder(p) => Action::OpenFinder(Some(PathBuf::from(p))),
             RowAction::Url(u) => Action::Open(u.clone()),
+            RowAction::Run(a) => a.clone(),
             RowAction::Copy(text) => {
                 crate::finder::fs::copy_text(text);
                 return SpotlightEvent::Close;

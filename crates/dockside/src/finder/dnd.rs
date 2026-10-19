@@ -41,7 +41,7 @@ thread_local! {
 }
 
 /// Drop targets need OLE (not just COM) on the UI thread.
-fn ensure_ole() {
+pub fn ensure_ole() {
     if !OLE_READY.get() {
         if let Err(e) = unsafe { OleInitialize(None) } {
             log!("OleInitialize failed: {e}");
@@ -67,14 +67,18 @@ pub fn revoke(hwnd: HWND) {
 }
 
 /// Drags `paths` with the shell's drag image until they are dropped or the drag
-/// is cancelled. Modal: call outside the App borrow.
-pub fn drag_out(hwnd: HWND, paths: &[PathBuf]) {
-    let Some(data) = data_object(paths) else { return };
+/// is cancelled. Modal: call outside the App borrow. Returns true if they were dropped somewhere.
+pub fn drag_out(hwnd: HWND, paths: &[PathBuf]) -> bool {
+    let Some(data) = data_object(paths) else { return false };
     OUTGOING.with(|o| *o.borrow_mut() = paths.to_vec());
     let r = unsafe { SHDoDragDrop(hwnd, &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) };
     OUTGOING.with(|o| o.borrow_mut().clear());
-    if let Err(e) = r {
-        log!("drag failed: {e}");
+    match r {
+        Ok(effect) => effect != DROPEFFECT_NONE,
+        Err(e) => {
+            log!("drag failed: {e}");
+            false
+        }
     }
 }
 
@@ -100,7 +104,7 @@ fn data_object(paths: &[PathBuf]) -> Option<IDataObject> {
 }
 
 /// File paths in a drop (CF_HDROP); empty for anything else.
-fn hdrop_paths(data: &IDataObject) -> Vec<PathBuf> {
+pub fn hdrop_paths(data: &IDataObject) -> Vec<PathBuf> {
     let fmt = FORMATETC {
         cfFormat: CF_HDROP.0,
         ptd: std::ptr::null_mut(),

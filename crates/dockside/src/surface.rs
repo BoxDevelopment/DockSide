@@ -159,6 +159,16 @@ impl Surface {
         }
     }
 
+    /// Puts the surface back at the top of the topmost band. Windows can lift a
+    /// newly focused, maximized window above topmost windows, so this is re-asserted.
+    pub fn raise(&self) {
+        // The content window is owned by the backdrop, so it comes along on top.
+        let hwnd = self.backdrop.unwrap_or(self.content);
+        unsafe {
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
     fn show_windows(&self, show: bool) {
         let cmd = if show { SW_SHOWNOACTIVATE } else { SW_HIDE };
         unsafe {

@@ -11,6 +11,7 @@ mod dock;
 mod finder;
 mod geom;
 mod gfx;
+mod island;
 mod menu;
 mod menubar;
 mod settings;

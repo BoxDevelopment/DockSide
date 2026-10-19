@@ -417,6 +417,61 @@ impl Painter<'_> {
         }
     }
 
+    /// A bitmap stretched over `r` with rounded corners (album art).
+    pub fn bitmap_round(&self, bmp: &ID2D1Bitmap, r: Rect, radius: f32, opacity: f32) {
+        unsafe {
+            let size = bmp.GetSize();
+            if size.width <= 0.0 || size.height <= 0.0 {
+                return;
+            }
+            let m = Matrix3x2 {
+                M11: r.w / size.width,
+                M12: 0.0,
+                M21: 0.0,
+                M22: r.h / size.height,
+                M31: r.x,
+                M32: r.y,
+            };
+            let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+            let brush_props = D2D1_BRUSH_PROPERTIES { opacity, transform: m };
+            let brush: Option<ID2D1Brush> = match self.ctx {
+                Some(ctx) => {
+                    let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
+                        extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                        extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                        interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                    };
+                    ctx.CreateBitmapBrush(bmp, Some(&props), Some(&brush_props)).ok().and_then(|b| b.cast().ok())
+                }
+                None => {
+                    let props = D2D1_BITMAP_BRUSH_PROPERTIES {
+                        extendModeX: D2D1_EXTEND_MODE_CLAMP,
+                        extendModeY: D2D1_EXTEND_MODE_CLAMP,
+                        interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    };
+                    self.rt.CreateBitmapBrush(bmp, Some(&props), Some(&brush_props)).ok().and_then(|b| b.cast().ok())
+                }
+            };
+            if let Some(brush) = brush {
+                self.rt.FillRoundedRectangle(&rr, &brush);
+            }
+        }
+    }
+
+    /// Like [`Painter::text`], with fixed-width digits so changing numbers don't jiggle.
+    pub fn text_tabular(&self, text: &str, format: &IDWriteTextFormat, r: Rect, c: Color) {
+        let Some(layout) = self.gfx.layout(text, format, r.w, r.h) else { return };
+        unsafe {
+            if let Ok(typo) = self.gfx.dwrite.CreateTypography() {
+                let feature = DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 };
+                if typo.AddFontFeature(feature).is_ok() {
+                    let _ = layout.SetTypography(&typo, DWRITE_TEXT_RANGE { startPosition: 0, length: u32::MAX });
+                }
+            }
+            self.rt.DrawTextLayout(pt(r.x, r.y), &layout, self.color(c), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT)
+        }
+    }
+
     /// Fills `c` through the bitmap's alpha (used to darken a pressed icon).
     pub fn tint_bitmap(&self, bmp: &ID2D1Bitmap, r: Rect, c: Color) {
         unsafe {

@@ -130,7 +130,9 @@ impl FinderCmd {
 /// Runs a modal command for the Finder window `hwnd`; follow up with [`FinderCmd::Reload`].
 pub fn run_modal(hwnd: HWND, cmd: FinderCmd) {
     match cmd {
-        FinderCmd::Drag(paths) => dnd::drag_out(hwnd, &paths),
+        FinderCmd::Drag(paths) => {
+            dnd::drag_out(hwnd, &paths);
+        }
         FinderCmd::Transfer { paths, dest, copy } => {
             fs::transfer(&paths, &dest, copy, hwnd);
         }

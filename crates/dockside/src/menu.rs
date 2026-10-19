@@ -48,6 +48,10 @@ pub enum Action {
     LogOut,
     Lock,
     OpenConfig,
+    /// Timer / stopwatch / shelf commands for the Dynamic Island.
+    Island(crate::island::IslandCmd),
+    /// Drag files out of the Dynamic Island (modal).
+    IslandDrag(Vec<std::path::PathBuf>),
     Quit,
 }
 

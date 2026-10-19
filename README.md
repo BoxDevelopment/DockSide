@@ -50,6 +50,25 @@ hidden while DockSide runs and is always restored when it exits.
   Ctrl+↑ parent, Alt+←/→ back/forward, Enter open, F2 rename, Delete trash, Ctrl+Shift+. hidden files,
   type to select
 
+**Dynamic Island**
+- An always-present black pill at the top center of the menu bar that morphs between activities on
+  spring physics (bouncy growth, a press squish, hover lift, cross-fades). With two activities running,
+  the second splits off into a bubble beside it, like the iPhone
+- Click the idle pill for the time, your next meeting and one-click timers; right-click for timers,
+  the shelf and settings
+- **Now Playing** from anything that reports to Windows' media controls (Spotify, browsers, Media Player):
+  artwork, a waveform tinted from it, and an expanded player with scrubbing and transport controls
+- **Volume and brightness HUD** in place of the Windows popups (volume keys, or scroll over the island);
+  drag the bar to set the volume
+- **Timer and stopwatch**: from the home panel, the right-click menu, or Spotlight ("timer 10m", "stopwatch")
+- **File shelf**: drop files on the island to hold them, then drag them out where you need them
+- **Upcoming meetings** from the Windows calendar, a few minutes before they start
+- **Mic and camera indicators**: an orange / green dot while an app is using them, with the app's name
+- **Alerts**: notifications (as banners from the island), Bluetooth devices connecting with their battery,
+  screenshots (click to open, drag to use), finished downloads (with a live download activity while they run),
+  charging / low battery, Caps Lock and Do Not Disturb
+- Alerts queue up and wait while you hover them; every source can be switched off in `[island]`
+
 **Spotlight**
 - Alt+Space (configurable in Settings → General, or `[spotlight] hotkey`) or the menu bar's magnifier
 - Finds every app (desktop and Store) plus files and folders in Desktop, Documents, Downloads,
@@ -114,10 +133,12 @@ crates/dockside/src
 ├── menu.rs       popup menus + the standard menu contents
 ├── finder/       Finder window (views, input), filesystem helpers, background icon loader
 ├── settings.rs   System Settings window
+├── island/       Dynamic Island: spring-driven pill, views, glyphs; media, calendar, notifications,
+│                 bluetooth and system sources feed it from background threads
 ├── chrome.rs     shared window chrome: shadow, body, traffic lights
 ├── surface.rs    backdrop (DWM acrylic) window + layered content window pair
 ├── gfx/          Direct2D canvas/painter, DirectWrite text, icon loading (shell + WIC)
-├── anim.rs       DwmFlush-paced frame clock
+├── anim.rs       DwmFlush-paced frame clock, damped springs
 ├── config.rs     TOML config: defaults merged under the user file, hot reload, toml_edit writes
 ├── theme.rs      light/dark palette
 └── win/          Win32: AppBar, taskbar, window enumeration, system actions, accent policy
@@ -134,7 +155,8 @@ crates/dockside/src
 - [ ] Real per-app menus via UI Automation, where apps expose them
 - [x] Spotlight
 - [ ] Mission Control / App Exposé, Launchpad
-- [ ] Dynamic Island: a pill at the top of the screen for media, timers, and notifications
+- [x] Dynamic Island: Now Playing, HUDs, timers, shelf, calendar, notifications, device and status alerts
+- [ ] Dynamic Island: reply to notifications, Live Activities from other apps
 - [x] A System Settings-style GUI for the config, plus Start at login
 
 ## Notes

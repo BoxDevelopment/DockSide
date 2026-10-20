@@ -646,7 +646,7 @@ impl Spotlight {
 fn command_action(c: commands::Command) -> Option<Action> {
     use crate::win::controls;
     use crate::win::system::Shortcut;
-    use commands::{Command, PowerMode};
+    use commands::Command;
     const WIN_D: Shortcut = Shortcut::new("w", b'D' as u16, "D");
     const WIN_SHIFT_S: Shortcut = Shortcut::new("ws", b'S' as u16, "S");
     let volume = |level: f32| {
@@ -665,7 +665,7 @@ fn command_action(c: commands::Command) -> Option<Action> {
         Command::ControlPanel => Action::Launch { path: "control.exe".into(), args: None },
         Command::DockSideSettings => Action::OpenSettings(None),
         Command::LowPowerMode(on) => {
-            controls::set_power_mode(if on { PowerMode::Efficiency } else { PowerMode::Balanced });
+            controls::set_low_power_mode(on);
             return None;
         }
         Command::PowerMode(m) => {

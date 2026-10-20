@@ -41,7 +41,52 @@ pub fn low_power_mode() -> bool {
         let mut g = GUID::zeroed();
         (unsafe { f(&mut g) } == 0).then_some(g)
     });
-    saver || overlay == Some(BEST_EFFICIENCY)
+    // The power status flag can miss Energy Saver turned on from Quick Settings.
+    saver || energy_saver_override() == Some(1) || overlay == Some(BEST_EFFICIENCY)
+}
+
+type QueryWnf = unsafe extern "system" fn(*const u64, *const c_void, *const c_void, *mut u32, *mut c_void, *mut u32) -> i32;
+
+/// The last value published to `WNF_ENERGY_SAVER`.
+fn energy_saver_override() -> Option<u32> {
+    let f = unsafe { GetProcAddress(LoadLibraryW(w!("ntdll.dll")).ok()?, s!("NtQueryWnfStateData"))? };
+    let f: QueryWnf = unsafe { std::mem::transmute(f) };
+    let (mut stamp, mut value, mut len) = (0u32, 0u32, 4u32);
+    let r = unsafe { f(&WNF_ENERGY_SAVER, std::ptr::null(), std::ptr::null(), &mut stamp, &mut value as *mut _ as *mut c_void, &mut len) };
+    (r == 0 && len == 4).then_some(value)
+}
+
+/// The undocumented WNF state Quick Settings' Energy saver tile publishes to:
+/// 1 turns Energy Saver on, 2 turns it off.
+const WNF_ENERGY_SAVER: u64 = 0x41C6_013D_A3BC_3075;
+
+type PublishWnf = unsafe extern "system" fn(u64, *const c_void, *const c_void, u32, *const c_void) -> i32;
+
+/// Turns Low Power Mode on (Energy Saver) or off (Energy Saver off, and the
+/// power mode back to Balanced if it was Best power efficiency).
+pub fn set_low_power_mode(on: bool) {
+    let publish = unsafe { LoadLibraryW(w!("ntdll.dll")).ok().and_then(|lib| GetProcAddress(lib, s!("RtlPublishWnfStateData"))) };
+    match publish {
+        Some(f) => {
+            let f: PublishWnf = unsafe { std::mem::transmute(f) };
+            let state: u32 = if on { 1 } else { 2 };
+            let r = unsafe { f(WNF_ENERGY_SAVER, std::ptr::null(), &state as *const _ as *const c_void, 4, std::ptr::null()) };
+            if r != 0 {
+                log!("energy saver change failed: {r:#x}");
+            }
+        }
+        None => log!("energy saver API unavailable"),
+    }
+    if !on {
+        let overlay = powrprof(s!("PowerGetEffectiveOverlayScheme")).and_then(|f| {
+            let f: GetOverlay = unsafe { std::mem::transmute(f) };
+            let mut g = GUID::zeroed();
+            (unsafe { f(&mut g) } == 0).then_some(g)
+        });
+        if overlay == Some(BEST_EFFICIENCY) {
+            set_power_mode(crate::spotlight::commands::PowerMode::Balanced);
+        }
+    }
 }
 
 pub fn set_power_mode(mode: crate::spotlight::commands::PowerMode) {

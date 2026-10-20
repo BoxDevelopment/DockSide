@@ -52,6 +52,7 @@ const COMMANDS: &[(&str, &str, char, Command)] = &[
     ("Log Out", "log out logout sign out signout", '\u{F3B1}', Command::LogOut),
     ("Empty Trash", "empty trash recycle bin", '\u{E74D}', Command::EmptyTrash),
     ("Low Power Mode", "low power mode battery saver energy saver efficiency", '\u{EBAA}', Command::LowPowerMode(true)),
+    ("Power Mode: Best Power Efficiency", "power mode best power efficiency", '\u{E945}', Command::PowerMode(PowerMode::Efficiency)),
     ("Power Mode: Balanced", "power mode balanced", '\u{E945}', Command::PowerMode(PowerMode::Balanced)),
     ("Power Mode: Best Performance", "power mode best performance high performance", '\u{E945}', Command::PowerMode(PowerMode::Performance)),
     ("Dark Mode", "dark mode light mode appearance theme night", '\u{E793}', Command::DarkMode(true)),

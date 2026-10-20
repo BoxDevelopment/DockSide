@@ -344,6 +344,7 @@ impl Island {
         let bar_h = if cfg.menubar.enabled { cfg.menubar.height } else { 0.0 };
         let (top, compact_h) =
             if bar_h > 0.0 { let h = (bar_h - 2.0).clamp(18.0, 36.0); ((bar_h - h) / 2.0, h) } else { (6.0, 30.0) };
+        let top = top + cfg.island.vertical_offset;
         let (iw, ih) = blob_size(compact_h);
         let rect = window_rect(&monitor, top, iw, ih);
         let surface = Surface::new(gfx, rect, monitor.scale, Backdrop::None, Color::TRANSPARENT)?;

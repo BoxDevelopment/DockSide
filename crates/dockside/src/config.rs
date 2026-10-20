@@ -108,6 +108,7 @@ pub struct DockCfg {
     pub show_running: bool,
     pub show_trash: bool,
     pub autohide: bool,
+    pub show_on_desktop: bool,
     pub reserve_space: bool,
     #[serde(default)]
     pub apps: Vec<DockApp>,
@@ -150,6 +151,8 @@ pub struct IslandCfg {
     /// Keep the idle pill visible when nothing is happening.
     pub always_show: bool,
     pub expand_on_hover: bool,
+    /// Points to move the island down (negative moves it up).
+    pub vertical_offset: f32,
     /// Seconds paused media stays in the island (0 = until the app ends its session).
     pub hide_paused_after: u32,
 

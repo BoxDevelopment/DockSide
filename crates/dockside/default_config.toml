@@ -62,6 +62,8 @@ show_running = true
 show_trash = true
 # Slide the Dock off-screen until the pointer touches the bottom edge.
 autohide = false
+# With autohide, keep the Dock shown while the desktop is focused.
+show_on_desktop = false
 # Keep maximized windows from covering the Dock (ignored with autohide).
 reserve_space = true
 
@@ -139,6 +141,8 @@ enabled = true
 always_show = true
 # Expand an activity when the pointer rests on it (otherwise click).
 expand_on_hover = false
+# Points to move the island down from its spot; negative moves it up.
+vertical_offset = 0
 # Seconds paused media stays in the island; 0 keeps it until the app closes.
 hide_paused_after = 60
 

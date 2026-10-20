@@ -122,12 +122,14 @@ pub enum Key {
     /// An on/off setting in `[island]`, by name.
     Island(&'static str),
     IslandIcs,
+    IslandOffset,
     DockEnabled,
     DockSize,
     DockMag,
     DockMagSize,
     DockOffset,
     DockAutohide,
+    DockShowOnDesktop,
     DockIconStyle,
     DockBackdrop,
     DockRunning,
@@ -167,12 +169,14 @@ impl Key {
             Key::MbTray => ("menubar", "show_tray"),
             Key::Island(name) => ("island", name),
             Key::IslandIcs => ("island", "calendar_ics"),
+            Key::IslandOffset => ("island", "vertical_offset"),
             Key::DockEnabled => ("dock", "enabled"),
             Key::DockSize => ("dock", "tile_size"),
             Key::DockMag => ("dock", "magnification"),
             Key::DockMagSize => ("dock", "magnified_size"),
             Key::DockOffset => ("dock", "bottom_margin"),
             Key::DockAutohide => ("dock", "autohide"),
+            Key::DockShowOnDesktop => ("dock", "show_on_desktop"),
             Key::DockIconStyle => ("dock", "icon_style"),
             Key::DockBackdrop => ("dock", "backdrop"),
             Key::DockRunning => ("dock", "show_running"),
@@ -431,6 +435,7 @@ impl SettingsWindow {
                         Row::Toggle("Show Dynamic Island", Key::Island("enabled")),
                         Row::Toggle("Always show the island", Key::Island("always_show")),
                         Row::Toggle("Expand when hovered", Key::Island("expand_on_hover")),
+                        Row::Slider("Vertical offset", Key::IslandOffset),
                     ],
                 },
                 Group {
@@ -487,11 +492,17 @@ impl SettingsWindow {
                         Row::Slider("Magnified size", Key::DockMagSize),
                         Row::Slider("Vertical offset", Key::DockOffset),
                         Row::Toggle("Automatically hide and show the Dock", Key::DockAutohide),
+                    ]
+                    .into_iter()
+                    // A refinement of auto-hide, so only offered while it's on.
+                    .chain(cfg.dock.autohide.then_some(Row::Toggle("Always show on the desktop", Key::DockShowOnDesktop)))
+                    .chain([
                         Row::Segmented("Icon style", Key::DockIconStyle),
                         Row::Segmented("Background", Key::DockBackdrop),
                         Row::Toggle("Show running apps", Key::DockRunning),
                         Row::Toggle("Show Trash", Key::DockTrash),
-                    ],
+                    ])
+                    .collect(),
                 },
                 Group {
                     title: Some("Pinned apps"),
@@ -544,6 +555,7 @@ impl SettingsWindow {
             Key::DockEnabled => d.enabled,
             Key::DockMag => d.magnification,
             Key::DockAutohide => d.autohide,
+            Key::DockShowOnDesktop => d.show_on_desktop,
             Key::DockRunning => d.show_running,
             Key::DockTrash => d.show_trash,
             Key::SpotlightEnabled => cfg.spotlight.enabled,
@@ -706,6 +718,7 @@ impl SettingsWindow {
             Key::MbHeight => (cfg.menubar.height, 22.0, 40.0),
             Key::DockMagSize => (cfg.dock.magnified_size, 48.0, 160.0),
             Key::DockOffset => (cfg.dock.bottom_margin, 0.0, 120.0),
+            Key::IslandOffset => (cfg.island.vertical_offset, -10.0, 40.0),
             _ => (0.0, 0.0, 1.0),
         }
     }

@@ -309,6 +309,8 @@ pub struct Dock {
     /// 0 = fully shown, 1 = fully hidden (auto-hide).
     hide_t: f32,
     idle: f32,
+    /// The desktop has focus (for `show_on_desktop`).
+    on_desktop: bool,
     pub menu_item: Option<usize>,
     pub tracking: bool,
     reserved: bool,
@@ -328,6 +330,7 @@ impl Dock {
         let placeholder = RECT { left: 0, top: 0, right: 1, bottom: 1 };
         let surface = Surface::new(gfx, placeholder, monitor.scale, d.backdrop, theme.dock_tint)?;
         let reserved = d.reserve_space && !d.autohide;
+        let on_desktop = apps::is_desktop(unsafe { GetForegroundWindow() });
         if reserved {
             let thickness = ((metrics.margin + metrics.shelf_h) * monitor.scale).round() as i32;
             appbar::register(surface.content, WM_APP_APPBAR, ABE_BOTTOM, monitor.rect, thickness);
@@ -347,8 +350,9 @@ impl Dock {
             drag: None,
             eased: HashMap::new(),
             ease_left: 0.0,
-            hide_t: if d.autohide { 1.0 } else { 0.0 },
+            hide_t: if d.autohide && !(d.show_on_desktop && on_desktop) { 1.0 } else { 0.0 },
             idle: 0.0,
+            on_desktop,
             menu_item: None,
             tracking: false,
             reserved,
@@ -577,6 +581,13 @@ impl Dock {
         }
     }
 
+    /// Records whether the desktop has focus; returns true when an animation should start.
+    pub fn set_on_desktop(&mut self, on: bool) -> bool {
+        let changed = self.on_desktop != on;
+        self.on_desktop = on;
+        changed && self.cfg.autohide && self.cfg.show_on_desktop
+    }
+
     /// Advances animations; returns true while anything is still moving.
     pub fn tick(&mut self, dt: f32) -> bool {
         let mut animating = false;
@@ -602,7 +613,11 @@ impl Dock {
         }
 
         if self.cfg.autohide {
-            let wants_shown = self.hovering || self.drag.is_some() || self.menu_item.is_some() || self.pressed.is_some();
+            let wants_shown = self.hovering
+                || self.drag.is_some()
+                || self.menu_item.is_some()
+                || self.pressed.is_some()
+                || (self.cfg.show_on_desktop && self.on_desktop);
             let target = if wants_shown {
                 self.idle = 0.0;
                 0.0

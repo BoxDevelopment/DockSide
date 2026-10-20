@@ -936,6 +936,19 @@ impl App {
     fn update_foreground(&mut self) {
         self.raise_surfaces();
         let fg = unsafe { GetForegroundWindow() };
+        // Our own shell surfaces (Dock, menu bar, menus) leave the state as it was.
+        let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
+            Some(false)
+        } else if fg.is_invalid() || apps::window_pid(fg) == self.pid {
+            None
+        } else {
+            Some(apps::is_desktop(fg) || win::class_name(fg) == "Shell_TrayWnd")
+        };
+        if let Some(on) = on_desktop {
+            if self.dock.as_mut().is_some_and(|d| d.set_on_desktop(on)) {
+                self.animate();
+            }
+        }
         if self.finders.iter().any(|f| f.hwnd == fg) {
             if let Some(mb) = &mut self.menubar {
                 mb.set_app("Finder".into(), fg, Some(FINDER_PATH.to_string()));

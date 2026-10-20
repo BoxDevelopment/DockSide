@@ -50,7 +50,7 @@ enabled = true
 tile_size = 48
 magnification = true
 magnified_size = 80
-# Gap between the Dock and the bottom of the screen.
+# Gap between the Dock and the bottom of the screen (Settings: Vertical offset).
 bottom_margin = 4
 backdrop = "acrylic"
 tint_light = "#F6F6F680"

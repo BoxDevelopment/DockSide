@@ -126,6 +126,7 @@ pub enum Key {
     DockSize,
     DockMag,
     DockMagSize,
+    DockOffset,
     DockAutohide,
     DockIconStyle,
     DockBackdrop,
@@ -170,6 +171,7 @@ impl Key {
             Key::DockSize => ("dock", "tile_size"),
             Key::DockMag => ("dock", "magnification"),
             Key::DockMagSize => ("dock", "magnified_size"),
+            Key::DockOffset => ("dock", "bottom_margin"),
             Key::DockAutohide => ("dock", "autohide"),
             Key::DockIconStyle => ("dock", "icon_style"),
             Key::DockBackdrop => ("dock", "backdrop"),
@@ -483,6 +485,7 @@ impl SettingsWindow {
                         Row::Slider("Size", Key::DockSize),
                         Row::Toggle("Magnification", Key::DockMag),
                         Row::Slider("Magnified size", Key::DockMagSize),
+                        Row::Slider("Vertical offset", Key::DockOffset),
                         Row::Toggle("Automatically hide and show the Dock", Key::DockAutohide),
                         Row::Segmented("Icon style", Key::DockIconStyle),
                         Row::Segmented("Background", Key::DockBackdrop),
@@ -702,6 +705,7 @@ impl SettingsWindow {
             Key::DockSize => (cfg.dock.tile_size, 24.0, 96.0),
             Key::MbHeight => (cfg.menubar.height, 22.0, 40.0),
             Key::DockMagSize => (cfg.dock.magnified_size, 48.0, 160.0),
+            Key::DockOffset => (cfg.dock.bottom_margin, 0.0, 120.0),
             _ => (0.0, 0.0, 1.0),
         }
     }

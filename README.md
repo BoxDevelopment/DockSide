@@ -3,7 +3,7 @@
 # DockSide
 
 A fast, open-source macOS-style desktop shell for Windows 11, written in Rust.
-Pretty much 99% vibe-code. Couldn't find a good alternative so I made my own.
+Ai Assisted. Couldn't find a good alternative so I made my own.
 Feel free to contribute.
 
 Discord: boxeth

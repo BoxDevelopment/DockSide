@@ -252,7 +252,7 @@ y = 436
 
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]
-"explorer.exe" = "Finder"
+"explorer.exe" = "File Explorer"
 "msedge.exe" = "Microsoft Edge"
 "WindowsTerminal.exe" = "Terminal"
 "Code.exe" = "Visual Studio Code"

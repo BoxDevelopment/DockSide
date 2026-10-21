@@ -77,6 +77,13 @@ impl IconStore {
     }
 }
 
+impl IconStore {
+    /// An icon DockSide draws itself, made by `make` on first use.
+    pub fn builtin(&mut self, key: &str, make: impl FnOnce() -> Option<IconPixels>) -> Option<Rc<IconPixels>> {
+        self.cache.entry(key.to_string()).or_insert_with(|| make().map(Rc::new)).clone()
+    }
+}
+
 pub fn load_shell_icon(parse_name: &str) -> Option<IconPixels> {
     load_shell_image(parse_name, ICON_PX, false)
 }

@@ -317,6 +317,7 @@ fn parse(user: &str) -> Result<Config> {
     let mut over: toml::Value = toml::from_str(user).context("config.toml is not valid TOML")?;
     migrate_sidebar(&mut over);
     migrate_island(&mut over);
+    migrate_explorer_name(&mut over);
     merge(&mut base, over);
     let mut cfg: Config = base.try_into().context("config.toml has an invalid value")?;
     for app in &mut cfg.dock.apps {
@@ -358,6 +359,16 @@ fn migrate_sidebar(over: &mut toml::Value) {
 
 /// Island switches that used to be shared now come in pairs: each half
 /// starts from the old shared value.
+/// File Explorer used to be shown as "Finder"; that's DockSide's own Finder now.
+fn migrate_explorer_name(over: &mut toml::Value) {
+    let Some(names) = over.get_mut("app_names").and_then(|n| n.as_table_mut()) else { return };
+    for (exe, name) in names.iter_mut() {
+        if exe.eq_ignore_ascii_case("explorer.exe") && name.as_str() == Some("Finder") {
+            *name = toml::Value::String("File Explorer".into());
+        }
+    }
+}
+
 fn migrate_island(over: &mut toml::Value) {
     let Some(island) = over.get_mut("island").and_then(|i| i.as_table_mut()) else { return };
     let splits = [

@@ -15,7 +15,7 @@ use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
 use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{IconStore, RECYCLE_BIN};
-use crate::gfx::{Align, Gfx, Weight};
+use crate::gfx::{finder_icon, Align, Gfx, Weight};
 use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
 use crate::theme::Theme;
@@ -251,12 +251,10 @@ pub fn compute_layout(
     Layout { items, left, right }
 }
 
-/// Finder is our own window, drawn with the File Explorer icon.
+/// Finder is our own window, with an icon we draw ourselves.
 fn icon_source(path: &str) -> String {
-    if path == FINDER_PATH { EXPLORER.to_string() } else { path.to_string() }
+    if path == FINDER_PATH { finder_icon::KEY.to_string() } else { path.to_string() }
 }
-
-const EXPLORER: &str = r"C:\Windows\explorer.exe";
 
 /// Pinned files that no longer exist are skipped (URIs and shell ids always pass).
 fn pin_exists(app: &DockApp) -> bool {
@@ -871,9 +869,12 @@ impl Dock {
             if item.kind == Kind::Separator || self.bitmaps.contains_key(&item.icon_key) {
                 continue;
             }
-            let bmp = icons
-                .get(&gfx.wic, &item.icon_key, item.custom_icon.as_deref())
-                .and_then(|px| px.to_bitmap(self.surface.canvas.target()));
+            let px = if item.icon_key == finder_icon::KEY && item.custom_icon.is_none() {
+                icons.builtin(finder_icon::KEY, || finder_icon::render(gfx))
+            } else {
+                icons.get(&gfx.wic, &item.icon_key, item.custom_icon.as_deref())
+            };
+            let bmp = px.and_then(|px| px.to_bitmap(self.surface.canvas.target()));
             self.bitmaps.insert(item.icon_key.clone(), bmp);
         }
 
@@ -917,7 +918,8 @@ impl Dock {
                 p.fill_round(rect.inset(rect.w * 0.08, rect.w * 0.08), rect.w * 0.2, theme.text_disabled);
                 return;
             };
-            let draw_rect = if squircle && item.custom_icon.is_none() {
+            // The Finder icon is already a tile.
+            let draw_rect = if squircle && item.custom_icon.is_none() && item.icon_key != finder_icon::KEY {
                 let tile = rect.inset(rect.w * 0.06, rect.w * 0.06);
                 p.fill_round(tile.offset(0.0, rect.w * 0.01), tile.w * 0.225, Color::gray(0, 0.12 * opacity));
                 // macOS-style tile: white in light mode, near-black (with a faint edge) in dark mode.

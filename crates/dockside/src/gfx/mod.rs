@@ -4,6 +4,7 @@
 //! render target draws into, pushed to the screen with `UpdateLayeredWindow`.
 //! Render targets use the monitor DPI, so all drawing is in logical points.
 
+pub mod finder_icon;
 pub mod icons;
 
 use std::cell::RefCell;
@@ -253,8 +254,7 @@ impl Canvas {
         Ok(())
     }
 
-    /// The drawn pixels (premultiplied BGRA, top-down), for tests that look at output.
-    #[cfg(test)]
+    /// The drawn pixels (premultiplied BGRA, top-down).
     pub fn pixels(&self) -> Vec<u8> {
         let mut bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {

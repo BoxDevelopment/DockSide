@@ -8,6 +8,11 @@
 //! behind near the edges with a little chromatic dispersion, a light frost and
 //! saturation boost, and specular highlights that catch light from the top-left.
 //!
+//! Panes that only ever sit over the desktop (the menu bar and Dock with
+//! reserved space, desktop widgets) refract the wallpaper image instead (see
+//! [`Source`]). They need no capture, so they aren't hidden from it and appear
+//! in screenshots and recordings.
+//!
 //! Everything runs on the UI thread: the frame pool is created with
 //! `Create` (not free-threaded), so frames arrive through its DispatcherQueue.
 
@@ -21,6 +26,7 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HMODULE, HWND, RECT};
+use crate::win::wallpaper;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -46,6 +52,17 @@ pub enum Style {
     Subtle,
 }
 const MIPS: u32 = 5;
+
+/// What a pane refracts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Source {
+    /// A live capture of the screen: right over apps, but the pane must hide
+    /// from all screen capture so it never refracts itself.
+    Screen,
+    /// The desktop wallpaper, drawn directly, for panes that only sit over the
+    /// desktop. Falls back to `Screen` under a live wallpaper.
+    Wallpaper,
+}
 
 const SHADER: &str = r#"
 Texture2D src : register(t0);
@@ -198,6 +215,22 @@ struct Monitor {
     frame: Option<ID3D11Texture2D>,
 }
 
+/// A monitor's wallpaper, as `Source::Wallpaper` panes see it.
+struct Wallpaper {
+    handle: HMONITOR,
+    rect: RECT,
+    /// None when it couldn't be loaded (not retried until the wallpaper changes).
+    tex: Option<ID3D11Texture2D>,
+}
+
+fn monitor_rect(handle: HMONITOR) -> RECT {
+    let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+    unsafe {
+        let _ = GetMonitorInfoW(handle, &mut info);
+    }
+    info.rcMonitor
+}
+
 struct Engine {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -208,6 +241,7 @@ struct Engine {
     sampler: ID3D11SamplerState,
     constants: ID3D11Buffer,
     monitors: Vec<Monitor>,
+    wallpapers: Vec<Wallpaper>,
     panes: Vec<Weak<RefCell<PaneState>>>,
 }
 
@@ -298,6 +332,7 @@ impl Engine {
             sampler: sampler.unwrap(),
             constants: constants.unwrap(),
             monitors: Vec::new(),
+            wallpapers: Vec::new(),
             panes: Vec::new(),
         })
     }
@@ -347,6 +382,45 @@ impl Engine {
             _item: item,
             frame: None,
         })
+    }
+
+    /// A monitor's wallpaper texture with its screen origin and size, loaded on
+    /// first use and again when the monitor's bounds change.
+    fn wallpaper(&mut self, handle: HMONITOR) -> Option<(ID3D11Texture2D, (i32, i32), (i32, i32))> {
+        let rect = monitor_rect(handle);
+        let found = self.wallpapers.iter().position(|w| w.handle == handle && w.rect == rect);
+        let i = match found {
+            Some(i) => i,
+            None => {
+                self.wallpapers.retain(|w| w.handle != handle);
+                let tex = self.load_wallpaper(rect).map_err(|e| log!("glass wallpaper failed: {e}")).ok();
+                self.wallpapers.push(Wallpaper { handle, rect, tex });
+                self.wallpapers.len() - 1
+            }
+        };
+        let tex = self.wallpapers[i].tex.clone()?;
+        Some((tex, (rect.left, rect.top), (rect.right - rect.left, rect.bottom - rect.top)))
+    }
+
+    fn load_wallpaper(&self, rect: RECT) -> Result<ID3D11Texture2D> {
+        let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+        let pixels = wallpaper::render(rect)?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            Width: w as u32,
+            Height: h as u32,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_IMMUTABLE,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+        };
+        let init = D3D11_SUBRESOURCE_DATA { pSysMem: pixels.as_ptr() as _, SysMemPitch: (w * 4) as u32, SysMemSlicePitch: 0 };
+        let mut tex = None;
+        unsafe { self.device.CreateTexture2D(&desc, Some(&init), Some(&mut tex))? };
+        Ok(tex.unwrap())
     }
 
     /// Takes the newest frame for a monitor; true when there was one.
@@ -399,7 +473,7 @@ impl Engine {
             .panes
             .iter()
             .filter_map(|p| p.upgrade())
-            .filter_map(|p| p.try_borrow().ok().map(|s| s.monitor.0 as isize))
+            .filter_map(|p| p.try_borrow().ok().filter(|s| s.source == Source::Screen).map(|s| s.monitor.0 as isize))
             .collect();
         self.monitors.retain(|m| {
             let keep = used.contains(&(m.handle.0 as isize));
@@ -420,19 +494,28 @@ impl Engine {
             pane.monitor = monitor;
             self.prune();
         }
-        let Some(mi) = self.monitor(monitor) else { return Ok(()) };
-        let m = &self.monitors[mi];
-        let Some(frame) = m.frame.clone() else { return Ok(()) };
+        let (frame, origin, (mw, mh)) = match pane.source {
+            Source::Screen => {
+                let Some(mi) = self.monitor(monitor) else { return Ok(()) };
+                let m = &self.monitors[mi];
+                let Some(frame) = m.frame.clone() else { return Ok(()) };
+                (frame, m.origin, (m.size.Width, m.size.Height))
+            }
+            Source::Wallpaper => {
+                let Some(w) = self.wallpaper(monitor) else { return Ok(()) };
+                w
+            }
+        };
 
         // Region behind the pane, plus a margin, in monitor-local texels.
         let mut wr = RECT::default();
         unsafe { GetWindowRect(pane.hwnd, &mut wr)? };
-        let (px, py) = (wr.left - m.origin.0, wr.top - m.origin.1);
+        let (px, py) = (wr.left - origin.0, wr.top - origin.1);
         let (w, h) = (pane.size.0 as i32, pane.size.1 as i32);
-        let x0 = (px - MARGIN).clamp(0, m.size.Width);
-        let y0 = (py - MARGIN).clamp(0, m.size.Height);
-        let x1 = (px + w + MARGIN).clamp(0, m.size.Width);
-        let y1 = (py + h + MARGIN).clamp(0, m.size.Height);
+        let x0 = (px - MARGIN).clamp(0, mw);
+        let y0 = (py - MARGIN).clamp(0, mh);
+        let x1 = (px + w + MARGIN).clamp(0, mw);
+        let y1 = (py + h + MARGIN).clamp(0, mh);
         if x1 - x0 < 1 || y1 - y0 < 1 {
             return Ok(());
         }
@@ -533,6 +616,25 @@ pub fn shutdown() {
     }
 }
 
+/// Reloads the wallpaper under `Source::Wallpaper` panes (after the user
+/// changed it, or a slideshow moved on).
+pub fn wallpaper_changed() {
+    ENGINE.with(|e| {
+        let Ok(mut e) = e.try_borrow_mut() else { return };
+        let Some(engine) = e.as_mut() else { return };
+        engine.wallpapers.clear();
+        let panes: Vec<_> = engine.panes.iter().filter_map(|p| p.upgrade()).collect();
+        for pane in panes {
+            let Ok(mut state) = pane.try_borrow_mut() else { continue };
+            if state.source == Source::Wallpaper {
+                if let Err(e) = engine.render(&mut state) {
+                    log!("glass render failed: {e}");
+                }
+            }
+        }
+    });
+}
+
 fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
     ENGINE.with(|e| {
         let mut e = e.try_borrow_mut().ok()?;
@@ -562,7 +664,8 @@ fn on_frame(key: isize) {
         let panes: Vec<_> = engine.panes.iter().filter_map(|p| p.upgrade()).collect();
         for pane in panes {
             let Ok(mut state) = pane.try_borrow_mut() else { continue };
-            if state.monitor.0 as isize == key || !state.shown {
+            // Wallpaper panes redraw when they move or the wallpaper changes, not per frame.
+            if state.source == Source::Screen && (state.monitor.0 as isize == key || !state.shown) {
                 if let Err(e) = engine.render(&mut state) {
                     log!("glass render failed: {e}");
                 }
@@ -578,6 +681,7 @@ struct PaneState {
     radius: f32,
     tint: Color,
     style: Style,
+    source: Source,
     monitor: HMONITOR,
     src: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, (u32, u32))>,
     /// Has presented at least once.
@@ -588,8 +692,9 @@ struct PaneState {
 pub struct Pane(Rc<RefCell<PaneState>>);
 
 impl Pane {
-    /// Excludes `hwnd` from capture and returns the pane with its swap chain.
-    pub fn new(hwnd: HWND, tint: Color, style: Style) -> Option<(Self, IDXGISwapChain1)> {
+    /// Returns the pane with its swap chain. A `Screen` pane's window is
+    /// excluded from capture.
+    pub fn new(hwnd: HWND, tint: Color, style: Style, source: Source) -> Option<(Self, IDXGISwapChain1)> {
         let swapchain = with_engine(|engine| -> Result<IDXGISwapChain1> {
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: 1,
@@ -605,7 +710,18 @@ impl Pane {
             unsafe { engine.factory.CreateSwapChainForComposition(&engine.device, &desc, None) }
         })?;
         let swapchain = swapchain.map_err(|e| log!("glass swap chain failed: {e}")).ok()?;
-        exclude_from_capture(hwnd, true);
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let source = match source {
+            Source::Wallpaper if wallpaper::is_live() => {
+                log!("live wallpaper: glass refracts the screen instead");
+                Source::Screen
+            }
+            Source::Wallpaper if with_engine(|e| e.wallpaper(monitor).is_none()).unwrap_or(true) => Source::Screen,
+            s => s,
+        };
+        if source == Source::Screen {
+            exclude_from_capture(hwnd, true);
+        }
         let state = Rc::new(RefCell::new(PaneState {
             hwnd,
             swapchain: swapchain.clone(),
@@ -613,16 +729,23 @@ impl Pane {
             radius: 0.0,
             tint,
             style,
-            monitor: unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) },
+            source,
+            monitor,
             src: None,
             shown: false,
         }));
         with_engine(|engine| {
             engine.panes.push(Rc::downgrade(&state));
-            let monitor = state.borrow().monitor;
-            engine.monitor(monitor);
+            if source == Source::Screen {
+                engine.monitor(monitor);
+            }
         });
         Some((Self(state), swapchain))
+    }
+
+    /// Whether the pane's window is hidden from screenshots and recordings.
+    pub fn hidden_from_capture(&self) -> bool {
+        self.0.borrow().source == Source::Screen
     }
 
     /// Size and corner radius in physical pixels.
@@ -659,6 +782,9 @@ impl Pane {
 impl Drop for Pane {
     fn drop(&mut self) {
         // The capture itself stops on the next frame, once `prune` sees no pane on its monitor.
-        exclude_from_capture(self.0.borrow().hwnd, false);
+        let s = self.0.borrow();
+        if s.source == Source::Screen {
+            exclude_from_capture(s.hwnd, false);
+        }
     }
 }

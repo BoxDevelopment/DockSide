@@ -83,11 +83,13 @@ fn effective_tint(kind: Backdrop, tint: Color) -> Color {
 
 impl Surface {
     pub fn new(gfx: &Gfx, rect: RECT, scale: f32, kind: Backdrop, tint: Color) -> Result<Self> {
-        Self::with_layer(gfx, rect, scale, kind, tint, true)
+        Self::with_layer(gfx, rect, scale, kind, tint, true, glass::Source::Screen)
     }
 
     /// `topmost: false` makes an ordinary-band surface (desktop widgets).
-    pub fn with_layer(gfx: &Gfx, rect: RECT, scale: f32, kind: Backdrop, tint: Color, topmost: bool) -> Result<Self> {
+    /// `source` is what glass refracts: `Wallpaper` for surfaces that only sit
+    /// over the desktop, which keeps them in screenshots and recordings.
+    pub fn with_layer(gfx: &Gfx, rect: RECT, scale: f32, kind: Backdrop, tint: Color, topmost: bool, source: glass::Source) -> Result<Self> {
         let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | if topmost { WS_EX_TOPMOST } else { WINDOW_EX_STYLE(0) };
         let tint = effective_tint(kind, tint);
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
@@ -98,7 +100,7 @@ impl Surface {
         } else {
             let hwnd = create_window(ex | WS_EX_NOREDIRECTIONBITMAP, WS_POPUP, rect, HWND::default())?;
             accent::prepare(hwnd);
-            match CompositionBackdrop::new(hwnd, tint, (kind == Backdrop::Glass).then_some(glass::Style::Bold)) {
+            match CompositionBackdrop::new(hwnd, tint, (kind == Backdrop::Glass).then_some(glass::Style::Bold), source) {
                 Ok(c) => {
                     c.set_shape(0.0, 0.0, w as f32, h as f32, 0.0);
                     composition = Some(c);
@@ -118,8 +120,8 @@ impl Surface {
         };
         let content = create_window(ex | WS_EX_LAYERED, WS_POPUP, rect, backdrop.unwrap_or_default())?;
         accent::prepare(content);
-        if composition.as_ref().is_some_and(|c| c.refracts()) {
-            // Refracting glass samples the screen, so it mustn't see its own content.
+        if composition.as_ref().is_some_and(|c| c.hidden_from_capture()) {
+            // Glass refracting the screen mustn't see its own content.
             glass::exclude_from_capture(content, true);
         }
         let canvas = Canvas::new(gfx, w, h, scale)?;
@@ -134,7 +136,7 @@ impl Surface {
         let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WINDOW_EX_STYLE(topmost);
         let hwnd = create_window(ex, WS_POPUP, RECT { left: 0, top: 0, right: 1, bottom: 1 }, HWND::default())?;
         accent::prepare(hwnd);
-        if self.composition.as_ref().is_some_and(|c| c.refracts()) {
+        if self.composition.as_ref().is_some_and(|c| c.hidden_from_capture()) {
             glass::exclude_from_capture(hwnd, true);
         }
         unsafe {

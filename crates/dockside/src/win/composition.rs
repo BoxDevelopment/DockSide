@@ -30,7 +30,7 @@ use windows::UI::Composition::{
 };
 
 use crate::geom::Color;
-use crate::win::glass::{Pane, Style};
+use crate::win::glass::{Pane, Source, Style};
 
 struct Shared {
     compositor: Compositor,
@@ -150,8 +150,8 @@ pub struct CompositionBackdrop {
 
 impl CompositionBackdrop {
     /// `hwnd` should be created with `WS_EX_NOREDIRECTIONBITMAP`. `glass` adds
-    /// Liquid Glass over the tint: refraction when available, else sheen and rim.
-    pub fn new(hwnd: HWND, tint: Color, glass: Option<Style>) -> Result<Self> {
+    /// Liquid Glass over the tint: refraction (of `source`) when available, else sheen and rim.
+    pub fn new(hwnd: HWND, tint: Color, glass: Option<Style>, source: Source) -> Result<Self> {
         let compositor = SHARED.with(|s| s.as_ref().map(|s| s.compositor.clone()));
         let Some(compositor) = compositor else {
             return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL));
@@ -198,7 +198,7 @@ impl CompositionBackdrop {
             None
         };
         let refraction = if let Some(style) = style.filter(|_| crate::win::glass::enabled()) {
-            Pane::new(hwnd, tint, style).and_then(|(pane, swapchain)| {
+            Pane::new(hwnd, tint, style, source).and_then(|(pane, swapchain)| {
                 let layer = (|| -> Result<SpriteVisual> {
                     let interop: ICompositorInterop = compositor.cast()?;
                     let surface = unsafe { interop.CreateCompositionSurfaceForSwapChain(&swapchain)? };
@@ -247,9 +247,10 @@ impl CompositionBackdrop {
         }
     }
 
-    /// True when a refracting pane covers this backdrop (its window is hidden from capture).
-    pub fn refracts(&self) -> bool {
-        self.refraction.is_some()
+    /// True when a pane refracting the live screen covers this backdrop, so its
+    /// window (and anything drawn over it) must be hidden from capture.
+    pub fn hidden_from_capture(&self) -> bool {
+        self.refraction.as_ref().is_some_and(|(pane, _)| pane.hidden_from_capture())
     }
 
     /// Re-renders the refraction after the window moved or reshaped.

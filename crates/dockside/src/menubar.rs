@@ -79,7 +79,9 @@ impl MenuBar {
             right: monitor.rect.right,
             bottom: monitor.rect.top + height,
         };
-        let surface = Surface::new(gfx, rect, monitor.scale, m.backdrop, theme.menubar_tint)?;
+        // With its space reserved, only the desktop is ever behind the menu bar.
+        let source = if m.reserve_space { crate::win::glass::Source::Wallpaper } else { crate::win::glass::Source::Screen };
+        let surface = Surface::with_layer(gfx, rect, monitor.scale, m.backdrop, theme.menubar_tint, true, source)?;
         if m.reserve_space {
             appbar::register(surface.content, WM_APP_APPBAR, ABE_TOP, monitor.rect, height);
         }

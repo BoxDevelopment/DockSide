@@ -328,14 +328,16 @@ impl Dock {
 
         let metrics = Metrics::new(d);
         let placeholder = RECT { left: 0, top: 0, right: 1, bottom: 1 };
-        let mut surface = Surface::new(gfx, placeholder, monitor.scale, d.backdrop, theme.dock_tint)?;
+        let reserved = d.reserve_space && !d.autohide;
+        // With its space reserved, only the desktop is ever behind the Dock.
+        let source = if reserved { crate::win::glass::Source::Wallpaper } else { crate::win::glass::Source::Screen };
+        let mut surface = Surface::with_layer(gfx, placeholder, monitor.scale, d.backdrop, theme.dock_tint, true, source)?;
         // A see-through ("clear") shelf would show its own shadow through it.
         if d.shadow && d.backdrop != crate::config::Backdrop::Clear {
             if let Err(e) = surface.set_shadow(gfx, if theme.dark { 0.42 } else { 0.24 }) {
                 log!("dock shadow failed: {e}");
             }
         }
-        let reserved = d.reserve_space && !d.autohide;
         let on_desktop = apps::is_desktop(unsafe { GetForegroundWindow() });
         if reserved {
             let thickness = ((metrics.margin + metrics.shelf_h) * monitor.scale).round() as i32;

@@ -11,6 +11,7 @@ pub mod startup;
 pub mod system;
 pub mod taskbar;
 pub mod tray;
+pub mod wallpaper;
 
 use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::*;

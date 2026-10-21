@@ -73,6 +73,8 @@ const TIMER_THEME: usize = 6;
 const TIMER_DISPLAY: usize = 7;
 /// Destroys replaced surfaces once their replacements are on screen.
 const TIMER_RETIRE: usize = 8;
+/// Wallpaper broadcast: reload what wallpaper-backed glass refracts.
+const TIMER_WALLPAPER: usize = 9;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
 
@@ -1654,6 +1656,7 @@ impl App {
                         TIMER_RELOAD => self.reload(),
                         TIMER_REBUILD => self.build(),
                         TIMER_RETIRE => self.retired.clear(),
+                        TIMER_WALLPAPER => win::glass::wallpaper_changed(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
                         TIMER_THEME
@@ -1779,8 +1782,11 @@ impl App {
             self.timer(TIMER_DISPLAY, 400);
             return None;
         }
-        if msg == WM_SETTINGCHANGE && lp.0 != 0 {
-            let area = unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() };
+        if msg == WM_SETTINGCHANGE {
+            if wp.0 as u32 == SPI_SETDESKWALLPAPER.0 {
+                self.timer(TIMER_WALLPAPER, 300);
+            }
+            let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() } } else { String::new() };
             if area == "ImmersiveColorSet" {
                 self.timer(TIMER_THEME, 400);
             }

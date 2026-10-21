@@ -427,7 +427,7 @@ impl Widgets {
             bottom: top + ((item.y + h + SHADOW) * s).round() as i32,
         };
         let tint = if theme.dark { Color::rgba(30, 30, 32, 0.55) } else { Color::rgba(246, 246, 248, 0.55) };
-        let mut surface = match Surface::with_layer(gfx, rect, s, self.cfg.backdrop, tint, false) {
+        let mut surface = match Surface::with_layer(gfx, rect, s, self.cfg.backdrop, tint, false, crate::win::glass::Source::Wallpaper) {
             Ok(s) => s,
             Err(e) => return log!("{} widget failed: {e}", title(item.kind)),
         };

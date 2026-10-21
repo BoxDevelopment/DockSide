@@ -177,9 +177,9 @@ impl SidebarBackdrop {
         let hwnd = create_window(ex, WS_POPUP, RECT::default(), HWND::default()).ok()?;
         accent::prepare(hwnd);
         let tint = Self::tint(theme, kind);
-        match CompositionBackdrop::new(hwnd, tint, glass.then_some(glass::Style::Subtle)) {
+        match CompositionBackdrop::new(hwnd, tint, glass.then_some(glass::Style::Subtle), glass::Source::Screen) {
             Ok(composition) => {
-                if composition.refracts() {
+                if composition.hidden_from_capture() {
                     // The pane shows through the owner, so the owner mustn't be captured either.
                     glass::exclude_from_capture(owner, true);
                 }
@@ -233,7 +233,7 @@ impl SidebarBackdrop {
 
 impl Drop for SidebarBackdrop {
     fn drop(&mut self) {
-        if self.composition.refracts() {
+        if self.composition.hidden_from_capture() {
             glass::exclude_from_capture(self.owner, false);
         }
         unsafe {

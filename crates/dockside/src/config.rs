@@ -101,6 +101,8 @@ pub struct DockCfg {
     pub magnification: bool,
     pub magnified_size: f32,
     pub bottom_margin: f32,
+    /// Gap between items, as a percentage of the tile size.
+    pub item_spacing: f32,
     pub backdrop: Backdrop,
     pub tint_light: String,
     pub tint_dark: String,

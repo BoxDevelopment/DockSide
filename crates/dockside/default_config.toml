@@ -52,6 +52,8 @@ magnification = true
 magnified_size = 80
 # Gap between the Dock and the bottom of the screen (Settings: Vertical offset).
 bottom_margin = 4
+# Gap between Dock items, as a percentage of the icon size (Settings: Item spacing).
+item_spacing = 8
 backdrop = "acrylic"
 tint_light = "#F6F6F680"
 tint_dark = "#2A2A2C80"

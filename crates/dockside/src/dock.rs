@@ -163,7 +163,7 @@ impl Metrics {
         Self {
             tile,
             max,
-            gap: tile * 0.08,
+            gap: tile * cfg.item_spacing.clamp(0.0, 100.0) / 100.0,
             pad: tile * 0.1,
             shelf_h,
             sep_w: tile * 0.22,

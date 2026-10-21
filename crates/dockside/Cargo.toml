@@ -37,6 +37,7 @@ features = [
     "UI_Notifications",
     "Web",
     "Web_Http",
+    "Web_Http_Headers",
     "UI_Notifications_Management",
     "UI_Composition",
     "UI_Composition_Desktop",

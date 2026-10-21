@@ -18,6 +18,7 @@ mod settings;
 mod spotlight;
 mod surface;
 mod theme;
+mod update;
 mod win;
 
 use windows::core::w;

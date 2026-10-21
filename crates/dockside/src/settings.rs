@@ -211,6 +211,7 @@ enum Hit {
     AddApp,
     OpenConfig,
     OpenLog,
+    OpenUpdate,
     Field(Key),
     ConnectClaude(bool),
 }
@@ -404,10 +405,14 @@ impl SettingsWindow {
                 },
                 Group {
                     title: Some("About"),
-                    rows: vec![
-                        Row::Info("Version", env!("CARGO_PKG_VERSION").to_string()),
-                        Row::Info("Settings folder", crate::config::dir().display().to_string()),
-                    ],
+                    rows: {
+                        let mut rows = vec![Row::Info("Version", crate::update::current())];
+                        if crate::update::available().is_some() {
+                            rows.push(Row::Buttons("A newer version is available", vec![("Download", Hit::OpenUpdate)]));
+                        }
+                        rows.push(Row::Info("Settings folder", crate::config::dir().display().to_string()));
+                        rows
+                    },
                 },
             ],
             Page::Appearance => vec![
@@ -870,6 +875,9 @@ impl SettingsWindow {
             }
             Hit::AddApp => Action::AddDockApp,
             Hit::OpenConfig => Action::OpenConfig,
+            Hit::OpenUpdate => Action::Open(
+                crate::update::available().map_or_else(|| crate::update::REPO_URL.to_string() + "/releases", |r| r.url),
+            ),
             Hit::OpenLog => Action::Open(crate::config::dir().join("dockside.log").display().to_string()),
             Hit::ConnectClaude(on) => Action::ConnectClaude(on),
             Hit::Slider(_) => return SettingsEvent::None,

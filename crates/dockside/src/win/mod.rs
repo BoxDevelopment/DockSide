@@ -162,6 +162,7 @@ pub const WM_APP_DESKTOP: u32 = WM_APP + 17;
 /// A relaunch checking the running instance is alive; answered with `PING_REPLY`.
 pub const WM_APP_PING: u32 = WM_APP + 18;
 pub const PING_REPLY: usize = 0x444F_434B; // "DOCK"
+pub const WM_APP_UPDATE: u32 = WM_APP + 19;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
 

@@ -31,6 +31,8 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked
+        env:
+          DOCKSIDE_BUILD: ${{ github.run_number }}
 
       - name: Package
         id: package

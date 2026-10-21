@@ -794,6 +794,19 @@ impl Island {
 
     // --- alerts ----------------------------------------------------------------
 
+    pub fn show_update(&mut self, release: &crate::update::Release) {
+        let note = notifications::Note {
+            app: "DockSide".into(),
+            app_id: release.url.clone(),
+            title: format!("Update available: {}", release.tag),
+            body: "Click to download it from GitHub".into(),
+            icon: None,
+        };
+        self.show_alert(Alert::Note(note), 10.0);
+        self.retarget();
+        self.dirty = true;
+    }
+
     fn show_alert(&mut self, alert: Alert, secs: f32) {
         let until = Instant::now() + Duration::from_secs_f32(secs);
         if let Some(s) = self.alert.as_mut() {
@@ -1282,6 +1295,7 @@ impl Island {
             Some(Alert::Screenshot(p)) => Some(IslandEvent::Run(Action::Open(p.to_string_lossy().into_owned()))),
             Some(Alert::Downloaded(p)) => Some(IslandEvent::Run(Action::Reveal(p.to_string_lossy().into_owned()))),
             Some(Alert::Bluetooth { .. }) => Some(IslandEvent::Run(Action::Open("ms-settings:bluetooth".into()))),
+            Some(Alert::Note(n)) if n.app_id.starts_with("https://") => Some(IslandEvent::Run(Action::Open(n.app_id.clone()))),
             Some(Alert::Note(n)) if !n.app_id.is_empty() => Some(IslandEvent::OpenApp(n.app_id.clone())),
             _ => None,
         };

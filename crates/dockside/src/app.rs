@@ -39,6 +39,7 @@ use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
+    WM_APP_UPDATE,
 };
 
 thread_local! {
@@ -75,6 +76,7 @@ pub fn run() -> anyhow::Result<()> {
     let app = App::new(msg_hwnd)?;
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|app| app.build());
+    crate::update::watch(msg_hwnd.0 as isize, WM_APP_UPDATE);
 
     unsafe {
         SetTimer(msg_hwnd, TIMER_TICK, 1000, None);
@@ -1476,6 +1478,13 @@ impl App {
                         i.on_signals();
                         self.animate();
                     }
+                }
+                WM_APP_UPDATE => {
+                    if let (Some(i), Some(r)) = (&mut self.island, crate::update::available()) {
+                        i.show_update(&r);
+                        self.animate();
+                    }
+                    self.mark_settings_dirty();
                 }
                 WM_APP_DESKTOP_KEY => match wp.0 {
                     DESKTOP_LEFT => win::desktops::step(-1),

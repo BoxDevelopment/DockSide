@@ -67,6 +67,10 @@ const TIMER_REFRESH: usize = 2;
 const TIMER_RELOAD: usize = 3;
 const TIMER_REBUILD: usize = 4;
 const TIMER_FINDER: usize = 5;
+/// Color-scheme broadcast: rebuild only if light/dark actually flipped.
+const TIMER_THEME: usize = 6;
+/// Display broadcast: rebuild only if the primary monitor actually changed.
+const TIMER_DISPLAY: usize = 7;
 
 const HOTKEY_SPOTLIGHT: i32 = 1;
 
@@ -578,6 +582,10 @@ pub struct App {
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
     taskbar_created: u32,
+    /// Windows' last ABN_FULLSCREENAPP report (checked against the foreground window).
+    fullscreen_reported: bool,
+    /// Shell surfaces are currently hidden for a fullscreen app.
+    fullscreen_hidden: bool,
 }
 
 impl App {
@@ -654,6 +662,8 @@ impl App {
             win_hooks,
             _watcher: watcher,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            fullscreen_reported: false,
+            fullscreen_hidden: false,
         })
     }
 
@@ -698,6 +708,9 @@ impl App {
         // After the menu bar, so it stacks above it.
         self.rebuild_island();
         self.rebuild_widgets();
+        // The new surfaces start shown; hide them again if a fullscreen app is still up.
+        self.fullscreen_hidden = false;
+        self.update_fullscreen();
         self.setup_desktops();
         self.refresh_windows();
         self.flush();
@@ -1041,8 +1054,30 @@ impl App {
         }
     }
 
+    /// Hides the shell surfaces while a real app fills the screen. Windows'
+    /// report alone isn't trusted: live wallpapers and desktop overlays trigger
+    /// it too, and it can go stale when focus moves on.
+    fn update_fullscreen(&mut self) {
+        let fg = unsafe { GetForegroundWindow() };
+        let hide = self.fullscreen_reported && apps::is_fullscreen_app(fg, self.monitor.rect);
+        if hide == self.fullscreen_hidden {
+            return;
+        }
+        self.fullscreen_hidden = hide;
+        if let Some(mb) = &mut self.menubar {
+            mb.surface.set_hidden(hide);
+        }
+        if let Some(d) = &mut self.dock {
+            d.surface.set_hidden(hide);
+        }
+        if let Some(i) = &mut self.island {
+            i.set_fullscreen(hide);
+        }
+    }
+
     fn update_foreground(&mut self) {
         self.raise_surfaces();
+        self.update_fullscreen();
         let fg = unsafe { GetForegroundWindow() };
         // Our own shell surfaces (Dock, menu bar, menus) leave the state as it was.
         let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg) || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg);
@@ -1550,6 +1585,16 @@ impl App {
                         TIMER_REFRESH => self.refresh_windows(),
                         TIMER_RELOAD => self.reload(),
                         TIMER_REBUILD => self.build(),
+                        // Wallpaper Engine and similar re-tint the accent color constantly;
+                        // a full rebuild each time makes everything flicker away.
+                        TIMER_THEME if crate::theme::wants_dark(&self.cfg) != self.theme.dark => self.build(),
+                        TIMER_DISPLAY if Monitor::primary() != self.monitor => self.build(),
+                        TIMER_DISPLAY => {
+                            self.raise_surfaces();
+                            if let Some(w) = &self.widgets {
+                                w.place();
+                            }
+                        }
                         TIMER_FINDER => {
                             for id in std::mem::take(&mut self.finder_changed) {
                                 if let Some(f) = self.finders.iter_mut().find(|f| f.id == id) {
@@ -1652,29 +1697,25 @@ impl App {
         }
 
         // Broadcasts reach every one of our top-level windows; debounce into one rebuild.
-        if msg == self.taskbar_created || msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
+        if msg == self.taskbar_created {
             self.timer(TIMER_REBUILD, 400);
+            return None;
+        }
+        if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
+            self.timer(TIMER_DISPLAY, 400);
             return None;
         }
         if msg == WM_SETTINGCHANGE && lp.0 != 0 {
             let area = unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() };
             if area == "ImmersiveColorSet" {
-                self.timer(TIMER_REBUILD, 400);
+                self.timer(TIMER_THEME, 400);
             }
             return None;
         }
         if msg == WM_APP_APPBAR {
             if wp.0 as u32 == ABN_FULLSCREENAPP {
-                let hide = lp.0 != 0;
-                if let Some(mb) = &mut self.menubar {
-                    mb.surface.set_hidden(hide);
-                }
-                if let Some(d) = &mut self.dock {
-                    d.surface.set_hidden(hide);
-                }
-                if let Some(i) = &mut self.island {
-                    i.set_fullscreen(hide);
-                }
+                self.fullscreen_reported = lp.0 != 0;
+                self.update_fullscreen();
                 self.flush();
             }
             return Some(LRESULT(0));

@@ -75,16 +75,7 @@ fn is_app_window(hwnd: HWND) -> bool {
         if ex & WS_EX_NOACTIVATE.0 != 0 && ex & WS_EX_APPWINDOW.0 == 0 {
             return false;
         }
-        let mut cloaked: u32 = 0;
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED,
-            &mut cloaked as *mut _ as *mut c_void,
-            std::mem::size_of::<u32>() as u32,
-        )
-        .is_ok()
-            && cloaked != 0
-        {
+        if is_cloaked(hwnd) {
             return false;
         }
         if GetWindowTextLengthW(hwnd) == 0 {
@@ -97,8 +88,40 @@ fn is_app_window(hwnd: HWND) -> bool {
     )
 }
 
+fn is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked: u32 = 0;
+    let ok = unsafe {
+        DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut c_void, std::mem::size_of::<u32>() as u32)
+    };
+    ok.is_ok() && cloaked != 0
+}
+
 pub fn is_desktop(hwnd: HWND) -> bool {
     matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW")
+}
+
+/// Whether `hwnd` is an app filling `monitor` (a game, a fullscreen video).
+/// Windows' own fullscreen report also fires for live wallpapers and desktop
+/// overlays (Wallpaper Engine, desktop pets), which are the desktop or are
+/// layered/click-through windows drawn over it.
+pub fn is_fullscreen_app(hwnd: HWND, monitor: RECT) -> bool {
+    if hwnd.is_invalid() || is_desktop(hwnd) || is_cloaked(hwnd) {
+        return false;
+    }
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() {
+            return false;
+        }
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        if ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) != 0 {
+            return false;
+        }
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_err() {
+            return false;
+        }
+        r.left <= monitor.left && r.top <= monitor.top && r.right >= monitor.right && r.bottom >= monitor.bottom
+    }
 }
 
 pub fn window_title(hwnd: HWND) -> String {

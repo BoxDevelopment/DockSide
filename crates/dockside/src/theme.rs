@@ -29,13 +29,18 @@ pub struct Theme {
     pub shadow: Color,
 }
 
+/// Whether the config's appearance resolves to dark right now.
+pub fn wants_dark(cfg: &Config) -> bool {
+    match cfg.general.appearance {
+        Appearance::Auto => system::is_dark_mode(),
+        Appearance::Light => false,
+        Appearance::Dark => true,
+    }
+}
+
 impl Theme {
     pub fn new(cfg: &Config, gfx: &Gfx) -> Theme {
-        let dark = match cfg.general.appearance {
-            Appearance::Auto => system::is_dark_mode(),
-            Appearance::Light => false,
-            Appearance::Dark => true,
-        };
+        let dark = wants_dark(cfg);
         let font = if gfx.font_exists(&cfg.general.font) {
             cfg.general.font.clone()
         } else {

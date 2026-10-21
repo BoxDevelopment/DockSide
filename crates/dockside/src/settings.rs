@@ -242,13 +242,28 @@ struct Editing {
     invalid: bool,
 }
 
+/// Slider knob radius; the knob travels inside the track so it never
+/// overhangs either end.
+const KNOB: f32 = 9.0;
+
 #[derive(Clone, Copy)]
 struct SliderDrag {
     key: Key,
-    track: Rect,
+    /// Knob-centre travel: starts at `x0`, spans `w`.
+    x0: f32,
+    w: f32,
     min: f32,
     max: f32,
-    value: f32,
+    /// Continuous position (0..1) so the knob follows the cursor smoothly.
+    t: f32,
+    /// Cursor offset from the knob centre when it was grabbed.
+    grab: f32,
+}
+
+impl SliderDrag {
+    fn value(&self) -> f32 {
+        (self.min + self.t * (self.max - self.min)).round()
+    }
 }
 
 pub struct SettingsWindow {
@@ -262,6 +277,9 @@ pub struct SettingsWindow {
     hover: Option<Hit>,
     pressed: Option<Hit>,
     slider: Option<SliderDrag>,
+    /// Value just released, shown until the config reload catches up so the
+    /// knob doesn't flick back to the old value.
+    pending: Option<(Key, f32)>,
     editing: Option<Editing>,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     login: bool,
@@ -296,6 +314,7 @@ impl SettingsWindow {
             hover: None,
             pressed: None,
             slider: None,
+            pending: None,
             editing: None,
             bitmaps: HashMap::new(),
             login: startup::is_enabled(),
@@ -727,9 +746,11 @@ impl SettingsWindow {
 
     pub fn on_move(&mut self, x: f32, y: f32) {
         if let Some(s) = &mut self.slider {
-            let t = ((x - s.track.x) / s.track.w).clamp(0.0, 1.0);
-            s.value = (s.min + t * (s.max - s.min)).round();
-            self.dirty = true;
+            let t = ((x - s.grab - s.x0) / s.w).clamp(0.0, 1.0);
+            if t != s.t {
+                s.t = t;
+                self.dirty = true;
+            }
             return;
         }
         let h = self.hit_at(x, y);
@@ -759,9 +780,14 @@ impl SettingsWindow {
         if let Some(Hit::Slider(key)) = self.pressed {
             if let Some((track, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Slider(key)) {
                 let (value, min, max) = Self::slider_spec(key, cfg);
-                // The hit rect is the track grown vertically; recover the track.
-                let track = Rect::new(track.x + 9.0, track.y, track.w - 18.0, track.h);
-                self.slider = Some(SliderDrag { key, track, min, max, value });
+                let value = self.pending.filter(|p| p.0 == key).map_or(value, |p| p.1);
+                // The hit rect spans the track horizontally; the knob centre travels inside it.
+                let (x0, w) = (track.x + KNOB, track.w - 2.0 * KNOB);
+                let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+                let kx = x0 + w * t;
+                // Grabbing the knob itself keeps it under the cursor instead of jumping.
+                let grab = if (x - kx).abs() <= KNOB + 2.0 { x - kx } else { 0.0 };
+                self.slider = Some(SliderDrag { key, x0, w, min, max, t, grab });
                 self.on_move(x, y);
             }
         }
@@ -772,7 +798,13 @@ impl SettingsWindow {
         let pressed = self.pressed.take();
         self.dirty = true;
         if let Some(s) = self.slider.take() {
-            return SettingsEvent::Action(s.key.set(ConfigValue::Int(s.value as i64)));
+            let value = s.value();
+            if value == Self::slider_spec(s.key, cfg).0.round() {
+                self.pending = None;
+                return SettingsEvent::None;
+            }
+            self.pending = Some((s.key, value));
+            return SettingsEvent::Action(s.key.set(ConfigValue::Int(value as i64)));
         }
         let hit = self.hit_at(x, y).filter(|h| Some(*h) == pressed);
         // Clicking anywhere outside the field being edited commits it.
@@ -881,8 +913,14 @@ impl SettingsWindow {
         self.max_scroll = (content_h - viewport.h).max(0.0);
         self.scroll = self.scroll.min(self.max_scroll);
 
+        if let Some((key, v)) = self.pending {
+            if Self::slider_spec(key, cfg).0.round() == v {
+                self.pending = None;
+            }
+        }
+
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
-        let (hover, page, scroll, slider) = (self.hover, self.page, self.scroll, self.slider);
+        let (hover, page, scroll, slider, pending) = (self.hover, self.page, self.scroll, self.slider, self.pending);
         let page_title = PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("");
         let (login, fonts, bitmaps, editing) = (self.login, &self.fonts, &self.bitmaps, &self.editing);
         let field_bg = if dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE };
@@ -969,19 +1007,23 @@ impl SettingsWindow {
                                 Row::Slider(label, key) => {
                                     p.text(label, &regular, label_r, theme.text);
                                     let (mut value, min, max) = Self::slider_spec(*key, cfg);
+                                    if let Some((_, v)) = pending.filter(|p| p.0 == *key) {
+                                        value = v;
+                                    }
+                                    let mut t = ((value - min) / (max - min)).clamp(0.0, 1.0);
                                     if let Some(s) = slider.filter(|s| s.key == *key) {
-                                        value = s.value;
+                                        (value, t) = (s.value(), s.t);
                                     }
                                     let track = Rect::new(right_edge - 240.0, r.cy() - 2.0, 240.0, 4.0);
-                                    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+                                    let kx = track.x + KNOB + (track.w - 2.0 * KNOB) * t;
                                     p.fill_round(track, 2.0, switch_off);
-                                    p.fill_round(Rect::new(track.x, track.y, track.w * t, track.h), 2.0, theme.accent);
-                                    let kx = track.x + track.w * t;
-                                    p.fill_circle(kx, r.cy() + 0.5, 9.0, Color::gray(0, 0.15));
-                                    p.fill_circle(kx, r.cy(), 9.0, Color::WHITE);
-                                    let value_r = Rect::new(track.x - 60.0, r.y, 50.0, r.h);
+                                    // The fill always ends under the knob, so nothing pokes out at the minimum.
+                                    p.fill_round(Rect::new(track.x, track.y, kx - track.x, track.h), 2.0, theme.accent);
+                                    p.fill_circle(kx, r.cy() + 0.5, KNOB, Color::gray(0, 0.15));
+                                    p.fill_circle(kx, r.cy(), KNOB, Color::WHITE);
+                                    let value_r = Rect::new(track.x - 62.0, r.y, 50.0, r.h);
                                     p.text(&format!("{}", value as i32), &right, value_r, theme.text_secondary);
-                                    hits.push((Rect::new(track.x - 9.0, r.y, track.w + 18.0, r.h), Hit::Slider(*key)));
+                                    hits.push((Rect::new(track.x, r.y, track.w, r.h), Hit::Slider(*key)));
                                 }
                                 Row::Swatches(label) => {
                                     p.text(label, &regular, label_r, theme.text);

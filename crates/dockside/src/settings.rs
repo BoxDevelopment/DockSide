@@ -144,6 +144,7 @@ pub(crate) enum Key {
     DockBackdrop,
     DockRunning,
     DockTrash,
+    DockShadow,
     SpotlightEnabled,
     SpotlightHotkey,
     SearchEngine,
@@ -198,6 +199,7 @@ impl Key {
             Key::DockBackdrop => ("dock", "backdrop"),
             Key::DockRunning => ("dock", "show_running"),
             Key::DockTrash => ("dock", "show_trash"),
+            Key::DockShadow => ("dock", "shadow"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
             Key::SearchEngine => ("spotlight", "search_engine"),
@@ -679,6 +681,7 @@ impl SettingsWindow {
                     .chain([
                         Row::Segmented("Icon style", Key::DockIconStyle),
                         Row::Segmented("Background", Key::DockBackdrop),
+                        Row::Toggle("Shadow", Key::DockShadow),
                         Row::Toggle("Show running apps", Key::DockRunning),
                         Row::Toggle("Show Trash", Key::DockTrash),
                     ])
@@ -782,6 +785,7 @@ impl SettingsWindow {
             Key::DockShowOnDesktop => d.show_on_desktop,
             Key::DockRunning => d.show_running,
             Key::DockTrash => d.show_trash,
+            Key::DockShadow => d.shadow,
             Key::SpotlightEnabled => cfg.spotlight.enabled,
             Key::WidgetsEnabled => cfg.widgets.enabled,
             _ => false,

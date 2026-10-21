@@ -65,6 +65,8 @@ icon_style = "native"
 # Show running apps that aren't pinned.
 show_running = true
 show_trash = true
+# A soft drop shadow under the Dock.
+shadow = true
 # Slide the Dock off-screen until the pointer touches the bottom edge.
 autohide = false
 # With autohide, keep the Dock shown while the desktop is focused.

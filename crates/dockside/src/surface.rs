@@ -5,6 +5,9 @@
 //! * a *content* window (layered, per-pixel alpha) owned by, and therefore
 //!   always above, the backdrop, which Direct2D renders into.
 //!
+//! A surface may also cast a soft drop shadow from a third, click-through
+//! window under the backdrop (see [`Surface::set_shadow`]).
+//!
 //! Both are non-activating tool windows, so clicking them never steals focus
 //! from the app the user is working in. Shell surfaces are topmost; desktop
 //! widgets are not (they sit just above the wallpaper).
@@ -31,6 +34,41 @@ pub struct Surface {
     shape: Option<[i32; 5]>,
     shown: bool,
     hidden: bool,
+    shadow: Option<Shadow>,
+}
+
+/// Room around a shadowed shape for the shadow to fall into, in points.
+const SHADOW_MARGIN: f32 = 26.0;
+
+/// A drop shadow under a shaped surface, in a layered window that clicks
+/// through, so the shadow never blocks the windows around the surface.
+struct Shadow {
+    hwnd: HWND,
+    canvas: Canvas,
+    /// Peak opacity of the ambient shadow.
+    strength: f32,
+    /// Screen bounds + radius of the shape to shadow, and what's on screen now.
+    want: Option<[i32; 5]>,
+    drawn: Option<[i32; 5]>,
+}
+
+/// One soft layer: rounded rects stacked outward from `body`, weighted so
+/// opacity falls off smoothly (an eased curve, not a linear ramp) over `blur`.
+fn soft_shadow(p: &Painter, body: Rect, radius: f32, blur: f32, dy: f32, alpha: f32) {
+    const STEPS: usize = 28;
+    let falloff = |d: f32| {
+        let t = (d / blur).clamp(0.0, 1.0);
+        let s = 1.0 - t * t * (3.0 - 2.0 * t);
+        s * s
+    };
+    // Tucked in slightly, so the shadow reads as under the shape, not a halo around it.
+    let spread = blur * 0.2;
+    let base = body.inset(spread, spread).offset(0.0, dy);
+    for k in (0..STEPS).rev() {
+        let (g0, g1) = (blur * k as f32 / STEPS as f32, blur * (k + 1) as f32 / STEPS as f32);
+        let a = alpha * (falloff(g0) - falloff(g1));
+        p.fill_round(base.inset(-g0, -g0), (radius - spread + g0).max(0.0), Color::gray(0, a));
+    }
 }
 
 /// "blur" is the same blurred backdrop with a much lighter tint; "glass" is
@@ -85,7 +123,60 @@ impl Surface {
             glass::exclude_from_capture(content, true);
         }
         let canvas = Canvas::new(gfx, w, h, scale)?;
-        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false })
+        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None })
+    }
+
+    /// Casts a soft drop shadow under the backdrop shape. `strength` is the
+    /// ambient shadow's peak opacity.
+    pub fn set_shadow(&mut self, gfx: &Gfx, strength: f32) -> Result<()> {
+        let owned = self.backdrop.unwrap_or(self.content);
+        let topmost = unsafe { GetWindowLongW(owned, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0;
+        let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WINDOW_EX_STYLE(topmost);
+        let hwnd = create_window(ex, WS_POPUP, RECT { left: 0, top: 0, right: 1, bottom: 1 }, HWND::default())?;
+        accent::prepare(hwnd);
+        if self.composition.as_ref().is_some_and(|c| c.refracts()) {
+            glass::exclude_from_capture(hwnd, true);
+        }
+        unsafe {
+            // Owned windows stay above their owner, so the surface always covers its shadow.
+            SetWindowLongPtrW(owned, GWLP_HWNDPARENT, hwnd.0 as isize);
+            let _ = SetWindowPos(hwnd, owned, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if self.shown && !self.hidden {
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+        let canvas = Canvas::new(gfx, 1, 1, self.scale)?;
+        self.shadow = Some(Shadow { hwnd, canvas, strength, want: None, drawn: None });
+        Ok(())
+    }
+
+    /// Redraws the shadow if its shape changed since it was last drawn.
+    fn update_shadow(&mut self, gfx: &Gfx) {
+        let (s, bottom) = (self.scale, self.rect.bottom);
+        let Some(sh) = &mut self.shadow else { return };
+        let Some(key) = sh.want.filter(|k| sh.drawn != Some(*k)) else { return };
+        sh.drawn = Some(key);
+        let m = (SHADOW_MARGIN * s).ceil() as i32;
+        let (left, top) = (key[0] - m, key[1] - m);
+        let w = key[2] - key[0] + 2 * m;
+        // Clipped to the surface, like the backdrop, so a Dock sliding away
+        // doesn't cast onto a monitor below.
+        let visible = (key[3] + m).min(bottom) - top;
+        let h = visible.max(1);
+        let body = Rect::new(m as f32 / s, m as f32 / s, (key[2] - key[0]) as f32 / s, (key[3] - key[1]) as f32 / s);
+        let (radius, strength) = (key[4] as f32 / s, sh.strength);
+        let r = sh.canvas.resize(w, h).and_then(|_| {
+            sh.canvas.draw(gfx, |p| {
+                if visible > 0 {
+                    soft_shadow(p, body, radius, SHADOW_MARGIN * 0.75, 6.0, strength);
+                    // A tight contact shadow that defines the edge.
+                    soft_shadow(p, body, radius, 3.0, 1.0, strength * 0.45);
+                }
+            })
+        });
+        if let Err(e) = r.and_then(|_| sh.canvas.present(sh.hwnd, left, top)) {
+            log!("shadow render failed: {e}");
+        }
     }
 
     pub fn width_pt(&self) -> f32 {
@@ -123,6 +214,20 @@ impl Surface {
         if dx == 0 && dy == 0 {
             return;
         }
+        if let Some(sh) = &mut self.shadow {
+            for k in [&mut sh.want, &mut sh.drawn].into_iter().flatten() {
+                k[0] += dx;
+                k[1] += dy;
+                k[2] += dx;
+                k[3] += dy;
+            }
+            let m = (SHADOW_MARGIN * self.scale).ceil() as i32;
+            if let Some(k) = sh.drawn {
+                unsafe {
+                    let _ = SetWindowPos(sh.hwnd, None, k[0] - m, k[1] - m, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+        }
         self.rect = RECT { left, top, right: self.rect.right + dx, bottom: self.rect.bottom + dy };
         let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
         unsafe {
@@ -146,9 +251,9 @@ impl Surface {
         }
     }
 
-    /// The window that carries the surface's z-order (the content is owned by it).
+    /// The window that carries the surface's z-order (the rest are owned by it).
     pub fn root(&self) -> HWND {
-        self.backdrop.unwrap_or(self.content)
+        self.shadow.as_ref().map(|s| s.hwnd).or(self.backdrop).unwrap_or(self.content)
     }
 
     /// Fits the backdrop to a rounded rect given in surface-local points.
@@ -156,7 +261,6 @@ impl Surface {
     /// The backdrop window is sized to the shape's bounds (so the rest of the
     /// surface stays click-through) and Composition rounds it at any radius.
     pub fn set_backdrop_shape(&mut self, r: Rect, radius: f32) {
-        let Some(bd) = self.backdrop else { return };
         let s = self.scale;
         let key = [
             self.rect.left + (r.x * s).round() as i32,
@@ -165,6 +269,10 @@ impl Surface {
             self.rect.top + (r.bottom() * s).round() as i32,
             (radius * s).round() as i32,
         ];
+        if let Some(sh) = &mut self.shadow {
+            sh.want = Some(key);
+        }
+        let Some(bd) = self.backdrop else { return };
         if self.shape == Some(key) {
             return;
         }
@@ -191,6 +299,7 @@ impl Surface {
     pub fn render(&mut self, gfx: &Gfx, f: impl FnOnce(&Painter)) -> Result<()> {
         self.canvas.draw(gfx, f)?;
         self.canvas.present(self.content, self.rect.left, self.rect.top)?;
+        self.update_shadow(gfx);
         if !self.shown && !self.hidden {
             self.shown = true;
             self.show_windows(true);
@@ -212,8 +321,8 @@ impl Surface {
     /// Puts the surface back at the top of the topmost band. Windows can lift a
     /// newly focused, maximized window above topmost windows, so this is re-asserted.
     pub fn raise(&self) {
-        // The content window is owned by the backdrop, so it comes along on top.
-        let hwnd = self.backdrop.unwrap_or(self.content);
+        // The other windows are owned by the root, so they come along on top.
+        let hwnd = self.root();
         unsafe {
             let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
@@ -222,6 +331,9 @@ impl Surface {
     fn show_windows(&self, show: bool) {
         let cmd = if show { SW_SHOWNOACTIVATE } else { SW_HIDE };
         unsafe {
+            if let Some(sh) = &self.shadow {
+                let _ = ShowWindow(sh.hwnd, cmd);
+            }
             if let Some(bd) = self.backdrop {
                 let _ = ShowWindow(bd, cmd);
             }
@@ -237,6 +349,9 @@ impl Drop for Surface {
             let _ = DestroyWindow(self.content);
             if let Some(bd) = self.backdrop {
                 let _ = DestroyWindow(bd);
+            }
+            if let Some(sh) = &self.shadow {
+                let _ = DestroyWindow(sh.hwnd);
             }
         }
     }

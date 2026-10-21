@@ -123,6 +123,8 @@ pub struct DockCfg {
     pub icon_style: IconStyle,
     pub show_running: bool,
     pub show_trash: bool,
+    /// A soft drop shadow under the shelf.
+    pub shadow: bool,
     pub autohide: bool,
     pub show_on_desktop: bool,
     pub reserve_space: bool,

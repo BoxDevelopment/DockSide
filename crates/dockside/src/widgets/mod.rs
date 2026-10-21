@@ -51,6 +51,8 @@ const EDGE: f32 = 24.0;
 /// How close an edge must come to snap.
 const SNAP: f32 = 12.0;
 const DRAG_THRESHOLD: f32 = 4.0;
+/// How far ahead calendar widgets look: the rest of this month's grid and beyond.
+const CALENDAR_HORIZON: i64 = 42 * 86_400;
 
 /// `GWLP_USERDATA` of widget windows, so the window procedure can keep them
 /// on the desktop layer.
@@ -509,7 +511,7 @@ impl Widgets {
         let stop = Stop::default();
         let calendar = key.calendar.as_ref().map(|ics| {
             let inbox = Inbox::new(self.hwnd, self.msg_data);
-            calendar::watch(inbox.clone(), stop.clone(), calendar::links(ics));
+            calendar::watch(inbox.clone(), stop.clone(), calendar::links(ics), CALENDAR_HORIZON);
             inbox
         });
         let weather = key.weather.as_ref().map(|(location, fahrenheit, h24)| {

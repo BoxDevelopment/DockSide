@@ -14,6 +14,8 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use super::sources::{Inbox, Signal, Stop};
 
 const REFRESH: Duration = Duration::from_secs(180);
+/// How far ahead the island looks (it only needs the next meeting).
+pub const ISLAND_HORIZON: i64 = 30 * 3600;
 /// Calendar links are re-downloaded less often than the local store is read.
 const LINK_REFRESH: Duration = Duration::from_secs(300);
 /// 100ns ticks between 1601 and 1970.
@@ -100,7 +102,8 @@ fn download(url: &str) -> windows::core::Result<String> {
     Ok(client.GetStringAsync(&uri)?.get()?.to_string())
 }
 
-pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>) {
+/// Reads events from an hour ago to `horizon` seconds ahead.
+pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>, horizon: i64) {
     let spawned = std::thread::Builder::new().name("calendar".into()).spawn(move || {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -132,7 +135,7 @@ pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>) {
                 }
             }
             let mut events = match &store {
-                Some(s) => fetch(s).unwrap_or_else(|e| {
+                Some(s) => fetch(s, horizon).unwrap_or_else(|e| {
                     log!("calendar read failed: {e}");
                     Vec::new()
                 }),
@@ -140,7 +143,7 @@ pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>) {
             };
             let now = unix_now();
             for text in feeds.iter().flatten() {
-                events.extend(super::ics::events_between(text, now - 3600, now + 30 * 3600));
+                events.extend(super::ics::events_between(text, now - 3600, now + horizon));
             }
             events.retain(|e| e.end > now);
             events.sort_by_key(|e| e.start);
@@ -162,7 +165,7 @@ pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>) {
     }
 }
 
-fn fetch(store: &windows::ApplicationModel::Appointments::AppointmentStore) -> windows::core::Result<Vec<CalEvent>> {
+fn fetch(store: &windows::ApplicationModel::Appointments::AppointmentStore, horizon: i64) -> windows::core::Result<Vec<CalEvent>> {
     let options = FindAppointmentsOptions::new()?;
     let props = options.FetchProperties()?;
     for p in [
@@ -175,10 +178,10 @@ fn fetch(store: &windows::ApplicationModel::Appointments::AppointmentStore) -> w
     ] {
         props.Append(&p)?;
     }
-    options.SetMaxCount(40)?;
-    // From an hour ago (events in progress) to the end of tomorrow-ish.
+    options.SetMaxCount(200)?;
+    // From an hour ago (events in progress) to the horizon.
     let start = DateTime { UniversalTime: EPOCH_DIFF + (unix_now() - 3600) * 10_000_000 };
-    let length = TimeSpan { Duration: 30 * 3600 * 10_000_000 };
+    let length = TimeSpan { Duration: (3600 + horizon) * 10_000_000 };
     let list = store.FindAppointmentsAsyncWithOptions(start, length, &options)?.get()?;
     let mut out = Vec::new();
     for a in list {

@@ -352,6 +352,14 @@ fn month_grid(p: &Painter, r: Rect, c: &Ctx, today: NaiveDate, header: bool, fs:
     let weeks = sources::month_weeks(today, first);
     let row = ((r.bottom() - y) / weeks.len() as f32).min(fs * 2.4);
     let num = p.gfx.format(&c.theme.font, fs, Weight::Bold, Align::Center);
+    let busy: std::collections::HashSet<u32> = c
+        .data
+        .events
+        .iter()
+        .filter_map(|e| local_date(e.start))
+        .filter(|d| d.year() == today.year() && d.month() == today.month())
+        .map(|d| d.day())
+        .collect();
     for (wi, week) in weeks.iter().enumerate() {
         for (di, day) in week.iter().enumerate() {
             let Some(d) = day else { continue };
@@ -362,19 +370,41 @@ fn month_grid(p: &Painter, r: Rect, c: &Ctx, today: NaiveDate, header: bool, fs:
                 ink = WHITE;
             }
             p.text_tabular(&d.to_string(), &num, cell, ink);
+            // A dot under days that have events (today's sits on the red circle).
+            if busy.contains(d) {
+                let dot = if *d == today.day() { WHITE } else { c.theme.text_secondary };
+                p.fill_circle(cell.cx(), cell.cy() + fs * 0.62, (fs * 0.11).max(1.2), dot);
+            }
         }
     }
 }
 
-/// "Tomorrow, 9:00 AM – 9:30 AM", or just the span for today.
-fn event_when(e: &CalEvent) -> String {
-    if e.ongoing() {
-        return format!("Now – {}", e.span().rsplit(" – ").next().unwrap_or_default());
+fn local_date(unix: i64) -> Option<NaiveDate> {
+    chrono::DateTime::from_timestamp(unix, 0).map(|t| t.with_timezone(&Local).date_naive())
+}
+
+/// "Tomorrow", "Friday", "Mon 3 Nov"; None for today.
+fn day_label(d: NaiveDate) -> Option<String> {
+    let days = (d - Local::now().date_naive()).num_days();
+    match days {
+        0 => None,
+        1 => Some("Tomorrow".into()),
+        2..=6 => Some(d.format("%A").to_string()),
+        _ => Some(d.format("%a %-d %b").to_string()),
     }
-    let day = chrono::DateTime::from_timestamp(e.start, 0).map(|t| t.with_timezone(&Local).date_naive());
-    match day {
-        Some(d) if d != Local::now().date_naive() => format!("{}, {}", d.format("%A"), e.span()),
-        _ => e.span(),
+}
+
+/// "Tomorrow, 9:00 AM – 9:30 AM", or just the span for today. `short` drops
+/// the end time (small widgets): "Tomorrow, 9:00 AM".
+fn event_when(e: &CalEvent, short: bool) -> String {
+    let end = e.span().rsplit(" – ").next().unwrap_or_default().to_string();
+    if e.ongoing() {
+        return if short { "Now".into() } else { format!("Now – {end}") };
+    }
+    let time = if short { e.clock() } else { e.span() };
+    match local_date(e.start).and_then(day_label) {
+        Some(day) => format!("{day}, {time}"),
+        None => time,
     }
 }
 
@@ -383,7 +413,7 @@ fn event_list(p: &Painter, r: Rect, c: &Ctx, max: usize) -> f32 {
     let mut y = r.y;
     let events: Vec<_> = c.data.events.iter().take(max).collect();
     if events.is_empty() {
-        text(p, c, "No more events today", 12.0, Weight::Regular, Align::Leading, Rect::new(r.x, y, r.w, 18.0), c.theme.text_secondary);
+        text(p, c, "No upcoming events", 12.0, Weight::Regular, Align::Leading, Rect::new(r.x, y, r.w, 18.0), c.theme.text_secondary);
         return y + 18.0;
     }
     for e in events {
@@ -392,7 +422,7 @@ fn event_list(p: &Painter, r: Rect, c: &Ctx, max: usize) -> f32 {
         }
         p.fill_round(Rect::new(r.x, y + 2.0, 3.5, 30.0), 1.75, c.theme.accent);
         text(p, c, &e.title, 13.0, Weight::Bold, Align::Leading, Rect::new(r.x + 10.0, y, r.w - 10.0, 18.0), c.theme.text);
-        text(p, c, &event_when(e), 11.0, Weight::Regular, Align::Leading, Rect::new(r.x + 10.0, y + 17.0, r.w - 10.0, 16.0), c.theme.text_secondary);
+        text(p, c, &event_when(e, r.w < 200.0), 11.0, Weight::Regular, Align::Leading, Rect::new(r.x + 10.0, y + 17.0, r.w - 10.0, 16.0), c.theme.text_secondary);
         y += 40.0;
     }
     y
@@ -408,7 +438,11 @@ fn date_block(p: &Painter, x: f32, y: f32, w: f32, c: &Ctx, big: f32) {
 fn calendar(p: &Painter, r: Rect, c: &Ctx) {
     let today = Local::now().date_naive();
     match c.item.size {
-        WidgetSize::Small => month_grid(p, r.inset(14.0, 14.0), c, today, true, 11.0),
+        // Like macOS's default small Calendar: the date and what's next.
+        WidgetSize::Small => {
+            date_block(p, r.x + PAD, r.y + 14.0, r.w - 2.0 * PAD, c, 30.0);
+            event_list(p, Rect::new(r.x + PAD, r.y + 70.0, r.w - 2.0 * PAD, r.h - 82.0), c, 2);
+        }
         WidgetSize::Medium => {
             let left = Rect::new(r.x + PAD, r.y + 14.0, 150.0, r.h - 28.0);
             date_block(p, left.x, left.y, left.w, c, 36.0);

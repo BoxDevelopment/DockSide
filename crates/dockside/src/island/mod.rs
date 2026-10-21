@@ -367,7 +367,7 @@ impl Island {
             sources::watch_brightness(inbox.clone(), stop.clone());
         }
         if ic.calendar {
-            calendar::watch(inbox.clone(), stop.clone(), calendar::links(&ic.calendar_ics));
+            calendar::watch(inbox.clone(), stop.clone(), calendar::links(&ic.calendar_ics), calendar::ISLAND_HORIZON);
         }
         if ic.notifications {
             notifications::watch(inbox.clone(), stop.clone());

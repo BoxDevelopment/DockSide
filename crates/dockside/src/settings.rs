@@ -233,6 +233,7 @@ pub(crate) enum Hit {
     Field(Key),
     ConnectClaude(bool),
     AddWidget(crate::config::WidgetKind),
+    ResetWidgets,
     Onboarding,
 }
 
@@ -723,7 +724,15 @@ impl SettingsWindow {
                             ),
                         ],
                     },
-                    Group { title: Some("Add a widget"), rows: vec![add(&KINDS[..3]), add(&KINDS[3..6]), add(&KINDS[6..])] },
+                    Group {
+                        title: Some("Add a widget"),
+                        rows: vec![
+                            add(&KINDS[..3]),
+                            add(&KINDS[3..6]),
+                            add(&KINDS[6..]),
+                            Row::Buttons("Start over with the default widgets", vec![("Reset Widgets…", Hit::ResetWidgets)]),
+                        ],
+                    },
                     Group {
                         title: Some("Weather"),
                         rows: vec![
@@ -1054,6 +1063,7 @@ impl SettingsWindow {
             Hit::OpenLog => Action::Open(crate::config::dir().join("dockside.log").display().to_string()),
             Hit::ConnectClaude(on) => Action::ConnectClaude(on),
             Hit::AddWidget(kind) => Action::Widget(crate::widgets::WidgetCmd::Add(kind)),
+            Hit::ResetWidgets => Action::Widget(crate::widgets::WidgetCmd::Reset),
             Hit::Slider(_) => return SettingsEvent::None,
         };
         SettingsEvent::Action(action)

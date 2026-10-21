@@ -60,6 +60,14 @@ impl Store {
         }
     }
 
+    /// Forgets every note (the widgets they belonged to are gone).
+    pub fn clear_notes(&mut self) {
+        if !self.notes.is_empty() {
+            self.notes.clear();
+            self.dirty = true;
+        }
+    }
+
     pub fn add_reminder(&mut self, text: &str) {
         let text = text.trim();
         if !text.is_empty() {

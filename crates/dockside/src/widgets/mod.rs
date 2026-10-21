@@ -184,6 +184,8 @@ pub enum WidgetCmd {
     Resize(u32, WidgetSize),
     /// Fetch the weather again now.
     Refresh,
+    /// Put back the default widgets, where they start out (notes are cleared).
+    Reset,
 }
 
 pub enum WidgetEvent {
@@ -824,6 +826,7 @@ impl Widgets {
             entries.push(Entry::Separator);
         }
         entries.push(Entry::item("Edit Widgets…", Action::OpenSettings(Some(crate::settings::Page::Widgets))));
+        entries.push(Entry::item("Reset Widgets…", Action::Widget(WidgetCmd::Reset)));
         entries.push(Entry::item(format!("Remove “{}”", title(kind)), Action::Widget(WidgetCmd::Remove(id))));
         let r = w.surface.rect;
         let s = w.surface.scale;
@@ -986,6 +989,11 @@ impl Widgets {
                     i.x = i.x.min((self.screen.right() - w).max(self.screen.x));
                     i.y = i.y.min((self.screen.bottom() - h).max(self.screen.y));
                 }
+            }
+            WidgetCmd::Reset => {
+                items = crate::config::defaults().widgets.items;
+                self.store.clear_notes();
+                self.store.save_if_dirty();
             }
             WidgetCmd::Refresh => {
                 // A new key restarts the weather thread.

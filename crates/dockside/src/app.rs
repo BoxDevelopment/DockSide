@@ -319,6 +319,13 @@ fn execute(action: Action) {
                 app.flush();
             });
         }
+        // Confirmed outside the App borrow: the message box runs a modal loop.
+        Action::Widget(WidgetCmd::Reset) => {
+            let ask = "Put the default widgets back where they started? Widgets you've added, moved or resized                        are replaced, and the text in Notes widgets is cleared. Your reminders and widget settings are kept.";
+            if system::confirm("Reset Widgets", ask) {
+                with_app(|app| app.widget_cmd(WidgetCmd::Reset));
+            }
+        }
         Action::Widget(cmd) => {
             with_app(|app| app.widget_cmd(cmd));
         }
@@ -839,8 +846,8 @@ impl App {
 
     /// Adds, removes or resizes a widget: written to the config, then applied.
     fn widget_cmd(&mut self, cmd: WidgetCmd) {
-        if self.widgets.is_none() && matches!(cmd, WidgetCmd::Add(_)) {
-            // Adding a widget while they're off turns them on.
+        if self.widgets.is_none() && matches!(cmd, WidgetCmd::Add(_) | WidgetCmd::Reset) {
+            // Adding (or resetting) widgets while they're off turns them on.
             let on = config::ConfigValue::Bool(true);
             if let Err(e) = config::save_value(&self.cfg_path, "widgets", "enabled", &on) {
                 return log!("could not turn widgets on: {e:#}");

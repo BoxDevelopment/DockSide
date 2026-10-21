@@ -41,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::anim::Spring;
-use crate::config::{Backdrop, Config, ConfigValue, IslandCfg};
+use crate::config::{Backdrop, Config, ConfigValue, IslandCfg, IslandStyle};
 use crate::finder::dnd::Phase;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{load_shell_image, IconPixels};
@@ -68,6 +68,9 @@ const CAPS_SWITCH_DELAY: f32 = 0.18;
 /// Most desktops the switch indicator draws dots for.
 const MAX_DESKTOP_DOTS: usize = 9;
 const PANEL_RADIUS: f32 = 36.0;
+/// Notch style: bottom corner radius when compact (relative to its height) and as a panel.
+const NOTCH_COMPACT_RADIUS: f32 = 0.34;
+const NOTCH_PANEL_RADIUS: f32 = 22.0;
 /// Extra height at the bottom of a panel for its page dots.
 const DOTS_H: f32 = 16.0;
 /// Horizontal scroll needed for one page (a notch is 120), and the pause after
@@ -254,9 +257,13 @@ pub struct Island {
     cfg: IslandCfg,
     monitor: Monitor,
     accent: Color,
-    /// Top of the pill and its compact height, in points.
+    /// Top of the window and the pill's compact height, in points.
     top: f32,
     compact_h: f32,
+    /// Notch style: the shape runs up to the screen edge, and the pill (its
+    /// content area) sits `lip` points below the window top.
+    notch: bool,
+    lip: f32,
 
     // Sources.
     media: Media,
@@ -345,8 +352,11 @@ impl Island {
         let (top, compact_h) =
             if bar_h > 0.0 { let h = (bar_h - 2.0).clamp(18.0, 36.0); ((bar_h - h) / 2.0, h) } else { (6.0, 30.0) };
         let top = top + cfg.island.vertical_offset;
+        let notch = cfg.island.style == IslandStyle::Notch;
+        let lip = if notch { top.max(0.0) } else { 0.0 };
+        let top = top - lip;
         let (iw, ih) = blob_size(compact_h);
-        let rect = window_rect(&monitor, top, iw, ih);
+        let rect = window_rect(&monitor, top, iw, ih + lip);
         let surface = Surface::new(gfx, rect, monitor.scale, Backdrop::None, Color::TRANSPARENT)?;
         let ic = &cfg.island;
         let inbox = Inbox::new(hwnd, msg_signal);
@@ -374,6 +384,8 @@ impl Island {
             accent: theme.accent,
             top,
             compact_h,
+            notch,
+            lip,
             media: Media::start(hwnd, msg_media),
             inbox,
             stop,
@@ -1449,14 +1461,23 @@ impl Island {
         let (pw, ph) = self.pill_size();
         let privacy_on = !self.privacy.camera.is_empty() || !self.privacy.mic.is_empty();
         let side = if self.bubble.value > 0.001 || self.bubble.target > 0.0 || privacy_on { ch + 26.0 } else { 0.0 };
-        if let Err(e) = self.surface.set_rect(window_rect(&self.monitor, self.top, pw + 2.0 * side, ph)) {
+        let lip = self.lip;
+        if let Err(e) = self.surface.set_rect(window_rect(&self.monitor, self.top, pw + 2.0 * side, ph + lip)) {
             return log!("island resize failed: {e}");
         }
         let win_w = self.surface.width_pt();
-        let pill = Rect::new((win_w - pw) / 2.0, 0.0, pw, ph);
+        let pill = Rect::new((win_w - pw) / 2.0, lip, pw, ph);
         self.pill_rect = pill;
         let grown = ((ph - ch) / 30.0).clamp(0.0, 1.0);
-        let radius = if ph <= ch * 1.05 { ph / 2.0 } else { (ph / 2.0).min(lerp(ch / 2.0, PANEL_RADIUS, grown)) };
+        // The black shape. A notch runs up past the window top so its top
+        // corners are cut off square and only the bottom ones show rounded.
+        let (shape, radius) = if self.notch {
+            let radius = (ph / 2.0).min(lerp(ch * NOTCH_COMPACT_RADIUS, NOTCH_PANEL_RADIUS, grown));
+            (Rect::new(pill.x, -radius, pw, ph + lip + radius), radius)
+        } else {
+            let radius = if ph <= ch * 1.05 { ph / 2.0 } else { (ph / 2.0).min(lerp(ch / 2.0, PANEL_RADIUS, grown)) };
+            (pill, radius)
+        };
         let presence = self.presence.value.clamp(0.0, 1.0);
         let fit = self.fit();
         let a = presence * self.content.value.clamp(0.0, 1.0) * fit;
@@ -1465,7 +1486,7 @@ impl Island {
         let b = self.bubble.value.max(0.0);
         let bd = ch * (0.55 + 0.45 * b.min(1.0));
         let bcx = pill.right() - ch / 2.0 + (ch + 6.0) * b;
-        let bubble_rect = Rect::new(bcx - bd / 2.0, ch / 2.0 - bd / 2.0, bd, bd);
+        let bubble_rect = Rect::new(bcx - bd / 2.0, lip + ch / 2.0 - bd / 2.0, bd, bd);
 
         let fonts = Fonts::new(gfx, &theme.font);
         let view = View {
@@ -1526,7 +1547,8 @@ impl Island {
         let dot = if !self.privacy.camera.is_empty() { Some(GREEN) } else if !self.privacy.mic.is_empty() { Some(ORANGE) } else { None };
         let mut hits = Vec::new();
         if presence > 0.5 {
-            hits.push((pill, Hit::Pill));
+            // A notch also answers along the strip up to the screen edge.
+            hits.push((Rect::new(pill.x, 0.0, pw, ph + lip), Hit::Pill));
             if b > 0.6 {
                 hits.push((bubble_rect, Hit::Bubble));
             }
@@ -1538,13 +1560,13 @@ impl Island {
                 for i in 0..12 {
                     let g = i as f32 * 1.7;
                     let sa = 0.045 * grown * presence * (12 - i) as f32 / 12.0;
-                    p.fill_round(pill.inset(-g, -g).offset(0.0, 7.0), radius + g, Color::BLACK.alpha(sa));
+                    p.fill_round(shape.inset(-g, -g).offset(0.0, 7.0), radius + g, Color::BLACK.alpha(sa));
                 }
-                p.clear_round(pill, radius);
+                p.clear_round(shape, radius);
             }
-            p.fill_round(pill, radius, Color::BLACK.alpha(presence));
+            p.fill_round(shape, radius, Color::BLACK.alpha(presence));
             if grown > 0.01 {
-                p.stroke_round(pill.inset(0.25, 0.25), radius, Color::gray(255, 0.07 * grown * presence), 0.5);
+                p.stroke_round(shape.inset(0.25, 0.25), radius, Color::gray(255, 0.07 * grown * presence), 0.5);
             }
             if b > 0.001 {
                 p.fill_circle(bubble_rect.cx(), bubble_rect.cy(), bd / 2.0, Color::BLACK.alpha(presence));
@@ -1554,8 +1576,8 @@ impl Island {
             }
             if let Some(c) = dot {
                 let x = if b > 0.001 { bubble_rect.right() } else { pill.right() } + 9.0;
-                p.fill_circle(x, ch / 2.0, 6.0, c.alpha(0.22 * presence));
-                p.fill_circle(x, ch / 2.0, 3.4, c.alpha(presence));
+                p.fill_circle(x, lip + ch / 2.0, 6.0, c.alpha(0.22 * presence));
+                p.fill_circle(x, lip + ch / 2.0, 3.4, c.alpha(presence));
             }
             if a <= 0.0 {
                 return;

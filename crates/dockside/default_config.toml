@@ -143,6 +143,9 @@ enabled = true
 always_show = true
 # Expand an activity when the pointer rests on it (otherwise click).
 expand_on_hover = false
+# "pill" floats a capsule; "notch" hangs from the top edge with a flat top and
+# rounded bottom corners, and opens into squarer panels.
+style = "pill"
 # Points to move the island down from its spot; negative moves it up.
 vertical_offset = 0
 # Seconds paused media stays in the island; 0 keeps it until the app closes.

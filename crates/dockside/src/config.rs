@@ -67,6 +67,17 @@ pub enum IconStyle {
     Squircle,
 }
 
+/// Shape of the Dynamic Island.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum IslandStyle {
+    /// A floating capsule, like the iPhone.
+    Pill,
+    /// Hangs from the top edge with a flat top and rounded bottom corners,
+    /// like a MacBook notch; panels open as squarer cards.
+    Notch,
+}
+
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ShortcutStyle {
@@ -153,6 +164,7 @@ pub struct IslandCfg {
     /// Keep the idle pill visible when nothing is happening.
     pub always_show: bool,
     pub expand_on_hover: bool,
+    pub style: IslandStyle,
     /// Points to move the island down (negative moves it up).
     pub vertical_offset: f32,
     /// Seconds paused media stays in the island (0 = until the app ends its session).

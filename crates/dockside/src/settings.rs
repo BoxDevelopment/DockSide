@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::chrome::{self, SHADOW};
-use crate::config::{Appearance, Backdrop, Config, ConfigValue, IconStyle, ShortcutStyle};
+use crate::config::{Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandStyle, ShortcutStyle};
 use crate::finder::text::TextField;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
@@ -122,6 +122,7 @@ pub enum Key {
     /// An on/off setting in `[island]`, by name.
     Island(&'static str),
     IslandIcs,
+    IslandStyle,
     IslandOffset,
     DockEnabled,
     DockSize,
@@ -170,6 +171,7 @@ impl Key {
             Key::MbTray => ("menubar", "show_tray"),
             Key::Island(name) => ("island", name),
             Key::IslandIcs => ("island", "calendar_ics"),
+            Key::IslandStyle => ("island", "style"),
             Key::IslandOffset => ("island", "vertical_offset"),
             Key::DockEnabled => ("dock", "enabled"),
             Key::DockSize => ("dock", "tile_size"),
@@ -456,6 +458,7 @@ impl SettingsWindow {
                         Row::Toggle("Show Dynamic Island", Key::Island("enabled")),
                         Row::Toggle("Always show the island", Key::Island("always_show")),
                         Row::Toggle("Expand when hovered", Key::Island("expand_on_hover")),
+                        Row::Segmented("Style", Key::IslandStyle),
                         Row::Slider("Vertical offset", Key::IslandOffset),
                     ],
                 },
@@ -667,6 +670,10 @@ impl SettingsWindow {
                 let sel = values.iter().position(|v| v.eq_ignore_ascii_case(&cfg.spotlight.search_engine));
                 (labels, values, sel)
             }
+            Key::IslandStyle => fixed(
+                &[("Pill", "pill"), ("Notch", "notch")],
+                Some((cfg.island.style == IslandStyle::Notch) as usize),
+            ),
             Key::DockIconStyle => fixed(
                 &[("Native", "native"), ("Squircle", "squircle")],
                 Some((cfg.dock.icon_style == IconStyle::Squircle) as usize),

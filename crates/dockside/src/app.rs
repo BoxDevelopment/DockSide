@@ -26,6 +26,7 @@ use crate::config::{self, Config, DockApp};
 use crate::dock::Dock;
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
+use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND};
 use crate::island::sources::VolumeKey;
 use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
@@ -41,7 +42,7 @@ use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
-    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA,
+    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER,
 };
 
 thread_local! {
@@ -259,6 +260,19 @@ fn execute(action: Action) {
         Action::ToggleSpotlight => {
             with_app(|app| app.toggle_spotlight());
         }
+        Action::ChangeIcon { target, name } => {
+            with_app(|app| app.open_icon_picker(target, &name));
+        }
+        Action::SetAppIcon { target, icon } => {
+            with_app(|app| app.set_app_icon(&target, icon));
+        }
+        // The file dialog runs a modal loop: outside the App borrow.
+        Action::PickIconFile(target) => {
+            with_app(|app| app.icon_picker = None);
+            if let Some(path) = system::pick_image(HWND::default()) {
+                with_app(|app| app.set_app_icon(&target, Some(path)));
+            }
+        }
         Action::OpenSettings(page) => {
             with_app(|app| app.open_settings(page));
         }
@@ -366,6 +380,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Spotlight closes as soon as it loses focus (posted: we may be mid-dispatch).
         WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == SPOTLIGHT_HWND.load(Ordering::Relaxed) => {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_SPOTLIGHT);
+        }
+        WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == PICKER_HWND.load(Ordering::Relaxed) => {
+            win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_PICKER);
         }
         // Shell surfaces never take focus; app windows (Finder, Settings) behave normally.
         WM_MOUSEACTIVATE if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW.0 == 0 => {
@@ -592,6 +609,8 @@ pub struct App {
     /// Finder windows whose folder changed on disk (reloaded on a short timer).
     finder_changed: Vec<u32>,
     spotlight: Option<Spotlight>,
+    /// Change Icon… for a Dock app.
+    icon_picker: Option<IconPicker>,
     index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
     island_hook: Option<HHOOK>,
@@ -680,6 +699,7 @@ impl App {
             kinds: finder::fs::KindCache::default(),
             finder_changed: Vec::new(),
             spotlight: None,
+            icon_picker: None,
             index: Default::default(),
             hooks: Vec::new(),
             island_hook: None,
@@ -821,8 +841,8 @@ impl App {
                 w.sync(&self.gfx, &self.theme, &self.cfg);
             }
         }
-        if old.dock != self.cfg.dock {
-            let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock);
+        if old.dock != self.cfg.dock || old.app_icons != self.cfg.app_icons {
+            let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock) && old.app_icons == self.cfg.app_icons;
             match &mut self.dock {
                 Some(d) if only_apps => {
                     d.set_apps(&self.cfg.dock.apps);
@@ -1111,6 +1131,7 @@ impl App {
             self.island.as_ref().map(|i| &i.surface),
             self.menu.as_ref().map(|m| &m.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
+            self.icon_picker.as_ref().map(|p| &p.surface),
         ];
         for s in surfaces.into_iter().flatten() {
             s.raise();
@@ -1243,6 +1264,9 @@ impl App {
         if let Some(o) = self.onboarding.as_mut().filter(|o| o.dirty) {
             o.render(&self.gfx, &self.theme, &self.cfg);
         }
+        if let Some(p) = self.icon_picker.as_mut().filter(|p| p.dirty) {
+            p.render(&self.gfx, &self.theme);
+        }
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
         }
@@ -1336,6 +1360,91 @@ impl App {
                 self.spotlight = None;
                 push(action);
             }
+        }
+        Some(LRESULT(0))
+    }
+
+    // --- Icon picker -------------------------------------------------------
+
+    fn open_icon_picker(&mut self, target: IconTarget, name: &str) {
+        self.close_menu();
+        self.spotlight = None;
+        let hwnd = self.msg_hwnd.0 as isize;
+        match IconPicker::new(&self.gfx, &self.theme, &self.cfg, &self.monitor, target, name, hwnd, WM_APP_ICON_PICKER) {
+            Ok(mut p) => {
+                p.render(&self.gfx, &self.theme);
+                p.focus();
+                self.icon_picker = Some(p);
+            }
+            Err(e) => log!("icon picker failed: {e}"),
+        }
+    }
+
+    /// Writes a Dock app's custom icon (`None` resets it) and applies it. A
+    /// pinned app keeps it in its `[[dock.apps]]` entry; others in `[app_icons]`.
+    fn set_app_icon(&mut self, target: &IconTarget, icon: Option<String>) {
+        self.icon_picker = None;
+        let path = self.cfg_path.clone();
+        let written = (|| -> anyhow::Result<()> {
+            if let Some(pinned) = &target.pinned {
+                let mut apps = self.cfg.dock.apps.clone();
+                for a in apps.iter_mut().filter(|a| a.path == *pinned) {
+                    a.icon = icon.clone();
+                }
+                config::save_dock_apps(&path, &apps)?;
+            }
+            if let Some(exe) = &target.exe {
+                match (&icon, target.pinned.is_some()) {
+                    (Some(i), false) => config::save_value(&path, "app_icons", exe, &config::ConfigValue::Str(i.clone()))?,
+                    // A pinned app's own entry wins; drop any older per-exe icon.
+                    _ => config::remove_value(&path, "app_icons", exe)?,
+                }
+            }
+            Ok(())
+        })();
+        match written {
+            Ok(()) => self.reload(),
+            Err(e) => log!("could not save the icon: {e:#}"),
+        }
+    }
+
+    fn on_picker_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        let p = self.icon_picker.as_mut()?;
+        let (x, y) = mouse_pt(lp, p.surface.scale);
+        let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
+        let event = match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => p.on_key(wp.0 as u16, down(VK_CONTROL), down(VK_SHIFT)),
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    p.on_char(c);
+                }
+                PickerEvent::None
+            }
+            WM_SYSCHAR => PickerEvent::None,
+            WM_MOUSEWHEEL => {
+                p.on_wheel((wp.0 >> 16) as u16 as i16);
+                PickerEvent::None
+            }
+            WM_MOUSEMOVE => {
+                if !p.tracking {
+                    p.tracking = true;
+                    track_leave(p.surface.content);
+                }
+                p.on_move(x, y);
+                PickerEvent::None
+            }
+            WM_MOUSELEAVE => {
+                p.on_leave();
+                PickerEvent::None
+            }
+            WM_LBUTTONUP => p.on_click(x, y),
+            _ => return None,
+        };
+        match event {
+            PickerEvent::None => {}
+            PickerEvent::Close => self.icon_picker = None,
+            PickerEvent::Run(action) => push(action),
         }
         Some(LRESULT(0))
     }
@@ -1693,6 +1802,12 @@ impl App {
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
                 WM_HOTKEY if wp.0 as i32 == HOTKEY_SPOTLIGHT => self.toggle_spotlight(),
                 WM_APP_CLOSE_SPOTLIGHT => self.spotlight = None,
+                WM_APP_CLOSE_PICKER => self.icon_picker = None,
+                WM_APP_ICON_PICKER => {
+                    if let Some(p) = &mut self.icon_picker {
+                        p.poll();
+                    }
+                }
                 WM_APP_INDEX_READY => {
                     if let (Some(s), Ok(idx)) = (&mut self.spotlight, self.index.lock()) {
                         s.search(&idx);
@@ -1813,6 +1928,11 @@ impl App {
         }
         if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
             let r = self.on_spotlight_message(msg, wp, lp);
+            self.flush();
+            return r;
+        }
+        if self.icon_picker.as_ref().is_some_and(|p| p.surface.content == hwnd) {
+            let r = self.on_picker_message(msg, wp, lp);
             self.flush();
             return r;
         }

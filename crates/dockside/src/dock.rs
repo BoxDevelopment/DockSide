@@ -1,7 +1,7 @@
 //! The Dock: pinned + running apps, magnification, launch bounce, running
 //! indicators, tooltips, context menus, drag-to-reorder and auto-hide.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use windows::core::Result;
@@ -16,6 +16,7 @@ use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{IconStore, RECYCLE_BIN};
 use crate::gfx::{finder_icon, Align, Gfx, Weight};
+use crate::icon_picker::IconTarget;
 use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
 use crate::theme::Theme;
@@ -72,8 +73,13 @@ struct Item {
     bounce: Option<Bounce>,
 }
 
+/// A custom icon from `[app_icons]` for an exe file name.
+fn exe_icon(icons: &BTreeMap<String, String>, exe: &str) -> Option<String> {
+    icons.iter().find(|(k, _)| k.eq_ignore_ascii_case(exe)).map(|(_, v)| v.clone())
+}
+
 impl Item {
-    fn pinned(app: &DockApp) -> Item {
+    fn pinned(app: &DockApp, icons: &BTreeMap<String, String>) -> Item {
         let lower = app.path.to_lowercase();
         let match_name = app
             .match_exe
@@ -93,7 +99,7 @@ impl Item {
             launch: app.path.clone(),
             args: app.args.clone(),
             icon_key: icon_source(&app.path),
-            custom_icon: app.icon.clone(),
+            custom_icon: app.icon.clone().or_else(|| match_name.as_deref().and_then(|m| exe_icon(icons, m))),
             match_name,
             pinned: Some(app.clone()),
             windows: Vec::new(),
@@ -101,19 +107,24 @@ impl Item {
         }
     }
 
-    fn running(w: &AppWindow, name: String) -> Item {
+    fn running(w: &AppWindow, name: String, icons: &BTreeMap<String, String>) -> Item {
         Item {
             kind: Kind::App,
             name,
             launch: w.exe.clone(),
             args: None,
             icon_key: icon_source(&w.exe),
-            custom_icon: None,
+            custom_icon: exe_icon(icons, &w.exe_name()),
             match_name: Some(w.exe_name()),
             pinned: None,
             windows: vec![w.clone()],
             bounce: None,
         }
+    }
+
+    /// What its bitmap is cached under: a custom icon replaces the app's own.
+    fn bitmap_key(&self) -> &str {
+        self.custom_icon.as_deref().unwrap_or(&self.icon_key)
     }
 
     fn special(kind: Kind) -> Item {
@@ -251,6 +262,12 @@ pub fn compute_layout(
     Layout { items, left, right }
 }
 
+/// A logo picked from Dashboard Icons (saved as `dash-*.png`): drawn on a tile
+/// like shell icons, where other custom icons are already tile-shaped.
+fn is_library_logo(path: &str) -> bool {
+    Path::new(path).file_name().is_some_and(|f| f.to_string_lossy().starts_with("dash-"))
+}
+
 /// Finder is our own window, with an icon we draw ourselves.
 fn icon_source(path: &str) -> String {
     if path == FINDER_PATH { finder_icon::KEY.to_string() } else { path.to_string() }
@@ -312,13 +329,15 @@ pub struct Dock {
     pub menu_item: Option<usize>,
     pub tracking: bool,
     reserved: bool,
+    /// `[app_icons]`: custom icons by exe file name.
+    app_icons: BTreeMap<String, String>,
     pub dirty: bool,
 }
 
 impl Dock {
     pub fn new(gfx: &Gfx, theme: &Theme, cfg: &Config, monitor: Monitor) -> Result<Self> {
         let d = &cfg.dock;
-        let mut items: Vec<Item> = d.apps.iter().filter(|a| pin_exists(a)).map(Item::pinned).collect();
+        let mut items: Vec<Item> = d.apps.iter().filter(|a| pin_exists(a)).map(|a| Item::pinned(a, &cfg.app_icons)).collect();
         if d.show_trash {
             items.push(Item::special(Kind::Separator));
             items.push(Item::special(Kind::Trash));
@@ -362,6 +381,7 @@ impl Dock {
             menu_item: None,
             tracking: false,
             reserved,
+            app_icons: cfg.app_icons.clone(),
             dirty: true,
         };
         dock.fit_window()?;
@@ -380,7 +400,7 @@ impl Dock {
         let mut old: Vec<Item> = std::mem::take(&mut self.items).into_iter().filter(|i| i.kind == Kind::App).collect();
         let mut items: Vec<Item> = Vec::new();
         for app in apps.iter().filter(|a| pin_exists(a)) {
-            let mut item = Item::pinned(app);
+            let mut item = Item::pinned(app, &self.app_icons);
             if let Some(pos) = old.iter().position(|o| o.launch.eq_ignore_ascii_case(&app.path)) {
                 let prev = old.remove(pos);
                 item.windows = prev.windows;
@@ -390,7 +410,7 @@ impl Dock {
         }
         // Apps that are still running stay in the Dock unpinned.
         for prev in old.into_iter().filter(|o| !o.windows.is_empty()) {
-            let mut item = Item::running(&prev.windows[0], prev.name.clone());
+            let mut item = Item::running(&prev.windows[0], prev.name.clone(), &self.app_icons);
             item.windows = prev.windows;
             items.push(item);
         }
@@ -550,7 +570,7 @@ impl Dock {
                 item.windows.push(w.clone());
             } else {
                 let at = self.items.iter().position(|i| i.kind != Kind::App).unwrap_or(self.items.len());
-                self.items.insert(at, Item::running(w, names.name_for(&w.exe, &cfg.app_names)));
+                self.items.insert(at, Item::running(w, names.name_for(&w.exe, &cfg.app_names), &cfg.app_icons));
             }
         }
         self.items.retain(|i| i.kind != Kind::App || i.pinned.is_some() || !i.windows.is_empty() || i.bounce.is_some());
@@ -844,6 +864,13 @@ impl Dock {
                 if Path::new(&item.launch).exists() {
                     v.push(Entry::item("Show in Explorer", Action::Reveal(item.launch.clone())));
                 }
+                let target = IconTarget {
+                    pinned: item.pinned.as_ref().map(|p| p.path.clone()),
+                    exe: item.match_name.clone().filter(|m| m.ends_with(".exe")),
+                };
+                if target.pinned.is_some() || target.exe.is_some() {
+                    v.push(Entry::item("Change Icon\u{2026}", Action::ChangeIcon { target, name: item.name.clone() }));
+                }
                 v.push(Entry::Separator);
                 if item.windows.is_empty() {
                     v.push(Entry::item("Open", Action::Launch { path: item.launch.clone(), args: item.args.clone() }));
@@ -866,7 +893,7 @@ impl Dock {
         self.dirty = false;
 
         for item in &self.items {
-            if item.kind == Kind::Separator || self.bitmaps.contains_key(&item.icon_key) {
+            if item.kind == Kind::Separator || self.bitmaps.contains_key(item.bitmap_key()) {
                 continue;
             }
             let px = if item.icon_key == finder_icon::KEY && item.custom_icon.is_none() {
@@ -875,7 +902,7 @@ impl Dock {
                 icons.get(&gfx.wic, &item.icon_key, item.custom_icon.as_deref())
             };
             let bmp = px.and_then(|px| px.to_bitmap(self.surface.canvas.target()));
-            self.bitmaps.insert(item.icon_key.clone(), bmp);
+            self.bitmaps.insert(item.bitmap_key().to_string(), bmp);
         }
 
         let slots = self.slots();
@@ -914,12 +941,13 @@ impl Dock {
         let (items, bitmaps, pressed, menu_item) = (&self.items, &self.bitmaps, self.pressed, self.menu_item);
 
         let draw_icon = |p: &crate::gfx::Painter, item: &Item, rect: Rect, opacity: f32, darken: bool| {
-            let Some(Some(bmp)) = bitmaps.get(&item.icon_key) else {
+            let Some(Some(bmp)) = bitmaps.get(item.bitmap_key()) else {
                 p.fill_round(rect.inset(rect.w * 0.08, rect.w * 0.08), rect.w * 0.2, theme.text_disabled);
                 return;
             };
-            // The Finder icon is already a tile.
-            let draw_rect = if squircle && item.custom_icon.is_none() && item.icon_key != finder_icon::KEY {
+            // The Finder icon and most custom icons are already tiles; library logos aren't.
+            let tiled = item.icon_key != finder_icon::KEY && item.custom_icon.as_deref().is_none_or(is_library_logo);
+            let draw_rect = if squircle && tiled {
                 let tile = rect.inset(rect.w * 0.06, rect.w * 0.06);
                 p.fill_round(tile.offset(0.0, rect.w * 0.01), tile.w * 0.225, Color::gray(0, 0.12 * opacity));
                 // macOS-style tile: white in light mode, near-black (with a faint edge) in dark mode.

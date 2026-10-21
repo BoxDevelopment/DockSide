@@ -88,31 +88,12 @@ mod tests {
     #[test]
     #[ignore]
     fn writes_png() {
-        use windows::core::HSTRING;
-        use windows::Win32::Foundation::GENERIC_WRITE;
-        use windows::Win32::Graphics::Imaging::*;
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
         let Ok(out) = std::env::var("DOCKSIDE_ICON_OUT") else { return };
         unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         }
         let gfx = crate::gfx::Gfx::new().unwrap();
         let px = super::render(&gfx).unwrap();
-        unsafe {
-            let stream = gfx.wic.CreateStream().unwrap();
-            stream.InitializeFromFilename(&HSTRING::from(out), GENERIC_WRITE.0).unwrap();
-            let encoder = gfx.wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()).unwrap();
-            encoder.Initialize(&stream, WICBitmapEncoderNoCache).unwrap();
-            let mut frame = None;
-            encoder.CreateNewFrame(&mut frame, std::ptr::null_mut()).unwrap();
-            let frame = frame.unwrap();
-            frame.Initialize(None).unwrap();
-            frame.SetSize(px.width, px.height).unwrap();
-            let mut format = GUID_WICPixelFormat32bppPBGRA;
-            frame.SetPixelFormat(&mut format).unwrap();
-            frame.WritePixels(px.height, px.width * 4, &px.data).unwrap();
-            frame.Commit().unwrap();
-            encoder.Commit().unwrap();
-        }
+        crate::gfx::write_png(&gfx, px.width, px.height, &px.data, &out);
     }
 }

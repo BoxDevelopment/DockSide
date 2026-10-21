@@ -191,17 +191,31 @@ pub fn reveal(path: &str) {
 
 /// Shows the system file picker for an app (.exe / .lnk) to add to the Dock.
 pub fn pick_app(owner: HWND) -> Option<String> {
-    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("Apps and shortcuts"), pszSpec: w!("*.exe;*.lnk") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    pick_file(owner, w!("Add to Dock"), &filters)
+}
+
+/// An image for a Dock icon.
+pub fn pick_image(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("Images"), pszSpec: w!("*.png;*.ico;*.jpg;*.jpeg;*.bmp") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    pick_file(owner, w!("Choose an Icon"), &filters)
+}
+
+fn pick_file(owner: HWND, title: PCWSTR, filters: &[windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC]) -> Option<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
     unsafe {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let filters = [
-            COMDLG_FILTERSPEC { pszName: w!("Apps and shortcuts"), pszSpec: w!("*.exe;*.lnk") },
-            COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
-        ];
-        dialog.SetFileTypes(&filters).ok()?;
-        dialog.SetTitle(w!("Add to Dock")).ok()?;
+        dialog.SetFileTypes(filters).ok()?;
+        dialog.SetTitle(title).ok()?;
         dialog.Show(owner).ok()?; // Err when cancelled
         let item = dialog.GetResult().ok()?;
         let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;

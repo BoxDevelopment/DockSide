@@ -554,3 +554,26 @@ impl Painter<'_> {
         }
     }
 }
+
+/// Saves premultiplied BGRA pixels as a PNG, for tests that want a look.
+#[cfg(test)]
+pub fn write_png(gfx: &Gfx, width: u32, height: u32, data: &[u8], path: &str) {
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Graphics::Imaging::*;
+    unsafe {
+        let stream = gfx.wic.CreateStream().unwrap();
+        stream.InitializeFromFilename(&HSTRING::from(path), GENERIC_WRITE.0).unwrap();
+        let encoder = gfx.wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null()).unwrap();
+        encoder.Initialize(&stream, WICBitmapEncoderNoCache).unwrap();
+        let mut frame = None;
+        encoder.CreateNewFrame(&mut frame, std::ptr::null_mut()).unwrap();
+        let frame = frame.unwrap();
+        frame.Initialize(None).unwrap();
+        frame.SetSize(width, height).unwrap();
+        let mut format = GUID_WICPixelFormat32bppPBGRA;
+        frame.SetPixelFormat(&mut format).unwrap();
+        frame.WritePixels(height, width * 4, data).unwrap();
+        frame.Commit().unwrap();
+        encoder.Commit().unwrap();
+    }
+}

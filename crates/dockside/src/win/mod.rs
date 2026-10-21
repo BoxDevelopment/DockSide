@@ -168,6 +168,10 @@ pub const WM_APP_UPDATE: u32 = WM_APP + 19;
 pub const WM_APP_WIDGETS: u32 = WM_APP + 20;
 /// Now Playing changed (the widgets' own media watcher).
 pub const WM_APP_WIDGET_MEDIA: u32 = WM_APP + 21;
+/// The icon picker's background workers finished something.
+pub const WM_APP_ICON_PICKER: u32 = WM_APP + 22;
+/// The icon picker lost focus: close it.
+pub const WM_APP_CLOSE_PICKER: u32 = WM_APP + 23;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
 

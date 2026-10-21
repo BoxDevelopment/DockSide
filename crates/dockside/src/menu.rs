@@ -34,6 +34,12 @@ pub enum Action {
     SetStartAtLogin(bool),
     /// File picker, then pin the chosen app.
     AddDockApp,
+    /// Open the icon picker for a Dock app (with its display name).
+    ChangeIcon { target: crate::icon_picker::IconTarget, name: String },
+    /// Set (or, with `None`, reset) a Dock app's custom icon.
+    SetAppIcon { target: crate::icon_picker::IconTarget, icon: Option<String> },
+    /// Image file picker, then use the file as a Dock app's icon.
+    PickIconFile(crate::icon_picker::IconTarget),
     OpenSettings(Option<crate::settings::Page>),
     /// Show the first-launch Setup Assistant again.
     OpenOnboarding,

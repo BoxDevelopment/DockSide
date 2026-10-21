@@ -20,6 +20,9 @@ pub struct Config {
     pub widgets: WidgetsCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
+    /// Custom Dock icons by exe file name, for apps that aren't pinned.
+    #[serde(default)]
+    pub app_icons: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -125,6 +128,8 @@ pub struct DockCfg {
     pub show_trash: bool,
     /// A soft drop shadow under the shelf.
     pub shadow: bool,
+    /// macOSicons.com API key, for Mac-style results in Change Icon… ("" = off).
+    pub macosicons_key: String,
     pub autohide: bool,
     pub show_on_desktop: bool,
     pub reserve_space: bool,
@@ -537,6 +542,20 @@ pub enum ConfigValue {
 /// Sets `[table] key = value`, keeping the rest of the file (and comments) intact.
 pub fn save_value(path: &Path, table: &str, key: &str, value: &ConfigValue) -> Result<()> {
     save_values(path, table, &[(key, value.clone())])
+}
+
+/// Removes `[table] key` if it's there, keeping the rest of the file intact.
+pub fn remove_value(path: &Path, table: &str, key: &str) -> Result<()> {
+    use toml_edit::DocumentMut;
+
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: DocumentMut = text.parse().context("config.toml is not valid TOML")?;
+    if let Some(t) = doc.get_mut(table).and_then(|t| t.as_table_like_mut()) {
+        if t.remove(key).is_some() {
+            std::fs::write(path, doc.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 /// Sets several keys of one table in a single write.

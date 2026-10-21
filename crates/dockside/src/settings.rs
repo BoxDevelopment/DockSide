@@ -145,6 +145,7 @@ pub(crate) enum Key {
     DockRunning,
     DockTrash,
     DockShadow,
+    DockMacIconsKey,
     SpotlightEnabled,
     SpotlightHotkey,
     SearchEngine,
@@ -200,6 +201,7 @@ impl Key {
             Key::DockRunning => ("dock", "show_running"),
             Key::DockTrash => ("dock", "show_trash"),
             Key::DockShadow => ("dock", "shadow"),
+            Key::DockMacIconsKey => ("dock", "macosicons_key"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
             Key::SearchEngine => ("spotlight", "search_engine"),
@@ -688,6 +690,13 @@ impl SettingsWindow {
                     .collect(),
                 },
                 Group {
+                    title: Some("Custom icons"),
+                    rows: vec![
+                        Row::Info("Change an app's icon", "Right-click it in the Dock, then Change Icon\u{2026}".into()),
+                        Row::Text("macOSicons.com API key", Key::DockMacIconsKey, "Optional: adds Mac-style icons"),
+                    ],
+                },
+                Group {
                     title: Some("Pinned apps"),
                     rows: (0..cfg.dock.apps.len())
                         .map(Row::App)
@@ -895,6 +904,7 @@ impl SettingsWindow {
     fn text_value(key: Key, cfg: &Config) -> String {
         match key {
             Key::CustomSearchUrl => cfg.spotlight.custom_search_url.clone(),
+            Key::DockMacIconsKey => cfg.dock.macosicons_key.clone(),
             Key::IslandIcs => cfg.island.calendar_ics.clone(),
             Key::WidgetsLocation => cfg.widgets.location.clone(),
             Key::WidgetsClocks => cfg.widgets.world_clocks.join(", "),
@@ -1354,6 +1364,11 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                     // A calendar link is a secret: show where it points, not the link.
                     if *key == Key::IslandIcs && !value.is_empty() {
                         value = crate::island::calendar_links_summary(&value);
+                    }
+                    // So is an API key: show only its last few characters.
+                    if *key == Key::DockMacIconsKey && !value.is_empty() {
+                        let tail: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+                        value = format!("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} {tail}");
                     }
                     if value.is_empty() {
                         p.text(placeholder, &regular, tr, theme.text_disabled);

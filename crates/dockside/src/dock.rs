@@ -986,11 +986,18 @@ impl Dock {
     }
 }
 
-impl Drop for Dock {
-    fn drop(&mut self) {
-        if self.reserved {
+impl Dock {
+    /// Gives back reserved screen space early, before a replacement reserves its own.
+    pub fn release_space(&mut self) {
+        if std::mem::take(&mut self.reserved) {
             appbar::remove(self.surface.content);
         }
+    }
+}
+
+impl Drop for Dock {
+    fn drop(&mut self) {
+        self.release_space();
     }
 }
 

@@ -71,6 +71,21 @@ const TIMER_FINDER: usize = 5;
 const TIMER_THEME: usize = 6;
 /// Display broadcast: rebuild only if the primary monitor actually changed.
 const TIMER_DISPLAY: usize = 7;
+/// Destroys replaced surfaces once their replacements are on screen.
+const TIMER_RETIRE: usize = 8;
+/// Long enough for DWM to present a new surface's backdrop.
+const RETIRE_MS: u32 = 250;
+
+/// Energy Saver and battery saver on/off, reported via WM_POWERBROADCAST.
+const GUID_ENERGY_SAVER_STATUS: windows::core::GUID = windows::core::GUID::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
+const GUID_POWER_SAVING_STATUS: windows::core::GUID = windows::core::GUID::from_u128(0xe00958c0_c213_4ace_ac77_fecced2eeea5);
+
+/// What decides whether DWM blurs our backdrops. Energy Saver turns blur off
+/// and back on without rebuilding the host backdrop brushes, so a change here
+/// needs fresh surfaces.
+fn backdrop_state() -> (bool, bool) {
+    (system::transparency_enabled(), win::controls::low_power_mode())
+}
 
 const HOTKEY_SPOTLIGHT: i32 = 1;
 
@@ -80,6 +95,11 @@ pub fn run() -> anyhow::Result<()> {
     MSG_HWND.store(msg_hwnd.0 as isize, Ordering::Relaxed);
 
     let app = App::new(msg_hwnd)?;
+    for guid in [GUID_ENERGY_SAVER_STATUS, GUID_POWER_SAVING_STATUS] {
+        if let Err(e) = unsafe { windows::Win32::System::Power::RegisterPowerSettingNotification(HANDLE(msg_hwnd.0), &guid, DEVICE_NOTIFY_WINDOW_HANDLE) } {
+            log!("power notification failed: {e}");
+        }
+    }
     APP.with(|a| *a.borrow_mut() = Some(app));
     with_app(|app| {
         app.build();
@@ -586,6 +606,11 @@ pub struct App {
     fullscreen_reported: bool,
     /// Shell surfaces are currently hidden for a fullscreen app.
     fullscreen_hidden: bool,
+    /// `backdrop_state()` when the surfaces were last built.
+    backdrop_state: (bool, bool),
+    /// Replaced surfaces, left on screen under their replacements until
+    /// `TIMER_RETIRE` so a rebuild never shows a gap.
+    retired: Vec<Box<dyn std::any::Any>>,
 }
 
 impl App {
@@ -664,6 +689,8 @@ impl App {
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             fullscreen_reported: false,
             fullscreen_hidden: false,
+            backdrop_state: backdrop_state(),
+            retired: Vec::new(),
         })
     }
 
@@ -671,11 +698,12 @@ impl App {
     fn build(&mut self) {
         crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
         self.close_menu();
-        self.island = None;
-        self.widgets = None;
-        self.dock = None;
-        self.menubar = None;
+        self.retire_island();
+        self.retire_widgets();
+        self.retire_dock();
+        self.retire_menubar();
         self.theme = Theme::new(&self.cfg, &self.gfx);
+        self.backdrop_state = backdrop_state();
         self.monitor = Monitor::primary();
 
         if self.cfg.general.hide_taskbar {
@@ -809,7 +837,7 @@ impl App {
         if self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::MenuBar(_))) {
             self.close_menu();
         }
-        self.menubar = None;
+        self.retire_menubar();
         if self.cfg.menubar.enabled {
             match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
                 Ok(m) => {
@@ -821,8 +849,41 @@ impl App {
         }
     }
 
+    /// Keeps `old` on screen for `RETIRE_MS`, under whatever replaces it.
+    fn retire(&mut self, old: impl std::any::Any) {
+        self.retired.push(Box::new(old));
+        self.timer(TIMER_RETIRE, RETIRE_MS);
+    }
+
+    fn retire_menubar(&mut self) {
+        if let Some(mut m) = self.menubar.take() {
+            m.release_space();
+            self.retire(m);
+        }
+    }
+
+    fn retire_dock(&mut self) {
+        if let Some(mut d) = self.dock.take() {
+            d.release_space();
+            self.retire(d);
+        }
+    }
+
+    fn retire_island(&mut self) {
+        if let Some(i) = self.island.take() {
+            self.retire(i);
+        }
+    }
+
+    fn retire_widgets(&mut self) {
+        if let Some(mut w) = self.widgets.take() {
+            w.save_state();
+            self.retire(w);
+        }
+    }
+
     fn rebuild_island(&mut self) {
-        self.island = None;
+        self.retire_island();
         if self.cfg.island.enabled {
             let hwnd = self.msg_hwnd.0 as isize;
             match Island::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_MEDIA, WM_APP_ISLAND) {
@@ -850,7 +911,7 @@ impl App {
     }
 
     fn rebuild_widgets(&mut self) {
-        self.widgets = None;
+        self.retire_widgets();
         if self.cfg.widgets.enabled {
             let hwnd = self.msg_hwnd.0 as isize;
             self.widgets = Some(Widgets::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA));
@@ -972,7 +1033,7 @@ impl App {
         if self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::Dock(_))) {
             self.close_menu();
         }
-        self.dock = None;
+        self.retire_dock();
         if self.cfg.dock.enabled {
             match Dock::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
                 Ok(d) => self.dock = Some(d),
@@ -1573,6 +1634,13 @@ impl App {
                     }
                 }
                 WM_APP_FRAME => self.on_frame(),
+                WM_POWERBROADCAST => {
+                    if wp.0 as u32 == PBT_POWERSETTINGCHANGE {
+                        // Give DWM a moment to switch its effects first.
+                        self.timer(TIMER_THEME, 800);
+                    }
+                    return Some(LRESULT(1));
+                }
                 WM_TIMER => {
                     let id = wp.0;
                     if id != TIMER_TICK {
@@ -1585,9 +1653,15 @@ impl App {
                         TIMER_REFRESH => self.refresh_windows(),
                         TIMER_RELOAD => self.reload(),
                         TIMER_REBUILD => self.build(),
+                        TIMER_RETIRE => self.retired.clear(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
-                        TIMER_THEME if crate::theme::wants_dark(&self.cfg) != self.theme.dark => self.build(),
+                        TIMER_THEME
+                            if crate::theme::wants_dark(&self.cfg) != self.theme.dark
+                                || backdrop_state() != self.backdrop_state =>
+                        {
+                            self.build()
+                        }
                         TIMER_DISPLAY if Monitor::primary() != self.monitor => self.build(),
                         TIMER_DISPLAY => {
                             self.raise_surfaces();

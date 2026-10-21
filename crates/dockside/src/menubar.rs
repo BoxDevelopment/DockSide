@@ -296,11 +296,18 @@ impl MenuBar {
     }
 }
 
-impl Drop for MenuBar {
-    fn drop(&mut self) {
-        if self.reserved {
+impl MenuBar {
+    /// Gives back reserved screen space early, before a replacement reserves its own.
+    pub fn release_space(&mut self) {
+        if std::mem::take(&mut self.reserved) {
             appbar::remove(self.surface.content);
         }
+    }
+}
+
+impl Drop for MenuBar {
+    fn drop(&mut self) {
+        self.release_space();
     }
 }
 

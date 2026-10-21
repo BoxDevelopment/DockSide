@@ -1009,13 +1009,20 @@ impl Widgets {
     }
 }
 
-impl Drop for Widgets {
-    fn drop(&mut self) {
+impl Widgets {
+    /// Ends any open edit and saves, so a replacement loads the latest state.
+    pub fn save_state(&mut self) {
         let open: Vec<usize> = (0..self.widgets.len()).filter(|&i| self.widgets[i].edit.is_some()).collect();
         for i in open {
             self.end_edit(i);
         }
         self.store.save_if_dirty();
+    }
+}
+
+impl Drop for Widgets {
+    fn drop(&mut self) {
+        self.save_state();
     }
 }
 

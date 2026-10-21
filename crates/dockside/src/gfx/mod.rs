@@ -101,6 +101,11 @@ impl Gfx {
         self.format_ex(family, size, Weight::Regular, Align::Center, true)
     }
 
+    /// Top-aligned text that wraps, with the given alignment (notes, long titles).
+    pub fn format_block(&self, family: &str, size: f32, weight: Weight, align: Align) -> IDWriteTextFormat {
+        self.format_ex(family, size, weight, align, true)
+    }
+
     fn format_ex(&self, family: &str, size: f32, weight: Weight, align: Align, wrap: bool) -> IDWriteTextFormat {
         let key = (family.to_string(), (size * 100.0) as u32, weight, align, wrap);
         if let Some(f) = self.formats.borrow().get(&key) {
@@ -248,6 +253,31 @@ impl Canvas {
         Ok(())
     }
 
+    /// The drawn pixels (premultiplied BGRA, top-down), for tests that look at output.
+    #[cfg(test)]
+    pub fn pixels(&self) -> Vec<u8> {
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: self.width,
+                biHeight: -self.height,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (self.width * self.height * 4) as usize];
+        unsafe {
+            // GetDIBits wants the bitmap deselected.
+            SelectObject(self.dc, self.old);
+            GetDIBits(self.dc, self.bitmap, 0, self.height as u32, Some(buf.as_mut_ptr() as *mut c_void), &mut bmi, DIB_RGB_COLORS);
+            SelectObject(self.dc, self.bitmap);
+        }
+        buf
+    }
+
     unsafe fn free_bitmap(&mut self) {
         if !self.bitmap.is_invalid() {
             SelectObject(self.dc, self.old);
@@ -364,6 +394,24 @@ impl Painter<'_> {
         unsafe { self.rt.FillRoundedRectangle(&rr, self.color(c)) }
     }
 
+    /// A rounded rect filled with a top-to-bottom gradient.
+    pub fn fill_round_gradient(&self, r: Rect, radius: f32, top: Color, bottom: Color) {
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: top.d2d() },
+            D2D1_GRADIENT_STOP { position: 1.0, color: bottom.d2d() },
+        ];
+        unsafe {
+            let Ok(coll) = self.rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP) else {
+                return self.fill_round(r, radius, top);
+            };
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES { startPoint: pt(r.x, r.y), endPoint: pt(r.x, r.bottom()) };
+            if let Ok(brush) = self.rt.CreateLinearGradientBrush(&props, None, &coll) {
+                let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
+                self.rt.FillRoundedRectangle(&rr, &brush);
+            }
+        }
+    }
+
     pub fn stroke_round(&self, r: Rect, radius: f32, c: Color, width: f32) {
         let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
         unsafe { self.rt.DrawRoundedRectangle(&rr, self.color(c), width, None) }
@@ -398,6 +446,11 @@ impl Painter<'_> {
                 self.rt.DrawTextLayout(pt(r.x, r.y), &layout, self.color(c), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT)
             }
         }
+    }
+
+    /// Draws a prepared text layout with its top-left at (x, y).
+    pub fn text_layout(&self, layout: &IDWriteTextLayout, x: f32, y: f32, c: Color) {
+        unsafe { self.rt.DrawTextLayout(pt(x, y), layout, self.color(c), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT) }
     }
 
     /// High-quality scaled bitmap draw (cubic when the device context is available).

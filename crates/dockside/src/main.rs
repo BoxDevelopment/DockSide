@@ -19,6 +19,7 @@ mod spotlight;
 mod surface;
 mod theme;
 mod update;
+mod widgets;
 mod win;
 
 use windows::core::w;

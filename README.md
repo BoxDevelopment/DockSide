@@ -83,6 +83,18 @@ hidden while DockSide runs and is always restored when it exits.
   KaTeX commands with previews; Enter copies the code (for Notion equations), Shift+Enter the symbol
 - Enter opens; folders open in Finder; Ctrl+Enter reveals the item in Finder; Esc clears, then closes
 
+**Widgets**
+- macOS Sonoma-style desktop widgets: frosted cards on the wallpaper, below every window
+  (they stay put through Show Desktop and never pop over the app you're using)
+- Clock (analog, or with the date), World Clock (one zone, four, or a list), Weather (current, hourly
+  and a 5-day forecast from Open-Meteo; the place is found automatically or set in Settings), Calendar
+  (month grid with your next events), Up Next, Reminders (a checklist you type into), Notes (type straight
+  into the widget), Batteries (this PC plus connected Bluetooth devices), Now Playing (with transport
+  controls) and System (CPU graph, memory, disk, network)
+- Small, medium and large sizes; drag a widget anywhere and it snaps to the screen edges and its neighbours
+- Right-click a widget to resize or remove it; add more in Settings → Widgets
+- Positions live in `[[widgets.items]]`; notes and reminders in `%APPDATA%\DockSide\widgets.json`
+
 **Desktops**
 - Alt+1 … Alt+9 jump straight to that Windows virtual desktop
 - Win+Ctrl+← / → switch through DockSide, and Windows' desktop-name popup is hidden
@@ -121,6 +133,8 @@ you right-click the Dock, or by launching DockSide again while it's running.
 - **Menu Bar:** background, logo, clock format, reserved space, status items
 - **Dock:** size, magnification and magnified size, auto-hide, icon style, background,
   running apps, Trash, pinned apps (add with a file picker, remove with −)
+- **Widgets:** show or hide them, background, add any widget, Weather location and units,
+  World Clock time zones
 
 "Start at login" registers the exe you're running (`HKCU\...\Run`). Use a release build
 (`cargo build --release`) for that, not `target\debug`.
@@ -146,6 +160,8 @@ crates/dockside/src
 ├── menu.rs       popup menus + the standard menu contents
 ├── finder/       Finder window (views, input), filesystem helpers, background icon loader
 ├── settings.rs   System Settings window
+├── widgets/      desktop widgets: layout, snapping and the desktop layer; views, glyphs; weather,
+│                 battery and system stat sources; notes / reminders store
 ├── island/       Dynamic Island: spring-driven pill, views, glyphs; media, calendar, notifications,
 │                 bluetooth and system sources feed it from background threads
 ├── chrome.rs     shared window chrome: shadow, body, traffic lights
@@ -162,7 +178,8 @@ crates/dockside/src
 
 - [x] Finder: sidebar, icon / list / column views, rename, trash, context menus
 - [x] Finder: drag and drop, Quick Look (Space), tabs, search, sidebar vibrancy
-- [ ] Widgets: a desktop widget layer (clock, weather, calendar, battery, notes)
+- [x] Widgets: a desktop widget layer (clock, world clock, weather, calendar, up next, reminders,
+      notes, batteries, now playing, system)
 - [x] True rounded acrylic via `Windows.UI.Composition` host backdrop
 - [x] Dock: drag to reorder, drag out to remove, auto-hide
 - [ ] Dock: minimized windows, a downloads stack, multi-monitor

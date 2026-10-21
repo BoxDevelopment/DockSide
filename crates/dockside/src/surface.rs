@@ -5,8 +5,9 @@
 //! * a *content* window (layered, per-pixel alpha) owned by, and therefore
 //!   always above, the backdrop, which Direct2D renders into.
 //!
-//! Both are topmost, non-activating tool windows, so clicking them never steals
-//! focus from the app the user is working in.
+//! Both are non-activating tool windows, so clicking them never steals focus
+//! from the app the user is working in. Shell surfaces are topmost; desktop
+//! widgets are not (they sit just above the wallpaper).
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -44,7 +45,12 @@ fn effective_tint(kind: Backdrop, tint: Color) -> Color {
 
 impl Surface {
     pub fn new(gfx: &Gfx, rect: RECT, scale: f32, kind: Backdrop, tint: Color) -> Result<Self> {
-        let ex = WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+        Self::with_layer(gfx, rect, scale, kind, tint, true)
+    }
+
+    /// `topmost: false` makes an ordinary-band surface (desktop widgets).
+    pub fn with_layer(gfx: &Gfx, rect: RECT, scale: f32, kind: Backdrop, tint: Color, topmost: bool) -> Result<Self> {
+        let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | if topmost { WS_EX_TOPMOST } else { WINDOW_EX_STYLE(0) };
         let tint = effective_tint(kind, tint);
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
 
@@ -109,6 +115,40 @@ impl Surface {
             _ => {}
         }
         self.canvas.resize(w, h)
+    }
+
+    /// Moves the surface (and a shaped backdrop with it) without redrawing.
+    pub fn move_to(&mut self, left: i32, top: i32) {
+        let (dx, dy) = (left - self.rect.left, top - self.rect.top);
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        self.rect = RECT { left, top, right: self.rect.right + dx, bottom: self.rect.bottom + dy };
+        let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        unsafe {
+            let _ = SetWindowPos(self.content, None, left, top, 0, 0, flags);
+            if let Some(bd) = self.backdrop {
+                let (x, y) = match &mut self.shape {
+                    Some(k) => {
+                        k[0] += dx;
+                        k[1] += dy;
+                        k[2] += dx;
+                        k[3] += dy;
+                        (k[0], k[1])
+                    }
+                    None => (left, top),
+                };
+                let _ = SetWindowPos(bd, None, x, y, 0, 0, flags);
+            }
+        }
+        if let Some(c) = &self.composition {
+            c.refresh();
+        }
+    }
+
+    /// The window that carries the surface's z-order (the content is owned by it).
+    pub fn root(&self) -> HWND {
+        self.backdrop.unwrap_or(self.content)
     }
 
     /// Fits the backdrop to a rounded rect given in surface-local points.

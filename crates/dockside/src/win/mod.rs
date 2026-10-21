@@ -163,6 +163,10 @@ pub const WM_APP_DESKTOP: u32 = WM_APP + 17;
 pub const WM_APP_PING: u32 = WM_APP + 18;
 pub const PING_REPLY: usize = 0x444F_434B; // "DOCK"
 pub const WM_APP_UPDATE: u32 = WM_APP + 19;
+/// A desktop widget source (weather, calendar, device batteries) has news.
+pub const WM_APP_WIDGETS: u32 = WM_APP + 20;
+/// Now Playing changed (the widgets' own media watcher).
+pub const WM_APP_WIDGET_MEDIA: u32 = WM_APP + 21;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
 

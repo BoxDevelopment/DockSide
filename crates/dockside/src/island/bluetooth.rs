@@ -144,3 +144,59 @@ fn battery_of(name: &str) -> Option<u8> {
         v.cast::<IReference<u8>>().ok()?.Value().ok()
     })
 }
+
+/// Battery levels of the Bluetooth devices connected right now, by device name
+/// (the Batteries widget). Blocking: call from a worker thread.
+pub fn batteries() -> Vec<(String, u8)> {
+    // Paired devices keep their PnP nodes (and last battery level) while away:
+    // only list the ones connected now.
+    let connected: Vec<String> = IIterable::<HSTRING>::try_from(vec![HSTRING::from(CONNECTED)])
+        .and_then(|props| {
+            let aqs = format!("({AQS}) AND {CONNECTED}:=System.StructuredQueryType.Boolean#True");
+            DeviceInformation::FindAllAsyncWithKindAqsFilterAndAdditionalProperties(
+                &HSTRING::from(aqs),
+                &props,
+                DeviceInformationKind::AssociationEndpoint,
+            )?
+            .get()
+        })
+        .map(|list| list.into_iter().filter_map(|d| d.Name().ok()).map(|n| n.to_string()).filter(|n| !n.is_empty()).collect())
+        .unwrap_or_default();
+    if connected.is_empty() {
+        return Vec::new();
+    }
+    let Ok(props) = IIterable::<HSTRING>::try_from(vec![HSTRING::from(BATTERY)]) else { return Vec::new() };
+    let list = DeviceInformation::FindAllAsyncWithKindAqsFilterAndAdditionalProperties(
+        &HSTRING::from("System.Devices.Present:=System.StructuredQueryType.Boolean#True"),
+        &props,
+        DeviceInformationKind::Device,
+    )
+    .and_then(|op| op.get());
+    let Ok(list) = list else { return Vec::new() };
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for d in list {
+        let level = d
+            .Properties()
+            .and_then(|p| p.Lookup(&HSTRING::from(BATTERY)))
+            .ok()
+            .and_then(|v| v.cast::<IReference<u8>>().ok())
+            .and_then(|v| v.Value().ok());
+        let (Some(level), Ok(name)) = (level, d.Name()) else { continue };
+        // One device shows up as several nodes ("AirPods Hands-Free AG", "AirPods Stereo"...).
+        let name = device_name(&name.to_string());
+        let live = connected.iter().any(|c| name.starts_with(c.as_str()) || c.starts_with(name.as_str()));
+        if live && !name.is_empty() && !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, level.min(100)));
+        }
+    }
+    out
+}
+
+fn device_name(node: &str) -> String {
+    const SUFFIXES: [&str; 5] = [" Hands-Free AG", " Hands-Free", " Stereo", " Avrcp Transport", " LE"];
+    let mut name = node.trim();
+    for s in SUFFIXES {
+        name = name.strip_suffix(s).unwrap_or(name);
+    }
+    name.trim().to_string()
+}

@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Power::{GetSystemPowerStatus, SetSuspendState, SYSTEM_POWER_STATUS};
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -26,6 +26,24 @@ fn personalize_dword(name: PCWSTR) -> Option<u32> {
         )
     };
     r.is_ok().then_some(value)
+}
+
+/// A regional setting from Control Panel\International ("iMeasure", "iFirstDayOfWeek"...).
+pub fn intl_string(name: &str) -> Option<String> {
+    let mut buf = [0u16; 64];
+    let mut size = std::mem::size_of_val(&buf) as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Control Panel\\International"),
+            &windows::core::HSTRING::from(name),
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    r.is_ok().then(|| crate::win::from_wide(&buf))
 }
 
 pub fn is_dark_mode() -> bool {

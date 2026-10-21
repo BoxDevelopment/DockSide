@@ -16,10 +16,10 @@
 //! surface is resized to the pill (plus a shadow margin) every frame, so the
 //! rest of the screen stays click-through.
 
-mod bluetooth;
-mod calendar;
+pub mod bluetooth;
+pub mod calendar;
 pub mod claude;
-mod glyphs;
+pub mod glyphs;
 mod ics;
 pub mod media;
 mod notifications;

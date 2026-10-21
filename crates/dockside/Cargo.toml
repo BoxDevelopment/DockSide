@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 anyhow = "1"
 chrono = "0.4"
+# World Clock widget time zones.
+chrono-tz = "0.10"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
 # Claude Code hook events and its settings.json (key order kept when editing).
@@ -41,6 +43,11 @@ features = [
     "UI_Notifications_Management",
     "UI_Composition",
     "UI_Composition_Desktop",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinSock",
+    "Win32_System_SystemInformation",
     "Win32_System_Variant",
     "Win32_System_Wmi",
     "Win32_System_WinRT",

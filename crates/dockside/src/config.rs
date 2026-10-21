@@ -17,6 +17,7 @@ pub struct Config {
     pub finder: FinderCfg,
     pub island: IslandCfg,
     pub desktops: DesktopsCfg,
+    pub widgets: WidgetsCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
 }
@@ -205,6 +206,59 @@ pub struct IslandCfg {
     pub download_alerts: bool,
 }
 
+/// Desktop widgets: frosted cards that sit on the wallpaper, below every window.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct WidgetsCfg {
+    pub enabled: bool,
+    /// "acrylic", "blur", "glass" or "none" (solid).
+    pub backdrop: Backdrop,
+    /// Weather location: a place name, "lat,lon", or empty to find it from the network.
+    pub location: String,
+    /// "auto" (from the Windows region), "c" or "f".
+    pub temperature_unit: String,
+    /// World Clock zones: "Area/City" or "Label=Area/City".
+    pub world_clocks: Vec<String>,
+    #[serde(default)]
+    pub items: Vec<WidgetItem>,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WidgetKind {
+    Clock,
+    WorldClock,
+    Weather,
+    Calendar,
+    UpNext,
+    Batteries,
+    Notes,
+    Reminders,
+    NowPlaying,
+    System,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WidgetSize {
+    Small,
+    Medium,
+    Large,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct WidgetItem {
+    /// Stable id (notes are stored by it); assigned on load when missing.
+    #[serde(default)]
+    pub id: u32,
+    pub kind: WidgetKind,
+    pub size: WidgetSize,
+    /// Top-left corner, in points from the top-left of the screen.
+    pub x: f32,
+    pub y: f32,
+    /// World Clock (small): the zone to show, instead of the first of `world_clocks`.
+    pub zone: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct DockApp {
     pub name: Option<String>,
@@ -271,7 +325,21 @@ fn parse(user: &str) -> Result<Config> {
     if cfg.menubar.logo.contains('%') {
         cfg.menubar.logo = expand_env(&cfg.menubar.logo);
     }
+    assign_widget_ids(&mut cfg.widgets.items);
     Ok(cfg)
+}
+
+/// Widgets without an id (the defaults, hand-written ones) get the next free ones, in order.
+fn assign_widget_ids(items: &mut [WidgetItem]) {
+    let mut next = items.iter().map(|w| w.id).max().unwrap_or(0);
+    let mut seen = std::collections::HashSet::new();
+    for w in items {
+        if w.id == 0 || !seen.insert(w.id) {
+            next += 1;
+            w.id = next;
+            seen.insert(next);
+        }
+    }
 }
 
 /// `sidebar_vibrancy = false` (before `sidebar` existed) meant a solid sidebar.
@@ -404,12 +472,51 @@ pub fn save_dock_apps(path: &Path, apps: &[DockApp]) -> Result<()> {
     Ok(())
 }
 
+/// Rewrites the `[[widgets.items]]` array, keeping the rest of the file intact.
+pub fn save_widgets(path: &Path, items: &[WidgetItem]) -> Result<()> {
+    use toml_edit::{value, ArrayOfTables, DocumentMut, Item, Table};
+
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut doc: DocumentMut = text.parse().context("config.toml is not valid TOML")?;
+    if !doc.contains_table("widgets") {
+        doc["widgets"] = Item::Table(Table::new());
+    }
+    let name = |s: &dyn std::fmt::Debug| {
+        // WidgetKind::WorldClock -> "world_clock", WidgetSize::Small -> "small".
+        let mut out = String::new();
+        for (i, c) in format!("{s:?}").chars().enumerate() {
+            if c.is_uppercase() && i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        }
+        out
+    };
+    let mut arr = ArrayOfTables::new();
+    for w in items {
+        let mut t = Table::new();
+        t["id"] = value(w.id as i64);
+        t["kind"] = value(name(&w.kind));
+        t["size"] = value(name(&w.size));
+        t["x"] = value(w.x.round() as i64);
+        t["y"] = value(w.y.round() as i64);
+        if let Some(z) = &w.zone {
+            t["zone"] = value(z.as_str());
+        }
+        arr.push(t);
+    }
+    doc["widgets"]["items"] = Item::ArrayOfTables(arr);
+    std::fs::write(path, doc.to_string())?;
+    Ok(())
+}
+
 /// A scalar setting value written by the settings UI.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigValue {
     Bool(bool),
     Int(i64),
     Str(String),
+    List(Vec<String>),
 }
 
 /// Sets `[table] key = value`, keeping the rest of the file (and comments) intact.
@@ -431,6 +538,7 @@ pub fn save_values(path: &Path, table: &str, values: &[(&str, ConfigValue)]) -> 
             ConfigValue::Bool(b) => toml_edit::value(*b),
             ConfigValue::Int(i) => toml_edit::value(*i),
             ConfigValue::Str(s) => toml_edit::value(s.as_str()),
+            ConfigValue::List(l) => toml_edit::value(l.iter().map(String::as_str).collect::<toml_edit::Array>()),
         };
     }
     std::fs::write(path, doc.to_string())?;
@@ -485,6 +593,45 @@ sort = \"modified\"
         assert_eq!(parse("[finder]\nsidebar_vibrancy = true\n").unwrap().finder.sidebar, Backdrop::Glass);
         let cfg = parse("[finder]\nsidebar_vibrancy = false\nsidebar = \"acrylic\"\n").unwrap();
         assert_eq!(cfg.finder.sidebar, Backdrop::Acrylic);
+    }
+
+    #[test]
+    fn widgets_parse_and_get_ids() {
+        let cfg = defaults();
+        assert!(!cfg.widgets.items.is_empty());
+        let ids: Vec<u32> = cfg.widgets.items.iter().map(|w| w.id).collect();
+        assert!(ids.iter().all(|&i| i > 0));
+        let cfg = parse("[[widgets.items]]
+id = 5
+kind = \"world_clock\"
+size = \"medium\"
+x = 1
+y = 2
+[[widgets.items]]
+kind = \"notes\"
+size = \"small\"
+x = 3
+y = 4
+").unwrap();
+        assert_eq!(cfg.widgets.items[0].kind, WidgetKind::WorldClock);
+        assert_eq!(cfg.widgets.items[1].id, 6);
+    }
+
+    #[test]
+    fn widgets_round_trip() {
+        let dir = std::env::temp_dir().join(format!("dockside-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "# keep me
+[widgets]
+enabled = true
+").unwrap();
+        let items = defaults().widgets.items;
+        save_widgets(&path, &items).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"));
+        assert_eq!(parse(&text).unwrap().widgets.items, items);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

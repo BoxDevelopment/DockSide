@@ -194,6 +194,57 @@ screenshots = true
 download_alerts = true
 # (Virtual desktop switches: `island` under [desktops].)
 
+[widgets]
+# Widgets on the desktop, below your windows. Drag them to move them (they snap
+# to each other and the screen edges); right-click one to resize or remove it.
+# Add more in System Settings > Widgets.
+enabled = true
+# "acrylic", "blur", "glass" (Liquid Glass) or "none" (solid)
+backdrop = "acrylic"
+# Weather location: a place ("London", "Paris, France"), coordinates
+# ("51.5,-0.12"), or "" to find it from your network.
+location = ""
+# "auto" follows the Windows region (Fahrenheit for the US), or "c" / "f".
+temperature_unit = "auto"
+# World Clock time zones, "Area/City" or "Label=Area/City"
+# (see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
+world_clocks = ["America/Los_Angeles", "America/New_York", "Europe/London", "Asia/Tokyo"]
+
+# Widgets and where they sit (top-left corner, in points from the screen's top-left).
+#   kind - clock, world_clock, weather, calendar, up_next, batteries, notes,
+#          reminders, now_playing or system
+#   size - small, medium or large (not every widget has every size)
+#   zone - world_clock: the time zone of a small one (optional)
+[[widgets.items]]
+kind = "clock"
+size = "small"
+x = 24
+y = 48
+
+[[widgets.items]]
+kind = "calendar"
+size = "small"
+x = 218
+y = 48
+
+[[widgets.items]]
+kind = "weather"
+size = "medium"
+x = 24
+y = 242
+
+[[widgets.items]]
+kind = "batteries"
+size = "small"
+x = 24
+y = 436
+
+[[widgets.items]]
+kind = "notes"
+size = "small"
+x = 218
+y = 436
+
 # Display names by exe file name (menu bar + Dock tooltips).
 [app_names]
 "explorer.exe" = "Finder"

@@ -54,6 +54,8 @@ pub enum Action {
     IslandDrag(Vec<std::path::PathBuf>),
     /// Add / remove the island's hooks in Claude Code's settings.
     ConnectClaude(bool),
+    /// Add, remove or resize a desktop widget.
+    Widget(crate::widgets::WidgetCmd),
     /// Switch Windows (and DockSide) to dark or light mode.
     SetDarkMode(bool),
     /// Click an app's notification-area icon.

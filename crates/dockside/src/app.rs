@@ -34,12 +34,13 @@ use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::theme::Theme;
+use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
-    WM_APP_UPDATE,
+    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA,
 };
 
 thread_local! {
@@ -309,6 +310,9 @@ fn execute(action: Action) {
                 app.flush();
             });
         }
+        Action::Widget(cmd) => {
+            with_app(|app| app.widget_cmd(cmd));
+        }
         Action::Quit => unsafe { PostQuitMessage(0) },
     }
 }
@@ -331,6 +335,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // (Both forms: leaving the proposed rect untouched makes it the client rect.)
         WM_NCCALCSIZE if GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0 => {
             return LRESULT(0)
+        }
+        // Desktop widgets stay on the desktop layer: nothing else may restack them
+        // (clicking or typing into one would otherwise lift it over app windows).
+        WM_WINDOWPOSCHANGING
+            if GetWindowLongPtrW(hwnd, GWLP_USERDATA) == crate::widgets::TAG && !crate::widgets::placing() =>
+        {
+            let pos = &mut *(lp.0 as *mut WINDOWPOS);
+            pos.flags |= SWP_NOZORDER;
+            return LRESULT(0);
         }
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => {
@@ -525,6 +538,7 @@ pub struct App {
     menubar: Option<MenuBar>,
     dock: Option<Dock>,
     island: Option<Island>,
+    widgets: Option<Widgets>,
     menu: Option<PopupMenu>,
     settings: Option<SettingsWindow>,
     finders: Vec<FinderWindow>,
@@ -603,6 +617,7 @@ impl App {
             menubar: None,
             dock: None,
             island: None,
+            widgets: None,
             menu: None,
             settings: None,
             finders: Vec::new(),
@@ -628,6 +643,7 @@ impl App {
         crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
         self.close_menu();
         self.island = None;
+        self.widgets = None;
         self.dock = None;
         self.menubar = None;
         self.theme = Theme::new(&self.cfg, &self.gfx);
@@ -662,6 +678,7 @@ impl App {
         }
         // After the menu bar, so it stacks above it.
         self.rebuild_island();
+        self.rebuild_widgets();
         self.setup_desktops();
         self.refresh_windows();
         self.flush();
@@ -712,6 +729,9 @@ impl App {
             if let Some(d) = &mut self.dock {
                 d.dirty = true;
             }
+            if let Some(w) = &mut self.widgets {
+                w.invalidate();
+            }
         }
         if old.spotlight != self.cfg.spotlight {
             self.register_hotkey();
@@ -726,6 +746,18 @@ impl App {
             || old.menubar.height != self.cfg.menubar.height
         {
             self.rebuild_island();
+        }
+        let (w0, w1) = (&old.widgets, &self.cfg.widgets);
+        if w0.enabled != w1.enabled || w0.backdrop != w1.backdrop || old.menubar.enabled != self.cfg.menubar.enabled
+            || old.menubar.height != self.cfg.menubar.height
+        {
+            self.rebuild_widgets();
+        } else if w0 != w1 || old.island.calendar_ics != self.cfg.island.calendar_ics
+            || old.menubar.clock_format != self.cfg.menubar.clock_format
+        {
+            if let Some(w) = &mut self.widgets {
+                w.sync(&self.gfx, &self.theme, &self.cfg);
+            }
         }
         if old.dock != self.cfg.dock {
             let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock);
@@ -783,6 +815,35 @@ impl App {
             _ => {}
         }
         self.animate();
+    }
+
+    fn rebuild_widgets(&mut self) {
+        self.widgets = None;
+        if self.cfg.widgets.enabled {
+            let hwnd = self.msg_hwnd.0 as isize;
+            self.widgets = Some(Widgets::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA));
+        }
+    }
+
+    /// Adds, removes or resizes a widget: written to the config, then applied.
+    fn widget_cmd(&mut self, cmd: WidgetCmd) {
+        if self.widgets.is_none() && matches!(cmd, WidgetCmd::Add(_)) {
+            // Adding a widget while they're off turns them on.
+            let on = config::ConfigValue::Bool(true);
+            if let Err(e) = config::save_value(&self.cfg_path, "widgets", "enabled", &on) {
+                return log!("could not turn widgets on: {e:#}");
+            }
+            self.reload();
+        }
+        let Some(items) = self.widgets.as_mut().and_then(|w| w.command(cmd)) else { return };
+        self.save_widgets(&items);
+    }
+
+    fn save_widgets(&mut self, items: &[config::WidgetItem]) {
+        match config::save_widgets(&self.cfg_path, items) {
+            Ok(()) => self.reload(),
+            Err(e) => log!("could not save widgets: {e:#}"),
+        }
     }
 
     /// Installs or removes the desktop shortcuts and switch watcher to match the config.
@@ -904,6 +965,9 @@ impl App {
         if self.island.as_mut().is_some_and(|i| i.on_tick(system::battery())) {
             self.animate();
         }
+        if let Some(w) = &mut self.widgets {
+            w.on_tick();
+        }
         if self.cfg.general.hide_taskbar {
             taskbar::reapply();
         }
@@ -949,6 +1013,12 @@ impl App {
         if let Some(on) = on_desktop {
             if self.dock.as_mut().is_some_and(|d| d.set_on_desktop(on)) {
                 self.animate();
+            }
+            // Show Desktop (Win+D) restacks the desktop; keep widgets right above it.
+            if on {
+                if let Some(w) = &self.widgets {
+                    w.place();
+                }
             }
         }
         if self.finders.iter().any(|f| f.hwnd == fg) {
@@ -1014,6 +1084,9 @@ impl App {
         }
         if let Some(i) = self.island.as_mut().filter(|i| i.dirty) {
             i.render(&self.gfx, &self.theme);
+        }
+        if let Some(w) = self.widgets.as_mut().filter(|w| w.needs_render()) {
+            w.render(&self.gfx, &self.theme);
         }
         if let Some(s) = &mut self.settings {
             if s.dirty {
@@ -1479,6 +1552,16 @@ impl App {
                         self.animate();
                     }
                 }
+                WM_APP_WIDGETS => {
+                    if let Some(w) = &mut self.widgets {
+                        w.on_data();
+                    }
+                }
+                WM_APP_WIDGET_MEDIA => {
+                    if let Some(w) = &mut self.widgets {
+                        w.on_media();
+                    }
+                }
                 WM_APP_UPDATE => {
                     if let (Some(i), Some(r)) = (&mut self.island, crate::update::available()) {
                         i.show_update(&r);
@@ -1569,6 +1652,8 @@ impl App {
             self.on_dock_mouse(hwnd, msg, lp)
         } else if self.island.as_ref().is_some_and(|i| i.surface.content == hwnd) {
             self.on_island_mouse(hwnd, msg, wp, lp)
+        } else if self.widgets.as_ref().is_some_and(|w| w.owns(hwnd)) {
+            self.on_widget_message(hwnd, msg, wp, lp)
         } else {
             None
         };
@@ -1765,6 +1850,74 @@ impl App {
         Some(LRESULT(0))
     }
 
+    fn on_widget_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        let w = self.widgets.as_mut()?;
+        let (x, y) = mouse_pt(lp, w.scale());
+        let event = match msg {
+            WM_MOUSEMOVE => {
+                if w.on_move(hwnd, x, y) {
+                    track_leave(hwnd);
+                }
+                WidgetEvent::None
+            }
+            WM_MOUSELEAVE => {
+                w.on_leave(hwnd);
+                WidgetEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                w.on_down(hwnd, x, y);
+                unsafe { SetCapture(hwnd) };
+                WidgetEvent::None
+            }
+            WM_LBUTTONUP => {
+                // (The capture change this sends arrives while we're busy, so it's ignored.)
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                w.on_up(hwnd, x, y, &self.gfx, &self.theme)
+            }
+            WM_CAPTURECHANGED => w.on_capture_lost(),
+            WM_RBUTTONUP => {
+                if let Some((entries, placement)) = w.context_menu(hwnd, x, y) {
+                    self.open_menu(entries, placement, MenuSource::Window);
+                }
+                WidgetEvent::None
+            }
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
+                if !w.on_key(hwnd, wp.0 as u16, down(VK_CONTROL), down(VK_SHIFT), &self.gfx, &self.theme) {
+                    return None;
+                }
+                WidgetEvent::None
+            }
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    w.on_char(hwnd, c, &self.gfx, &self.theme);
+                }
+                WidgetEvent::None
+            }
+            // Typing ends when the widget loses the keyboard; DefWindowProc still runs.
+            WM_ACTIVATE => {
+                if wp.0 & 0xFFFF == 0 {
+                    w.on_deactivate(hwnd);
+                }
+                return None;
+            }
+            _ => return None,
+        };
+        match event {
+            WidgetEvent::None => {}
+            WidgetEvent::Action(a) => push(a),
+            WidgetEvent::Save(items) => self.save_widgets(&items),
+            WidgetEvent::OpenMedia(id) => push(open_media_app(&id)),
+            WidgetEvent::Focus(h) => unsafe {
+                let _ = SetForegroundWindow(h);
+            },
+        }
+        Some(LRESULT(0))
+    }
+
     fn on_dock_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
         let d = self.dock.as_mut()?;
         let (x, y) = mouse_pt(lp, d.surface.scale);
@@ -1846,6 +1999,7 @@ impl Drop for App {
         }
         self.menu = None;
         self.island = None;
+        self.widgets = None;
         self.dock = None;
         self.menubar = None;
         crate::win::tray::stop();

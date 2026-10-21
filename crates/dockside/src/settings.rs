@@ -42,14 +42,16 @@ pub enum Page {
     Finder,
     Desktops,
     Island,
+    Widgets,
 }
 
-const PAGES: [(Page, &str); 7] = [
+const PAGES: [(Page, &str); 8] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
     (Page::Island, "Dynamic Island"),
     (Page::Dock, "Dock"),
+    (Page::Widgets, "Widgets"),
     (Page::Finder, "Finder"),
     (Page::Desktops, "Desktops"),
 ];
@@ -140,6 +142,11 @@ pub enum Key {
     SpotlightHotkey,
     SearchEngine,
     CustomSearchUrl,
+    WidgetsEnabled,
+    WidgetsBackdrop,
+    WidgetsLocation,
+    WidgetsUnit,
+    WidgetsClocks,
 }
 
 impl Key {
@@ -189,6 +196,11 @@ impl Key {
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
             Key::SearchEngine => ("spotlight", "search_engine"),
             Key::CustomSearchUrl => ("spotlight", "custom_search_url"),
+            Key::WidgetsEnabled => ("widgets", "enabled"),
+            Key::WidgetsBackdrop => ("widgets", "backdrop"),
+            Key::WidgetsLocation => ("widgets", "location"),
+            Key::WidgetsUnit => ("widgets", "temperature_unit"),
+            Key::WidgetsClocks => ("widgets", "world_clocks"),
         }
     }
 
@@ -214,6 +226,7 @@ enum Hit {
     OpenUpdate,
     Field(Key),
     ConnectClaude(bool),
+    AddWidget(crate::config::WidgetKind),
 }
 
 enum Row {
@@ -552,6 +565,42 @@ impl SettingsWindow {
                     ],
                 },
             ],
+            Page::Widgets => {
+                use crate::widgets::{title, KINDS};
+                let add = |kinds: &[crate::config::WidgetKind]| {
+                    Row::Buttons("", kinds.iter().map(|&k| (title(k), Hit::AddWidget(k))).collect())
+                };
+                let count = cfg.widgets.items.len();
+                vec![
+                    Group {
+                        title: None,
+                        rows: vec![
+                            Row::Toggle("Show widgets on the desktop", Key::WidgetsEnabled),
+                            Row::Segmented("Background", Key::WidgetsBackdrop),
+                            Row::Info(
+                                "On the desktop",
+                                match count {
+                                    0 => "No widgets yet".to_string(),
+                                    1 => "1 widget: drag to move, right-click to resize".to_string(),
+                                    n => format!("{n} widgets: drag to move, right-click to resize"),
+                                },
+                            ),
+                        ],
+                    },
+                    Group { title: Some("Add a widget"), rows: vec![add(&KINDS[..3]), add(&KINDS[3..6]), add(&KINDS[6..])] },
+                    Group {
+                        title: Some("Weather"),
+                        rows: vec![
+                            Row::Text("Location", Key::WidgetsLocation, "Automatic, or a place like \u{201C}Paris, France\u{201D}"),
+                            Row::Segmented("Temperature", Key::WidgetsUnit),
+                        ],
+                    },
+                    Group {
+                        title: Some("World Clock"),
+                        rows: vec![Row::Text("Time zones", Key::WidgetsClocks, "America/New_York, Europe/London")],
+                    },
+                ]
+            }
             Page::Desktops => vec![Group {
                 title: None,
                 rows: vec![
@@ -589,6 +638,7 @@ impl SettingsWindow {
             Key::DockRunning => d.show_running,
             Key::DockTrash => d.show_trash,
             Key::SpotlightEnabled => cfg.spotlight.enabled,
+            Key::WidgetsEnabled => cfg.widgets.enabled,
             _ => false,
         }
     }
@@ -652,6 +702,12 @@ impl SettingsWindow {
             ),
             Key::MbBackdrop => fixed(&MB_BACKDROPS, Some(backdrop(cfg.menubar.backdrop))),
             Key::DockBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.dock.backdrop)).filter(|&i| i < BACKDROPS.len())),
+            Key::WidgetsBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.widgets.backdrop)).filter(|&i| i < BACKDROPS.len())),
+            Key::WidgetsUnit => {
+                const UNITS: [(&str, &str); 3] = [("Automatic", "auto"), ("\u{B0}C", "c"), ("\u{B0}F", "f")];
+                let current = cfg.widgets.temperature_unit.to_lowercase();
+                fixed(&UNITS, Some(UNITS.iter().position(|u| u.1 == current).unwrap_or(0)))
+            }
             Key::MbLogo => {
                 let sel = match cfg.menubar.logo.to_lowercase().as_str() {
                     "apple" => Some(0),
@@ -691,6 +747,8 @@ impl SettingsWindow {
         match key {
             Key::CustomSearchUrl => cfg.spotlight.custom_search_url.clone(),
             Key::IslandIcs => cfg.island.calendar_ics.clone(),
+            Key::WidgetsLocation => cfg.widgets.location.clone(),
+            Key::WidgetsClocks => cfg.widgets.world_clocks.join(", "),
             _ => String::new(),
         }
     }
@@ -701,7 +759,9 @@ impl SettingsWindow {
         let Some(ed) = &mut self.editing else { return SettingsEvent::None };
         let text = ed.field.string().trim().to_string();
         let bad_link = ed.key == Key::IslandIcs && !crate::island::calendar_links_valid(&text);
-        if bad_link || ed.key == Key::CustomSearchUrl && !text.is_empty() && !web::valid_template(&text) {
+        let zones: Vec<String> = text.split(',').map(|z| z.trim().to_string()).filter(|z| !z.is_empty()).collect();
+        let bad_zone = ed.key == Key::WidgetsClocks && zones.iter().any(|z| crate::widgets::sources::parse_zone(z).is_none());
+        if bad_link || bad_zone || ed.key == Key::CustomSearchUrl && !text.is_empty() && !web::valid_template(&text) {
             ed.invalid = true;
             self.dirty = true;
             return SettingsEvent::None;
@@ -711,6 +771,9 @@ impl SettingsWindow {
         self.dirty = true;
         if text == Self::text_value(key, cfg) {
             return SettingsEvent::None;
+        }
+        if key == Key::WidgetsClocks {
+            return SettingsEvent::Action(key.set(ConfigValue::List(zones)));
         }
         SettingsEvent::Action(key.set(ConfigValue::Str(text)))
     }
@@ -880,6 +943,7 @@ impl SettingsWindow {
             ),
             Hit::OpenLog => Action::Open(crate::config::dir().join("dockside.log").display().to_string()),
             Hit::ConnectClaude(on) => Action::ConnectClaude(on),
+            Hit::AddWidget(kind) => Action::Widget(crate::widgets::WidgetCmd::Add(kind)),
             Hit::Slider(_) => return SettingsEvent::None,
         };
         SettingsEvent::Action(action)
@@ -1219,6 +1283,14 @@ fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &windows::Win32:
             let (w, h) = (r.w * 0.5, r.h * 0.36);
             p.stroke_round(Rect::new(r.cx() - w / 2.0 + 2.0, r.cy() - h / 2.0 - 2.0, w, h), 1.2, white.alpha(0.6), 1.1);
             p.fill_round(Rect::new(r.cx() - w / 2.0 - 1.5, r.cy() - h / 2.0 + 1.5, w, h), 1.2, white);
+        }
+        Page::Widgets => {
+            p.fill_round(r, 5.0, Color::rgba(255, 149, 0, 1.0));
+            let k = r.w / 20.0;
+            let tile = |x: f32, y: f32, w: f32, h: f32| p.fill_round(Rect::new(r.x + x * k, r.y + y * k, w * k, h * k), 1.6 * k, white);
+            tile(4.0, 4.0, 5.5, 5.5);
+            tile(10.5, 4.0, 5.5, 5.5);
+            tile(4.0, 10.5, 12.0, 5.5);
         }
         Page::Finder => {
             // The two-tone Finder face.

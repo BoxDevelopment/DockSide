@@ -31,6 +31,8 @@ pub struct General {
     pub shortcut_style: ShortcutStyle,
     /// "glass" backdrops bend what's behind them (hides them from screen capture).
     pub glass_refraction: bool,
+    /// The Setup Assistant was finished or skipped (it opens on launch until then).
+    pub onboarding_done: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -555,6 +557,7 @@ mod tests {
         assert!(cfg.dock.apps.len() >= 3);
         assert_eq!(cfg.menubar.height, 24.0);
         assert!(cfg.island.enabled);
+        assert!(!cfg.general.onboarding_done);
     }
 
     #[test]

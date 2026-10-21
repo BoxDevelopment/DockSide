@@ -14,6 +14,7 @@ mod gfx;
 mod island;
 mod menu;
 mod menubar;
+mod onboarding;
 mod settings;
 mod spotlight;
 mod surface;

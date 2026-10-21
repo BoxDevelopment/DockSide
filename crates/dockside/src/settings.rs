@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
+use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::chrome::{self, SHADOW};
@@ -30,7 +31,7 @@ const W: f32 = 780.0;
 const H: f32 = 560.0;
 const SIDEBAR: f32 = 210.0;
 const TITLE_H: f32 = 52.0;
-const ROW_H: f32 = 40.0;
+pub(crate) const ROW_H: f32 = 40.0;
 const CONTENT_PAD: f32 = 24.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -95,8 +96,13 @@ const CLOCKS: [(&str, &str); 4] = [
 
 const FONT_CHOICES: [&str; 4] = ["SF Pro Text", "SF Pro", "Inter", "Segoe UI Variable Text"];
 
+/// The font choices that are installed, for the Font control.
+pub(crate) fn installed_fonts(gfx: &Gfx) -> Vec<String> {
+    FONT_CHOICES.iter().filter(|f| gfx.font_exists(f)).map(|f| f.to_string()).collect()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Key {
+pub(crate) enum Key {
     StartAtLogin,
     HideTaskbar,
     ShortcutStyle,
@@ -211,7 +217,7 @@ impl Key {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Hit {
+pub(crate) enum Hit {
     Close,
     Minimize,
     Page(Page),
@@ -227,9 +233,10 @@ enum Hit {
     Field(Key),
     ConnectClaude(bool),
     AddWidget(crate::config::WidgetKind),
+    Onboarding,
 }
 
-enum Row {
+pub(crate) enum Row {
     Toggle(&'static str, Key),
     Segmented(&'static str, Key),
     Slider(&'static str, Key),
@@ -253,7 +260,7 @@ pub enum SettingsEvent {
 }
 
 /// A text row being edited.
-struct Editing {
+pub(crate) struct Editing {
     key: Key,
     field: TextField,
     /// Last commit was rejected (shown with a red outline).
@@ -265,7 +272,7 @@ struct Editing {
 const KNOB: f32 = 9.0;
 
 #[derive(Clone, Copy)]
-struct SliderDrag {
+pub(crate) struct SliderDrag {
     key: Key,
     /// Knob-centre travel: starts at `x0`, spans `w`.
     x0: f32,
@@ -282,6 +289,131 @@ impl SliderDrag {
     fn value(&self) -> f32 {
         (self.min + self.t * (self.max - self.min)).round()
     }
+
+    /// Starts dragging the slider whose hit rect (spanning the track) is `track`,
+    /// pressed at `x`. `pending` is a value released but not yet reloaded.
+    pub(crate) fn begin(key: Key, track: Rect, x: f32, cfg: &Config, pending: Option<(Key, f32)>) -> Self {
+        let (value, min, max) = SettingsWindow::slider_spec(key, cfg);
+        let value = pending.filter(|p| p.0 == key).map_or(value, |p| p.1);
+        // The hit rect spans the track horizontally; the knob centre travels inside it.
+        let (x0, w) = (track.x + KNOB, track.w - 2.0 * KNOB);
+        let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+        let kx = x0 + w * t;
+        // Grabbing the knob itself keeps it under the cursor instead of jumping.
+        let grab = if (x - kx).abs() <= KNOB + 2.0 { x - kx } else { 0.0 };
+        let mut s = SliderDrag { key, x0, w, min, max, t, grab };
+        s.drag(x);
+        s
+    }
+
+    /// Follows the cursor; true when the knob moved.
+    pub(crate) fn drag(&mut self, x: f32) -> bool {
+        let t = ((x - self.grab - self.x0) / self.w).clamp(0.0, 1.0);
+        let moved = t != self.t;
+        self.t = t;
+        moved
+    }
+
+    /// The released value to show until the reload catches up, and the action
+    /// saving it; `None` when the value didn't change.
+    pub(crate) fn finish(&self, cfg: &Config) -> Option<((Key, f32), Action)> {
+        let value = self.value();
+        if value == SettingsWindow::slider_spec(self.key, cfg).0.round() {
+            return None;
+        }
+        Some(((self.key, value), self.key.set(ConfigValue::Int(value as i64))))
+    }
+}
+
+/// A slider setting's current value.
+pub(crate) fn slider_value(key: Key, cfg: &Config) -> f32 {
+    SettingsWindow::slider_spec(key, cfg).0
+}
+
+/// Text formats and colors shared by every settings row.
+pub(crate) struct Style {
+    regular: IDWriteTextFormat,
+    right: IDWriteTextFormat,
+    center: IDWriteTextFormat,
+    button: IDWriteTextFormat,
+    pub card_bg: Color,
+    pub card_border: Color,
+    pub control_bg: Color,
+    pub selected_seg: Color,
+    switch_off: Color,
+    field_bg: Color,
+}
+
+impl Style {
+    pub(crate) fn new(gfx: &Gfx, theme: &Theme) -> Self {
+        let dark = theme.dark;
+        Style {
+            regular: gfx.format(&theme.font, 13.0, Weight::Regular, Align::Leading),
+            right: gfx.format(&theme.font, 13.0, Weight::Regular, Align::Trailing),
+            center: gfx.format(&theme.font, 12.0, Weight::Regular, Align::Center),
+            button: gfx.format(&theme.font, 13.0, Weight::Regular, Align::Center),
+            card_bg: if dark { Color::rgba(44, 44, 46, 1.0) } else { Color::WHITE },
+            card_border: if dark { Color::gray(255, 0.07) } else { Color::gray(0, 0.07) },
+            control_bg: if dark { Color::gray(255, 0.1) } else { Color::gray(0, 0.06) },
+            selected_seg: if dark { Color::gray(255, 0.22) } else { Color::WHITE },
+            switch_off: if dark { Color::gray(255, 0.16) } else { Color::gray(0, 0.12) },
+            field_bg: if dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE },
+        }
+    }
+}
+
+/// What a row needs to draw itself: the config and the window's control state.
+pub(crate) struct RowCtx<'a> {
+    pub theme: &'a Theme,
+    pub cfg: &'a Config,
+    pub style: &'a Style,
+    pub hover: Option<Hit>,
+    pub slider: Option<SliderDrag>,
+    pub pending: Option<(Key, f32)>,
+    pub login: bool,
+    pub fonts: &'a [String],
+    /// Pinned-app icons (Dock page only).
+    pub bitmaps: Option<&'a HashMap<String, Option<ID2D1Bitmap>>>,
+    pub editing: Option<&'a Editing>,
+}
+
+/// A card holding `rows`, `ROW_H` each, with hairlines between them.
+pub(crate) fn draw_card(p: &Painter, card: Rect, rows: &[Row], ctx: &RowCtx, hits: &mut Vec<(Rect, Hit)>) {
+    let s = ctx.style;
+    p.fill_round(card, 10.0, s.card_bg);
+    p.stroke_round(card.inset(0.25, 0.25), 10.0, s.card_border, 0.5);
+    for (i, row) in rows.iter().enumerate() {
+        let r = Rect::new(card.x, card.y + i as f32 * ROW_H, card.w, ROW_H);
+        if i > 0 {
+            p.line(r.x + 14.0, r.y, r.right() - 14.0, r.y, s.card_border, 1.0);
+        }
+        draw_row(p, row, r, ctx, hits);
+    }
+}
+
+/// The action for clicking a toggle, segment or accent swatch (`None` for any
+/// other hit, or a segment that's already selected). Start at login flips `login`.
+pub(crate) fn control_action(hit: Hit, login: &mut bool, fonts: &[String], cfg: &Config) -> Option<Action> {
+    Some(match hit {
+        Hit::Toggle(Key::StartAtLogin) => {
+            *login = !*login;
+            Action::SetStartAtLogin(*login)
+        }
+        Hit::Toggle(key) => key.set(ConfigValue::Bool(!SettingsWindow::toggle_on(*login, key, cfg))),
+        Hit::Segment(key, i) => {
+            let (_, values, sel) = SettingsWindow::segments(fonts, key, cfg);
+            if sel == Some(i) {
+                return None;
+            }
+            key.set(ConfigValue::Str(values[i].clone()))
+        }
+        Hit::Swatch(i) => Action::SetConfig {
+            table: "general",
+            key: "accent",
+            value: ConfigValue::Str(ACCENTS[i].to_string()),
+        },
+        _ => return None,
+    })
 }
 
 pub struct SettingsWindow {
@@ -320,7 +452,7 @@ impl SettingsWindow {
             let _ = SetWindowTextW(hwnd, w!("System Settings"));
         }
         SETTINGS_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
-        let fonts = FONT_CHOICES.iter().filter(|f| gfx.font_exists(f)).map(|f| f.to_string()).collect();
+        let fonts = installed_fonts(gfx);
         Ok(Self {
             hwnd,
             canvas: Canvas::new(gfx, w, h, s)?,
@@ -408,6 +540,10 @@ impl SettingsWindow {
                         }
                         rows
                     },
+                },
+                Group {
+                    title: Some("Setup Assistant"),
+                    rows: vec![Row::Buttons("Walk through the basics again", vec![("Open Setup Assistant…", Hit::Onboarding)])],
                 },
                 Group {
                     title: Some("Configuration"),
@@ -825,11 +961,7 @@ impl SettingsWindow {
 
     pub fn on_move(&mut self, x: f32, y: f32) {
         if let Some(s) = &mut self.slider {
-            let t = ((x - s.grab - s.x0) / s.w).clamp(0.0, 1.0);
-            if t != s.t {
-                s.t = t;
-                self.dirty = true;
-            }
+            self.dirty |= s.drag(x);
             return;
         }
         let h = self.hit_at(x, y);
@@ -858,16 +990,7 @@ impl SettingsWindow {
         self.pressed = self.hit_at(x, y);
         if let Some(Hit::Slider(key)) = self.pressed {
             if let Some((track, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Slider(key)) {
-                let (value, min, max) = Self::slider_spec(key, cfg);
-                let value = self.pending.filter(|p| p.0 == key).map_or(value, |p| p.1);
-                // The hit rect spans the track horizontally; the knob centre travels inside it.
-                let (x0, w) = (track.x + KNOB, track.w - 2.0 * KNOB);
-                let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
-                let kx = x0 + w * t;
-                // Grabbing the knob itself keeps it under the cursor instead of jumping.
-                let grab = if (x - kx).abs() <= KNOB + 2.0 { x - kx } else { 0.0 };
-                self.slider = Some(SliderDrag { key, x0, w, min, max, t, grab });
-                self.on_move(x, y);
+                self.slider = Some(SliderDrag::begin(key, *track, x, cfg, self.pending));
             }
         }
         self.dirty = true;
@@ -877,13 +1000,12 @@ impl SettingsWindow {
         let pressed = self.pressed.take();
         self.dirty = true;
         if let Some(s) = self.slider.take() {
-            let value = s.value();
-            if value == Self::slider_spec(s.key, cfg).0.round() {
+            let Some((pending, action)) = s.finish(cfg) else {
                 self.pending = None;
                 return SettingsEvent::None;
-            }
-            self.pending = Some((s.key, value));
-            return SettingsEvent::Action(s.key.set(ConfigValue::Int(value as i64)));
+            };
+            self.pending = Some(pending);
+            return SettingsEvent::Action(action);
         }
         let hit = self.hit_at(x, y).filter(|h| Some(*h) == pressed);
         // Clicking anywhere outside the field being edited commits it.
@@ -912,23 +1034,11 @@ impl SettingsWindow {
                 self.scroll = 0.0;
                 return SettingsEvent::None;
             }
-            Hit::Toggle(Key::StartAtLogin) => {
-                self.login = !self.login;
-                Action::SetStartAtLogin(self.login)
-            }
-            Hit::Toggle(key) => key.set(ConfigValue::Bool(!Self::toggle_on(self.login, key, cfg))),
-            Hit::Segment(key, i) => {
-                let (_, values, sel) = Self::segments(&self.fonts, key, cfg);
-                if sel == Some(i) {
-                    return SettingsEvent::None;
-                }
-                key.set(ConfigValue::Str(values[i].clone()))
-            }
-            Hit::Swatch(i) => Action::SetConfig {
-                table: "general",
-                key: "accent",
-                value: ConfigValue::Str(ACCENTS[i].to_string()),
+            Hit::Toggle(_) | Hit::Segment(..) | Hit::Swatch(_) => match control_action(hit, &mut self.login, &self.fonts, cfg) {
+                Some(a) => a,
+                None => return SettingsEvent::None,
             },
+            Hit::Onboarding => Action::OpenOnboarding,
             Hit::Remove(i) => {
                 let mut apps = cfg.dock.apps.clone();
                 if i < apps.len() {
@@ -953,17 +1063,8 @@ impl SettingsWindow {
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme, cfg: &Config, icons: &mut IconStore) {
         self.dirty = false;
-        let dark = theme.dark;
-        let card_bg = if dark { Color::rgba(44, 44, 46, 1.0) } else { Color::WHITE };
-        let card_border = if dark { Color::gray(255, 0.07) } else { Color::gray(0, 0.07) };
-        let control_bg = if dark { Color::gray(255, 0.1) } else { Color::gray(0, 0.06) };
-        let selected_seg = if dark { Color::gray(255, 0.22) } else { Color::WHITE };
-        let switch_off = if dark { Color::gray(255, 0.16) } else { Color::gray(0, 0.12) };
-
-        let regular = gfx.format(&theme.font, 13.0, Weight::Regular, Align::Leading);
-        let right = gfx.format(&theme.font, 13.0, Weight::Regular, Align::Trailing);
-        let center = gfx.format(&theme.font, 12.0, Weight::Regular, Align::Center);
-        let button_font = gfx.format(&theme.font, 13.0, Weight::Regular, Align::Center);
+        let style = Style::new(gfx, theme);
+        let (regular, control_bg) = (&style.regular, style.control_bg);
         let title_font = gfx.format(&theme.font, 15.0, Weight::Bold, Align::Leading);
         let header_font = gfx.format(&theme.font, 12.0, Weight::Bold, Align::Leading);
         let glyph_font = gfx.format("Segoe Fluent Icons", 12.0, Weight::Regular, Align::Center);
@@ -1005,8 +1106,18 @@ impl SettingsWindow {
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
         let (hover, page, scroll, slider, pending) = (self.hover, self.page, self.scroll, self.slider, self.pending);
         let page_title = PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("");
-        let (login, fonts, bitmaps, editing) = (self.login, &self.fonts, &self.bitmaps, &self.editing);
-        let field_bg = if dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE };
+        let ctx = RowCtx {
+            theme,
+            cfg,
+            style: &style,
+            hover,
+            slider,
+            pending,
+            login: self.login,
+            fonts: &self.fonts,
+            bitmaps: Some(&self.bitmaps),
+            editing: self.editing.as_ref(),
+        };
 
         let r = {
             let draw = |p: &Painter| {
@@ -1029,7 +1140,7 @@ impl SettingsWindow {
                     let icon = Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0);
                     draw_page_icon(p, pg, icon, &glyph_font);
                     let text_c = if selected { Color::WHITE } else { theme.text };
-                    p.text(name, &regular, Rect::new(icon.right() + 8.0, row.y, row.w - 40.0, row.h), text_c);
+                    p.text(name, regular, Rect::new(icon.right() + 8.0, row.y, row.w - 40.0, row.h), text_c);
                     hits.push((row, Hit::Page(pg)));
                     y += 32.0;
                 }
@@ -1046,166 +1157,8 @@ impl SettingsWindow {
                             y += 26.0;
                         }
                         let card = Rect::new(content_x, y, content_w, group.rows.len() as f32 * ROW_H);
-                        p.fill_round(card, 10.0, card_bg);
-                        p.stroke_round(card.inset(0.25, 0.25), 10.0, card_border, 0.5);
-                        for (i, row) in group.rows.iter().enumerate() {
-                            let r = Rect::new(card.x, y, card.w, ROW_H);
-                            if i > 0 {
-                                p.line(r.x + 14.0, r.y, r.right() - 14.0, r.y, card_border, 1.0);
-                            }
-                            let label_r = Rect::new(r.x + 14.0, r.y, r.w * 0.5, r.h);
-                            let right_edge = r.right() - 14.0;
-                            match row {
-                                Row::Toggle(label, key) => {
-                                    p.text(label, &regular, Rect::new(label_r.x, r.y, r.w - 80.0, r.h), theme.text);
-                                    let on = Self::toggle_on(login, *key, cfg);
-                                    let track = Rect::new(right_edge - 34.0, r.cy() - 10.0, 34.0, 20.0);
-                                    p.fill_round(track, 10.0, if on { theme.accent } else { switch_off });
-                                    let kx = if on { track.right() - 10.0 } else { track.x + 10.0 };
-                                    p.fill_circle(kx, r.cy() + 0.5, 8.5, Color::gray(0, 0.12));
-                                    p.fill_circle(kx, r.cy(), 8.5, Color::WHITE);
-                                    hits.push((track.inset(-4.0, -6.0), Hit::Toggle(*key)));
-                                }
-                                Row::Segmented(label, key) => {
-                                    p.text(label, &regular, label_r, theme.text);
-                                    let (labels, _, sel) = Self::segments(fonts, *key, cfg);
-                                    let widths: Vec<f32> = labels.iter().map(|l| p.gfx.measure(l, &center) + 22.0).collect();
-                                    let total: f32 = widths.iter().sum::<f32>() + 4.0;
-                                    let outer = Rect::new(right_edge - total, r.cy() - 12.0, total, 24.0);
-                                    p.fill_round(outer, 7.0, control_bg);
-                                    let mut sx = outer.x + 2.0;
-                                    for (i, (l, w)) in labels.iter().zip(&widths).enumerate() {
-                                        let seg = Rect::new(sx, outer.y + 2.0, *w, 20.0);
-                                        if sel == Some(i) {
-                                            p.fill_round(seg.offset(0.0, 0.5), 5.0, Color::gray(0, 0.08));
-                                            p.fill_round(seg, 5.0, selected_seg);
-                                        } else if hover == Some(Hit::Segment(*key, i)) {
-                                            p.fill_round(seg, 5.0, control_bg);
-                                        }
-                                        p.text(l, &center, seg, theme.text);
-                                        hits.push((seg, Hit::Segment(*key, i)));
-                                        sx += w;
-                                    }
-                                }
-                                Row::Slider(label, key) => {
-                                    p.text(label, &regular, label_r, theme.text);
-                                    let (mut value, min, max) = Self::slider_spec(*key, cfg);
-                                    if let Some((_, v)) = pending.filter(|p| p.0 == *key) {
-                                        value = v;
-                                    }
-                                    let mut t = ((value - min) / (max - min)).clamp(0.0, 1.0);
-                                    if let Some(s) = slider.filter(|s| s.key == *key) {
-                                        (value, t) = (s.value(), s.t);
-                                    }
-                                    let track = Rect::new(right_edge - 240.0, r.cy() - 2.0, 240.0, 4.0);
-                                    let kx = track.x + KNOB + (track.w - 2.0 * KNOB) * t;
-                                    p.fill_round(track, 2.0, switch_off);
-                                    // The fill always ends under the knob, so nothing pokes out at the minimum.
-                                    p.fill_round(Rect::new(track.x, track.y, kx - track.x, track.h), 2.0, theme.accent);
-                                    p.fill_circle(kx, r.cy() + 0.5, KNOB, Color::gray(0, 0.15));
-                                    p.fill_circle(kx, r.cy(), KNOB, Color::WHITE);
-                                    let value_r = Rect::new(track.x - 62.0, r.y, 50.0, r.h);
-                                    p.text(&format!("{}", value as i32), &right, value_r, theme.text_secondary);
-                                    hits.push((Rect::new(track.x, r.y, track.w, r.h), Hit::Slider(*key)));
-                                }
-                                Row::Swatches(label) => {
-                                    p.text(label, &regular, label_r, theme.text);
-                                    for (i, hex) in ACCENTS.iter().enumerate() {
-                                        let c = Color::parse(hex).unwrap_or(theme.accent);
-                                        let cx = right_edge - 9.0 - (ACCENTS.len() - 1 - i) as f32 * 26.0;
-                                        let selected = cfg.general.accent.eq_ignore_ascii_case(hex);
-                                        if selected {
-                                            p.stroke_circle(cx, r.cy(), 11.5, c, 2.0);
-                                        }
-                                        p.fill_circle(cx, r.cy(), 8.5, c);
-                                        if selected {
-                                            p.fill_circle(cx, r.cy(), 3.0, Color::WHITE);
-                                        }
-                                        hits.push((Rect::new(cx - 12.0, r.cy() - 12.0, 24.0, 24.0), Hit::Swatch(i)));
-                                    }
-                                }
-                                Row::App(i) => {
-                                    if let Some(app) = cfg.dock.apps.get(*i) {
-                                        let key = app.icon.clone().unwrap_or_else(|| app.path.clone());
-                                        let icon = Rect::new(r.x + 12.0, r.cy() - 13.0, 26.0, 26.0);
-                                        if let Some(Some(bmp)) = bitmaps.get(&key) {
-                                            p.bitmap(bmp, icon, 1.0);
-                                        }
-                                        let name = app.name.clone().unwrap_or_else(|| app.path.clone());
-                                        p.text(&name, &regular, Rect::new(icon.right() + 10.0, r.y, r.w * 0.45, r.h), theme.text);
-                                        let path_r = Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55 - 52.0, r.h);
-                                        p.text(&app.path, &right, path_r, theme.text_disabled);
-                                        let (cx, cy) = (right_edge - 9.0, r.cy());
-                                        let hot = hover == Some(Hit::Remove(*i));
-                                        p.fill_circle(cx, cy, 9.0, if hot { Color::rgba(255, 82, 87, 1.0) } else { control_bg });
-                                        p.line(cx - 4.0, cy, cx + 4.0, cy, if hot { Color::WHITE } else { theme.text_secondary }, 1.6);
-                                        hits.push((Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), Hit::Remove(*i)));
-                                    }
-                                }
-                                Row::Buttons(label, buttons) => {
-                                    p.text(label, &regular, label_r, theme.text);
-                                    let mut bx = right_edge;
-                                    for (text, hit) in buttons.iter() {
-                                        let bw = p.gfx.measure(text, &button_font) + 24.0;
-                                        bx -= bw;
-                                        let b = Rect::new(bx, r.cy() - 12.0, bw, 24.0);
-                                        let bg = if hover == Some(*hit) { selected_seg } else { control_bg };
-                                        p.fill_round(b, 6.0, bg);
-                                        p.stroke_round(b.inset(0.25, 0.25), 6.0, card_border, 0.5);
-                                        p.text(text, &button_font, b, theme.text);
-                                        hits.push((b, *hit));
-                                        bx -= 8.0;
-                                    }
-                                }
-                                Row::Text(label, key, placeholder) => {
-                                    p.text(label, &regular, label_r, theme.text);
-                                    let f = Rect::new(right_edge - 320.0, r.cy() - 12.0, 320.0, 24.0);
-                                    p.fill_round(f, 6.0, field_bg);
-                                    let ed = editing.as_ref().filter(|e| e.key == *key);
-                                    let ring = match ed {
-                                        Some(e) if e.invalid => Color::rgba(255, 69, 58, 1.0),
-                                        Some(_) => theme.accent,
-                                        None => card_border,
-                                    };
-                                    p.stroke_round(f.inset(0.5, 0.5), 6.0, ring, if ed.is_some() { 2.0 } else { 1.0 });
-                                    let tr = Rect::new(f.x + 8.0, f.y, f.w - 16.0, f.h);
-                                    match ed {
-                                        Some(e) => {
-                                            let prefix = |n: usize| p.gfx.measure(&e.field.text[..n].iter().collect::<String>(), &regular);
-                                            let (a, b) = e.field.range();
-                                            if a != b {
-                                                let (x0, x1) = (prefix(a), prefix(b));
-                                                p.fill_rect(Rect::new(tr.x + x0, f.y + 4.0, x1 - x0, f.h - 8.0), theme.accent.alpha(0.35));
-                                            } else {
-                                                let cx = tr.x + prefix(a) + 0.5;
-                                                p.line(cx, f.y + 5.0, cx, f.bottom() - 5.0, theme.text, 1.0);
-                                            }
-                                            p.text(&e.field.string(), &regular, tr, theme.text);
-                                        }
-                                        None => {
-                                            let mut value = Self::text_value(*key, cfg);
-                                            // A calendar link is a secret: show where it points, not the link.
-                                            if *key == Key::IslandIcs && !value.is_empty() {
-                                                value = crate::island::calendar_links_summary(&value);
-                                            }
-                                            if value.is_empty() {
-                                                p.text(placeholder, &regular, tr, theme.text_disabled);
-                                            } else {
-                                                p.text(&value, &regular, tr, theme.text);
-                                            }
-                                        }
-                                    }
-                                    hits.push((f, Hit::Field(*key)));
-                                }
-                                Row::Info(label, value) => {
-                                    p.text(label, &regular, label_r, theme.text);
-                                    let vr = Rect::new(r.x + r.w * 0.3, r.y, r.w * 0.7 - 14.0, r.h);
-                                    p.text(value, &right, vr, theme.text_secondary);
-                                }
-                            }
-                            y += ROW_H;
-                        }
-                        y += 20.0;
+                        draw_card(p, card, &group.rows, &ctx, &mut hits);
+                        y += card.h + 20.0;
                     }
                 });
             };
@@ -1246,8 +1199,167 @@ impl Drop for SettingsWindow {
     }
 }
 
+/// One row's label and control, drawn into `r`.
+fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect, Hit)>) {
+    let (theme, cfg, st) = (ctx.theme, ctx.cfg, ctx.style);
+    let (regular, right, center, button_font) = (&st.regular, &st.right, &st.center, &st.button);
+    let (card_border, control_bg, selected_seg, switch_off, field_bg) =
+        (st.card_border, st.control_bg, st.selected_seg, st.switch_off, st.field_bg);
+    let (hover, slider, pending, login, fonts, editing) = (ctx.hover, ctx.slider, ctx.pending, ctx.login, ctx.fonts, ctx.editing);
+    let label_r = Rect::new(r.x + 14.0, r.y, r.w * 0.5, r.h);
+    let right_edge = r.right() - 14.0;
+    match row {
+        Row::Toggle(label, key) => {
+            p.text(label, &regular, Rect::new(label_r.x, r.y, r.w - 80.0, r.h), theme.text);
+            let on = SettingsWindow::toggle_on(login, *key, cfg);
+            let track = Rect::new(right_edge - 34.0, r.cy() - 10.0, 34.0, 20.0);
+            p.fill_round(track, 10.0, if on { theme.accent } else { switch_off });
+            let kx = if on { track.right() - 10.0 } else { track.x + 10.0 };
+            p.fill_circle(kx, r.cy() + 0.5, 8.5, Color::gray(0, 0.12));
+            p.fill_circle(kx, r.cy(), 8.5, Color::WHITE);
+            hits.push((track.inset(-4.0, -6.0), Hit::Toggle(*key)));
+        }
+        Row::Segmented(label, key) => {
+            p.text(label, &regular, label_r, theme.text);
+            let (labels, _, sel) = SettingsWindow::segments(fonts, *key, cfg);
+            let widths: Vec<f32> = labels.iter().map(|l| p.gfx.measure(l, &center) + 22.0).collect();
+            let total: f32 = widths.iter().sum::<f32>() + 4.0;
+            let outer = Rect::new(right_edge - total, r.cy() - 12.0, total, 24.0);
+            p.fill_round(outer, 7.0, control_bg);
+            let mut sx = outer.x + 2.0;
+            for (i, (l, w)) in labels.iter().zip(&widths).enumerate() {
+                let seg = Rect::new(sx, outer.y + 2.0, *w, 20.0);
+                if sel == Some(i) {
+                    p.fill_round(seg.offset(0.0, 0.5), 5.0, Color::gray(0, 0.08));
+                    p.fill_round(seg, 5.0, selected_seg);
+                } else if hover == Some(Hit::Segment(*key, i)) {
+                    p.fill_round(seg, 5.0, control_bg);
+                }
+                p.text(l, &center, seg, theme.text);
+                hits.push((seg, Hit::Segment(*key, i)));
+                sx += w;
+            }
+        }
+        Row::Slider(label, key) => {
+            p.text(label, &regular, label_r, theme.text);
+            let (mut value, min, max) = SettingsWindow::slider_spec(*key, cfg);
+            if let Some((_, v)) = pending.filter(|p| p.0 == *key) {
+                value = v;
+            }
+            let mut t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+            if let Some(s) = slider.filter(|s| s.key == *key) {
+                (value, t) = (s.value(), s.t);
+            }
+            let track = Rect::new(right_edge - 240.0, r.cy() - 2.0, 240.0, 4.0);
+            let kx = track.x + KNOB + (track.w - 2.0 * KNOB) * t;
+            p.fill_round(track, 2.0, switch_off);
+            // The fill always ends under the knob, so nothing pokes out at the minimum.
+            p.fill_round(Rect::new(track.x, track.y, kx - track.x, track.h), 2.0, theme.accent);
+            p.fill_circle(kx, r.cy() + 0.5, KNOB, Color::gray(0, 0.15));
+            p.fill_circle(kx, r.cy(), KNOB, Color::WHITE);
+            let value_r = Rect::new(track.x - 62.0, r.y, 50.0, r.h);
+            p.text(&format!("{}", value as i32), &right, value_r, theme.text_secondary);
+            hits.push((Rect::new(track.x, r.y, track.w, r.h), Hit::Slider(*key)));
+        }
+        Row::Swatches(label) => {
+            p.text(label, &regular, label_r, theme.text);
+            for (i, hex) in ACCENTS.iter().enumerate() {
+                let c = Color::parse(hex).unwrap_or(theme.accent);
+                let cx = right_edge - 9.0 - (ACCENTS.len() - 1 - i) as f32 * 26.0;
+                let selected = cfg.general.accent.eq_ignore_ascii_case(hex);
+                if selected {
+                    p.stroke_circle(cx, r.cy(), 11.5, c, 2.0);
+                }
+                p.fill_circle(cx, r.cy(), 8.5, c);
+                if selected {
+                    p.fill_circle(cx, r.cy(), 3.0, Color::WHITE);
+                }
+                hits.push((Rect::new(cx - 12.0, r.cy() - 12.0, 24.0, 24.0), Hit::Swatch(i)));
+            }
+        }
+        Row::App(i) => {
+            if let Some(app) = cfg.dock.apps.get(*i) {
+                let key = app.icon.clone().unwrap_or_else(|| app.path.clone());
+                let icon = Rect::new(r.x + 12.0, r.cy() - 13.0, 26.0, 26.0);
+                if let Some(Some(bmp)) = ctx.bitmaps.and_then(|b| b.get(&key)) {
+                    p.bitmap(bmp, icon, 1.0);
+                }
+                let name = app.name.clone().unwrap_or_else(|| app.path.clone());
+                p.text(&name, &regular, Rect::new(icon.right() + 10.0, r.y, r.w * 0.45, r.h), theme.text);
+                let path_r = Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55 - 52.0, r.h);
+                p.text(&app.path, &right, path_r, theme.text_disabled);
+                let (cx, cy) = (right_edge - 9.0, r.cy());
+                let hot = hover == Some(Hit::Remove(*i));
+                p.fill_circle(cx, cy, 9.0, if hot { Color::rgba(255, 82, 87, 1.0) } else { control_bg });
+                p.line(cx - 4.0, cy, cx + 4.0, cy, if hot { Color::WHITE } else { theme.text_secondary }, 1.6);
+                hits.push((Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), Hit::Remove(*i)));
+            }
+        }
+        Row::Buttons(label, buttons) => {
+            p.text(label, &regular, label_r, theme.text);
+            let mut bx = right_edge;
+            for (text, hit) in buttons.iter() {
+                let bw = p.gfx.measure(text, &button_font) + 24.0;
+                bx -= bw;
+                let b = Rect::new(bx, r.cy() - 12.0, bw, 24.0);
+                let bg = if hover == Some(*hit) { selected_seg } else { control_bg };
+                p.fill_round(b, 6.0, bg);
+                p.stroke_round(b.inset(0.25, 0.25), 6.0, card_border, 0.5);
+                p.text(text, &button_font, b, theme.text);
+                hits.push((b, *hit));
+                bx -= 8.0;
+            }
+        }
+        Row::Text(label, key, placeholder) => {
+            p.text(label, &regular, label_r, theme.text);
+            let f = Rect::new(right_edge - 320.0, r.cy() - 12.0, 320.0, 24.0);
+            p.fill_round(f, 6.0, field_bg);
+            let ed = editing.filter(|e| e.key == *key);
+            let ring = match ed {
+                Some(e) if e.invalid => Color::rgba(255, 69, 58, 1.0),
+                Some(_) => theme.accent,
+                None => card_border,
+            };
+            p.stroke_round(f.inset(0.5, 0.5), 6.0, ring, if ed.is_some() { 2.0 } else { 1.0 });
+            let tr = Rect::new(f.x + 8.0, f.y, f.w - 16.0, f.h);
+            match ed {
+                Some(e) => {
+                    let prefix = |n: usize| p.gfx.measure(&e.field.text[..n].iter().collect::<String>(), &regular);
+                    let (a, b) = e.field.range();
+                    if a != b {
+                        let (x0, x1) = (prefix(a), prefix(b));
+                        p.fill_rect(Rect::new(tr.x + x0, f.y + 4.0, x1 - x0, f.h - 8.0), theme.accent.alpha(0.35));
+                    } else {
+                        let cx = tr.x + prefix(a) + 0.5;
+                        p.line(cx, f.y + 5.0, cx, f.bottom() - 5.0, theme.text, 1.0);
+                    }
+                    p.text(&e.field.string(), &regular, tr, theme.text);
+                }
+                None => {
+                    let mut value = SettingsWindow::text_value(*key, cfg);
+                    // A calendar link is a secret: show where it points, not the link.
+                    if *key == Key::IslandIcs && !value.is_empty() {
+                        value = crate::island::calendar_links_summary(&value);
+                    }
+                    if value.is_empty() {
+                        p.text(placeholder, &regular, tr, theme.text_disabled);
+                    } else {
+                        p.text(&value, &regular, tr, theme.text);
+                    }
+                }
+            }
+            hits.push((f, Hit::Field(*key)));
+        }
+        Row::Info(label, value) => {
+            p.text(label, &regular, label_r, theme.text);
+            let vr = Rect::new(r.x + r.w * 0.3, r.y, r.w * 0.7 - 14.0, r.h);
+            p.text(value, &right, vr, theme.text_secondary);
+        }
+    }
+}
+
 /// Colored rounded-square page icons, like macOS System Settings.
-fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat) {
+pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &windows::Win32::Graphics::DirectWrite::IDWriteTextFormat) {
     let white = Color::WHITE;
     match page {
         Page::General => {

@@ -47,13 +47,18 @@ impl Palette {
     }
 }
 
-/// Shadow, body, sidebar split and hairline border.
-pub fn window(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette) {
+/// The soft drop shadow under a window body.
+pub fn shadow(p: &Painter, body: Rect, theme: &Theme) {
     for i in 0..14 {
         let grow = i as f32 * 1.8;
         let a = 0.035 * (14 - i) as f32 / 14.0;
         p.fill_round(body.inset(-grow, -grow).offset(0.0, 8.0), RADIUS + grow, theme.shadow.alpha(a));
     }
+}
+
+/// Shadow, body, sidebar split and hairline border.
+pub fn window(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette) {
+    shadow(p, body, theme);
     if pal.sidebar.a < 1.0 {
         // A see-through sidebar must not show the shadow under the body.
         p.clear_round(body, RADIUS);

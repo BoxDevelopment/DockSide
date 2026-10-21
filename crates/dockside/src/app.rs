@@ -31,6 +31,7 @@ use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
+use crate::onboarding::{Onboarding, OnboardingEvent};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::theme::Theme;
@@ -76,7 +77,12 @@ pub fn run() -> anyhow::Result<()> {
 
     let app = App::new(msg_hwnd)?;
     APP.with(|a| *a.borrow_mut() = Some(app));
-    with_app(|app| app.build());
+    with_app(|app| {
+        app.build();
+        if !app.cfg.general.onboarding_done {
+            app.open_onboarding();
+        }
+    });
     crate::update::watch(msg_hwnd.0 as isize, WM_APP_UPDATE);
 
     unsafe {
@@ -229,6 +235,9 @@ fn execute(action: Action) {
         }
         Action::OpenSettings(page) => {
             with_app(|app| app.open_settings(page));
+        }
+        Action::OpenOnboarding => {
+            with_app(|app| app.open_onboarding());
         }
         Action::SetDockApps(list) => {
             match config::save_dock_apps(&config::path(), &list) {
@@ -541,6 +550,8 @@ pub struct App {
     widgets: Option<Widgets>,
     menu: Option<PopupMenu>,
     settings: Option<SettingsWindow>,
+    /// The Setup Assistant, on first launch or when reopened.
+    onboarding: Option<Onboarding>,
     finders: Vec<FinderWindow>,
     next_finder_id: u32,
     loader: finder::loader::IconLoader,
@@ -620,6 +631,7 @@ impl App {
             widgets: None,
             menu: None,
             settings: None,
+            onboarding: None,
             finders: Vec::new(),
             next_finder_id: 1,
             loader: finder::loader::IconLoader::new(msg_hwnd.0 as isize, WM_APP_ICONS),
@@ -896,9 +908,32 @@ impl App {
         }
     }
 
+    /// Repaints the windows that show settings (System Settings, Setup Assistant).
     fn mark_settings_dirty(&mut self) {
         if let Some(s) = &mut self.settings {
             s.dirty = true;
+        }
+        if let Some(o) = &mut self.onboarding {
+            o.dirty = true;
+        }
+    }
+
+    fn open_onboarding(&mut self) {
+        match &self.onboarding {
+            Some(o) => o.show(),
+            None => match Onboarding::new(&self.gfx, &self.monitor) {
+                Ok(o) => self.onboarding = Some(o),
+                Err(e) => log!("setup assistant failed: {e}"),
+            },
+        }
+        self.flush();
+    }
+
+    /// Closes the Setup Assistant and remembers not to open it on launch again.
+    fn finish_onboarding(&mut self) {
+        self.onboarding = None;
+        if !self.cfg.general.onboarding_done {
+            push(Action::SetConfig { table: "general", key: "onboarding_done", value: config::ConfigValue::Bool(true) });
         }
     }
 
@@ -1003,7 +1038,8 @@ impl App {
         self.raise_surfaces();
         let fg = unsafe { GetForegroundWindow() };
         // Our own shell surfaces (Dock, menu bar, menus) leave the state as it was.
-        let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
+        let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg) || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg);
+        let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || ours {
             Some(false)
         } else if fg.is_invalid() || apps::window_pid(fg) == self.pid {
             None
@@ -1030,6 +1066,12 @@ impl App {
         if self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
             if let Some(mb) = &mut self.menubar {
                 mb.set_app("System Settings".into(), fg, None);
+            }
+            return;
+        }
+        if self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg) {
+            if let Some(mb) = &mut self.menubar {
+                mb.set_app("Setup Assistant".into(), fg, None);
             }
             return;
         }
@@ -1092,6 +1134,9 @@ impl App {
             if s.dirty {
                 s.render(&self.gfx, &self.theme, &self.cfg, &mut self.icons);
             }
+        }
+        if let Some(o) = self.onboarding.as_mut().filter(|o| o.dirty) {
+            o.render(&self.gfx, &self.theme, &self.cfg);
         }
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
@@ -1633,6 +1678,11 @@ impl App {
             self.flush();
             return r;
         }
+        if self.onboarding.as_ref().is_some_and(|o| o.hwnd == hwnd) {
+            let r = self.on_onboarding_message(hwnd, msg, wp, lp);
+            self.flush();
+            return r;
+        }
         if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
             let r = self.on_spotlight_message(msg, wp, lp);
             self.flush();
@@ -1717,6 +1767,63 @@ impl App {
             }
             WM_CLOSE => self.settings = None,
             _ => return None,
+        }
+        Some(LRESULT(0))
+    }
+
+    fn on_onboarding_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let o = self.onboarding.as_mut()?;
+        let scale = o.scale();
+        let (x, y) = mouse_pt(lp, scale);
+        let event = match msg {
+            WM_NCHITTEST => {
+                // lParam is in screen coordinates here.
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let (lx, ly) = ((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
+                let hit = if o.is_caption(lx, ly) { HTCAPTION } else { HTCLIENT };
+                return Some(LRESULT(hit as isize));
+            }
+            WM_MOUSEMOVE => {
+                if !o.tracking {
+                    o.tracking = true;
+                    track_leave(hwnd);
+                }
+                o.on_move(x, y);
+                OnboardingEvent::None
+            }
+            WM_MOUSELEAVE => {
+                o.on_leave();
+                OnboardingEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                o.on_down(x, y, &self.cfg);
+                unsafe { SetCapture(hwnd) };
+                OnboardingEvent::None
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                o.on_up(x, y, &self.cfg)
+            }
+            WM_KEYDOWN => o.on_key(wp.0 as u16),
+            WM_CLOSE => OnboardingEvent::Finish(None),
+            _ => return None,
+        };
+        match event {
+            OnboardingEvent::None => {}
+            OnboardingEvent::Action(a) => push(a),
+            OnboardingEvent::Finish(a) => {
+                self.finish_onboarding();
+                if let Some(a) = a {
+                    push(a);
+                }
+            }
         }
         Some(LRESULT(0))
     }

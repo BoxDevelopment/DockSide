@@ -25,6 +25,7 @@ pub enum Command {
     TaskManager,
     ControlPanel,
     DockSideSettings,
+    SetupAssistant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +67,7 @@ const COMMANDS: &[(&str, &str, char, Command)] = &[
     ("Task Manager", "task manager processes activity monitor", '\u{E9D9}', Command::TaskManager),
     ("Control Panel", "control panel", '\u{E80F}', Command::ControlPanel),
     ("DockSide Settings", "dockside settings preferences menu bar dock", '\u{E713}', Command::DockSideSettings),
+    ("DockSide Setup Assistant", "setup assistant onboarding welcome tour getting started guide", '\u{E8FC}', Command::SetupAssistant),
 ];
 
 /// Commands matching `raw` (any case). `low_power` / `dark` are the current
@@ -246,6 +248,12 @@ mod tests {
         assert_eq!(on[0].title, "Turn Low Power Mode On");
         assert_eq!(search("low power", true, false)[0].command, Command::LowPowerMode(false));
         assert_eq!(search("dark mode", true, true)[0].title, "Turn Dark Mode Off");
+    }
+
+    #[test]
+    fn setup_assistant() {
+        assert_eq!(search("setup assistant", false, false)[0].command, Command::SetupAssistant);
+        assert_eq!(search("onboarding", false, false)[0].command, Command::SetupAssistant);
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub enum Action {
     /// File picker, then pin the chosen app.
     AddDockApp,
     OpenSettings(Option<crate::settings::Page>),
+    /// Show the first-launch Setup Assistant again.
+    OpenOnboarding,
     /// Open a Finder window (at a folder, or Home).
     OpenFinder(Option<std::path::PathBuf>),
     /// Show or hide the Spotlight search panel.

@@ -664,6 +664,7 @@ fn command_action(c: commands::Command) -> Option<Action> {
         Command::TaskManager => Action::Launch { path: "taskmgr.exe".into(), args: None },
         Command::ControlPanel => Action::Launch { path: "control.exe".into(), args: None },
         Command::DockSideSettings => Action::OpenSettings(None),
+        Command::SetupAssistant => Action::OpenOnboarding,
         Command::LowPowerMode(on) => {
             controls::set_low_power_mode(on);
             return None;

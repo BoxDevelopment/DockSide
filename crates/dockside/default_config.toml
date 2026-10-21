@@ -19,6 +19,9 @@ shortcut_style = "mac"
 # surfaces are hidden from screenshots and screen sharing; turn it off to keep
 # a non-bending glass that shows up in captures.
 glass_refraction = true
+# Set once the Setup Assistant has been finished or skipped. Set it back to
+# false to see it on the next launch (or open it from System Settings > General).
+onboarding_done = false
 
 [menubar]
 enabled = true

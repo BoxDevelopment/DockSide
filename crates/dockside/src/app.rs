@@ -1115,8 +1115,8 @@ impl App {
     fn refresh_windows(&mut self) {
         let mut windows = apps::list_windows();
         windows.extend(self.finder_app_windows());
-        if let Some(d) = &mut self.dock {
-            d.update_running(&windows, &mut self.names, &self.cfg);
+        if self.dock.as_mut().is_some_and(|d| d.update_running(&windows, &mut self.names, &self.cfg)) {
+            self.animate();
         }
         self.update_foreground();
     }

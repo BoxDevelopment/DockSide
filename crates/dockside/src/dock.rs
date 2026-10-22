@@ -540,9 +540,10 @@ impl Dock {
     }
 
     /// Attaches the current window list to items, adding/removing running apps.
-    pub fn update_running(&mut self, windows: &[AppWindow], names: &mut AppNames, cfg: &Config) {
+    /// Returns true when an animation should start (icons sliding to new slots).
+    pub fn update_running(&mut self, windows: &[AppWindow], names: &mut AppNames, cfg: &Config) -> bool {
         if self.drag.is_some() {
-            return; // indices must stay stable mid-drag
+            return false; // indices must stay stable mid-drag
         }
         self.snapshot_positions();
         let before: Vec<(String, bool)> = self.items.iter().map(|i| (i.launch.clone(), !i.windows.is_empty())).collect();
@@ -594,6 +595,7 @@ impl Dock {
             }
             self.dirty = true;
         }
+        self.ease_left > 0.0
     }
 
     /// Starts the launch bounce on the item that launches `path`.

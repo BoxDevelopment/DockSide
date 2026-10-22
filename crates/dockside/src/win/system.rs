@@ -8,7 +8,6 @@ use windows::Win32::System::Power::{GetSystemPowerStatus, SetSuspendState, SYSTE
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
 use windows::Win32::System::Shutdown::LockWorkStation;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 fn personalize_dword(name: PCWSTR) -> Option<u32> {
@@ -165,10 +164,7 @@ pub fn send_keys(keys: &[VIRTUAL_KEY]) {
 }
 
 pub fn open(target: &str) {
-    let t = HSTRING::from(target);
-    unsafe {
-        ShellExecuteW(None, w!("open"), &t, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    super::elevation::shell_open(target, None, None);
 }
 
 /// Opens a folder in File Explorer (not whatever the default folder handler is).
@@ -176,17 +172,11 @@ pub fn open_in_explorer(path: &str) {
     // A quoted drive root ("C:\") would escape its own closing quote; roots never need quotes.
     let trimmed = path.trim_end_matches('\\');
     let arg = if trimmed.len() <= 2 { format!("{trimmed}\\") } else { format!("\"{trimmed}\"") };
-    let args = HSTRING::from(arg);
-    unsafe {
-        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &args, PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    super::elevation::shell_open("explorer.exe", Some(&arg), None);
 }
 
 pub fn reveal(path: &str) {
-    let args = HSTRING::from(format!("/select,\"{path}\""));
-    unsafe {
-        ShellExecuteW(None, w!("open"), w!("explorer.exe"), &args, PCWSTR::null(), SW_SHOWNORMAL);
-    }
+    super::elevation::shell_open("explorer.exe", Some(&format!("/select,\"{path}\"")), None);
 }
 
 /// Shows the system file picker for an app (.exe / .lnk) to add to the Dock.

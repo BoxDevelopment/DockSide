@@ -6,6 +6,7 @@ pub mod apps;
 pub mod composition;
 pub mod controls;
 pub mod desktops;
+pub mod elevation;
 pub mod glass;
 pub mod startup;
 pub mod system;
@@ -104,7 +105,7 @@ pub fn create_window(
     rc: RECT,
     parent: HWND,
 ) -> Result<HWND> {
-    unsafe {
+    let hwnd = unsafe {
         CreateWindowExW(
             ex,
             CLASS_NAME,
@@ -119,7 +120,12 @@ pub fn create_window(
             hinstance(),
             None,
         )
-    }
+    }?;
+    // Broadcasts from unelevated processes (Explorer restarting, settings
+    // changes) would otherwise be dropped while we run elevated.
+    let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+    elevation::allow_messages(hwnd, &[taskbar_created, WM_SETTINGCHANGE]);
+    Ok(hwnd)
 }
 
 /// Posts a message to a window handle stored as an integer (for use from other threads).
@@ -172,6 +178,8 @@ pub const WM_APP_WIDGET_MEDIA: u32 = WM_APP + 21;
 pub const WM_APP_ICON_PICKER: u32 = WM_APP + 22;
 /// The icon picker lost focus: close it.
 pub const WM_APP_CLOSE_PICKER: u32 = WM_APP + 23;
+/// The elevated `--admin-task` helper finished (wParam bit 0: turned on, bit 1: succeeded).
+pub const WM_APP_ADMIN_TASK: u32 = WM_APP + 24;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
 

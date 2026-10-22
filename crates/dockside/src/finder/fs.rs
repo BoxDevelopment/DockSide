@@ -416,6 +416,14 @@ pub fn text_preview(e: &Entry) -> Option<String> {
 
 pub fn open_terminal(dir: &Path) {
     use std::os::windows::process::CommandExt;
+    // Elevated, a terminal would inherit admin rights: Explorer starts it instead.
+    if crate::win::elevation::is_elevated() {
+        let d = dir.display().to_string();
+        if !crate::win::elevation::shell_open("wt.exe", Some(&format!("-d \"{d}\"")), Some(&d)) {
+            crate::win::elevation::shell_open("cmd.exe", None, Some(&d));
+        }
+        return;
+    }
     let ok = std::process::Command::new("wt").arg("-d").arg(dir).spawn().is_ok();
     if !ok {
         const CREATE_NEW_CONSOLE: u32 = 0x10;

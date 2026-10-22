@@ -139,6 +139,8 @@ pub fn start() -> Result<()> {
             instance,
             None,
         )?;
+        // Apps reach us with WM_COPYDATA, which UIPI drops while we're elevated.
+        super::elevation::allow_messages(hwnd, &[WM_COPYDATA]);
         HOST.with(|h| *h.borrow_mut() = Some(Host { hwnd, icons: Vec::new() }));
         keep_on_top();
         // Running apps re-add their icons, which now come to us first.

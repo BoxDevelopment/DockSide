@@ -32,6 +32,8 @@ pub enum Action {
     /// Write one setting (`[table] key = value`) and apply it.
     SetConfig { table: &'static str, key: &'static str, value: crate::config::ConfigValue },
     SetStartAtLogin(bool),
+    /// Turn "Run as administrator" on or off (restarts DockSide).
+    SetRunAsAdmin(bool),
     /// File picker, then pin the chosen app.
     AddDockApp,
     /// Open the icon picker for a Dock app (with its display name).

@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::path::Path;
 
-use windows::core::{w, Interface, HSTRING, PCWSTR, PWSTR};
+use windows::core::{w, Interface, HSTRING, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::System::Threading::*;
-use windows::Win32::UI::Shell::{IShellLinkW, ShellExecuteW, ShellLink};
+use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::class_name;
@@ -216,11 +216,7 @@ pub fn close(hwnd: HWND) {
 }
 
 pub fn launch(path: &str, args: Option<&str>) -> bool {
-    let file = HSTRING::from(path);
-    let args = args.map(HSTRING::from);
-    let args_ptr = args.as_ref().map(|a| PCWSTR(a.as_ptr())).unwrap_or(PCWSTR::null());
-    let r = unsafe { ShellExecuteW(None, w!("open"), &file, args_ptr, PCWSTR::null(), SW_SHOWNORMAL) };
-    let ok = r.0 as isize > 32;
+    let ok = super::elevation::shell_open(path, args, None);
     if !ok {
         log!("launch failed for {path}");
     }

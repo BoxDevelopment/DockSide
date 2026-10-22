@@ -9,6 +9,8 @@ fn data(hwnd: HWND) -> APPBARDATA {
 
 /// Reserves `thickness` physical pixels along `edge` (ABE_TOP / ABE_BOTTOM) of `monitor`.
 pub fn register(hwnd: HWND, callback: u32, edge: u32, monitor: RECT, thickness: i32) {
+    // Explorer sends the callback; it runs unelevated.
+    super::elevation::allow_messages(hwnd, &[callback]);
     super::tray::explorer_first(|| unsafe {
         let mut abd = data(hwnd);
         abd.uCallbackMessage = callback;

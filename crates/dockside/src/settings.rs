@@ -239,6 +239,7 @@ pub(crate) enum Hit {
     AddWidget(crate::config::WidgetKind),
     ResetWidgets,
     Onboarding,
+    RunAsAdmin,
 }
 
 pub(crate) enum Row {
@@ -438,6 +439,8 @@ pub struct SettingsWindow {
     editing: Option<Editing>,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     login: bool,
+    /// "Run as administrator" is on (its scheduled task exists).
+    admin: bool,
     fonts: Vec<String>,
     shown: bool,
     pub tracking: bool,
@@ -473,6 +476,7 @@ impl SettingsWindow {
             editing: None,
             bitmaps: HashMap::new(),
             login: startup::is_enabled(),
+            admin: win::elevation::task_enabled(),
             fonts,
             shown: false,
             tracking: false,
@@ -482,6 +486,11 @@ impl SettingsWindow {
 
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    pub fn set_admin(&mut self, on: bool) {
+        self.admin = on;
+        self.dirty = true;
     }
 
     pub fn show_page(&mut self, page: Option<Page>) {
@@ -531,6 +540,13 @@ impl SettingsWindow {
                         Row::Toggle("Hide the Windows taskbar", Key::HideTaskbar),
                         Row::Segmented("Shortcut hints in menus", Key::ShortcutStyle),
                     ],
+                },
+                Group {
+                    title: Some("Administrator Apps"),
+                    rows: vec![Row::Buttons(
+                        "Run as administrator (works with admin apps)",
+                        vec![(if self.admin { "Turn Off" } else { "Turn On…" }, Hit::RunAsAdmin)],
+                    )],
                 },
                 Group {
                     title: Some("Spotlight"),
@@ -1062,6 +1078,7 @@ impl SettingsWindow {
                 None => return SettingsEvent::None,
             },
             Hit::Onboarding => Action::OpenOnboarding,
+            Hit::RunAsAdmin => Action::SetRunAsAdmin(!self.admin),
             Hit::Remove(i) => {
                 let mut apps = cfg.dock.apps.clone();
                 if i < apps.len() {

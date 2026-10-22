@@ -16,7 +16,8 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT,
+    MOD_CONTROL, MOD_NOREPEAT, MOD_WIN, TME_LEAVE, TRACKMOUSEEVENT, VK_LEFT, VK_RIGHT,
 };
 use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, ABN_FULLSCREENAPP};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -42,7 +43,7 @@ use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
-    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER,
+    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
 };
 
 thread_local! {
@@ -92,10 +93,53 @@ fn backdrop_state() -> (bool, bool) {
 
 const HOTKEY_SPOTLIGHT: i32 = 1;
 
+// Registered hotkeys mirroring the keyboard hooks. A hook sees keys first and
+// swallows them, so these only fire when it can't: while an elevated (admin)
+// window has focus, Windows skips our hooks but still delivers hotkeys.
+/// Alt+1…9 (ids 10-18).
+const HOTKEY_DESKTOP: i32 = 10;
+const HOTKEY_DESKTOP_LEFT: i32 = 19;
+const HOTKEY_DESKTOP_RIGHT: i32 = 20;
+/// Mute, Volume Down, Volume Up (ids 30-32).
+const HOTKEY_VOLUME: i32 = 30;
+/// Enter, Esc and the arrows while a menu is open (ids 40-45).
+const HOTKEY_MENU: i32 = 40;
+const MENU_KEYS: [u16; 6] = [0x0D, 0x1B, 0x25, 0x26, 0x27, 0x28];
+
+/// Registers (or unregisters) `(id, modifiers, virtual key)` hotkeys on `hwnd`.
+fn set_hotkeys(hwnd: HWND, keys: &[(i32, HOT_KEY_MODIFIERS, u32)], on: bool) {
+    for &(id, mods, vk) in keys {
+        unsafe {
+            let _ = UnregisterHotKey(hwnd, id);
+            if on && RegisterHotKey(hwnd, id, mods, vk).is_err() {
+                log!("hotkey {id} is taken by another app; it won't work over admin windows");
+            }
+        }
+    }
+}
+
+fn desktop_hotkeys() -> Vec<(i32, HOT_KEY_MODIFIERS, u32)> {
+    let mut keys: Vec<_> = (0..9).map(|n| (HOTKEY_DESKTOP + n, MOD_ALT | MOD_NOREPEAT, 0x31 + n as u32)).collect();
+    keys.push((HOTKEY_DESKTOP_LEFT, MOD_WIN | MOD_CONTROL | MOD_NOREPEAT, VK_LEFT.0 as u32));
+    keys.push((HOTKEY_DESKTOP_RIGHT, MOD_WIN | MOD_CONTROL | MOD_NOREPEAT, VK_RIGHT.0 as u32));
+    keys
+}
+
+fn volume_hotkeys() -> Vec<(i32, HOT_KEY_MODIFIERS, u32)> {
+    // Repeats allowed: holding a volume key keeps stepping.
+    (0..3).map(|n| (HOTKEY_VOLUME + n, HOT_KEY_MODIFIERS(0), 0xAD + n as u32)).collect()
+}
+
+fn menu_hotkeys() -> Vec<(i32, HOT_KEY_MODIFIERS, u32)> {
+    MENU_KEYS.iter().enumerate().map(|(n, &vk)| (HOTKEY_MENU + n as i32, HOT_KEY_MODIFIERS(0), vk as u32)).collect()
+}
+
 pub fn run() -> anyhow::Result<()> {
     win::register_class(Some(wndproc))?;
     let msg_hwnd = win::create_window(WINDOW_EX_STYLE(0), WINDOW_STYLE(0), RECT::default(), HWND_MESSAGE)?;
     MSG_HWND.store(msg_hwnd.0 as isize, Ordering::Relaxed);
+    // A relaunch and Claude Code's hooks run unelevated, even when we're not.
+    win::elevation::allow_messages(msg_hwnd, &[WM_APP_PING, WM_APP_OPEN_SETTINGS, WM_COPYDATA]);
 
     let app = App::new(msg_hwnd)?;
     for guid in [GUID_ENERGY_SAVER_STATUS, GUID_POWER_SAVING_STATUS] {
@@ -243,6 +287,17 @@ fn execute(action: Action) {
                 log!("could not change start at login: {e}");
             }
             with_app(|app| app.mark_settings_dirty());
+        }
+        Action::SetRunAsAdmin(on) => {
+            // Asked outside `with_app`: the dialog runs its own message loop.
+            let go = !on
+                || system::confirm(
+                    "Run as Administrator",
+                    "DockSide will restart with administrator rights, so the Dock, menu bar and shortcuts also work                      with apps running as administrator (like Task Manager).
+
+                     Apps you open from DockSide still start normally, without admin rights. While it runs as                      administrator, dragging files from File Explorer onto DockSide won't work.",
+                );
+            with_app(|app| if go { app.set_run_as_admin(on) } else { app.mark_settings_dirty() });
         }
         Action::AddDockApp => {
             let owner = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as _);
@@ -914,7 +969,9 @@ impl App {
             }
         }
         // One low-level hook for volume keys and Caps Lock while the island runs.
-        ISLAND_VOLUME_KEYS.store(self.island.is_some() && self.cfg.island.volume, Ordering::Relaxed);
+        let volume = self.island.is_some() && self.cfg.island.volume;
+        ISLAND_VOLUME_KEYS.store(volume, Ordering::Relaxed);
+        set_hotkeys(self.msg_hwnd, &volume_hotkeys(), volume);
         let want = self.island.is_some();
         match (want, self.island_hook) {
             (true, None) => unsafe {
@@ -967,6 +1024,9 @@ impl App {
         DESKTOP_ALT_KEYS.store(d.alt_number, Ordering::Relaxed);
         DESKTOP_ARROW_KEYS.store(d.replace_windows_switcher, Ordering::Relaxed);
         let want_hook = d.alt_number || d.replace_windows_switcher;
+        let keys = desktop_hotkeys();
+        set_hotkeys(self.msg_hwnd, &keys[..9], d.alt_number);
+        set_hotkeys(self.msg_hwnd, &keys[9..], d.replace_windows_switcher);
         match (want_hook, self.desktop_hook) {
             (true, None) => unsafe {
                 match SetWindowsHookExW(WH_KEYBOARD_LL, Some(desktop_key_hook), win::hinstance(), 0) {
@@ -1302,6 +1362,43 @@ impl App {
         let home = finder::fs::home();
         let roots = finder::fs::favorites().into_iter().map(|p| p.path).filter(|p| *p != home).collect();
         spotlight::index::rebuild(self.index.clone(), roots, self.msg_hwnd.0 as isize, WM_APP_INDEX_READY);
+    }
+
+    /// Adds or removes the elevated logon task: directly when we're already
+    /// admin, otherwise through a UAC prompt on a background thread.
+    fn set_run_as_admin(&mut self, on: bool) {
+        use win::elevation;
+        if elevation::is_elevated() {
+            let r = if on { elevation::install_task() } else { elevation::remove_task() };
+            if let Err(e) = &r {
+                log!("admin task: {e}");
+            }
+            return self.on_admin_task(on, r.is_ok());
+        }
+        let hwnd = self.msg_hwnd.0 as isize;
+        std::thread::spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+            }
+            let ok = elevation::change_task_elevated(on);
+            win::post_wp(hwnd, WM_APP_ADMIN_TASK, on as usize | (ok as usize) << 1);
+        });
+    }
+
+    /// The admin task changed (or didn't): restart into the matching mode.
+    fn on_admin_task(&mut self, on: bool, ok: bool) {
+        if !ok {
+            log!("could not turn run as administrator {}", if on { "on" } else { "off" });
+            return self.mark_settings_dirty();
+        }
+        if let Some(s) = &mut self.settings {
+            s.set_admin(on);
+        }
+        if on != win::elevation::is_elevated() {
+            win::elevation::request_relaunch(on);
+            unsafe { PostQuitMessage(0) };
+        }
+        self.mark_settings_dirty();
     }
 
     fn register_hotkey(&mut self) {
@@ -1701,6 +1798,7 @@ impl App {
                 }
             }
         }
+        set_hotkeys(self.msg_hwnd, &menu_hotkeys(), true);
     }
 
     fn remove_hooks(&mut self) {
@@ -1709,6 +1807,7 @@ impl App {
                 let _ = UnhookWindowsHookEx(h);
             }
         }
+        set_hotkeys(self.msg_hwnd, &menu_hotkeys(), false);
     }
 
     fn on_menu_key(&mut self, vk: u16) {
@@ -1801,6 +1900,22 @@ impl App {
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
                 WM_HOTKEY if wp.0 as i32 == HOTKEY_SPOTLIGHT => self.toggle_spotlight(),
+                // The hooks' keys, delivered as hotkeys while an admin window has focus.
+                WM_HOTKEY => {
+                    let id = wp.0 as i32;
+                    let (msg, value) = match id {
+                        HOTKEY_DESKTOP_LEFT => (WM_APP_DESKTOP_KEY, DESKTOP_LEFT),
+                        HOTKEY_DESKTOP_RIGHT => (WM_APP_DESKTOP_KEY, DESKTOP_RIGHT),
+                        _ if (HOTKEY_DESKTOP..HOTKEY_DESKTOP + 9).contains(&id) => (WM_APP_DESKTOP_KEY, (id - HOTKEY_DESKTOP + 1) as usize),
+                        _ if (HOTKEY_VOLUME..HOTKEY_VOLUME + 3).contains(&id) => (WM_APP_ISLAND_KEY, 0xAD + (id - HOTKEY_VOLUME) as usize),
+                        _ if (HOTKEY_MENU..HOTKEY_MENU + MENU_KEYS.len() as i32).contains(&id) => {
+                            (WM_APP_MENU_KEY, MENU_KEYS[(id - HOTKEY_MENU) as usize] as usize)
+                        }
+                        _ => return None,
+                    };
+                    win::post_wp(self.msg_hwnd.0 as isize, msg, value);
+                }
+                WM_APP_ADMIN_TASK => self.on_admin_task(wp.0 & 1 != 0, wp.0 & 2 != 0),
                 WM_APP_CLOSE_SPOTLIGHT => self.spotlight = None,
                 WM_APP_CLOSE_PICKER => self.icon_picker = None,
                 WM_APP_ICON_PICKER => {

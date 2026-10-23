@@ -2348,6 +2348,21 @@ impl App {
         let m = self.menu.as_mut()?;
         let (x, y) = mouse_pt(lp, m.surface.scale);
         match msg {
+            WM_NCHITTEST => {
+                // The shadow margin overlaps the bottom of the menu bar (and the
+                // top of the Dock); let it pass hits through to them, or a press
+                // low on a title opens the menu and its release lands here.
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let s = m.surface.scale;
+                let (lx, ly) = ((sx - rc.left) as f32 / s, (sy - rc.top) as f32 / s);
+                let hit = if m.in_body(lx, ly) { HTCLIENT as isize } else { HTTRANSPARENT as isize };
+                return Some(LRESULT(hit));
+            }
             WM_MOUSEMOVE => {
                 track_leave(hwnd);
                 if m.on_move(x, y) {

@@ -352,6 +352,11 @@ impl PopupMenu {
         }
     }
 
+    /// Whether a point (in surface points) is on the menu itself rather than its shadow.
+    pub fn in_body(&self, x: f32, y: f32) -> bool {
+        self.body.contains(x, y)
+    }
+
     fn index_at(&self, x: f32, y: f32) -> Option<usize> {
         self.rects.iter().position(|r| r.contains(x, y)).filter(|&i| self.entries[i].enabled())
     }

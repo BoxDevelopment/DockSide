@@ -16,7 +16,9 @@ use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVAT
 use windows::Win32::System::Com::{CoCreateInstance, IDispatch, IServiceProvider, CLSCTX_LOCAL_SERVER};
 use windows::Win32::System::Threading::{GetCurrentProcess, GetExitCodeProcess, OpenProcessToken, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::{ChangeWindowMessageFilterEx, MSGFLT_ALLOW, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, ChangeWindowMessageFilterEx, GetWindowThreadProcessId, MSGFLT_ALLOW, SW_SHOWNORMAL,
+};
 
 const TASK: &str = "DockSide";
 /// Passed by the task, so an instance it starts never hands off again.
@@ -85,6 +87,13 @@ fn via_explorer(file: &str, args: &str, dir: &str) -> windows::core::Result<()> 
         let background: IDispatch = view.GetItemObject(SVGIO_BACKGROUND)?;
         let folder_view: IShellFolderViewDual = background.cast()?;
         let shell: IShellDispatch2 = folder_view.Application()?.cast()?;
+        // Explorer isn't the foreground app (we took the click), so what it
+        // starts would open behind everything. Lend it our right to come forward.
+        let mut pid = 0;
+        GetWindowThreadProcessId(HWND(hwnd as isize as *mut _), Some(&mut pid));
+        if pid != 0 {
+            let _ = AllowSetForegroundWindow(pid);
+        }
         shell.ShellExecute(
             &BSTR::from(file),
             &VARIANT::from(BSTR::from(args)),

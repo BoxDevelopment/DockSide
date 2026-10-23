@@ -829,6 +829,10 @@ impl Widgets {
             let area = Rect::new(self.screen.x + EDGE, self.screen.y + EDGE, self.screen.w - 2.0 * EDGE, self.screen.h - 2.0 * EDGE);
             let (nx, ny) = snap(cx - gx, cy - gy, w, h, &others, area, self.screen);
             let wd = &mut self.widgets[j];
+            // Whatever it was pressed on isn't being clicked any more.
+            if wd.hover.take().is_some() {
+                wd.dirty = true;
+            }
             if (nx, ny) != (wd.item.x, wd.item.y) {
                 // It follows the pointer exactly (this also stops any glide).
                 wd.item.x = nx;
@@ -865,10 +869,8 @@ impl Widgets {
     pub fn on_down(&mut self, hwnd: HWND, x: f32, y: f32) {
         let Some(i) = self.index(hwnd) else { return };
         let w = &self.widgets[i];
-        // Clicks in text being typed place the caret instead of dragging.
-        if w.edit.is_some() && matches!(w.hit_at(x, y), Some(Hit::Note | Hit::NewReminder)) {
-            return;
-        }
+        // Any press may become a drag, even on text being typed into: a click
+        // (released without moving) still places the caret or presses the button.
         let body = w.body();
         self.drag = Some(Drag { id: w.item.id, grab: (x - body.x, y - body.y), start: cursor_pt(&self.monitor), moved: false });
     }

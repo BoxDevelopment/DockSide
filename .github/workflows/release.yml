@@ -1,6 +1,7 @@
 name: Build & Release
 
-# Every push to main is built, tested and published as a GitHub Release.
+# Every push to main is built, tested and published as a GitHub Release,
+# unless the head commit's message contains "Don't release".
 on:
   push:
     branches: [main]
@@ -16,6 +17,8 @@ concurrency:
 
 jobs:
   release:
+    # Skip when the commit message (title or description) says "Don't release".
+    if: ${{ !contains(github.event.head_commit.message, 'Don''t release') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4

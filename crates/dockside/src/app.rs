@@ -27,14 +27,14 @@ use crate::config::{self, Config, DockApp};
 use crate::dock::Dock;
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
-use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND};
+use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
 use crate::island::sources::VolumeKey;
 use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
-use crate::onboarding::{Onboarding, OnboardingEvent};
-use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
+use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
+use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::surface::Fading;
 use crate::theme::Theme;
@@ -225,6 +225,9 @@ fn execute(action: Action) {
         Action::Open(target) => system::open(&target),
         Action::Launch { path, .. } if path == FINDER_PATH => {
             with_app(|app| app.open_finder(None));
+        }
+        Action::Launch { path, .. } if path == SETTINGS_PATH => {
+            with_app(|app| app.open_settings(None));
         }
         Action::OpenFinder(path) => {
             with_app(|app| app.open_finder(path));
@@ -1103,6 +1106,7 @@ impl App {
                 Err(e) => log!("setup assistant failed: {e}"),
             },
         }
+        self.refresh_windows();
         self.flush();
     }
 
@@ -1111,6 +1115,7 @@ impl App {
         if let Some(o) = self.onboarding.take() {
             let hwnd = o.hwnd;
             self.fade_out_window(Box::new(o), hwnd);
+            self.refresh_windows();
         }
         if !self.cfg.general.onboarding_done {
             push(Action::SetConfig { table: "general", key: "onboarding_done", value: config::ConfigValue::Bool(true) });
@@ -1132,6 +1137,7 @@ impl App {
         if let Some(s) = self.settings.take() {
             let hwnd = s.hwnd;
             self.fade_out_window(Box::new(s), hwnd);
+            self.refresh_windows();
         }
     }
 
@@ -1146,6 +1152,7 @@ impl App {
                 Err(e) => log!("settings window failed: {e}"),
             },
         }
+        self.refresh_windows();
         self.flush();
     }
 
@@ -1259,7 +1266,7 @@ impl App {
 
     fn refresh_windows(&mut self) {
         let mut windows = apps::list_windows();
-        windows.extend(self.finder_app_windows());
+        windows.extend(self.own_app_windows());
         if self.dock.as_mut().is_some_and(|d| d.update_running(&windows, &mut self.names, &self.cfg)) {
             self.animate();
         }
@@ -1467,6 +1474,7 @@ impl App {
         p.surface.set_click_through();
         self.fading.push(Box::new(p));
         self.animate();
+        self.refresh_windows();
     }
 
     /// Fades Spotlight away; returns whether it was open.
@@ -1597,6 +1605,7 @@ impl App {
                 p.render(&self.gfx, &self.theme);
                 p.focus();
                 self.icon_picker = Some(p);
+                self.refresh_windows();
             }
             Err(e) => log!("icon picker failed: {e}"),
         }
@@ -1644,6 +1653,8 @@ impl App {
                 PickerEvent::None
             }
             WM_SYSCHAR => PickerEvent::None,
+            // The Dock's Quit; DefWindowProc would destroy just the content window.
+            WM_CLOSE => PickerEvent::Close,
             WM_MOUSEWHEEL => {
                 p.on_wheel((wp.0 >> 16) as u16 as i16);
                 PickerEvent::None
@@ -1744,6 +1755,16 @@ impl App {
             .collect()
     }
 
+    /// All our app-like windows (`apps::list_windows` skips our process), for the Dock.
+    fn own_app_windows(&self) -> Vec<apps::AppWindow> {
+        let window = |hwnd: HWND, exe: &str, title: &str| apps::AppWindow { hwnd, exe: exe.to_string(), title: title.to_string() };
+        let mut v = self.finder_app_windows();
+        v.extend(self.settings.as_ref().map(|s| window(s.hwnd, SETTINGS_PATH, "System Settings")));
+        v.extend(self.onboarding.as_ref().map(|o| window(o.hwnd, ONBOARDING_PATH, "Setup Assistant")));
+        v.extend(self.icon_picker.as_ref().map(|p| window(p.surface.content, PICKER_PATH, "Icon Picker")));
+        v
+    }
+
     fn on_finder_message(&mut self, idx: usize, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
         let f = &mut self.finders[idx];
@@ -1770,6 +1791,10 @@ impl App {
             WM_WINDOWPOSCHANGED => {
                 f.sync_backdrop();
                 f.dirty = true;
+                return None;
+            }
+            WM_SIZE => {
+                f.on_size();
                 return None;
             }
             WM_ACTIVATE => {
@@ -2282,6 +2307,10 @@ impl App {
                 }
             }
             WM_CLOSE => self.close_settings(),
+            WM_SIZE => {
+                s.on_size();
+                return None;
+            }
             _ => return None,
         }
         Some(LRESULT(0))
@@ -2329,6 +2358,10 @@ impl App {
             }
             WM_KEYDOWN => o.on_key(wp.0 as u16),
             WM_CLOSE => OnboardingEvent::Finish(None),
+            WM_SIZE => {
+                o.on_size();
+                return None;
+            }
             _ => return None,
         };
         match event {

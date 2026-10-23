@@ -28,6 +28,9 @@ use crate::win::{self, startup, Monitor};
 /// Lets the shared window procedure let this window activate (all others don't).
 pub static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// Dock path for this window: it shows in the Dock like an app, and opens it when pinned.
+pub const SETTINGS_PATH: &str = "dockside:settings";
+
 const W: f32 = 780.0;
 const H: f32 = 560.0;
 const SIDEBAR: f32 = 210.0;
@@ -534,6 +537,13 @@ impl SettingsWindow {
             tracking: false,
             dirty: true,
         })
+    }
+
+    /// On `WM_SIZE`: redraw when restored from minimized, so it zooms back in.
+    pub fn on_size(&mut self) {
+        if self.window.restored(self.hwnd) {
+            self.dirty = true;
+        }
     }
 
     /// Advances animations; returns true while frames are still needed.

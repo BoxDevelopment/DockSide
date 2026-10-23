@@ -32,6 +32,9 @@ use crate::win::Monitor;
 /// The panel's content window, so the window procedure can close it when it loses focus.
 pub static PICKER_HWND: AtomicIsize = AtomicIsize::new(0);
 
+/// Dock path for the open picker, which shows in the Dock like an app.
+pub const PICKER_PATH: &str = "dockside:icon-picker";
+
 const W: f32 = 640.0;
 const SEARCH_H: f32 = 54.0;
 const TABS_H: f32 = 42.0;

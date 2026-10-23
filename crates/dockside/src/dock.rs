@@ -16,7 +16,9 @@ use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{IconStore, RECYCLE_BIN};
 use crate::gfx::{finder_icon, Align, Gfx, Weight};
-use crate::icon_picker::IconTarget;
+use crate::icon_picker::{IconTarget, PICKER_PATH};
+use crate::onboarding::ONBOARDING_PATH;
+use crate::settings::SETTINGS_PATH;
 use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
 use crate::theme::Theme;
@@ -85,7 +87,7 @@ impl Item {
             .match_exe
             .as_ref()
             .map(|m| m.to_lowercase())
-            .or_else(|| (app.path == FINDER_PATH).then(|| FINDER_PATH.to_string()))
+            .or_else(|| own_app_name(&app.path).map(|_| app.path.clone()))
             .or_else(|| lower.ends_with(".exe").then(|| apps::exe_name(&app.path)))
             .or_else(|| {
                 lower.ends_with(".lnk").then(|| apps::resolve_lnk(&app.path)).flatten().map(|t| apps::exe_name(&t))
@@ -268,9 +270,32 @@ fn is_library_logo(path: &str) -> bool {
     Path::new(path).file_name().is_some_and(|f| f.to_string_lossy().starts_with("dash-"))
 }
 
-/// Finder is our own window, with an icon we draw ourselves.
+/// Finder is our own window, with an icon we draw ourselves; our other
+/// windows show DockSide's own icon.
 fn icon_source(path: &str) -> String {
-    if path == FINDER_PATH { finder_icon::KEY.to_string() } else { path.to_string() }
+    match path {
+        FINDER_PATH => finder_icon::KEY.to_string(),
+        SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH => {
+            std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// Names for DockSide's own windows, which show in the Dock like apps.
+fn own_app_name(path: &str) -> Option<&'static str> {
+    match path {
+        FINDER_PATH => Some("Finder"),
+        SETTINGS_PATH => Some("System Settings"),
+        PICKER_PATH => Some("Icon Picker"),
+        ONBOARDING_PATH => Some("Setup Assistant"),
+        _ => None,
+    }
+}
+
+/// The icon picker and Setup Assistant only exist while in use: nothing to keep in the Dock.
+fn pinnable(path: &str) -> bool {
+    path != PICKER_PATH && path != ONBOARDING_PATH
 }
 
 /// Pinned files that no longer exist are skipped (URIs and shell ids always pass).
@@ -571,7 +596,8 @@ impl Dock {
                 item.windows.push(w.clone());
             } else {
                 let at = self.items.iter().position(|i| i.kind != Kind::App).unwrap_or(self.items.len());
-                self.items.insert(at, Item::running(w, names.name_for(&w.exe, &cfg.app_names), &cfg.app_icons));
+                let name = own_app_name(&w.exe).map(String::from).unwrap_or_else(|| names.name_for(&w.exe, &cfg.app_names));
+                self.items.insert(at, Item::running(w, name, &cfg.app_icons));
             }
         }
         self.items.retain(|i| i.kind != Kind::App || i.pinned.is_some() || !i.windows.is_empty() || i.bounce.is_some());
@@ -795,7 +821,10 @@ impl Dock {
             Kind::App => {
                 let fg = unsafe { GetForegroundWindow() };
                 let hwnds: Vec<HWND> = item.windows.iter().map(|w| w.hwnd).collect();
-                if hwnds.contains(&fg) && !apps::is_minimized(fg) {
+                if item.launch == PICKER_PATH {
+                    // A panel, not a window: it can't minimize.
+                    Some(Action::BringToFront(hwnds))
+                } else if hwnds.contains(&fg) && !apps::is_minimized(fg) {
                     // Already in front: minimize it, like the Windows taskbar.
                     let open = hwnds.into_iter().filter(|&h| !apps::is_minimized(h)).collect();
                     Some(Action::MinimizeWindows(open))
@@ -856,13 +885,15 @@ impl Dock {
                     v.push(Entry::item("New Finder Window", Action::OpenFinder(None)));
                     v.push(Entry::Separator);
                 }
-                v.push(
-                    Entry::item(
-                        "Keep in Dock",
-                        Action::TogglePin { path: item.launch.clone(), name: item.name.clone(), pin: item.pinned.is_none() },
-                    )
-                    .checked(item.pinned.is_some()),
-                );
+                if pinnable(&item.launch) {
+                    v.push(
+                        Entry::item(
+                            "Keep in Dock",
+                            Action::TogglePin { path: item.launch.clone(), name: item.name.clone(), pin: item.pinned.is_none() },
+                        )
+                        .checked(item.pinned.is_some()),
+                    );
+                }
                 if Path::new(&item.launch).exists() {
                     v.push(Entry::item("Show in Explorer", Action::Reveal(item.launch.clone())));
                 }

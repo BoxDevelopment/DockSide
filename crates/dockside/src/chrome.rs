@@ -58,6 +58,9 @@ impl WindowAnim {
         let moving = self.appear.step(dt);
         if self.exit == Some(Exit::Minimize) && self.appear.value <= 0.02 {
             self.exit = None;
+            // Set here, not left to a render while minimized: the messages
+            // ShowWindow sends arrive mid-frame, when the App can't take them.
+            self.was_iconic = true;
             unsafe {
                 let _ = ShowWindow(hwnd, SW_MINIMIZE);
             }
@@ -85,6 +88,11 @@ impl WindowAnim {
     /// Faded all the way out after [`Self::close`]: the window can go.
     pub fn closed(&self) -> bool {
         self.exit == Some(Exit::Close) && self.appear.value <= 0.02
+    }
+
+    /// Back from minimized but not yet redrawn: it needs a frame to zoom in again.
+    pub fn restored(&self, hwnd: HWND) -> bool {
+        self.was_iconic && !unsafe { IsIconic(hwnd).as_bool() }
     }
 
     /// Call before drawing: false while `hwnd` is minimized (nothing to draw),

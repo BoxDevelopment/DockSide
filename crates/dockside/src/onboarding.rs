@@ -17,6 +17,9 @@ use crate::settings::{self, Anim, Hit, Key, Page, Row, RowCtx, SliderDrag, Style
 use crate::theme::Theme;
 use crate::win::{self, startup, Monitor};
 
+/// Dock path for this window, which shows in the Dock like an app.
+pub const ONBOARDING_PATH: &str = "dockside:setup-assistant";
+
 const W: f32 = 620.0;
 const H: f32 = 580.0;
 const HERO: f32 = 72.0;
@@ -310,6 +313,13 @@ impl Onboarding {
             tracking: false,
             dirty: true,
         })
+    }
+
+    /// On `WM_SIZE`: redraw when restored from minimized, so it zooms back in.
+    pub fn on_size(&mut self) {
+        if self.window.restored(self.hwnd) {
+            self.dirty = true;
+        }
     }
 
     /// Advances animations; returns true while frames are still needed.

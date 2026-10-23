@@ -496,6 +496,13 @@ impl FinderWindow {
 
     // --- animation ---------------------------------------------------------
 
+    /// On `WM_SIZE`: redraw when restored from minimized, so it zooms back in.
+    pub fn on_size(&mut self) {
+        if self.window.restored(self.hwnd) {
+            self.dirty = true;
+        }
+    }
+
     /// Advances animations; returns true while frames are still needed.
     pub fn tick(&mut self, dt: f32) -> bool {
         // What moved decides how much of the window the next frame repaints:

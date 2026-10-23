@@ -139,6 +139,68 @@ fn snap(x: f32, y: f32, w: f32, h: f32, others: &[Rect], area: Rect, screen: Rec
     (x.round(), y.round())
 }
 
+/// Which edges (or centre lines) to line up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Alignment {
+    Left,
+    Centre,
+    Right,
+    Top,
+    Middle,
+    Bottom,
+}
+
+impl Alignment {
+    const ALL: [Alignment; 6] = [Self::Left, Self::Centre, Self::Right, Self::Top, Self::Middle, Self::Bottom];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left Edges",
+            Self::Centre => "Centres",
+            Self::Right => "Right Edges",
+            Self::Top => "Top Edges",
+            Self::Middle => "Middles",
+            Self::Bottom => "Bottom Edges",
+        }
+    }
+}
+
+/// How far apart two rects are (0 when they touch or overlap).
+fn distance(a: Rect, b: Rect) -> f32 {
+    let dx = (a.x - b.right()).max(b.x - a.right()).max(0.0);
+    let dy = (a.y - b.bottom()).max(b.y - a.bottom()).max(0.0);
+    dx.hypot(dy)
+}
+
+/// Where `r` goes to line its `how` edge up with the nearest of `others` it
+/// can, without overlapping any and staying on `screen`. It's left where it
+/// is when it's already lined up with that one; None when nothing fits.
+fn aligned(r: Rect, others: &[Rect], how: Alignment, screen: Rect) -> Option<(f32, f32)> {
+    let mut near: Vec<Rect> = others.to_vec();
+    near.sort_by(|a, b| distance(r, *a).total_cmp(&distance(r, *b)));
+    near.into_iter().find_map(|o| {
+        let (x, y) = match how {
+            Alignment::Left => (o.x, r.y),
+            Alignment::Centre => (o.cx() - r.w / 2.0, r.y),
+            Alignment::Right => (o.right() - r.w, r.y),
+            Alignment::Top => (r.x, o.y),
+            Alignment::Middle => (r.x, o.cy() - r.h / 2.0),
+            Alignment::Bottom => (r.x, o.bottom() - r.h),
+        };
+        let x = x.round().clamp(screen.x, (screen.right() - r.w).max(screen.x));
+        let y = y.round().clamp(screen.y, (screen.bottom() - r.h).max(screen.y));
+        let to = Rect::new(x, y, r.w, r.h);
+        (!others.iter().any(|t| overlaps(*t, to))).then_some((x, y))
+    })
+}
+
+/// The spot in column `col` and row `row` (each 0-2: start, centre, end) of
+/// `area` for a `w` × `h` widget.
+fn spot(col: u8, row: u8, w: f32, h: f32, area: Rect) -> (f32, f32) {
+    let at = |start: f32, span: f32, size: f32, i: u8| (start + (span - size).max(0.0) * i as f32 / 2.0).round();
+    (at(area.x, area.w, w, col), at(area.y, area.h, h, row))
+}
+
 /// The first spot, column by column from the top left, where a widget of
 /// `size` fits without touching the others.
 fn free_spot(items: &[WidgetItem], size: WidgetSize, area: Rect) -> (f32, f32) {
@@ -183,6 +245,10 @@ pub enum WidgetCmd {
     Add(WidgetKind),
     Remove(u32),
     Resize(u32, WidgetSize),
+    /// Line a widget up with its nearest neighbour.
+    Align(u32, Alignment),
+    /// Move a widget to a column and row (each 0-2) of the screen.
+    MoveTo(u32, u8, u8),
     /// Fetch the weather again now.
     Refresh,
     /// Put back the default widgets, where they start out (notes are cleared).
@@ -237,7 +303,13 @@ struct Widget {
     /// Fades in when added; hover and checkmark springs.
     appear: Spring,
     motion: Motion<views::Anim>,
+    /// Where the card is on screen, in points: it glides to a new spot
+    /// (aligned, or moved) rather than jumping.
+    at: (Spring, Spring),
 }
+
+/// The glide to a new spot.
+const GLIDE: (f32, f32) = (0.32, 0.9);
 
 impl Widget {
     fn body(&self) -> Rect {
@@ -449,6 +521,7 @@ impl Widgets {
         surface.set_opacity(0.0);
         let mut appear = Spring::new(0.0, 0.24, 1.0);
         appear.set(1.0);
+        let at = (Spring::new(item.x, GLIDE.0, GLIDE.1), Spring::new(item.y, GLIDE.0, GLIDE.1));
         self.widgets.push(Widget {
             item,
             surface,
@@ -460,7 +533,16 @@ impl Widgets {
             art: None,
             appear,
             motion: Motion::default(),
+            at,
         });
+    }
+
+    /// Moves widget `i`'s windows to where its glide has got to.
+    fn follow(&mut self, i: usize) {
+        let s = self.monitor.scale;
+        let (left, top) = (self.monitor.rect.left, self.monitor.rect.top);
+        let w = &mut self.widgets[i];
+        w.surface.move_to(left + ((w.at.0.value - SHADOW) * s).round() as i32, top + ((w.at.1.value - SHADOW) * s).round() as i32);
     }
 
     fn has(&self, kind: WidgetKind) -> bool {
@@ -490,16 +572,14 @@ impl Widgets {
             match old.iter().position(same) {
                 Some(i) => {
                     let mut w = old.remove(i);
-                    if (w.item.x, w.item.y) != (item.x, item.y) {
-                        let s = self.monitor.scale;
-                        w.surface.move_to(
-                            self.monitor.rect.left + ((item.x - SHADOW) * s).round() as i32,
-                            self.monitor.rect.top + ((item.y - SHADOW) * s).round() as i32,
-                        );
-                    }
+                    // Moved (not by a drag, which moves it as it goes): glide there.
+                    w.at.0.set(item.x);
+                    w.at.1.set(item.y);
                     w.item = item.clone();
                     w.dirty = true;
                     self.widgets.push(w);
+                    // With motion reduced, it's already there.
+                    self.follow(self.widgets.len() - 1);
                 }
                 None => self.add_widget(gfx, theme, item.clone()),
             }
@@ -641,7 +721,8 @@ impl Widgets {
     /// Advances fades and springs; returns true while anything moves.
     pub fn animate(&mut self, dt: f32) -> bool {
         let mut moving = false;
-        for w in &mut self.widgets {
+        for i in 0..self.widgets.len() {
+            let w = &mut self.widgets[i];
             if w.appear.step(dt) {
                 w.surface.set_opacity(w.appear.value);
                 moving = true;
@@ -649,6 +730,10 @@ impl Widgets {
             if w.motion.tick(dt) {
                 w.dirty = true;
                 moving = true;
+            }
+            if !w.at.0.settled() || !w.at.1.settled() {
+                moving |= w.at.0.step(dt) | w.at.1.step(dt);
+                self.follow(i);
             }
         }
         self.leaving.retain_mut(|s| {
@@ -660,7 +745,8 @@ impl Widgets {
     }
 
     pub fn animating(&self) -> bool {
-        !self.leaving.is_empty() || self.widgets.iter().any(|w| !w.appear.settled() || w.motion.moving())
+        !self.leaving.is_empty()
+            || self.widgets.iter().any(|w| !w.appear.settled() || w.motion.moving() || !w.at.0.settled() || !w.at.1.settled())
     }
 
     // --- drawing -----------------------------------------------------------
@@ -742,15 +828,14 @@ impl Widgets {
             let others: Vec<Rect> = self.widgets.iter().filter(|o| o.item.id != id).map(|o| item_rect(&o.item)).collect();
             let area = Rect::new(self.screen.x + EDGE, self.screen.y + EDGE, self.screen.w - 2.0 * EDGE, self.screen.h - 2.0 * EDGE);
             let (nx, ny) = snap(cx - gx, cy - gy, w, h, &others, area, self.screen);
-            let s = self.monitor.scale;
             let wd = &mut self.widgets[j];
             if (nx, ny) != (wd.item.x, wd.item.y) {
+                // It follows the pointer exactly (this also stops any glide).
                 wd.item.x = nx;
                 wd.item.y = ny;
-                wd.surface.move_to(
-                    self.monitor.rect.left + ((nx - SHADOW) * s).round() as i32,
-                    self.monitor.rect.top + ((ny - SHADOW) * s).round() as i32,
-                );
+                wd.at.0.snap(nx);
+                wd.at.1.snap(ny);
+                self.follow(j);
             }
             return false;
         }
@@ -874,6 +959,9 @@ impl Widgets {
             })
             .collect();
         entries.push(Entry::Separator);
+        entries.push(Entry::submenu("Align with Neighbour", self.align_entries(i)));
+        entries.push(Entry::submenu("Move To", self.move_entries(i)));
+        entries.push(Entry::Separator);
         if kind == WidgetKind::Weather {
             entries.push(Entry::item("Refresh Weather", Action::Widget(WidgetCmd::Refresh)));
             entries.push(Entry::Separator);
@@ -884,6 +972,61 @@ impl Widgets {
         let r = w.surface.rect;
         let s = w.surface.scale;
         Some((entries, Placement::Below { x: r.left as f32 / s + x, y: r.top as f32 / s + y }))
+    }
+
+    /// Widget `i`'s rect and everyone else's.
+    fn rects(&self, i: usize) -> (Rect, Vec<Rect>) {
+        let others = self.widgets.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| item_rect(&o.item)).collect();
+        (item_rect(&self.widgets[i].item), others)
+    }
+
+    /// The area widgets are placed in: the screen, less a margin.
+    fn area(&self) -> Rect {
+        Rect::new(self.screen.x + EDGE, self.screen.y + EDGE, self.screen.w - 2.0 * EDGE, self.screen.h - 2.0 * EDGE)
+    }
+
+    /// "Align with Neighbour": ticked when already lined up, dimmed when there's no room.
+    fn align_entries(&self, i: usize) -> Vec<Entry> {
+        let (r, others) = self.rects(i);
+        let id = self.widgets[i].item.id;
+        let mut entries = Vec::new();
+        for how in Alignment::ALL {
+            if how == Alignment::Top {
+                entries.push(Entry::Separator);
+            }
+            entries.push(match aligned(r, &others, how, self.screen) {
+                Some(p) if p == (r.x, r.y) => Entry::disabled(how.label()).checked(true),
+                Some(_) => Entry::item(how.label(), Action::Widget(WidgetCmd::Align(id, how))),
+                None => Entry::disabled(how.label()),
+            });
+        }
+        entries
+    }
+
+    /// "Move To": the corners, the middles of the edges and the centre of the screen.
+    fn move_entries(&self, i: usize) -> Vec<Entry> {
+        const NAMES: [[&str; 3]; 3] =
+            [["Top Left", "Top Centre", "Top Right"], ["Middle Left", "Centre", "Middle Right"], ["Bottom Left", "Bottom Centre", "Bottom Right"]];
+        let (r, others) = self.rects(i);
+        let id = self.widgets[i].item.id;
+        let mut entries = Vec::new();
+        for (row, names) in NAMES.iter().enumerate() {
+            if row > 0 {
+                entries.push(Entry::Separator);
+            }
+            for (col, name) in names.iter().enumerate() {
+                let (x, y) = spot(col as u8, row as u8, r.w, r.h, self.area());
+                let taken = others.iter().any(|o| overlaps(*o, Rect::new(x, y, r.w, r.h)));
+                entries.push(if (x, y) == (r.x, r.y) {
+                    Entry::disabled(*name).checked(true)
+                } else if taken {
+                    Entry::disabled(*name)
+                } else {
+                    Entry::item(*name, Action::Widget(WidgetCmd::MoveTo(id, col as u8, row as u8)))
+                });
+            }
+        }
+        entries
     }
 
     /// Finishes typing into widget `i`: the note or new reminder is kept.
@@ -1023,7 +1166,7 @@ impl Widgets {
     /// The widget list after `cmd`, to be saved; None if nothing's to save.
     pub fn command(&mut self, cmd: WidgetCmd) -> Option<Vec<WidgetItem>> {
         let mut items = self.items();
-        let area = Rect::new(self.screen.x + EDGE, self.screen.y + EDGE, self.screen.w - 2.0 * EDGE, self.screen.h - 2.0 * EDGE);
+        let area = self.area();
         match cmd {
             WidgetCmd::Add(kind) => {
                 let size = sizes(kind)[0];
@@ -1042,6 +1185,21 @@ impl Widgets {
                     i.x = i.x.min((self.screen.right() - w).max(self.screen.x));
                     i.y = i.y.min((self.screen.bottom() - h).max(self.screen.y));
                 }
+            }
+            WidgetCmd::Align(id, how) => {
+                let i = self.widgets.iter().position(|w| w.item.id == id)?;
+                let (r, others) = self.rects(i);
+                let (x, y) = aligned(r, &others, how, self.screen)?;
+                (items[i].x, items[i].y) = (x, y);
+            }
+            WidgetCmd::MoveTo(id, col, row) => {
+                let i = self.widgets.iter().position(|w| w.item.id == id)?;
+                let (r, others) = self.rects(i);
+                let (x, y) = spot(col, row, r.w, r.h, area);
+                if others.iter().any(|o| overlaps(*o, Rect::new(x, y, r.w, r.h))) {
+                    return None;
+                }
+                (items[i].x, items[i].y) = (x, y);
             }
             WidgetCmd::Reset => {
                 items = crate::config::defaults().widgets.items;
@@ -1246,6 +1404,34 @@ mod tests {
         // Far from anything: left alone, but kept on screen.
         assert_eq!(snap(600.0, 400.0, 170.0, 170.0, &[other], area, screen), (600.0, 400.0));
         assert_eq!(snap(-80.0, 2000.0, 170.0, 170.0, &[], area, screen), (0.0, 630.0));
+    }
+
+    #[test]
+    fn aligns_with_the_nearest_neighbour_that_fits() {
+        let screen = Rect::new(0.0, 24.0, 1280.0, 776.0);
+        let me = Rect::new(60.0, 300.0, 170.0, 170.0);
+        // Above it, a little to the left; beside it, to the right.
+        let above = Rect::new(24.0, 48.0, 364.0, 170.0);
+        let beside = Rect::new(300.0, 310.0, 170.0, 170.0);
+        let others = [above, beside];
+        // Left edges with `beside` would overlap it, so `above` is used.
+        assert_eq!(aligned(me, &others, Alignment::Left, screen), Some((24.0, 300.0)));
+        assert_eq!(aligned(me, &others, Alignment::Centre, screen), Some((121.0, 300.0)));
+        // Lining its top up with the one beside it doesn't collide.
+        assert_eq!(aligned(me, &others, Alignment::Top, screen), Some((60.0, 310.0)));
+        // Right edges with either would run into `beside`.
+        assert_eq!(aligned(me, &others, Alignment::Right, screen), None);
+        // Already lined up: stays put.
+        assert_eq!(aligned(Rect::new(24.0, 300.0, 170.0, 170.0), &[above], Alignment::Left, screen), Some((24.0, 300.0)));
+        assert_eq!(aligned(me, &[], Alignment::Left, screen), None);
+    }
+
+    #[test]
+    fn spots_cover_the_area() {
+        let area = Rect::new(24.0, 48.0, 1232.0, 728.0);
+        assert_eq!(spot(0, 0, 170.0, 170.0, area), (24.0, 48.0));
+        assert_eq!(spot(1, 1, 170.0, 170.0, area), (555.0, 327.0));
+        assert_eq!(spot(2, 2, 170.0, 170.0, area), (1086.0, 606.0));
     }
 
     #[test]

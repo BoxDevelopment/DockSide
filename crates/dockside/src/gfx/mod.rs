@@ -666,8 +666,9 @@ impl Painter<'_> {
     }
 
     /// Like [`Painter::text`], with fixed-width digits so changing numbers don't jiggle.
-    pub fn text_tabular(&self, text: &str, format: &IDWriteTextFormat, r: Rect, c: Color) {
-        let Some(layout) = self.gfx.layout(text, format, r.w, r.h) else { return };
+    /// Returns the drawn width (tabular figures are wider than `measure` reports).
+    pub fn text_tabular(&self, text: &str, format: &IDWriteTextFormat, r: Rect, c: Color) -> f32 {
+        let Some(layout) = self.gfx.layout(text, format, r.w, r.h) else { return 0.0 };
         unsafe {
             if let Ok(typo) = self.gfx.dwrite.CreateTypography() {
                 let feature = DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 };
@@ -675,7 +676,12 @@ impl Painter<'_> {
                     let _ = layout.SetTypography(&typo, DWRITE_TEXT_RANGE { startPosition: 0, length: u32::MAX });
                 }
             }
-            self.rt.DrawTextLayout(pt(r.x, r.y), &layout, self.color(c), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT)
+            self.rt.DrawTextLayout(pt(r.x, r.y), &layout, self.color(c), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
+            let mut m = DWRITE_TEXT_METRICS::default();
+            match layout.GetMetrics(&mut m) {
+                Ok(()) => m.widthIncludingTrailingWhitespace,
+                Err(_) => 0.0,
+            }
         }
     }
 

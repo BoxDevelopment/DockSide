@@ -85,11 +85,13 @@ pub struct MenuItem {
     pub icon: Option<std::rc::Rc<crate::gfx::icons::IconPixels>>,
     /// What a right click does instead (tray icons open their own menu).
     pub alt_action: Option<Action>,
+    /// Items shown beside this one while it's highlighted (empty: none).
+    pub submenu: Vec<Entry>,
 }
 
 impl MenuItem {
     fn new(label: String, shortcut: Option<Shortcut>, action: Option<Action>) -> Self {
-        MenuItem { label, shortcut, action, checked: false, icon: None, alt_action: None }
+        MenuItem { label, shortcut, action, checked: false, icon: None, alt_action: None, submenu: Vec::new() }
     }
 }
 
@@ -126,6 +128,15 @@ impl Entry {
         Entry::Item(MenuItem::new(label.into(), None, None))
     }
 
+    /// An item that opens `entries` beside it (disabled when none of them is enabled).
+    pub fn submenu(label: impl Into<String>, entries: Vec<Entry>) -> Entry {
+        let mut item = MenuItem::new(label.into(), None, None);
+        if entries.iter().any(Entry::enabled) {
+            item.submenu = entries;
+        }
+        Entry::Item(item)
+    }
+
     pub fn shortcut(mut self, sc: Shortcut) -> Entry {
         if let Entry::Item(i) = &mut self {
             i.shortcut = Some(sc);
@@ -141,7 +152,11 @@ impl Entry {
     }
 
     fn enabled(&self) -> bool {
-        matches!(self, Entry::Item(MenuItem { action: Some(_), .. }))
+        matches!(self, Entry::Item(i) if i.action.is_some() || !i.submenu.is_empty())
+    }
+
+    fn has_submenu(&self) -> bool {
+        matches!(self, Entry::Item(i) if !i.submenu.is_empty())
     }
 }
 
@@ -160,6 +175,9 @@ pub enum Placement {
     Below { x: f32, y: f32 },
     /// Horizontal center and bottom edge of the menu body, in screen points.
     Above { cx: f32, bottom: f32 },
+    /// A submenu: right of `right` (or, without room, left of `left`), its
+    /// body's top at `top`, in screen points.
+    Beside { left: f32, right: f32, top: f32 },
 }
 
 pub enum MenuEvent {
@@ -168,6 +186,8 @@ pub enum MenuEvent {
     Close,
     /// Left/Right arrow: move to the neighbouring menu-bar menu.
     Step(i32),
+    /// Open the highlighted item's submenu (a click, Enter or the Right arrow).
+    Open,
 }
 
 const SHADOW: f32 = 20.0;
@@ -178,6 +198,22 @@ const SEP_H: f32 = 11.0;
 const PAD_Y: f32 = 5.0;
 const RADIUS: f32 = 7.0;
 const FONT_SIZE: f32 = 13.0;
+/// Room for a submenu's chevron.
+const CHEVRON: f32 = 8.0;
+
+/// Whether moving `from` → `to` heads for a submenu on the `edge` side,
+/// between `top` and `bottom`: `to` lies in the triangle from `from` to that
+/// side (with a little slack for unsteady hands).
+fn toward(from: (f32, f32), to: (f32, f32), edge: f32, top: f32, bottom: f32) -> bool {
+    let (dx, ex) = (to.0 - from.0, edge - from.0);
+    if dx == 0.0 || dx.signum() != ex.signum() || dx.abs() > ex.abs() {
+        return false;
+    }
+    // How much of the side the triangle spans this far along.
+    let t = dx / ex;
+    let (lo, hi) = (from.1 + (top - from.1) * t, from.1 + (bottom - from.1) * t);
+    (lo - 2.0..=hi + 2.0).contains(&to.1)
+}
 
 pub struct PopupMenu {
     pub surface: Surface,
@@ -191,6 +227,11 @@ pub struct PopupMenu {
     glide: Glide,
     /// Item icons (tray icons), made once rather than every frame.
     icons: Vec<Option<ID2D1Bitmap>>,
+    /// While a submenu is open: the side it's on and its top and bottom, in
+    /// surface points. Heading toward it keeps the highlight where it is.
+    aim: Option<(f32, f32, f32)>,
+    /// The last pointer position, in surface points.
+    last: (f32, f32),
 }
 
 /// Menus open instantly; once closed they fade out (see the App's frame loop).
@@ -223,6 +264,9 @@ impl PopupMenu {
                 }
             }
         }
+        if entries.iter().any(Entry::has_submenu) {
+            short_w = short_w.max(CHEVRON);
+        }
         let width = (22.0 + label_w + if short_w > 0.0 { 32.0 + short_w } else { 0.0 } + 18.0).clamp(160.0, 420.0);
         let height = PAD_Y * 2.0
             + entries.iter().map(|e| if matches!(e, Entry::Separator) { SEP_H } else { ITEM_H }).sum::<f32>();
@@ -234,6 +278,11 @@ impl PopupMenu {
         let (mut x, y) = match placement {
             Placement::Below { x, y } => (x, y),
             Placement::Above { cx, bottom } => (cx - width / 2.0, bottom - height),
+            Placement::Beside { left, right, top } => {
+                let x = if right + width <= mon_r - 4.0 { right } else { left - width };
+                let (mon_t, mon_b) = (monitor.rect.top as f32 / s, monitor.rect.bottom as f32 / s);
+                (x, top.min(mon_b - height - 4.0).max(mon_t))
+            }
         };
         x = x.clamp(mon_l + 4.0, (mon_r - width - 4.0).max(mon_l));
 
@@ -256,7 +305,66 @@ impl PopupMenu {
             cy += h;
         }
 
-        Ok(Self { surface, source, entries, rects, body, hovered: None, mac, glide: Glide::default(), icons: Vec::new() })
+        Ok(Self {
+            surface,
+            source,
+            entries,
+            rects,
+            body,
+            hovered: None,
+            mac,
+            glide: Glide::default(),
+            icons: Vec::new(),
+            aim: None,
+            last: (0.0, 0.0),
+        })
+    }
+
+    /// Top-left of the surface, in screen points.
+    fn origin(&self) -> (f32, f32) {
+        let s = self.surface.scale;
+        (self.surface.rect.left as f32 / s, self.surface.rect.top as f32 / s)
+    }
+
+    /// The menu body, in screen points.
+    pub fn screen_body(&self) -> Rect {
+        let (ox, oy) = self.origin();
+        self.body.offset(ox, oy)
+    }
+
+    /// The highlighted item, when it has a submenu.
+    pub fn hovered_submenu(&self) -> Option<usize> {
+        self.hovered.filter(|&i| self.entries[i].has_submenu())
+    }
+
+    pub fn has_hover(&self) -> bool {
+        self.hovered.is_some()
+    }
+
+    /// Item `i`'s submenu and where it opens: beside the menu, its first item level with `i`.
+    pub fn submenu(&self, i: usize) -> Option<(Vec<Entry>, Placement)> {
+        let Some(Entry::Item(item)) = self.entries.get(i) else { return None };
+        if item.submenu.is_empty() {
+            return None;
+        }
+        let (ox, oy) = self.origin();
+        let placement = Placement::Beside { left: ox + self.body.x, right: ox + self.body.right(), top: oy + self.rects[i].y - PAD_Y };
+        Some((item.submenu.clone(), placement))
+    }
+
+    /// Tells the menu where its open submenu is (body, in screen points), or that it closed.
+    pub fn aim_at(&mut self, child: Option<Rect>) {
+        let (ox, oy) = self.origin();
+        self.aim = child.map(|c| {
+            let edge = if c.cx() >= ox + self.body.cx() { self.body.right() } else { self.body.x };
+            (edge, c.y - oy, c.bottom() - oy)
+        });
+    }
+
+    /// Highlights the first item (a submenu opened from the keyboard).
+    pub fn select_first(&mut self) -> bool {
+        self.hovered = None;
+        self.on_key(0x28).1
     }
 
     /// Advances the highlight; returns true while it's moving (redraw then).
@@ -313,6 +421,11 @@ impl PopupMenu {
                 let c = if lit { Color::WHITE } else { theme.text_secondary };
                 p.text(&sc.label(mac), &font_right, Rect::new(r.x, r.y, r.w - 16.0, r.h), c);
             }
+            if !item.submenu.is_empty() {
+                let (cx, cy, h) = (r.right() - 16.0 - CHEVRON / 2.0, r.cy(), 4.0);
+                p.line(cx - h * 0.45, cy - h, cx + h * 0.55, cy, color, 1.5);
+                p.line(cx + h * 0.55, cy, cx - h * 0.45, cy + h, color, 1.5);
+            }
         };
 
         let r = self.surface.render(gfx, |p| {
@@ -363,6 +476,13 @@ impl PopupMenu {
 
     /// Returns true when the highlight changed.
     pub fn on_move(&mut self, x: f32, y: f32) -> bool {
+        let from = std::mem::replace(&mut self.last, (x, y));
+        // Heading for the open submenu across other items: they don't take the highlight.
+        if let Some((edge, top, bottom)) = self.aim {
+            if self.hovered.is_some() && toward(from, (x, y), edge, top, bottom) {
+                return false;
+            }
+        }
         let h = self.index_at(x, y);
         let changed = h != self.hovered;
         self.hovered = h;
@@ -370,6 +490,10 @@ impl PopupMenu {
     }
 
     pub fn on_leave(&mut self) -> bool {
+        // The open submenu's item stays highlighted while the pointer is in the submenu.
+        if self.aim.is_some() {
+            return false;
+        }
         let changed = self.hovered.is_some();
         self.hovered = None;
         changed
@@ -381,6 +505,7 @@ impl PopupMenu {
             return MenuEvent::Close;
         }
         match self.index_at(x, y).map(|i| &self.entries[i]) {
+            Some(e) if e.has_submenu() => MenuEvent::Open,
             Some(Entry::Item(MenuItem { alt_action: Some(a), .. })) if right => MenuEvent::Activate(a.clone()),
             Some(Entry::Item(MenuItem { action: Some(a), .. })) => MenuEvent::Activate(a.clone()),
             _ => MenuEvent::None,
@@ -397,6 +522,7 @@ impl PopupMenu {
         match vk {
             VK_ESCAPE => (MenuEvent::Close, false),
             VK_LEFT => (MenuEvent::Step(-1), false),
+            VK_RIGHT | VK_RETURN if self.hovered_submenu().is_some() => (MenuEvent::Open, false),
             VK_RIGHT => (MenuEvent::Step(1), false),
             VK_RETURN => match self.hovered.map(|i| &self.entries[i]) {
                 Some(Entry::Item(MenuItem { action: Some(a), .. })) => (MenuEvent::Activate(a.clone()), false),

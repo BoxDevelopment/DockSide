@@ -175,9 +175,8 @@ fn clock(p: &Painter, r: Rect, c: &Ctx) {
     let size = 44.0;
     let tr = Rect::new(x, r.y + 50.0, w, 56.0);
     let tf = p.gfx.format(&c.theme.font, size, Weight::Bold, Align::Leading);
-    p.text_tabular(&time, &tf, tr, c.theme.text);
+    let tw = p.text_tabular(&time, &tf, tr, c.theme.text);
     if !ampm.is_empty() {
-        let tw = p.gfx.measure(&time, &tf);
         text(p, c, &ampm, 15.0, Weight::Bold, Align::Leading, Rect::new(x + tw + 4.0, r.y + 72.0, 40.0, 24.0), c.theme.text_secondary);
     }
     text(p, c, &now.format("%B %-d").to_string(), 15.0, Weight::Regular, Align::Leading, Rect::new(x, r.y + 106.0, w, 22.0), c.theme.text_secondary);

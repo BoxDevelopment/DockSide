@@ -55,6 +55,7 @@ thread_local! {
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Windows the menu mouse hook must not treat as "outside" clicks.
 static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
+static OPEN_SUBMENU_HWND: AtomicIsize = AtomicIsize::new(0);
 static MENUBAR_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Whether the island's keyboard hook swallows volume keys (it shows its own HUD).
 static ISLAND_VOLUME_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -504,7 +505,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         // Close on any click except on the menu itself, or on the menu bar
         // (which switches between its menus on its own).
         let keep = root != 0
-            && (root == OPEN_MENU_HWND.load(Ordering::Relaxed) || root == MENUBAR_HWND.load(Ordering::Relaxed));
+            && [&OPEN_MENU_HWND, &OPEN_SUBMENU_HWND, &MENUBAR_HWND].iter().any(|h| root == h.load(Ordering::Relaxed));
         if apps::window_pid(target) != GetCurrentProcessId() || !keep {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_MENU);
         }
@@ -658,6 +659,8 @@ pub struct App {
     island: Option<Island>,
     widgets: Option<Widgets>,
     menu: Option<PopupMenu>,
+    /// The open menu's submenu, with the item it belongs to.
+    submenu: Option<(usize, PopupMenu)>,
     settings: Option<SettingsWindow>,
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
@@ -757,6 +760,7 @@ impl App {
             island: None,
             widgets: None,
             menu: None,
+            submenu: None,
             settings: None,
             onboarding: None,
             finders: Vec::new(),
@@ -1197,7 +1201,7 @@ impl App {
         if let Some(mb) = &mut self.menubar {
             still |= mb.animate(dt);
         }
-        if let Some(m) = &mut self.menu {
+        for m in self.menu.iter_mut().chain(self.submenu.as_mut().map(|(_, s)| s)) {
             if m.tick(dt) {
                 m.render(&self.gfx, &self.theme);
                 still = true;
@@ -1282,6 +1286,7 @@ impl App {
             self.menubar.as_ref().map(|m| &m.surface),
             self.island.as_ref().map(|i| &i.surface),
             self.menu.as_ref().map(|m| &m.surface),
+            self.submenu.as_ref().map(|(_, s)| &s.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
         ];
@@ -1435,6 +1440,7 @@ impl App {
     fn wants_frames(&self) -> bool {
         self.menubar.as_ref().is_some_and(|m| m.animating())
             || self.menu.as_ref().is_some_and(|m| m.animating())
+            || self.submenu.as_ref().is_some_and(|(_, s)| s.animating())
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
             || self.settings.as_ref().is_some_and(|s| s.animating())
@@ -1859,6 +1865,7 @@ impl App {
     // --- menus -------------------------------------------------------------
 
     fn open_menu(&mut self, entries: Vec<Entry>, placement: Placement, source: MenuSource) {
+        self.close_submenu();
         // Sliding across the menu bar swaps menus instantly, like macOS; anything else fades.
         let switching = matches!(source, MenuSource::MenuBar(_))
             && self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::MenuBar(_)));
@@ -1905,6 +1912,7 @@ impl App {
     }
 
     fn close_menu(&mut self) {
+        self.close_submenu();
         OPEN_MENU_HWND.store(0, Ordering::Relaxed);
         let Some(m) = self.menu.take() else { return };
         m.surface.set_click_through();
@@ -1912,6 +1920,61 @@ impl App {
         self.animate();
         self.remove_hooks();
         self.reset_menu_openers();
+    }
+
+    /// Opens the submenu of the open menu's highlighted item, right away (from
+    /// the keyboard, with its first item selected).
+    fn open_submenu(&mut self, keys: bool) {
+        let Some(m) = &self.menu else { return };
+        let Some(i) = m.hovered_submenu() else { return };
+        if self.submenu.as_ref().is_some_and(|(open, _)| *open == i) {
+            if keys {
+                let (_, sub) = self.submenu.as_mut().unwrap();
+                if sub.select_first() {
+                    sub.render(&self.gfx, &self.theme);
+                }
+            }
+            return;
+        }
+        self.close_submenu();
+        let Some(m) = &self.menu else { return };
+        let Some((entries, placement)) = m.submenu(i) else { return };
+        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.monitor, m.source) {
+            Ok(mut sub) => {
+                if keys {
+                    sub.select_first();
+                }
+                sub.render(&self.gfx, &self.theme);
+                OPEN_SUBMENU_HWND.store(sub.surface.content.0 as isize, Ordering::Relaxed);
+                if let Some(m) = &mut self.menu {
+                    m.aim_at(Some(sub.screen_body()));
+                }
+                self.submenu = Some((i, sub));
+            }
+            Err(e) => log!("submenu failed: {e}"),
+        }
+    }
+
+    fn close_submenu(&mut self) {
+        OPEN_SUBMENU_HWND.store(0, Ordering::Relaxed);
+        let Some((_, sub)) = self.submenu.take() else { return };
+        sub.surface.set_click_through();
+        self.fading.push(Box::new(sub));
+        self.animate();
+        if let Some(m) = &mut self.menu {
+            m.aim_at(None);
+        }
+    }
+
+    /// After the menu's highlight moved: the submenu follows it (a highlighted
+    /// submenu item opens its submenu; any other item closes it).
+    fn sync_submenu(&mut self) {
+        let Some(m) = &self.menu else { return };
+        match m.hovered_submenu() {
+            Some(_) => self.open_submenu(false),
+            None if m.has_hover() => self.close_submenu(),
+            None => {}
+        }
     }
 
     fn reset_menu_openers(&mut self) {
@@ -1989,15 +2052,34 @@ impl App {
     }
 
     fn on_menu_key(&mut self, vk: u16) {
+        // A submenu with a highlighted item has the keyboard; Left goes back.
+        if let Some((_, sub)) = self.submenu.as_mut().filter(|(_, s)| s.has_hover()) {
+            let (event, redraw) = sub.on_key(vk);
+            if redraw {
+                sub.render(&self.gfx, &self.theme);
+            }
+            match event {
+                MenuEvent::Activate(a) => self.activate_menu(a),
+                MenuEvent::Close => self.close_menu(),
+                MenuEvent::Step(-1) => self.close_submenu(),
+                _ => {}
+            }
+            return;
+        }
         let Some(m) = &mut self.menu else { return };
         let (event, redraw) = m.on_key(vk);
         if redraw {
             m.render(&self.gfx, &self.theme);
         }
         let source = m.source;
+        let hovered = m.hovered_submenu();
+        if self.submenu.as_ref().is_some_and(|(open, _)| Some(*open) != hovered) {
+            self.close_submenu();
+        }
         match event {
             MenuEvent::Activate(a) => self.activate_menu(a),
             MenuEvent::Close => self.close_menu(),
+            MenuEvent::Open => self.open_submenu(true),
             MenuEvent::Step(dir) => {
                 if let MenuSource::MenuBar(hit) = source {
                     self.open_menubar_menu(hit.step(dir));
@@ -2236,7 +2318,9 @@ impl App {
         }
 
         let result = if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
-            self.on_menu_mouse(hwnd, msg, lp)
+            self.on_menu_mouse(hwnd, msg, lp, false)
+        } else if self.submenu.as_ref().is_some_and(|(_, s)| s.surface.content == hwnd) {
+            self.on_menu_mouse(hwnd, msg, lp, true)
         } else if self.menubar.as_ref().is_some_and(|m| m.surface.content == hwnd) {
             self.on_menubar_mouse(hwnd, msg, lp)
         } else if self.dock.as_ref().is_some_and(|d| d.surface.content == hwnd) {
@@ -2377,8 +2461,9 @@ impl App {
         Some(LRESULT(0))
     }
 
-    fn on_menu_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
-        let m = self.menu.as_mut()?;
+    /// `sub`: the message is for the open submenu rather than the menu.
+    fn on_menu_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM, sub: bool) -> Option<LRESULT> {
+        let m = if sub { self.submenu.as_mut().map(|(_, s)| s)? } else { self.menu.as_mut()? };
         let (x, y) = mouse_pt(lp, m.surface.scale);
         match msg {
             WM_NCHITTEST => {
@@ -2400,6 +2485,9 @@ impl App {
                 track_leave(hwnd);
                 if m.on_move(x, y) {
                     m.render(&self.gfx, &self.theme);
+                    if !sub {
+                        self.sync_submenu();
+                    }
                 }
             }
             WM_MOUSELEAVE => {
@@ -2410,6 +2498,7 @@ impl App {
             WM_LBUTTONUP | WM_RBUTTONUP => match m.on_click(x, y, msg == WM_RBUTTONUP) {
                 MenuEvent::Activate(a) => self.activate_menu(a),
                 MenuEvent::Close => self.close_menu(),
+                MenuEvent::Open => self.open_submenu(false),
                 _ => {}
             },
             _ => return None,

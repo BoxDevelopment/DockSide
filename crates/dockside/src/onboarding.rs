@@ -338,13 +338,15 @@ impl Onboarding {
     }
 
     /// Brings the window back to the front.
-    pub fn show(&self) {
+    pub fn show(&mut self) {
         unsafe {
             if IsIconic(self.hwnd).as_bool() {
                 let _ = ShowWindow(self.hwnd, SW_RESTORE);
             }
             let _ = SetForegroundWindow(self.hwnd);
         }
+        // Called while the App is busy, so the restore's WM_SIZE never reaches us.
+        self.on_size();
     }
 
     fn body() -> Rect {

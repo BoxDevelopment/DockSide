@@ -611,6 +611,8 @@ impl SettingsWindow {
             }
             let _ = SetForegroundWindow(self.hwnd);
         }
+        // Called while the App is busy, so the restore's WM_SIZE never reaches us.
+        self.on_size();
     }
 
     fn body() -> Rect {

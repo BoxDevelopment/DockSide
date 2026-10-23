@@ -1096,7 +1096,7 @@ impl App {
     }
 
     fn open_onboarding(&mut self) {
-        match &self.onboarding {
+        match &mut self.onboarding {
             Some(o) => o.show(),
             None => match Onboarding::new(&self.gfx, &self.monitor) {
                 Ok(o) => {

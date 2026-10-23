@@ -7,12 +7,13 @@ use windows::core::{w, Result};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::chrome::{self, SHADOW};
+use crate::anim::{feel, lerp, Motion, Spring};
+use crate::chrome::{self, WindowAnim, SHADOW};
 use crate::config::Config;
 use crate::geom::{Color, Rect};
 use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::Action;
-use crate::settings::{self, Hit, Key, Page, Row, RowCtx, SliderDrag, Style, ROW_H};
+use crate::settings::{self, Anim, Hit, Key, Page, Row, RowCtx, SliderDrag, Style, ROW_H};
 use crate::theme::Theme;
 use crate::win::{self, startup, Monitor};
 
@@ -267,6 +268,12 @@ pub struct Onboarding {
     login: bool,
     fonts: Vec<String>,
     shown: bool,
+    /// Open / minimize zoom, control springs, and the slide between pages.
+    window: WindowAnim,
+    motion: Motion<Anim>,
+    page_t: Spring,
+    /// -1 going back a page, 1 going forward.
+    page_dir: f32,
     pub tracking: bool,
     pub dirty: bool,
 }
@@ -296,9 +303,24 @@ impl Onboarding {
             login: startup::is_enabled(),
             fonts: settings::installed_fonts(gfx),
             shown: false,
+            window: WindowAnim::opening(),
+            motion: Motion::default(),
+            page_t: Spring::new(1.0, 0.22, 1.0),
+            page_dir: 1.0,
             tracking: false,
             dirty: true,
         })
+    }
+
+    /// Advances animations; returns true while frames are still needed.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        let moving = self.window.tick(dt, self.hwnd) | self.motion.tick(dt) | self.page_t.step(dt);
+        self.dirty |= moving;
+        moving
+    }
+
+    pub fn animating(&self) -> bool {
+        self.window.moving() || self.motion.moving() || !self.page_t.settled()
     }
 
     pub fn scale(&self) -> f32 {
@@ -332,6 +354,11 @@ impl Onboarding {
     fn go(&mut self, step: usize) {
         let step = step.min(LAST);
         if step != self.step {
+            // The new page slides in from the side it's on.
+            self.page_dir = if step > self.step { 1.0 } else { -1.0 };
+            // Already mostly there on the first frame: a nudge, not a wait.
+            self.page_t.snap(0.3);
+            self.page_t.set(1.0);
             self.step = step;
             self.slider = None;
             self.pending = None;
@@ -409,9 +436,7 @@ impl Onboarding {
         match target {
             Target::Close | Target::Skip => OnboardingEvent::Finish(None),
             Target::Minimize => {
-                unsafe {
-                    let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
-                }
+                self.window.minimize();
                 OnboardingEvent::None
             }
             Target::Back => {
@@ -435,6 +460,10 @@ impl Onboarding {
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme, cfg: &Config) {
         self.dirty = false;
+        if !self.window.begin_render(self.hwnd) {
+            return;
+        }
+        self.motion.sweep();
         if let Some((key, v)) = self.pending {
             if settings::slider_value(key, cfg).round() == v {
                 self.pending = None;
@@ -448,20 +477,20 @@ impl Onboarding {
             pending: self.pending,
             login: self.login,
             fonts: &self.fonts,
+            motion: Some(&self.motion),
+            page_t: self.page_t.value,
+            page_dir: self.page_dir,
         };
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rc);
+        }
+        let (zx, zy, zoom, alpha) = self.window.transform(Self::body());
         let mut hits = Vec::new();
-        let r = self.canvas.draw(gfx, |p| hits = paint(p, gfx, theme, cfg, &frame));
+        let r = self.canvas.draw(gfx, |p| p.scaled_about(zx, zy, zoom, || hits = paint(p, gfx, theme, cfg, &frame)));
         self.hits = hits;
 
-        let presented = r.and_then(|_| {
-            if self.shown {
-                self.canvas.present_in_place(self.hwnd)
-            } else {
-                let mut rc = RECT::default();
-                unsafe { GetWindowRect(self.hwnd, &mut rc)? };
-                self.canvas.present(self.hwnd, rc.left, rc.top)
-            }
-        });
+        let presented = r.and_then(|_| self.canvas.present_alpha(self.hwnd, rc.left, rc.top, alpha));
         if let Err(e) = presented {
             log!("setup assistant render failed: {e}");
         }
@@ -492,6 +521,10 @@ struct Frame<'a> {
     pending: Option<(Key, f32)>,
     login: bool,
     fonts: &'a [String],
+    motion: Option<&'a Motion<Anim>>,
+    /// Page transition (0 -> 1) and the side the new page comes from.
+    page_t: f32,
+    page_dir: f32,
 }
 
 /// Paints the whole window (body at `Onboarding::body()`) and returns its hit rects.
@@ -527,6 +560,7 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             fonts: f.fonts,
             bitmaps: None,
             editing: None,
+            motion: f.motion,
         };
         let mut hits: Vec<(Rect, Target)> = Vec::new();
         let content = if theme.dark { Color::rgba(30, 30, 30, 1.0) } else { Color::rgba(250, 250, 250, 1.0) };
@@ -542,11 +576,16 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             });
             p.stroke_round(body.inset(0.25, 0.25), chrome::RADIUS, theme.menu_border, 0.5);
 
-            let group_hover = matches!(hover, Some(Target::Close | Target::Minimize));
+            let fade = |key: Anim, on: bool| f.motion.map_or(if on { 1.0 } else { 0.0 }, |m| m.fade(key, on));
+            let group_hover = fade(Anim::Lights, matches!(hover, Some(Target::Close | Target::Minimize)));
             for (r, light) in chrome::traffic_lights(p, body, group_hover, false) {
                 hits.push((r, if light == chrome::Light::Close { Target::Close } else { Target::Minimize }));
             }
 
+            // The page itself (hero to note) slides and fades in from the side it's on.
+            let page_a = f.page_t.clamp(0.0, 1.0);
+            let shift = (1.0 - f.page_t) * 24.0 * f.page_dir;
+            p.faded(page_a, || p.transformed(shift, 0.0, 1.0, || {
             // Hero, caption, title and explanation.
             let hero = Rect::new(body.cx() - HERO / 2.0, body.y + 44.0, HERO, HERO);
             draw_hero(p, page.hero, hero, theme, &glyph_small, &glyph_big);
@@ -573,6 +612,7 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             if !note.is_empty() {
                 p.text(&note, &note_font, Rect::new(body.x + 60.0, below + 14.0, body.w - 120.0, 36.0), theme.text_secondary);
             }
+            }));
 
             // Progress dots: one per page, clickable.
             let footer_y = body.bottom() - FOOTER_H;
@@ -581,14 +621,11 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             let dy = footer_y - 20.0;
             for i in 0..STEPS.len() {
                 let cx = body.cx() - dots_w / 2.0 + i as f32 * gap;
-                let c = if i == step {
-                    theme.accent
-                } else if hover == Some(Target::Dot(i)) {
-                    theme.text_secondary
-                } else {
-                    theme.text_disabled
-                };
-                p.fill_circle(cx, dy, if i == step { 4.0 } else { 3.0 }, c);
+                // The current dot grows and takes the accent; the old one shrinks back.
+                let on = f.motion.map_or(if i == step { 1.0 } else { 0.0 }, |m| m.get(Anim::Dot(i), if i == step { 1.0 } else { 0.0 }, feel::SLIDE));
+                let hot = fade(Anim::DotHover(i), hover == Some(Target::Dot(i)));
+                let c = theme.text_disabled.mix(theme.text_secondary, hot).mix(theme.accent, on);
+                p.fill_circle(cx, dy, lerp(3.0, 4.0, on), c);
                 hits.push((Rect::new(cx - 7.0, dy - 8.0, 14.0, 16.0), Target::Dot(i)));
             }
 
@@ -596,16 +633,17 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             p.line(body.x, footer_y, body.right(), footer_y, style.card_border, 1.0);
             let by = footer_y + (FOOTER_H - 30.0) / 2.0;
             let width = |label: &str| (p.gfx.measure(label, &button_font) + 32.0).max(92.0);
-            let mut button = |label: &str, x: f32, kind: Kind, target: Target| {
+            let mut button = |label: &str, x: f32, kind: Kind, target: Target, slot: usize| {
                 let r = Rect::new(x, by, width(label), 30.0);
-                draw_button(p, r, label, kind, hover == Some(target), pressed == Some(target), theme, &style, &button_font);
+                let hot = fade(Anim::Button(slot), hover == Some(target));
+                draw_button(p, r, label, kind, hot, pressed == Some(target), theme, &style, &button_font);
                 hits.push((r, target));
             };
             let left = body.x + 20.0;
             if step == LAST {
-                button("Open System Settings", left, Kind::Link, Target::OpenSettings);
+                button("Open System Settings", left, Kind::Link, Target::OpenSettings, 0);
             } else {
-                button("Skip Setup", left, Kind::Link, Target::Skip);
+                button("Skip Setup", left, Kind::Link, Target::Skip, 0);
             }
             let next = match step {
                 0 => "Get Started",
@@ -613,9 +651,9 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
                 _ => "Continue",
             };
             let next_x = body.right() - 20.0 - width(next);
-            button(next, next_x, Kind::Primary, Target::Next);
+            button(next, next_x, Kind::Primary, Target::Next, 1);
             if step > 0 {
-                button("Back", next_x - 10.0 - width("Back"), Kind::Secondary, Target::Back);
+                button("Back", next_x - 10.0 - width("Back"), Kind::Secondary, Target::Back, 2);
             }
         }
         hits
@@ -635,7 +673,7 @@ fn draw_button(
     r: Rect,
     label: &str,
     kind: Kind,
-    hot: bool,
+    hot: f32,
     down: bool,
     theme: &Theme,
     style: &Style,
@@ -645,13 +683,15 @@ fn draw_button(
         Kind::Primary => {
             p.fill_round(r.offset(0.0, 0.5), 8.0, Color::gray(0, 0.12));
             p.fill_round(r, 8.0, theme.accent);
-            if hot || down {
-                p.fill_round(r, 8.0, if down { Color::gray(0, 0.18) } else { Color::gray(255, 0.12) });
+            if down {
+                p.fill_round(r, 8.0, Color::gray(0, 0.18));
+            } else if hot > 0.0 {
+                p.fill_round(r, 8.0, Color::gray(255, 0.12 * hot));
             }
             p.text(label, font, r, Color::WHITE);
         }
         Kind::Secondary => {
-            p.fill_round(r, 8.0, if hot { style.selected_seg } else { style.control_bg });
+            p.fill_round(r, 8.0, style.control_bg.mix(style.selected_seg, hot));
             p.stroke_round(r.inset(0.25, 0.25), 8.0, style.card_border, 0.5);
             if down {
                 p.fill_round(r, 8.0, Color::gray(0, 0.08));
@@ -659,8 +699,8 @@ fn draw_button(
             p.text(label, font, r, theme.text);
         }
         Kind::Link => {
-            if hot {
-                p.fill_round(r, 8.0, style.control_bg);
+            if hot > 0.0 {
+                p.fill_round(r, 8.0, style.control_bg.alpha(style.control_bg.a * hot));
             }
             p.text(label, font, r, if down { theme.text } else { theme.accent });
         }
@@ -822,7 +862,18 @@ mod tests {
             let (cw, ch) = ((W + 2.0 * SHADOW) as i32, (H + 2.0 * SHADOW) as i32);
             for step in 0..STEPS.len() {
                 let mut canvas = Canvas::new(&gfx, cw, ch, 1.0).unwrap();
-                let frame = Frame { step, hover: Some(Target::Next), pressed: None, slider: None, pending: None, login: false, fonts: &fonts };
+                let frame = Frame {
+                    step,
+                    hover: Some(Target::Next),
+                    pressed: None,
+                    slider: None,
+                    pending: None,
+                    login: false,
+                    fonts: &fonts,
+                    motion: None,
+                    page_t: 1.0,
+                    page_dir: 1.0,
+                };
                 canvas.draw(&gfx, |p| drop(paint(p, &gfx, &theme, &cfg, &frame))).unwrap();
                 let px = canvas.pixels();
                 let (iw, ih) = (cw as usize, ch as usize);

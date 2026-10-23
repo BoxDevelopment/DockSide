@@ -24,7 +24,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use self::fs::{Entry as FileEntry, KindCache, Place, SortKey};
 use self::loader::IconLoader;
 use self::text::{KeyResult, TextField};
-use crate::chrome::{self, Light, SidebarBackdrop, SHADOW};
+use crate::anim::{feel, lerp, Glide, Motion, Scroll, Spring};
+use crate::chrome::{self, Light, SidebarBackdrop, WindowAnim, SHADOW};
 use crate::config::FinderCfg;
 use crate::geom::{Color, Rect};
 use crate::gfx::{pt as gfx_pt, Align, Canvas, Gfx, Painter, Weight};
@@ -82,8 +83,21 @@ const PERIOD: u16 = 0xBE;
 
 /// Width of the invisible resize border inside the body edge.
 const EDGE: f32 = 6.0;
+/// How long the overlay scrollbar lingers after scrolling stops, in seconds.
+const SCROLLBAR_LINGER: f32 = 0.9;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
+/// Everything in a Finder window that animates, keyed for [`Motion`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Anim {
+    Hover(Hit),
+    Scrollbar,
+    ViewPill,
+    SearchW,
+    TabBar,
+    Lights,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum View {
     Icons,
@@ -155,7 +169,7 @@ pub enum FinderEvent {
     Run(FinderCmd),
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Hit {
     Light(Light),
     Back,
@@ -185,7 +199,7 @@ struct Column {
     dir: PathBuf,
     entries: Vec<FileEntry>,
     selected: Option<usize>,
-    scroll: f32,
+    scroll: Scroll,
     error: Option<String>,
 }
 
@@ -213,7 +227,7 @@ struct Band {
 struct QuickLook {
     path: PathBuf,
     text: Option<String>,
-    scroll: f32,
+    scroll: Scroll,
     max_scroll: f32,
 }
 
@@ -268,7 +282,8 @@ pub struct FinderWindow {
     cursor: Option<usize>,
     columns: Vec<Column>,
     active_col: usize,
-    scroll: f32,
+    /// Smooth (eased) scrolling of the icon and list views.
+    scroll: Scroll,
     max_scroll: f32,
     grid_cols: usize,
     hits: Vec<(Rect, Hit)>,
@@ -303,6 +318,27 @@ pub struct FinderWindow {
     active_tab: usize,
     /// Blurred backdrop behind the translucent sidebar, when vibrancy is on and available.
     backdrop: Option<SidebarBackdrop>,
+    /// The view pill, search field, tab bar and scrollbar springs. Anything
+    /// following direct input (scrolling, hovering, selecting) stays instant.
+    motion: Motion<Anim>,
+    /// Open, close and minimize zooms of the whole window.
+    window: WindowAnim,
+    /// The sidebar's hover highlight and current-place selection, gliding from place to place.
+    side_glide: Glide,
+    sel_glide: Glide,
+    scrolled_at: Instant,
+    /// The overlay scrollbar is showing (and needs a redraw to fade once scrolling stops).
+    scrollbar_up: bool,
+    /// Quick Look zoom (0 -> 1), and the panel still shrinking away after closing.
+    ql_t: Spring,
+    ql_closing: Option<(QuickLook, FileEntry)>,
+    /// Window transform this frame: zoom origin (points), scale and opacity.
+    xf: (f32, f32, f32, f32),
+    /// The transform and body the sidebar backdrop was last placed for.
+    backdrop_for: Option<((f32, f32, f32, f32), Rect)>,
+    /// Set by `tick` when only this area is animating (the list scrolling, a
+    /// sidebar highlight gliding): the next frame repaints just that.
+    part: Option<Rect>,
     /// View, sort or hidden files changed: the App saves them as the defaults for new windows.
     pub prefs_dirty: bool,
     pub focused: bool,
@@ -365,7 +401,7 @@ impl FinderWindow {
             cursor: None,
             columns: Vec::new(),
             active_col: 0,
-            scroll: 0.0,
+            scroll: Scroll::default(),
             max_scroll: 0.0,
             grid_cols: 1,
             hits: Vec::new(),
@@ -393,6 +429,17 @@ impl FinderWindow {
             tabs: vec![None],
             active_tab: 0,
             backdrop: Self::new_backdrop(hwnd, prefs, ctx.theme),
+            motion: Motion::default(),
+            window: WindowAnim::opening(),
+            side_glide: Glide::default(),
+            sel_glide: Glide::selection(),
+            scrolled_at: Instant::now() - Duration::from_secs(10),
+            scrollbar_up: false,
+            ql_t: Spring::new(0.0, 0.2, 1.0),
+            ql_closing: None,
+            xf: (0.0, 0.0, 1.0, 1.0),
+            backdrop_for: None,
+            part: None,
             prefs_dirty: false,
             focused: true,
             tracking: false,
@@ -437,19 +484,117 @@ impl FinderWindow {
     /// Keeps the sidebar backdrop under the sidebar (call when the window moves, resizes or changes z-order).
     pub fn sync_backdrop(&mut self) {
         let body = self.body();
+        self.backdrop_for = Some((self.xf, body));
+        let (ox, oy, k, alpha) = self.xf;
         if let Some(bd) = &mut self.backdrop {
-            bd.sync(self.hwnd, chrome::sidebar_pane(body, SIDEBAR), chrome::PANE_RADIUS, self.scale);
+            let r = chrome::sidebar_pane(body, SIDEBAR);
+            let r = Rect::new(ox + (r.x - ox) * k, oy + (r.y - oy) * k, r.w * k, r.h * k);
+            bd.sync(self.hwnd, r, chrome::PANE_RADIUS * k, self.scale);
+            bd.set_opacity(alpha);
         }
+    }
+
+    // --- animation ---------------------------------------------------------
+
+    /// Advances animations; returns true while frames are still needed.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        // What moved decides how much of the window the next frame repaints:
+        // the list scrolling or a sidebar highlight gliding touch only their own
+        // area; anything else (or a redraw already asked for) repaints it all.
+        let was_dirty = self.dirty;
+        let mut full = self.motion.tick(dt);
+        full |= self.window.tick(dt, self.hwnd);
+        full |= self.ql_t.step(dt);
+        if let Some(ql) = &mut self.quicklook {
+            full |= ql.scroll.tick(dt);
+        }
+        if self.ql_closing.is_some() && self.ql_t.settled() {
+            self.ql_closing = None;
+            full = true;
+        }
+        let (body, vr) = (self.body(), self.view_rect());
+        let side = Rect::new(body.x, body.y, SIDEBAR, body.h);
+        let mut part: Option<Rect> = None;
+        let mut touch = |r: Rect| part = Some(part.map_or(r, |p| p.union(r)));
+        let mut list = self.scroll.tick(dt);
+        for c in &mut self.columns {
+            list |= c.scroll.tick(dt);
+        }
+        if list {
+            touch(vr);
+        }
+        if self.side_glide.tick(dt) | self.sel_glide.tick(dt) {
+            touch(side);
+        }
+        // While the scrollbar lingers, keep ticking without redrawing; once
+        // scrolling has stopped long enough, one redraw starts it fading.
+        let lingering = self.scrolled_at.elapsed().as_secs_f32() < SCROLLBAR_LINGER;
+        if self.scrollbar_up && !lingering {
+            self.scrollbar_up = false;
+            full = true;
+        }
+        let moving = full || part.is_some();
+        if moving {
+            // A pending redraw stays partial only if it was partial too.
+            let pending_full = was_dirty && self.part.is_none();
+            self.part = match (full || pending_full || self.quicklook.is_some(), part, self.part) {
+                (true, ..) => None,
+                (false, Some(p), Some(q)) => Some(p.union(q)),
+                (false, p, q) => p.or(q),
+            };
+            self.dirty = true;
+        }
+        moving || lingering
+    }
+
+    /// Whether the last render started something that needs frames.
+    pub fn animating(&self) -> bool {
+        self.motion.moving()
+            || self.window.moving()
+            || !self.ql_t.settled()
+            || self.scroll.moving()
+            || self.side_glide.moving()
+            || self.sel_glide.moving()
+            || self.columns.iter().any(|c| c.scroll.moving())
+            || self.quicklook.as_ref().is_some_and(|q| q.scroll.moving())
+            || self.scrollbar_up
+    }
+
+    /// Fades and zooms the window away; the App drops it once [`Self::closed`].
+    pub fn begin_close(&mut self) {
+        self.window.close();
+        self.dirty = true;
+        unsafe {
+            let ex = GetWindowLongW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongW(self.hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as i32);
+        }
+        dnd::revoke(self.hwnd);
+    }
+
+    pub fn closed(&self) -> bool {
+        self.window.closed()
+    }
+
+    fn begin_minimize(&mut self) {
+        self.window.minimize();
+        self.dirty = true;
+    }
+
+    fn close_quicklook(&mut self) {
+        let entry = self.ql_entry().cloned();
+        if let (Some(ql), Some(e)) = (self.quicklook.take(), entry) {
+            self.ql_closing = Some((ql, e));
+            self.ql_t.set(0.0);
+        }
+        self.dirty = true;
     }
 
     // --- tabs --------------------------------------------------------------
 
+    /// The tab bar slides open with a second tab and closes with the last but one.
     fn tab_h(&self) -> f32 {
-        if self.tabs.len() > 1 {
-            TABBAR
-        } else {
-            0.0
-        }
+        let want = if self.tabs.len() > 1 { TABBAR } else { 0.0 };
+        self.motion.get(Anim::TabBar, want, feel::SMOOTH).max(0.0)
     }
 
     fn tab_dir(&self, i: usize) -> Option<&Path> {
@@ -479,7 +624,7 @@ impl FinderWindow {
             cursor: self.cursor,
             columns: take(&mut self.columns),
             active_col: self.active_col,
-            scroll: self.scroll,
+            scroll: self.scroll.target(),
             search: take(&mut self.search),
         }
     }
@@ -500,7 +645,7 @@ impl FinderWindow {
         self.cursor = t.cursor;
         self.columns = t.columns;
         self.active_col = t.active_col;
-        self.scroll = t.scroll;
+        self.scroll.jump(t.scroll);
         self.search = t.search;
     }
 
@@ -614,7 +759,7 @@ impl FinderWindow {
         self.selected.clear();
         self.anchor = None;
         self.cursor = None;
-        self.scroll = 0.0;
+        self.scroll.jump(0.0);
         self.rename = None;
         // Like macOS, going somewhere else ends the search and Quick Look.
         self.search.clear();
@@ -624,7 +769,7 @@ impl FinderWindow {
             dir: self.cwd.clone(),
             entries: self.entries.clone(),
             selected: None,
-            scroll: 0.0,
+            scroll: Scroll::default(),
             error,
         }];
         self.active_col = 0;
@@ -738,7 +883,7 @@ impl FinderWindow {
                 self.selected = self.columns[0].selected.into_iter().collect();
             }
             self.view = view;
-            self.scroll = 0.0;
+            self.scroll.jump(0.0);
             self.prefs_dirty = true;
             self.dirty = true;
         }
@@ -779,7 +924,7 @@ impl FinderWindow {
         self.active_col = c;
         if let Some(e) = self.columns[c].entries.get(j).filter(|e| e.is_dir).cloned() {
             let (entries, error) = self.list_sorted(&e.path, kinds);
-            self.columns.push(Column { dir: e.path, entries, selected: None, scroll: 0.0, error });
+            self.columns.push(Column { dir: e.path, entries, selected: None, scroll: Scroll::default(), error });
         }
         self.dirty = true;
     }
@@ -1024,19 +1169,24 @@ impl FinderWindow {
     }
 
     pub fn on_wheel(&mut self, x: f32, delta: i32) {
-        let amount = delta as f32 / 120.0 * 60.0;
+        self.scrolled_at = Instant::now();
         if let Some(ql) = &mut self.quicklook {
-            ql.scroll = (ql.scroll - amount).clamp(0.0, ql.max_scroll);
+            ql.scroll.wheel(delta, 60.0, ql.max_scroll);
         } else if self.view == View::Columns {
             let vr = self.view_rect();
             let offset = self.column_offset(vr);
             let c = ((x - vr.x + offset) / COL_W).floor().max(0.0) as usize;
             if let Some(col) = self.columns.get_mut(c) {
                 let max = (col.entries.len() as f32 * ROW + 8.0 - vr.h).max(0.0);
-                col.scroll = (col.scroll - amount).clamp(0.0, max);
+                col.scroll.wheel(delta, 60.0, max);
             }
         } else {
-            self.scroll = (self.scroll - amount).clamp(0.0, self.max_scroll);
+            self.scroll.wheel(delta, 60.0, self.max_scroll);
+        }
+        // Only the list moved: unless a whole redraw is already due, repaint just it.
+        if self.quicklook.is_none() && (!self.dirty || self.part.is_some()) {
+            let vr = self.view_rect();
+            self.part = Some(self.part.map_or(vr, |p| p.union(vr)));
         }
         self.dirty = true;
     }
@@ -1111,7 +1261,7 @@ impl FinderWindow {
                 // Rubber band: Ctrl toggles items against the current selection, Shift adds to it.
                 let base = if ctrl || shift { self.selected.clone() } else { BTreeSet::new() };
                 self.selected = base.clone();
-                self.band = Some(Band { x0: x, y0: y + self.scroll, x1: x, y1: y, base, toggle: ctrl });
+                self.band = Some(Band { x0: x, y0: y + self.scroll.offset(), x1: x, y1: y, base, toggle: ctrl });
                 unsafe {
                     SetCapture(self.hwnd);
                 }
@@ -1146,7 +1296,7 @@ impl FinderWindow {
                     self.navigate(dir, true, kinds);
                 }
             }
-            Some(Hit::QlBackdrop) => self.quicklook = None,
+            Some(Hit::QlBackdrop) => self.close_quicklook(),
             // Tabs switch on press, like macOS.
             Some(Hit::Tab(i)) => self.select_tab(i, kinds),
             _ => {}
@@ -1198,9 +1348,7 @@ impl FinderWindow {
         let Some(hit) = self.hit_at(x, y).filter(|h| Some(*h) == pressed) else { return FinderEvent::None };
         match hit {
             Hit::Light(Light::Close) => return FinderEvent::Close,
-            Hit::Light(Light::Minimize) => unsafe {
-                let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
-            },
+            Hit::Light(Light::Minimize) => self.begin_minimize(),
             Hit::Light(Light::Zoom) => self.toggle_zoom(),
             Hit::Back => self.go_back(kinds),
             Hit::Forward => self.go_forward(kinds),
@@ -1215,7 +1363,7 @@ impl FinderWindow {
                 }
             }
             Hit::NewTab => self.new_tab(fs::home(), kinds),
-            Hit::QlClose => self.quicklook = None,
+            Hit::QlClose => self.close_quicklook(),
             Hit::QlOpen => {
                 if let Some(e) = self.ql_entry().cloned() {
                     self.quicklook = None;
@@ -1254,12 +1402,12 @@ impl FinderWindow {
         // Auto-scroll while dragging past the top or bottom edge.
         let top = if self.view == View::List { vr.y + HEADER } else { vr.y };
         if y < top {
-            self.scroll = (self.scroll - (top - y) * 0.5).max(0.0);
+            self.scroll.to(self.scroll.target() - (top - y) * 0.5);
         } else if y > vr.bottom() {
-            self.scroll = (self.scroll + (y - vr.bottom()) * 0.5).min(self.max_scroll);
+            self.scroll.to((self.scroll.target() + (y - vr.bottom()) * 0.5).min(self.max_scroll));
         }
         let Some(band) = &self.band else { return };
-        let r = band_rect(band.x0, band.y0, x, y + self.scroll);
+        let r = band_rect(band.x0, band.y0, x, y + self.scroll.offset());
         // Only rows the band spans can intersect it.
         let n = self.entries.len();
         let (first, last) = if self.view == View::Icons {
@@ -1441,7 +1589,7 @@ impl FinderWindow {
         }
 
         if self.quicklook.is_some() && matches!(vk, ESC | SPACE) {
-            self.quicklook = None;
+            self.close_quicklook();
             return FinderEvent::None;
         }
         self.on_shortcut(vk, ctrl, shift, alt, kinds)
@@ -1611,24 +1759,25 @@ impl FinderWindow {
             View::Icons => {
                 let Some(&i) = self.cursor.as_ref().or(self.selected.iter().next()) else { return };
                 let top = (i / self.grid_cols.max(1)) as f32 * CELL_H;
-                if top < self.scroll {
-                    self.scroll = top;
-                } else if top + CELL_H + 24.0 > self.scroll + vr.h {
-                    self.scroll = top + CELL_H + 24.0 - vr.h;
+                let s = self.scroll.target();
+                if top < s {
+                    self.scroll.to(top);
+                } else if top + CELL_H + 24.0 > s + vr.h {
+                    self.scroll.to(top + CELL_H + 24.0 - vr.h);
                 }
             }
             View::List => {
                 let Some(&i) = self.cursor.as_ref().or(self.selected.iter().next()) else { return };
                 let top = i as f32 * ROW;
                 let visible = vr.h - HEADER;
-                self.scroll = self.scroll.min(top).max(top + ROW - visible + 4.0).max(0.0);
+                self.scroll.to(self.scroll.target().min(top).max(top + ROW - visible + 4.0));
             }
             View::Columns => {
                 let c = self.active_col.min(self.columns.len() - 1);
                 let col = &mut self.columns[c];
                 if let Some(j) = col.selected {
                     let top = j as f32 * ROW;
-                    col.scroll = col.scroll.min(top).max(top + ROW - vr.h + 8.0).max(0.0);
+                    col.scroll.to(col.scroll.target().min(top).max(top + ROW - vr.h + 8.0));
                 }
             }
         }
@@ -1650,8 +1799,15 @@ impl FinderWindow {
     }
 
     fn toggle_quicklook(&mut self) {
-        if self.quicklook.take().is_none() && self.ql_entry().is_some() {
+        if self.quicklook.is_some() {
+            return self.close_quicklook();
+        }
+        if self.ql_entry().is_some() {
             self.quicklook = Some(QuickLook::default());
+            self.ql_closing = None;
+            // Visible from the first frame, then a quick zoom to full size.
+            self.ql_t.snap(self.ql_t.value.max(0.4));
+            self.ql_t.set(1.0);
         }
         self.dirty = true;
     }
@@ -1663,7 +1819,7 @@ impl FinderWindow {
             return;
         };
         if let Some(ql) = self.quicklook.as_mut().filter(|ql| ql.path != e.path) {
-            *ql = QuickLook { path: e.path.clone(), text: fs::text_preview(&e), scroll: 0.0, max_scroll: 0.0 };
+            *ql = QuickLook { path: e.path.clone(), text: fs::text_preview(&e), scroll: Scroll::default(), max_scroll: 0.0 };
         }
     }
 
@@ -1680,15 +1836,20 @@ impl FinderWindow {
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rc);
         }
+        let resized = (self.canvas.width, self.canvas.height) != (rc.right - rc.left, rc.bottom - rc.top);
         if let Err(e) = self.canvas.resize(rc.right - rc.left, rc.bottom - rc.top) {
             return log!("finder resize failed: {e}");
         }
-        if unsafe { IsIconic(self.hwnd).as_bool() } {
+        if !self.window.begin_render(self.hwnd) {
             return;
         }
+        self.motion.sweep();
         if self.quicklook.is_some() {
             self.sync_quicklook();
         }
+        // Open, close and minimize zoom the whole window (and its sidebar backdrop).
+        self.xf = self.window.transform(self.body());
+        let (zoom_x, zoom_y, zoom, window_alpha) = self.xf;
 
         let (gfx, theme) = (ctx.gfx, ctx.theme);
         let mut pal = chrome::Palette::new(theme);
@@ -1696,7 +1857,10 @@ impl FinderWindow {
             bd.set_theme(theme);
             pal.sidebar = SidebarBackdrop::fill();
         }
-        self.sync_backdrop();
+        // Only when it changed: placing it re-renders its glass.
+        if self.backdrop_for != Some((self.xf, self.body())) {
+            self.sync_backdrop();
+        }
         let floating = self.backdrop.is_some();
         let dark = theme.dark;
         let body = self.body();
@@ -1731,7 +1895,17 @@ impl FinderWindow {
             View::Columns => 0.0,
         };
         self.max_scroll = (content_h - vr.h).max(0.0);
-        self.scroll = self.scroll.min(self.max_scroll);
+        self.scroll.clamp(self.max_scroll);
+        // The overlay scrollbar shows at once while scrolling, then fades away.
+        let scrollbar_a = {
+            let recent = self.scrolled_at.elapsed().as_secs_f32() < SCROLLBAR_LINGER;
+            self.scrollbar_up = recent;
+            if recent {
+                self.motion.fade(Anim::Scrollbar, true)
+            } else {
+                self.motion.get(Anim::Scrollbar, 0.0, (0.3, 1.0))
+            }
+        };
 
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
         let status = {
@@ -1755,8 +1929,11 @@ impl FinderWindow {
         let path_names: Vec<String> = crumbs(&self.cwd).iter().map(|d| self.title_for(d)).collect();
         let preview = self.preview_entry().cloned();
         let column_offset = self.column_offset(vr);
-        let ql_entry = self.quicklook.as_ref().and(self.ql_entry().cloned());
-        let tab_titles: Vec<String> = if self.tabs.len() > 1 {
+        let ql_live = self.quicklook.is_some();
+        let ql_entry = if ql_live { self.ql_entry().cloned() } else { self.ql_closing.as_ref().map(|(_, e)| e.clone()) };
+        let ql_t = self.ql_t.value;
+        let tab_h = self.tab_h();
+        let tab_titles: Vec<String> = if tab_h > 0.5 {
             (0..self.tabs.len()).map(|i| self.tab_dir(i).map(|d| self.title_for(d)).unwrap_or_default()).collect()
         } else {
             Vec::new()
@@ -1768,20 +1945,42 @@ impl FinderWindow {
         let bitmaps = &mut self.bitmaps;
         let (entries, columns, selected) = (&self.entries, &self.columns, &self.selected);
         let (view, hover, error, rename) = (self.view, self.hover, &self.error, &self.rename);
-        let (scroll, max_scroll, grid_cols, active_col) = (self.scroll, self.max_scroll, self.grid_cols, self.active_col);
+        let scroll = self.scroll.offset_px(self.scale);
+        let px = self.scale;
+        let (max_scroll, grid_cols, active_col) = (self.max_scroll, self.grid_cols, self.active_col);
+        let motion = &self.motion;
         let (sort, ascending) = (self.sort, self.ascending);
         let (can_back, can_fwd) = (self.hist_pos > 0, self.hist_pos + 1 < self.history.len());
         let places: Vec<&Place> = self.favorites.iter().chain(&self.drives).collect();
         let fav_count = self.favorites.len();
         let cwd = &self.cwd;
+        // Sidebar rows, and the hover highlight gliding between them.
+        let side = if floating { chrome::sidebar_pane(body, SIDEBAR) } else { Rect::new(body.x, body.y, SIDEBAR, body.h) };
+        let place_rows = place_rows(side, places.len(), fav_count);
+        let side_target = match hover {
+            Some(Hit::Place(i)) if places.get(i).is_some_and(|p| p.path != *cwd) => place_rows.get(i).copied(),
+            _ => None,
+        };
+        let side_glide = self.side_glide.update(side_target);
+        let sel_glide = self.sel_glide.update(places.iter().position(|p| p.path == *cwd).map(|i| place_rows[i]));
         let (search, search_focus, drop_hit) = (&self.search, self.search_focus, self.drop_hit);
         let band = self.band.as_ref().map(|b| band_rect(b.x0, b.y0 - scroll, b.x1, b.y1));
-        let ql = self.quicklook.as_mut().zip(ql_entry);
+        let ql = match self.quicklook.as_mut() {
+            Some(q) => Some(q),
+            None => self.ql_closing.as_mut().map(|(q, _)| q),
+        }
+        .zip(ql_entry);
         let ql_bitmap = &mut self.ql_bitmap;
         let ql_px = ql.as_ref().and_then(|(_, e)| loader.get_large(e));
         let mut search_xs: Vec<f32> = Vec::new();
 
-        let drawn = self.canvas.draw(gfx, |p| {
+        // Just the animating area when that's all that changed (and the window
+        // itself isn't zooming or fading).
+        let part = self.part.take().filter(|_| !resized && zoom == 1.0 && window_alpha == 1.0).and_then(|r| self.canvas.part_px(r));
+        let drawn = self.canvas.draw_part(gfx, part, |p| p.scaled_about(zoom_x, zoom_y, zoom, || {
+            // Hover highlights fade in and out rather than blinking.
+            let hv = |h: Hit| motion.fade(Anim::Hover(h), hover == Some(h));
+            let soft_t = |t: f32| soft.alpha(soft.a * t);
             let mut icon_for = |p: &Painter, e: &FileEntry| -> Option<ID2D1Bitmap> {
                 let (key, _) = IconLoader::key_for(e);
                 if let Some(b) = bitmaps.get(&key) {
@@ -1844,34 +2043,41 @@ impl FinderWindow {
             }
 
             // Sidebar: monochrome glyphs and rounded selection, inside the floating pane.
-            let side = if floating { chrome::sidebar_pane(body, SIDEBAR) } else { Rect::new(body.x, body.y, SIDEBAR, body.h) };
             let glyph_c = if dark { Color::gray(255, 0.78) } else { Color::gray(0, 0.72) };
-            let mut y = side.y + 46.0;
+            // Hover and selection glide from place to place; under the selection
+            // the glyphs turn accent, clipped to it, so the colour moves with it.
+            if let Some((g, a)) = side_glide {
+                p.fill_round(g, 8.0, soft_t(a));
+            }
+            let sel_fill = if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.075) };
+            if let Some((g, a)) = sel_glide {
+                p.fill_round(g, 8.0, sel_fill.alpha(sel_fill.a * a));
+            }
+            let glyph_at = |i: usize| glyphs::Glyph::for_place(i, &places[i].name, i >= fav_count);
             for (i, place) in places.iter().enumerate() {
+                let row = place_rows[i];
                 if i == 0 || i == fav_count {
                     let header = if i == 0 { "Favorites" } else { "Locations" };
-                    p.text(header, &small_bold, Rect::new(side.x + 14.0, y, side.w - 24.0, 24.0), theme.text_secondary);
-                    y += 24.0;
-                }
-                let row = Rect::new(side.x + 6.0, y, side.w - 12.0, 28.0);
-                if place.path == *cwd {
-                    p.fill_round(row, 8.0, if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.075) });
-                } else if hover == Some(Hit::Place(i)) {
-                    p.fill_round(row, 8.0, soft);
+                    p.text(header, &small_bold, Rect::new(side.x + 14.0, row.y - 24.0, side.w - 24.0, 24.0), theme.text_secondary);
                 }
                 if drop_hit == Some(Hit::Place(i)) {
                     p.fill_round(row, 8.0, theme.accent.alpha(0.3));
                     p.stroke_round(row, 8.0, theme.accent, 1.5);
                 }
-                let glyph = glyphs::Glyph::for_place(i, &place.name, i >= fav_count);
-                let gc = if place.path == *cwd { theme.accent } else { glyph_c };
-                glyphs::draw(p, glyph, row.x + 16.0, row.cy(), gc);
+                glyphs::draw(p, glyph_at(i), row.x + 16.0, row.cy(), glyph_c);
                 p.text(&place.name, &regular, Rect::new(row.x + 32.0, row.y, row.w - 36.0, row.h), theme.text);
                 hits.push((row, Hit::Place(i)));
-                y += 28.0;
-                if i + 1 == fav_count {
-                    y += 10.0;
-                }
+            }
+            if let Some((g, a)) = sel_glide {
+                p.faded(a, || {
+                    p.clipped(g, || {
+                        for (i, row) in place_rows.iter().enumerate() {
+                            if row.bottom() > g.y && row.y < g.bottom() {
+                                glyphs::draw(p, glyph_at(i), row.x + 16.0, row.cy(), theme.accent);
+                            }
+                        }
+                    });
+                });
             }
 
             // Toolbar: glass capsules floating over the content, lined up with the traffic lights.
@@ -1882,8 +2088,9 @@ impl FinderWindow {
             p.line(nav.cx(), nav.y + 9.0, nav.cx(), nav.bottom() - 9.0, pal.divider, 1.0);
             for (k, (hit, enabled)) in [(Hit::Back, can_back), (Hit::Forward, can_fwd)].into_iter().enumerate() {
                 let b = Rect::new(nav.x + k as f32 * nav.w / 2.0, nav.y, nav.w / 2.0, nav.h);
-                if enabled && hover == Some(hit) {
-                    p.fill_round(b.inset(3.0, 3.0), (b.h - 6.0) / 2.0, soft);
+                let t = if enabled { hv(hit) } else { 0.0 };
+                if t > 0.0 {
+                    p.fill_round(b.inset(3.0, 3.0), (b.h - 6.0) / 2.0, soft_t(t));
                 }
                 let c = if enabled { theme.text } else { theme.text_disabled };
                 glyphs::chevron(p, b.cx(), b.cy(), hit == Hit::Back, 5.5, c, 1.7);
@@ -1894,23 +2101,31 @@ impl FinderWindow {
 
             // Search: a circle that expands into a field while in use.
             let right_edge = content_x + content_w - 14.0;
+            // The circle grows into a field (and shrinks back) rather than jumping.
             let expanded = search_focus || !search.is_empty();
-            let sw = if expanded { SEARCH_W.min(content_w * 0.35).max(120.0) } else { CONTROL_H };
+            let full_w = SEARCH_W.min(content_w * 0.35).max(120.0);
+            let sw = motion.get(Anim::SearchW, if expanded { full_w } else { CONTROL_H }, feel::SMOOTH).max(CONTROL_H);
+            let open_t = ((sw - CONTROL_H) / (full_w - CONTROL_H).max(1.0)).clamp(0.0, 1.0);
             let sf = Rect::new(right_edge - sw, ty, sw, CONTROL_H);
             glyphs::capsule(p, sf, dark, !expanded && hover == Some(Hit::Search));
-            if expanded {
+            // Before the clear button's: later hits win, so the X stays clickable.
+            hits.push((sf, Hit::Search));
+            if open_t > 0.01 {
                 if search_focus {
-                    p.stroke_round(sf.inset(-2.0, -2.0), sf.h / 2.0 + 2.0, theme.accent.alpha(0.55), 3.0);
+                    p.stroke_round(sf.inset(-2.0, -2.0), sf.h / 2.0 + 2.0, theme.accent.alpha(0.55 * open_t), 3.0);
                 }
-                glyphs::magnifier(p, sf.x + 17.0, sf.cy(), theme.text_secondary);
-                let text_r = Rect::new(sf.x + 30.0, sf.y, sf.w - if search.is_empty() { 40.0 } else { 54.0 }, sf.h);
-                if search.is_empty() {
-                    p.text("Search", &regular, text_r, theme.text_secondary);
-                }
-                search_xs = edit_text(p, text_r, search, search_focus);
+                let glyph_c = theme.text.alpha(lerp(theme.text.a, theme.text_secondary.a, open_t));
+                glyphs::magnifier(p, lerp(sf.cx(), sf.x + 17.0, open_t), sf.cy(), glyph_c);
+                let text_r = Rect::new(sf.x + 30.0, sf.y, (sf.w - if search.is_empty() { 40.0 } else { 54.0 }).max(0.0), sf.h);
+                p.faded(open_t, || {
+                    if search.is_empty() {
+                        p.clipped(text_r, || p.text("Search", &regular, Rect::new(text_r.x, text_r.y, 200.0, text_r.h), theme.text_secondary));
+                    }
+                    search_xs = edit_text(p, text_r, search, search_focus);
+                });
                 if !search.is_empty() {
                     let (cx, cy) = (sf.right() - 16.0, sf.cy());
-                    let a = if hover == Some(Hit::SearchClear) { 0.85 } else { 0.55 };
+                    let a = (0.55 + 0.3 * hv(Hit::SearchClear)) * open_t;
                     p.fill_circle(cx, cy, 6.5, theme.text_secondary.alpha(a));
                     p.line(cx - 2.3, cy - 2.3, cx + 2.3, cy + 2.3, field_bg, 1.4);
                     p.line(cx + 2.3, cy - 2.3, cx - 2.3, cy + 2.3, field_bg, 1.4);
@@ -1920,19 +2135,26 @@ impl FinderWindow {
                 glyphs::magnifier(p, sf.cx(), sf.cy(), theme.text);
                 search_xs = vec![sf.x + 30.0];
             }
-            hits.push((sf, Hit::Search));
 
             // View switcher capsule, the current view on a darker pill.
             let seg_w = 40.0;
             let outer = Rect::new(sf.x - 10.0 - seg_w * 3.0 - 8.0, ty, seg_w * 3.0 + 8.0, CONTROL_H);
             glyphs::capsule(p, outer, dark, false);
-            for (k, v) in [View::Icons, View::List, View::Columns].into_iter().enumerate() {
-                let seg = Rect::new(outer.x + 4.0 + k as f32 * seg_w, outer.y + 4.0, seg_w, outer.h - 8.0);
-                if v == view {
-                    p.fill_round(seg, seg.h / 2.0, if dark { Color::gray(255, 0.16) } else { Color::gray(0, 0.08) });
-                } else if hover == Some(Hit::ViewBtn(v)) {
-                    p.fill_round(seg, seg.h / 2.0, soft);
+            let views = [View::Icons, View::List, View::Columns];
+            let seg_at = |k: f32| Rect::new(outer.x + 4.0 + k * seg_w, outer.y + 4.0, seg_w, outer.h - 8.0);
+            for (k, v) in views.into_iter().enumerate() {
+                let t = if v == view { 0.0 } else { hv(Hit::ViewBtn(v)) };
+                if t > 0.0 {
+                    let seg = seg_at(k as f32);
+                    p.fill_round(seg, seg.h / 2.0, soft_t(t));
                 }
+            }
+            // The selected pill slides between segments, like a native segmented control.
+            let current = views.iter().position(|v| *v == view).unwrap_or(0) as f32;
+            let pill = seg_at(motion.get(Anim::ViewPill, current, feel::SLIDE));
+            p.fill_round(pill, pill.h / 2.0, if dark { Color::gray(255, 0.16) } else { Color::gray(0, 0.08) });
+            for (k, v) in views.into_iter().enumerate() {
+                let seg = seg_at(k as f32);
                 let c = theme.text;
                 let (cx, cy) = (seg.cx(), seg.cy());
                 match v {
@@ -1964,15 +2186,17 @@ impl FinderWindow {
             if !tab_titles.is_empty() {
                 let bar = Rect::new(content_x, body.y + TOOLBAR, content_w, TABBAR);
                 let shade = if dark { Color::gray(0, 0.22) } else { Color::gray(0, 0.05) };
+                p.push_clip(Rect::new(bar.x, bar.y, bar.w, tab_h + 1.0));
                 p.fill_rect(bar, pal.content);
                 let tw = (bar.w - NEW_TAB_W) / tab_titles.len() as f32;
                 for (i, t) in tab_titles.iter().enumerate() {
                     let r = Rect::new(bar.x + i as f32 * tw, bar.y, tw, TABBAR);
                     let active = i == active_tab;
+                    let tab_t = motion.fade(Anim::Hover(Hit::Tab(i)), matches!(hover, Some(Hit::Tab(h) | Hit::TabClose(h)) if h == i));
                     if !active {
                         p.fill_rect(r, shade);
-                        if matches!(hover, Some(Hit::Tab(h) | Hit::TabClose(h)) if h == i) {
-                            p.fill_rect(r, soft);
+                        if tab_t > 0.0 {
+                            p.fill_rect(r, soft_t(tab_t));
                         }
                     }
                     if drop_hit == Some(Hit::Tab(i)) {
@@ -1983,26 +2207,30 @@ impl FinderWindow {
                     p.text(t, &center, Rect::new(r.x + 26.0, r.y, r.w - 52.0, r.h), tc);
                     hits.push((r, Hit::Tab(i)));
                     let close = Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
-                    if matches!(hover, Some(Hit::Tab(h) | Hit::TabClose(h)) if h == i) {
-                        if hover == Some(Hit::TabClose(i)) {
-                            p.fill_round(close, 4.0, soft);
+                    if tab_t > 0.0 {
+                        let t = hv(Hit::TabClose(i));
+                        if t > 0.0 {
+                            p.fill_round(close, 4.0, soft_t(t));
                         }
                         let (cx, cy) = (close.cx(), close.cy());
-                        p.line(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5, theme.text_secondary, 1.3);
-                        p.line(cx + 3.5, cy - 3.5, cx - 3.5, cy + 3.5, theme.text_secondary, 1.3);
+                        let xc = theme.text_secondary.alpha(theme.text_secondary.a * tab_t);
+                        p.line(cx - 3.5, cy - 3.5, cx + 3.5, cy + 3.5, xc, 1.3);
+                        p.line(cx + 3.5, cy - 3.5, cx - 3.5, cy + 3.5, xc, 1.3);
                     }
                     hits.push((close, Hit::TabClose(i)));
                 }
                 let plus = Rect::new(bar.right() - NEW_TAB_W, bar.y, NEW_TAB_W, TABBAR);
                 p.fill_rect(plus, shade);
-                if hover == Some(Hit::NewTab) {
-                    p.fill_rect(plus, soft);
+                let t = hv(Hit::NewTab);
+                if t > 0.0 {
+                    p.fill_rect(plus, soft_t(t));
                 }
                 let (cx, cy) = (plus.cx(), plus.cy());
                 p.line(cx - 5.0, cy, cx + 5.0, cy, theme.text_secondary, 1.4);
                 p.line(cx, cy - 5.0, cx, cy + 5.0, theme.text_secondary, 1.4);
                 hits.push((plus, Hit::NewTab));
                 p.line(bar.x, bar.bottom(), bar.right(), bar.bottom(), pal.divider, 1.0);
+                p.pop_clip();
             }
 
             // Content.
@@ -2111,11 +2339,12 @@ impl FinderWindow {
                         if let Some(err) = &col.error {
                             p.text(err, &small_center, col_r.inset(10.0, 0.0), theme.text_secondary);
                         }
-                        let first = (col.scroll / ROW).floor().max(0.0) as usize;
-                        let last = (((col.scroll + vr.h) / ROW).ceil() as usize + 1).min(col.entries.len());
+                        let col_scroll = col.scroll.offset_px(px);
+                        let first = (col_scroll / ROW).floor().max(0.0) as usize;
+                        let last = (((col_scroll + vr.h) / ROW).ceil() as usize + 1).min(col.entries.len());
                         for j in first..last {
                             let e = &col.entries[j];
-                            let r = Rect::new(cx0 + 6.0, vr.y + 4.0 + j as f32 * ROW - col.scroll, COL_W - 12.0, ROW);
+                            let r = Rect::new(cx0 + 6.0, vr.y + 4.0 + j as f32 * ROW - col_scroll, COL_W - 12.0, ROW);
                             let sel = col.selected == Some(j);
                             let active = c == active_col;
                             if sel {
@@ -2178,11 +2407,12 @@ impl FinderWindow {
             }
 
             // Overlay scrollbar.
-            if max_scroll > 0.0 && view != View::Columns {
+            // Shows while scrolling, then fades away like macOS.
+            if max_scroll > 0.0 && view != View::Columns && scrollbar_a > 0.01 {
                 let total = vr.h + max_scroll;
                 let th = (vr.h * vr.h / total).max(24.0);
-                let ty = vr.y + (vr.h - th) * (scroll / max_scroll);
-                p.fill_round(Rect::new(vr.right() - 8.0, ty + 2.0, 5.0, th - 4.0), 2.5, Color::gray(128, 0.45));
+                let ty = vr.y + (vr.h - th) * (scroll / max_scroll).clamp(0.0, 1.0);
+                p.fill_round(Rect::new(vr.right() - 8.0, ty + 2.0, 5.0, th - 4.0), 2.5, Color::gray(128, 0.45 * scrollbar_a));
             }
 
             // Path bar: breadcrumbs from the root, trimmed from the left to fit.
@@ -2197,8 +2427,9 @@ impl FinderWindow {
             for (depth, name) in path_names.iter().enumerate().skip(first) {
                 let w = widths[depth] - 14.0;
                 let seg = Rect::new(x, pb.y + 2.0, w, pb.h - 4.0);
-                if hover == Some(Hit::Crumb(depth)) {
-                    p.fill_round(seg, 5.0, soft);
+                let t = hv(Hit::Crumb(depth));
+                if t > 0.0 {
+                    p.fill_round(seg, 5.0, soft_t(t));
                 }
                 glyphs::folder(p, seg.x + 10.0, seg.cy(), 0.72, theme.accent);
                 p.text(name, &small, Rect::new(seg.x + 20.0, seg.y, seg.w - 20.0, seg.h), theme.text_secondary);
@@ -2237,23 +2468,54 @@ impl FinderWindow {
                     info += &format!("  ·  Modified {}", fs::format_date(m));
                 }
                 let style = QlStyle { theme, dark, title: &ql_title, mono: &mono, center: &center, preview_title: &preview_title };
-                quick_look(p, body, ql, &e, image, &info, &style, hover, &mut hits);
+                // Quick Look zooms up out of the window and shrinks away when closed.
+                let t = ql_t.clamp(0.0, 1.0);
+                p.fill_round(body, chrome::RADIUS, Color::gray(0, 0.22 * t));
+                let mut gone = Vec::new();
+                let ql_hits = if ql_live {
+                    hits.push((body, Hit::QlBackdrop));
+                    &mut hits
+                } else {
+                    &mut gone
+                };
+                p.faded(t, || {
+                    p.scaled_about(body.cx(), body.cy(), lerp(0.92, 1.0, ql_t), || {
+                        quick_look(p, body, ql, &e, image, &info, &style, &hv, ql_hits);
+                    })
+                });
             }
 
             // Traffic lights last so they win hit-testing.
-            let group_hover = matches!(hover, Some(Hit::Light(_)));
+            let group_hover = motion.fade(Anim::Lights, matches!(hover, Some(Hit::Light(_))));
             // Lights sit inside the pane, centred on the toolbar row.
             let lights = Rect::new(body.x + 4.0, body.y + CONTROL_CY - 20.0, body.w, body.h);
             for (r, light) in chrome::traffic_lights(p, lights, group_hover, true) {
                 hits.push((r, Hit::Light(light)));
             }
-        });
+        }));
         self.hits = hits;
         self.search_xs = search_xs;
-        if let Err(e) = drawn.and_then(|_| self.canvas.present(self.hwnd, rc.left, rc.top)) {
+        if let Err(e) = drawn.and_then(|_| self.canvas.present_part(self.hwnd, rc.left, rc.top, window_alpha, part)) {
             log!("finder render failed: {e}");
         }
     }
+}
+
+/// The sidebar's place rows inside `side`: Favorites, then Locations, each under a header.
+fn place_rows(side: Rect, n: usize, fav_count: usize) -> Vec<Rect> {
+    let mut rows = Vec::with_capacity(n);
+    let mut y = side.y + 46.0;
+    for i in 0..n {
+        if i == 0 || i == fav_count {
+            y += 24.0;
+        }
+        rows.push(Rect::new(side.x + 6.0, y, side.w - 12.0, 28.0));
+        y += 28.0;
+        if i + 1 == fav_count {
+            y += 10.0;
+        }
+    }
+    rows
 }
 
 /// Normalized rectangle between two corners.
@@ -2293,13 +2555,11 @@ fn quick_look(
     image: Option<ID2D1Bitmap>,
     info: &str,
     s: &QlStyle,
-    hover: Option<Hit>,
+    hover: &dyn Fn(Hit) -> f32,
     hits: &mut Vec<(Rect, Hit)>,
 ) {
     let theme = s.theme;
     let ink = if s.dark { 255 } else { 0 };
-    p.fill_round(body, chrome::RADIUS, Color::gray(0, 0.22));
-    hits.push((body, Hit::QlBackdrop));
 
     let w = (body.w - 80.0).min(960.0);
     let h = body.h - 64.0;
@@ -2316,15 +2576,16 @@ fn quick_look(
     let bar = Rect::new(panel.x, panel.y, panel.w, 40.0);
     p.text(&e.name, s.title, Rect::new(bar.x + 100.0, bar.y, bar.w - 200.0, bar.h), theme.text);
     let close = Rect::new(bar.x + 10.0, bar.cy() - 12.0, 24.0, 24.0);
-    if hover == Some(Hit::QlClose) {
-        p.fill_round(close, 6.0, Color::gray(ink, 0.1));
+    let t = hover(Hit::QlClose);
+    if t > 0.0 {
+        p.fill_round(close, 6.0, Color::gray(ink, 0.1 * t));
     }
     let (cx, cy) = (close.cx(), close.cy());
     p.line(cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5, theme.text_secondary, 1.6);
     p.line(cx + 4.5, cy - 4.5, cx - 4.5, cy + 4.5, theme.text_secondary, 1.6);
     hits.push((close, Hit::QlClose));
     let open = Rect::new(bar.right() - 74.0, bar.cy() - 12.0, 64.0, 24.0);
-    p.fill_round(open, 6.0, Color::gray(ink, if hover == Some(Hit::QlOpen) { 0.16 } else { 0.08 }));
+    p.fill_round(open, 6.0, Color::gray(ink, 0.08 + 0.08 * hover(Hit::QlOpen)));
     p.text("Open", s.center, open, theme.text);
     hits.push((open, Hit::QlOpen));
     p.line(panel.x, bar.bottom(), panel.right(), bar.bottom(), Color::gray(ink, 0.1), 1.0);
@@ -2340,10 +2601,10 @@ fn quick_look(
             let _ = layout.GetMetrics(&mut m);
         }
         ql.max_scroll = (m.height - inner.h).max(0.0);
-        ql.scroll = ql.scroll.min(ql.max_scroll);
+        ql.scroll.clamp(ql.max_scroll);
         p.clipped(inner, || unsafe {
             if let Ok(brush) = p.rt.CreateSolidColorBrush(&theme.text.d2d(), None) {
-                p.rt.DrawTextLayout(gfx_pt(inner.x, inner.y - ql.scroll), &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+                p.rt.DrawTextLayout(gfx_pt(inner.x, inner.y - ql.scroll.offset()), &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
             }
         });
         return;
@@ -2385,4 +2646,83 @@ fn crumbs(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
     v.reverse();
     v
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    /// On-screen frame rate while scrolling a big folder every frame.
+    /// `cargo test --profile fast bench_finder -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_finder() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc_(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let _ = crate::win::register_class(Some(proc_));
+        let gfx = Gfx::new().unwrap();
+        let cfg = crate::config::defaults();
+        let theme = Theme::new(&cfg, &gfx);
+        let mut loader = IconLoader::new(0, 0);
+        let mut kinds = KindCache::default();
+        for view in [View::List, View::Icons] {
+            let prefs = FinderCfg { view, ..cfg.finder.clone() };
+            let mut ctx = Ctx { gfx: &gfx, theme: &theme, loader: &mut loader, kinds: &mut kinds };
+            let mut f = FinderWindow::new(&mut ctx, &Monitor::primary(), 1, PathBuf::from(r"C:\Windows\System32"), 0, 0, 0, &prefs).unwrap();
+            f.render(&mut ctx);
+            unsafe {
+                let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+            }
+            // Let icons arrive, then settle the opening animation.
+            for _ in 0..30 {
+                f.tick(1.0 / 60.0);
+                f.render(&mut ctx);
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            let n = 150;
+            let t = Instant::now();
+            let mut work = 0.0;
+            for k in 0..n {
+                f.on_wheel(500.0, if k % 50 < 25 { -120 } else { 120 });
+                f.tick(1.0 / 165.0);
+                let t0 = Instant::now();
+                f.render(&mut ctx);
+                work += t0.elapsed().as_secs_f64() * 1000.0;
+                unsafe {
+                    let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+                }
+            }
+            println!("{view:?}: {:.0} fps on screen, render {:.2} ms", n as f64 / t.elapsed().as_secs_f64(), work / n as f64);
+
+            // Partial frames must leave exactly what a full repaint would.
+            f.on_wheel(500.0, -360);
+            let mut partial = 0;
+            for _ in 0..40 {
+                if f.tick(1.0 / 165.0) {
+                    partial += f.part.is_some() as u32;
+                    f.render(&mut ctx);
+                }
+            }
+            let after_partial = f.canvas.pixels();
+            f.dirty = true;
+            f.render(&mut ctx);
+            let full = f.canvas.pixels();
+            f.render(&mut ctx);
+            let stable = f.canvas.pixels() == full;
+            let differing = after_partial.chunks(4).zip(full.chunks(4)).filter(|(a, b)| a != b).count();
+            println!("  {partial} partial frames; pixels differing from a full repaint: {differing} (full repaint deterministic: {stable})");
+            // Antialiasing on curves may shift a level or two; nothing may be stale.
+            let worst = after_partial.iter().zip(&full).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+            println!("  largest difference: {worst} / 255");
+            assert!(partial > 0);
+            if stable {
+                assert!(worst <= 2);
+            }
+        }
+    }
 }

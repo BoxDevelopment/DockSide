@@ -3,10 +3,12 @@
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 
+use crate::anim::Glide;
 use crate::geom::{Color, Rect};
 use crate::gfx::{Align, Gfx, Weight};
-use crate::surface::Surface;
+use crate::surface::{Fading, Surface};
 use crate::theme::Theme;
 use crate::win::apps::AppWindow;
 use crate::win::system::Shortcut;
@@ -185,6 +187,17 @@ pub struct PopupMenu {
     body: Rect,
     hovered: Option<usize>,
     mac: bool,
+    /// The selection highlight, gliding between items.
+    glide: Glide,
+    /// Item icons (tray icons), made once rather than every frame.
+    icons: Vec<Option<ID2D1Bitmap>>,
+}
+
+/// Menus open instantly; once closed they fade out (see the App's frame loop).
+impl Fading for PopupMenu {
+    fn surface_mut(&mut self) -> &mut Surface {
+        &mut self.surface
+    }
 }
 
 impl PopupMenu {
@@ -243,22 +256,68 @@ impl PopupMenu {
             cy += h;
         }
 
-        Ok(Self { surface, source, entries, rects, body, hovered: None, mac })
+        Ok(Self { surface, source, entries, rects, body, hovered: None, mac, glide: Glide::default(), icons: Vec::new() })
+    }
+
+    /// Advances the highlight; returns true while it's moving (redraw then).
+    pub fn tick(&mut self, dt: f32) -> bool {
+        self.glide.tick(dt)
+    }
+
+    pub fn animating(&self) -> bool {
+        self.glide.moving()
     }
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme) {
         let font = gfx.format(&theme.font, FONT_SIZE, Weight::Regular, Align::Leading);
         let font_right = gfx.format(&theme.font, FONT_SIZE, Weight::Regular, Align::Trailing);
         let has_backdrop = self.surface.backdrop.is_some();
-        let (body, entries, rects, hovered, mac) = (self.body, &self.entries, &self.rects, self.hovered, self.mac);
+        if self.icons.is_empty() {
+            let rt = self.surface.canvas.target().clone();
+            self.icons = self
+                .entries
+                .iter()
+                .map(|e| match e {
+                    Entry::Item(MenuItem { icon: Some(px), .. }) => px.to_bitmap(&rt),
+                    _ => None,
+                })
+                .collect();
+        }
+        let target = self.hovered.map(|i| self.rects[i].inset(5.0, 0.0));
+        let glide = self.glide.update(target);
+        let (body, entries, rects, mac, icons) = (self.body, &self.entries, &self.rects, self.mac, &self.icons);
+
+        // One item, in its plain colours or (`lit`) white for under the highlight.
+        let draw_item = |p: &crate::gfx::Painter, i: usize, lit: bool| {
+            let (Entry::Item(item), r) = (&entries[i], rects[i]) else { return };
+            let enabled = item.action.is_some();
+            let color = if lit {
+                Color::WHITE
+            } else if enabled {
+                theme.text
+            } else {
+                theme.text_disabled
+            };
+            if item.checked {
+                p.text("✓", &font, Rect::new(r.x + 8.0, r.y, 14.0, r.h), color);
+            }
+            let mut lx = r.x + 22.0;
+            if item.icon.is_some() {
+                if let Some(b) = &icons[i] {
+                    p.bitmap(b, Rect::new(lx, r.cy() - ICON / 2.0, ICON, ICON), 1.0);
+                }
+                lx += ICON + 6.0;
+            }
+            p.text(&item.label, &font, Rect::new(lx, r.y, r.right() - 18.0 - lx, r.h), color);
+            if let Some(sc) = &item.shortcut {
+                let c = if lit { Color::WHITE } else { theme.text_secondary };
+                p.text(&sc.label(mac), &font_right, Rect::new(r.x, r.y, r.w - 16.0, r.h), c);
+            }
+        };
 
         let r = self.surface.render(gfx, |p| {
             // Soft drop shadow, layered rounded rects.
-            for i in 0..10 {
-                let grow = i as f32 * 1.6;
-                let a = 0.022 * (10 - i) as f32 / 10.0;
-                p.fill_round(body.inset(-grow, -grow).offset(0.0, 4.0), RADIUS + grow, theme.shadow.alpha(a));
-            }
+            p.soft_shadow(body, RADIUS, 10, 1.6, 0.022, 4.0, theme.shadow);
             // Keep the shadow from darkening the blurred backdrop under the body.
             p.clear_rect(body.inset(2.0, 2.0));
             p.fill_round(body, RADIUS, if has_backdrop { theme.menu_tint.alpha(0.35) } else { theme.menu_tint.alpha(1.0) });
@@ -270,36 +329,22 @@ impl PopupMenu {
                         let y = r.cy();
                         p.line(r.x + 10.0, y, r.right() - 10.0, y, theme.menu_separator, 1.0);
                     }
-                    Entry::Item(item) => {
-                        let enabled = item.action.is_some();
-                        let selected = hovered == Some(i) && enabled;
-                        if selected {
-                            p.fill_round(r.inset(5.0, 0.0), 4.0, theme.accent);
-                        }
-                        let color = if selected {
-                            Color::WHITE
-                        } else if enabled {
-                            theme.text
-                        } else {
-                            theme.text_disabled
-                        };
-                        if item.checked {
-                            p.text("✓", &font, Rect::new(r.x + 8.0, r.y, 14.0, r.h), color);
-                        }
-                        let mut lx = r.x + 22.0;
-                        if let Some(px) = &item.icon {
-                            if let Some(b) = px.to_bitmap(p.rt) {
-                                p.bitmap(&b, Rect::new(lx, r.cy() - ICON / 2.0, ICON, ICON), 1.0);
-                            }
-                            lx += ICON + 6.0;
-                        }
-                        p.text(&item.label, &font, Rect::new(lx, r.y, r.right() - 18.0 - lx, r.h), color);
-                        if let Some(sc) = &item.shortcut {
-                            let c = if selected { Color::WHITE } else { theme.text_secondary };
-                            p.text(&sc.label(mac), &font_right, Rect::new(r.x, r.y, r.w - 16.0, r.h), c);
-                        }
-                    }
+                    Entry::Item(_) => draw_item(p, i, false),
                 }
+            }
+            // The highlight glides over the items; whatever it covers is redrawn
+            // white, clipped to it, so text turns exactly where the highlight is.
+            if let Some((g, a)) = glide {
+                p.faded(a, || {
+                    p.fill_round(g, 4.0, theme.accent);
+                    p.clipped(g, || {
+                        for (i, r) in rects.iter().enumerate() {
+                            if r.bottom() > g.y && r.y < g.bottom() {
+                                draw_item(p, i, true);
+                            }
+                        }
+                    });
+                });
             }
         });
         if let Err(e) = r {

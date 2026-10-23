@@ -5,6 +5,7 @@
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::anim::{lerp, Spring};
 use crate::config::Backdrop;
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
@@ -16,11 +17,102 @@ use crate::win::{accent, create_window, glass, system};
 pub const SHADOW: f32 = 30.0;
 pub const RADIUS: f32 = 18.0;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Light {
     Close,
     Minimize,
     Zoom,
+}
+
+/// How an app window is leaving the screen.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Exit {
+    Close,
+    Minimize,
+}
+
+/// Opening starts here (partly faded in) so the window shows up immediately.
+const OPEN_FROM: f32 = 0.35;
+const OPEN: (f32, f32) = (0.18, 1.0);
+
+/// Open, close and minimize for our own app windows, like macOS: the window
+/// fades while scaling about its centre, or shrinks away towards the Dock.
+pub struct WindowAnim {
+    appear: Spring,
+    exit: Option<Exit>,
+    /// Was minimized at the last render: zoom back in when restored.
+    was_iconic: bool,
+}
+
+impl WindowAnim {
+    /// Starts zooming in, for a window about to be shown. It's already visible
+    /// on its first frame and settles in under a fifth of a second.
+    pub fn opening() -> Self {
+        let mut appear = Spring::new(OPEN_FROM, OPEN.0, OPEN.1);
+        appear.set(1.0);
+        Self { appear, exit: None, was_iconic: false }
+    }
+
+    /// Advances; returns true while moving. Minimizes `hwnd` once it has shrunk away.
+    pub fn tick(&mut self, dt: f32, hwnd: HWND) -> bool {
+        let moving = self.appear.step(dt);
+        if self.exit == Some(Exit::Minimize) && self.appear.value <= 0.02 {
+            self.exit = None;
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_MINIMIZE);
+            }
+            return false;
+        }
+        moving
+    }
+
+    pub fn moving(&self) -> bool {
+        !self.appear.settled()
+    }
+
+    pub fn close(&mut self) {
+        self.exit = Some(Exit::Close);
+        self.appear = self.appear.with(0.14, 1.0);
+        self.appear.set(0.0);
+    }
+
+    pub fn minimize(&mut self) {
+        self.exit = Some(Exit::Minimize);
+        self.appear = self.appear.with(0.2, 1.0);
+        self.appear.set(0.0);
+    }
+
+    /// Faded all the way out after [`Self::close`]: the window can go.
+    pub fn closed(&self) -> bool {
+        self.exit == Some(Exit::Close) && self.appear.value <= 0.02
+    }
+
+    /// Call before drawing: false while `hwnd` is minimized (nothing to draw),
+    /// and after a restore the window zooms back up.
+    pub fn begin_render(&mut self, hwnd: HWND) -> bool {
+        if unsafe { IsIconic(hwnd).as_bool() } {
+            self.was_iconic = true;
+            return false;
+        }
+        if std::mem::take(&mut self.was_iconic) && self.exit.is_none() {
+            self.appear = self.appear.with(OPEN.0, OPEN.1);
+            self.appear.snap(OPEN_FROM);
+            self.appear.set(1.0);
+        }
+        true
+    }
+
+    /// Zoom origin (points), scale and opacity for a window whose body is `body`.
+    pub fn transform(&self, body: Rect) -> (f32, f32, f32, f32) {
+        let a = self.appear.value;
+        let alpha = a.clamp(0.0, 1.0);
+        match self.exit {
+            // Down into its bottom edge, towards the Dock.
+            Some(Exit::Minimize) => (body.cx(), body.bottom(), lerp(0.3, 1.0, a), alpha),
+            Some(Exit::Close) => (body.cx(), body.cy(), lerp(0.97, 1.0, a), alpha),
+            None => (body.cx(), body.cy(), lerp(0.96, 1.0, a), alpha),
+        }
+    }
 }
 
 pub struct Palette {
@@ -49,11 +141,7 @@ impl Palette {
 
 /// The soft drop shadow under a window body.
 pub fn shadow(p: &Painter, body: Rect, theme: &Theme) {
-    for i in 0..14 {
-        let grow = i as f32 * 1.8;
-        let a = 0.035 * (14 - i) as f32 / 14.0;
-        p.fill_round(body.inset(-grow, -grow).offset(0.0, 8.0), RADIUS + grow, theme.shadow.alpha(a));
-    }
+    p.soft_shadow(body, RADIUS, 14, 1.8, 0.035, 8.0, theme.shadow);
 }
 
 /// Shadow, body, sidebar split and hairline border.
@@ -85,11 +173,7 @@ pub fn sidebar_pane(body: Rect, sidebar_w: f32) -> Rect {
 /// Shadow and body with a see-through floating sidebar pane (macOS Tahoe):
 /// the window background runs edge to edge and the pane is cut out of it.
 pub fn window_floating(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette) {
-    for i in 0..14 {
-        let grow = i as f32 * 1.8;
-        let a = 0.035 * (14 - i) as f32 / 14.0;
-        p.fill_round(body.inset(-grow, -grow).offset(0.0, 8.0), RADIUS + grow, theme.shadow.alpha(a));
-    }
+    shadow(p, body, theme);
     p.clear_rect(body.inset(4.0, 4.0));
     p.fill_round(body, RADIUS, pal.content);
     let pane = sidebar_pane(body, sidebar_w);
@@ -98,11 +182,11 @@ pub fn window_floating(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, p
     p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
 }
 
-/// Draws close / minimize / zoom at the body's top-left. Glyphs appear while
-/// the pointer is over the group, like macOS. Returns hit rects.
-pub fn traffic_lights(p: &Painter, body: Rect, hovered: bool, zoom_enabled: bool) -> Vec<(Rect, Light)> {
+/// Draws close / minimize / zoom at the body's top-left. Glyphs fade in while
+/// the pointer is over the group (`hover`, 0..1), like macOS. Returns hit rects.
+pub fn traffic_lights(p: &Painter, body: Rect, hover: f32, zoom_enabled: bool) -> Vec<(Rect, Light)> {
     let mut hits = Vec::new();
-    let glyph = Color::gray(0, 0.55);
+    let glyph = Color::gray(0, 0.55 * hover);
     for (i, light) in [Light::Close, Light::Minimize, Light::Zoom].into_iter().enumerate() {
         let (cx, cy) = (body.x + 20.0 + i as f32 * 20.0, body.y + 20.0);
         let enabled = light != Light::Zoom || zoom_enabled;
@@ -117,7 +201,7 @@ pub fn traffic_lights(p: &Painter, body: Rect, hovered: bool, zoom_enabled: bool
         if !enabled {
             continue;
         }
-        if hovered {
+        if hover > 0.01 {
             match light {
                 Light::Close => {
                     p.line(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, glyph, 1.1);
@@ -145,6 +229,7 @@ pub struct SidebarBackdrop {
     kind: Backdrop,
     /// Last applied screen rect + radius, to skip redundant updates.
     placed: Option<[i32; 5]>,
+    opacity: f32,
 }
 
 impl SidebarBackdrop {
@@ -183,7 +268,7 @@ impl SidebarBackdrop {
                     // The pane shows through the owner, so the owner mustn't be captured either.
                     glass::exclude_from_capture(owner, true);
                 }
-                Some(Self { hwnd, owner, composition, tint, kind, placed: None })
+                Some(Self { hwnd, owner, composition, tint, kind, placed: None, opacity: 1.0 })
             }
             Err(e) => {
                 log!("sidebar backdrop unavailable: {e}");
@@ -192,6 +277,14 @@ impl SidebarBackdrop {
                 }
                 None
             }
+        }
+    }
+
+    /// Fades the backdrop along with its window.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        if (opacity - self.opacity).abs() > 0.002 {
+            self.opacity = opacity;
+            self.composition.set_opacity(opacity);
         }
     }
 

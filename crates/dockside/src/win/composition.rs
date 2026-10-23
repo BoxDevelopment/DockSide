@@ -140,6 +140,7 @@ impl Glass {
 
 pub struct CompositionBackdrop {
     _target: DesktopWindowTarget,
+    root: ContainerVisual,
     shape: ContainerVisual,
     geometry: CompositionRoundedRectangleGeometry,
     tint: CompositionColorBrush,
@@ -215,7 +216,7 @@ impl CompositionBackdrop {
         };
         root.Children()?.InsertAtTop(&shape)?;
 
-        Ok(Self { _target: target, shape, geometry, tint: tint_brush, glass, refraction, _layers: (blur, tint_layer) })
+        Ok(Self { _target: target, root, shape, geometry, tint: tint_brush, glass, refraction, _layers: (blur, tint_layer) })
     }
 
     /// Position, size and corner radius in window-local physical pixels.
@@ -238,6 +239,11 @@ impl CompositionBackdrop {
         if let Some((pane, _)) = &self.refraction {
             pane.set_shape(size.X, size.Y, r);
         }
+    }
+
+    /// Fades the whole backdrop (blur, tint and glass) to `opacity`.
+    pub fn set_opacity(&self, opacity: f32) {
+        let _ = self.root.SetOpacity(opacity.clamp(0.0, 1.0));
     }
 
     pub fn set_tint(&self, tint: Color) {

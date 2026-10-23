@@ -13,6 +13,12 @@ impl Rect {
     pub const fn new(x: f32, y: f32, w: f32, h: f32) -> Self {
         Self { x, y, w, h }
     }
+
+    /// The smallest rect covering both.
+    pub fn union(self, o: Rect) -> Rect {
+        let (x, y) = (self.x.min(o.x), self.y.min(o.y));
+        Rect::new(x, y, (self.x + self.w).max(o.x + o.w) - x, (self.y + self.h).max(o.y + o.h) - y)
+    }
     pub fn right(&self) -> f32 {
         self.x + self.w
     }
@@ -76,6 +82,18 @@ impl Color {
 
     pub fn alpha(self, a: f32) -> Self {
         Self { a, ..self }
+    }
+
+    /// Blends towards `other` by `t` (0..1), in premultiplied space so a
+    /// transparent end doesn't drag the colour through grey.
+    pub fn mix(self, other: Color, t: f32) -> Self {
+        let t = t.clamp(0.0, 1.0);
+        let a = self.a + (other.a - self.a) * t;
+        if a <= 0.0 {
+            return Color::TRANSPARENT;
+        }
+        let ch = |x: f32, y: f32| (x * self.a + (y * other.a - x * self.a) * t) / a;
+        Self { r: ch(self.r, other.r), g: ch(self.g, other.g), b: ch(self.b, other.b), a }
     }
 
     pub fn d2d(self) -> D2D1_COLOR_F {

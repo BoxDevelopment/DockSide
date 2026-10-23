@@ -35,6 +35,13 @@ pub struct Surface {
     shown: bool,
     hidden: bool,
     shadow: Option<Shadow>,
+    /// Whole-surface fade (0..1), for appearing and disappearing.
+    opacity: f32,
+}
+
+/// Something built on a [`Surface`] that can fade away after it's closed.
+pub trait Fading {
+    fn surface_mut(&mut self) -> &mut Surface;
 }
 
 /// Room around a shadowed shape for the shadow to fall into, in points.
@@ -125,7 +132,7 @@ impl Surface {
             glass::exclude_from_capture(content, true);
         }
         let canvas = Canvas::new(gfx, w, h, scale)?;
-        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None })
+        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0 })
     }
 
     /// Casts a soft drop shadow under the backdrop shape. `strength` is the
@@ -154,7 +161,7 @@ impl Surface {
 
     /// Redraws the shadow if its shape changed since it was last drawn.
     fn update_shadow(&mut self, gfx: &Gfx) {
-        let (s, bottom) = (self.scale, self.rect.bottom);
+        let (s, bottom, opacity) = (self.scale, self.rect.bottom, self.opacity);
         let Some(sh) = &mut self.shadow else { return };
         let Some(key) = sh.want.filter(|k| sh.drawn != Some(*k)) else { return };
         sh.drawn = Some(key);
@@ -176,7 +183,7 @@ impl Surface {
                 }
             })
         });
-        if let Err(e) = r.and_then(|_| sh.canvas.present(sh.hwnd, left, top)) {
+        if let Err(e) = r.and_then(|_| sh.canvas.present_alpha(sh.hwnd, left, top, opacity)) {
             log!("shadow render failed: {e}");
         }
     }
@@ -299,14 +306,70 @@ impl Surface {
     }
 
     pub fn render(&mut self, gfx: &Gfx, f: impl FnOnce(&Painter)) -> Result<()> {
-        self.canvas.draw(gfx, f)?;
-        self.canvas.present(self.content, self.rect.left, self.rect.top)?;
+        self.render_part(gfx, None, f)
+    }
+
+    /// Like [`Self::render`], repainting only `part` (points) when given: for
+    /// when just one area is animating. See [`Canvas::draw_part`].
+    pub fn render_part(&mut self, gfx: &Gfx, part: Option<Rect>, f: impl FnOnce(&Painter)) -> Result<()> {
+        let part = part.filter(|_| self.shown).and_then(|r| self.canvas.part_px(r));
+        self.canvas.draw_part(gfx, part, f)?;
+        self.canvas.present_part(self.content, self.rect.left, self.rect.top, self.opacity, part)?;
         self.update_shadow(gfx);
         if !self.shown && !self.hidden {
             self.shown = true;
             self.show_windows(true);
         }
         Ok(())
+    }
+
+    pub fn opacity(&self) -> f32 {
+        self.opacity
+    }
+
+    /// Fades the content, backdrop and shadow together, without redrawing.
+    pub fn set_opacity(&mut self, opacity: f32) {
+        let opacity = opacity.clamp(0.0, 1.0);
+        // Skip imperceptible steps, but always land exactly on the ends.
+        let end = opacity == 0.0 || opacity == 1.0;
+        if opacity == self.opacity || (!end && (opacity - self.opacity).abs() < 0.002) {
+            return;
+        }
+        self.opacity = opacity;
+        if let Some(c) = &self.composition {
+            c.set_opacity(opacity);
+        }
+        if !self.shown {
+            // Applied by the first render.
+            return;
+        }
+        crate::gfx::set_window_alpha(self.content, opacity);
+        if let Some(sh) = self.shadow.as_ref().filter(|sh| sh.drawn.is_some()) {
+            crate::gfx::set_window_alpha(sh.hwnd, opacity);
+        }
+        if !self.hidden {
+            self.show_accent_backdrop();
+        }
+    }
+
+    /// A DWM accent backdrop can't fade, so it shows only while the surface is mostly opaque.
+    fn show_accent_backdrop(&self) {
+        let Some(bd) = self.backdrop.filter(|_| self.composition.is_none()) else { return };
+        let show = self.opacity > 0.4;
+        unsafe {
+            if IsWindowVisible(bd).as_bool() != show {
+                let _ = ShowWindow(bd, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
+            }
+        }
+    }
+
+    /// Lets clicks fall through to whatever is underneath (a closing surface
+    /// that's still fading out mustn't swallow them).
+    pub fn set_click_through(&self) {
+        unsafe {
+            let ex = GetWindowLongW(self.content, GWL_EXSTYLE);
+            SetWindowLongW(self.content, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as i32);
+        }
     }
 
     /// Hide for fullscreen apps; `false` brings the surface back.
@@ -337,7 +400,8 @@ impl Surface {
                 let _ = ShowWindow(sh.hwnd, cmd);
             }
             if let Some(bd) = self.backdrop {
-                let _ = ShowWindow(bd, cmd);
+                let faded_out = self.composition.is_none() && self.opacity <= 0.4;
+                let _ = ShowWindow(bd, if faded_out { SW_HIDE } else { cmd });
             }
             let _ = ShowWindow(self.content, cmd);
         }

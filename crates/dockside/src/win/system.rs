@@ -54,6 +54,15 @@ pub fn transparency_enabled() -> bool {
     personalize_dword(w!("EnableTransparency")) != Some(0)
 }
 
+/// Settings > Accessibility > Visual effects > "Animation effects".
+pub fn animations_enabled() -> bool {
+    let mut on = windows::Win32::Foundation::BOOL(1);
+    let ok = unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut _ as *mut c_void), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
+    };
+    ok.is_err() || on.as_bool()
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Battery {
     pub percent: u8,

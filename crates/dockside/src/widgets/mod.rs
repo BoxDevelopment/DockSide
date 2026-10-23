@@ -24,6 +24,7 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::anim::{approach, Motion, Spring};
 use crate::config::{Backdrop, Config, WidgetItem, WidgetKind, WidgetSize, WidgetsCfg};
 use crate::finder::text::{KeyResult, TextField};
 use crate::geom::{Color, Rect};
@@ -159,7 +160,7 @@ fn free_spot(items: &[WidgetItem], size: WidgetSize, area: Rect) -> (f32, f32) {
     (area.x, area.y)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Hit {
     Note,
     Reminder(usize),
@@ -233,6 +234,9 @@ struct Widget {
     tracking: bool,
     edit: Option<Edit>,
     art: Option<(u64, ID2D1Bitmap)>,
+    /// Fades in when added; hover and checkmark springs.
+    appear: Spring,
+    motion: Motion<views::Anim>,
 }
 
 impl Widget {
@@ -362,6 +366,8 @@ pub struct Widgets {
     hwnd: isize,
     msg_data: u32,
     msg_media: u32,
+    /// Removed (or replaced, when resized) widgets fading out.
+    leaving: Vec<Surface>,
 }
 
 const VK_TAB: u16 = 0x09;
@@ -402,6 +408,7 @@ impl Widgets {
             hwnd,
             msg_data,
             msg_media,
+            leaving: Vec::new(),
         };
         for item in cfg.widgets.items.clone() {
             w.add_widget(gfx, theme, item);
@@ -439,7 +446,21 @@ impl Widgets {
             }
         }
         place_on_desktop(surface.root());
-        self.widgets.push(Widget { item, surface, dirty: true, hits: Vec::new(), hover: None, tracking: false, edit: None, art: None });
+        surface.set_opacity(0.0);
+        let mut appear = Spring::new(0.0, 0.24, 1.0);
+        appear.set(1.0);
+        self.widgets.push(Widget {
+            item,
+            surface,
+            dirty: true,
+            hits: Vec::new(),
+            hover: None,
+            tracking: false,
+            edit: None,
+            art: None,
+            appear,
+            motion: Motion::default(),
+        });
     }
 
     fn has(&self, kind: WidgetKind) -> bool {
@@ -483,9 +504,12 @@ impl Widgets {
                 None => self.add_widget(gfx, theme, item.clone()),
             }
         }
-        // Whatever's left in `old` was removed; dropping it closes the windows.
+        // Whatever's left in `old` was removed: it fades away, then its windows close.
         self.store.save_if_dirty();
-        drop(old);
+        for w in old {
+            w.surface.set_click_through();
+            self.leaving.push(w.surface);
+        }
         self.restart_sources();
     }
 
@@ -612,6 +636,33 @@ impl Widgets {
         self.store.save_if_dirty();
     }
 
+    // --- animation ---------------------------------------------------------
+
+    /// Advances fades and springs; returns true while anything moves.
+    pub fn animate(&mut self, dt: f32) -> bool {
+        let mut moving = false;
+        for w in &mut self.widgets {
+            if w.appear.step(dt) {
+                w.surface.set_opacity(w.appear.value);
+                moving = true;
+            }
+            if w.motion.tick(dt) {
+                w.dirty = true;
+                moving = true;
+            }
+        }
+        self.leaving.retain_mut(|s| {
+            let o = approach(s.opacity(), 0.0, dt, 20.0);
+            s.set_opacity(o);
+            o > 0.0
+        });
+        moving || !self.leaving.is_empty()
+    }
+
+    pub fn animating(&self) -> bool {
+        !self.leaving.is_empty() || self.widgets.iter().any(|w| !w.appear.settled() || w.motion.moving())
+    }
+
     // --- drawing -----------------------------------------------------------
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme) {
@@ -631,6 +682,7 @@ impl Widgets {
             }
             let body = w.body();
             let mut hits = Vec::new();
+            w.motion.sweep();
             let ctx = views::Ctx {
                 theme,
                 data,
@@ -639,6 +691,7 @@ impl Widgets {
                 edit: w.edit.as_ref(),
                 art: w.art.as_ref().map(|(_, b)| b),
                 hover: w.hover,
+                motion: Some(&w.motion),
             };
             let result = w.surface.render(gfx, |p| paint(p, body, &ctx, solid, &mut hits));
             if let Err(e) = result {
@@ -1131,7 +1184,7 @@ mod tests {
                 let (w, h) = dims(size);
                 let (cw, ch) = ((w + 2.0 * SHADOW) as i32, (h + 2.0 * SHADOW) as i32);
                 let mut canvas = Canvas::new(&gfx, cw, ch, 1.0).unwrap();
-                let ctx = views::Ctx { theme: &theme, data: &data, store: &store, item: &item, edit: None, art: None, hover: None };
+                let ctx = views::Ctx { theme: &theme, data: &data, store: &store, item: &item, edit: None, art: None, hover: None, motion: None };
                 let mut hits = Vec::new();
                 // Solid cards: there's no blurred backdrop window here.
                 canvas.draw(&gfx, |p| paint(p, Rect::new(SHADOW, SHADOW, w, h), &ctx, true, &mut hits)).unwrap();

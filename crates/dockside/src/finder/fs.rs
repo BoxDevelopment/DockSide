@@ -52,7 +52,7 @@ pub fn list(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
     Ok(out)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SortKey {
     Name,

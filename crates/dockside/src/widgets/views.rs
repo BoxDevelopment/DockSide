@@ -12,6 +12,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use super::sources::{self, WeatherState, Zone};
 use super::store::Store;
 use super::{glyphs, Data, Edit, Hit, RADIUS};
+use crate::anim::{lerp, Motion};
 use crate::config::{WidgetItem, WidgetKind, WidgetSize};
 use crate::geom::{Color, Rect};
 use crate::gfx::{pt, Align, Gfx, Painter, Weight};
@@ -29,6 +30,13 @@ const WHITE: Color = Color::WHITE;
 /// final line break lands on the new (empty) line.
 const ZWSP: char = '\u{200B}';
 
+/// A widget's springs: hover highlights and reminder checkmarks.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Anim {
+    Hover(Hit),
+    Done(usize),
+}
+
 pub struct Ctx<'a> {
     pub theme: &'a Theme,
     pub data: &'a Data,
@@ -37,9 +45,21 @@ pub struct Ctx<'a> {
     pub edit: Option<&'a Edit>,
     pub art: Option<&'a ID2D1Bitmap>,
     pub hover: Option<Hit>,
+    /// Without springs (gallery renders), everything shows its end state.
+    pub motion: Option<&'a Motion<Anim>>,
 }
 
 impl Ctx<'_> {
+    /// 0..1 hover highlight for `hit`.
+    fn hot(&self, hit: Hit) -> f32 {
+        let on = self.hover == Some(hit);
+        self.motion.map_or(if on { 1.0 } else { 0.0 }, |m| m.fade(Anim::Hover(hit), on))
+    }
+
+    fn anim(&self, key: Anim, target: f32, feel: (f32, f32)) -> f32 {
+        self.motion.map_or(target, |m| m.get(key, target, feel))
+    }
+
     fn red(&self) -> Color {
         if self.theme.dark { Color::rgba(255, 69, 58, 1.0) } else { Color::rgba(255, 59, 48, 1.0) }
     }
@@ -680,12 +700,16 @@ fn reminders(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
     for (i, rem) in c.store.reminders.iter().enumerate().take(rows) {
         let row = Rect::new(x, y, r.w - 2.0 * PAD, REMINDER_ROW);
         let (cx, cy) = (x + 8.0, row.cy());
-        let hot = c.hover == Some(Hit::Reminder(i));
-        if rem.done {
-            p.fill_circle(cx, cy, 8.0, c.theme.accent);
-            p.fill_circle(cx, cy, 3.5, WHITE);
-        } else {
-            p.stroke_circle(cx, cy, 7.5, if hot { c.theme.accent } else { c.theme.text_secondary }, 1.5);
+        let hot = c.hot(Hit::Reminder(i));
+        // Checking one off pops the fill in; unchecking shrinks it away.
+        let done = c.anim(Anim::Done(i), if rem.done { 1.0 } else { 0.0 }, (0.22, 0.8)).max(0.0);
+        if done < 0.999 {
+            let ring = c.theme.text_secondary.mix(c.theme.accent, hot);
+            p.stroke_circle(cx, cy, 7.5, ring.alpha(ring.a * (1.0 - done.min(1.0))), 1.5);
+        }
+        if done > 0.01 {
+            p.fill_circle(cx, cy, 8.0 * done, c.theme.accent);
+            p.fill_circle(cx, cy, 3.5 * done, WHITE);
         }
         hits.push((Rect::new(x - 4.0, row.y, 26.0, row.h), Hit::Reminder(i)));
         let ink = if rem.done { c.theme.text_secondary } else { c.theme.text };
@@ -726,8 +750,7 @@ fn reminders(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
             });
         }
         None => {
-            let hot = c.hover == Some(Hit::NewReminder);
-            let ink = if hot { c.theme.accent } else { c.theme.text_secondary };
+            let ink = c.theme.text_secondary.mix(c.theme.accent, c.hot(Hit::NewReminder));
             glyphs::plus(p, x + 8.0, row.cy(), 9.0, ink);
             text(p, c, "New Reminder", 13.0, Weight::Regular, Align::Leading, Rect::new(x + 24.0, row.y, row.w - 24.0, row.h), ink);
         }
@@ -746,10 +769,11 @@ fn clock_text(secs: f32) -> String {
 fn controls(p: &Painter, c: &Ctx, cx: f32, cy: f32, gap: f32, s: f32, playing: bool, hits: &mut Vec<(Rect, Hit)>) {
     for (dx, hit) in [(-gap, Hit::Prev), (0.0, Hit::Play), (gap, Hit::Next)] {
         let x = cx + dx;
-        let hot = c.hover == Some(hit);
+        let hot = c.hot(hit);
         let r = Rect::new(x - gap / 2.0, cy - s, gap, 2.0 * s);
-        if hot {
-            p.fill_circle(x, cy, s * 0.95, c.faint());
+        if hot > 0.0 {
+            let f = c.faint();
+            p.fill_circle(x, cy, s * lerp(0.8, 0.95, hot), f.alpha(f.a * hot));
         }
         match hit {
             Hit::Prev => ig::skip(p, x, cy, s * 0.62, c.theme.text, true),

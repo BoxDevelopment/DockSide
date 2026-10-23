@@ -19,13 +19,14 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetForegroundWindow};
 
 use self::index::{Index, Item, Kind};
+use crate::anim::Glide;
 use crate::chrome::SHADOW;
 use crate::config::Config;
 use crate::finder::loader::IconLoader;
 use crate::geom::{Color, Rect};
 use crate::gfx::{Align, Gfx, Painter, Weight};
 use crate::menu::Action;
-use crate::surface::Surface;
+use crate::surface::{Fading, Surface};
 use crate::theme::Theme;
 use crate::win::Monitor;
 
@@ -107,8 +108,17 @@ pub struct Spotlight {
     /// Where the cursor last was, in screen pixels. Windows sends mouse moves
     /// when results appear under a still cursor; only real moves pick a row.
     cursor: POINT,
+    /// The selection, gliding from row to row as the pointer or arrow keys move it.
+    glide: Glide,
     pub tracking: bool,
     pub dirty: bool,
+}
+
+/// Spotlight opens instantly (you're already typing); once closed it fades out.
+impl Fading for Spotlight {
+    fn surface_mut(&mut self) -> &mut Surface {
+        &mut self.surface
+    }
 }
 
 fn cursor_pos() -> POINT {
@@ -206,6 +216,7 @@ impl Spotlight {
             web: cfg.spotlight.clone(),
             low_power,
             cursor: cursor_pos(),
+            glide: Glide::default(),
             tracking: false,
             dirty: true,
         })
@@ -236,8 +247,21 @@ impl Spotlight {
     }
 
     /// Recomputes results for the current text.
+    /// Advances the selection glide; returns true while it's moving.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        let moving = self.glide.tick(dt);
+        self.dirty |= moving;
+        moving
+    }
+
+    pub fn animating(&self) -> bool {
+        self.glide.moving()
+    }
+
     pub fn search(&mut self, index: &Index) {
         self.dirty = true;
+        // New results: the selection appears on its row rather than sliding there.
+        self.glide.reset();
         self.selected = 0;
         self.rows.clear();
         let raw = self.query();
@@ -524,17 +548,32 @@ impl Spotlight {
         let (a, b) = self.range();
         let (sel_x0, sel_x1, caret_x) = (prefix_w(a), prefix_w(b), prefix_w(self.caret));
 
-        let (rows, selected) = (&self.rows, self.selected);
+        // Where each row (and any section header above it) sits.
+        let mut layout: Vec<(usize, Rect, bool)> = Vec::new();
+        let mut y = body.y + SEARCH_H + 8.0;
+        let mut last = "";
+        for (i, row) in self.rows.iter().enumerate() {
+            if y + ROW_H > body.bottom() {
+                break;
+            }
+            let header = row.section != last;
+            if header {
+                last = row.section;
+                y += HEADER_H;
+            }
+            layout.push((i, Rect::new(body.x + 8.0, y, W - 16.0, ROW_H), header));
+            y += ROW_H;
+        }
+        let target = layout.iter().find(|(i, ..)| *i == self.selected).map(|(_, r, _)| *r);
+        let glide = self.glide.update(target);
+
+        let rows = &self.rows;
         let bitmaps = &mut self.bitmaps;
         let mut hits = Vec::new();
 
         let r = self.surface.render(gfx, |p: &Painter| {
             // Shadow, then the tinted body over the blurred backdrop.
-            for i in 0..12 {
-                let grow = i as f32 * 2.0;
-                let alpha = 0.03 * (12 - i) as f32 / 12.0;
-                p.fill_round(body.inset(-grow, -grow).offset(0.0, 6.0), RADIUS + grow, theme.shadow.alpha(alpha));
-            }
+            p.soft_shadow(body, RADIUS, 12, 2.0, 0.03, 6.0, theme.shadow);
             p.clear_rect(body.inset(3.0, 3.0));
             p.fill_round(body, RADIUS, if has_backdrop { theme.menu_tint.alpha(0.3) } else { theme.menu_tint.alpha(1.0) });
             p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
@@ -560,23 +599,9 @@ impl Spotlight {
             }
             p.line(body.x, body.y + SEARCH_H, body.right(), body.y + SEARCH_H, theme.menu_separator, 1.0);
 
-            // Results.
-            let mut y = body.y + SEARCH_H + 8.0;
-            let mut last = "";
-            for (i, row) in rows.iter().enumerate() {
-                if y + ROW_H > body.bottom() {
-                    break;
-                }
-                if row.section != last {
-                    last = row.section;
-                    p.text(row.section, &header_font, Rect::new(body.x + 18.0, y, W - 36.0, HEADER_H), theme.text_secondary);
-                    y += HEADER_H;
-                }
-                let r = Rect::new(body.x + 8.0, y, W - 16.0, ROW_H);
-                let sel = i == selected;
-                if sel {
-                    p.fill_round(r, 7.0, theme.accent);
-                }
+            // Results. Each row draws in its plain colours or (`sel`) for under the highlight.
+            let mut draw_row = |p: &Painter, i: usize, r: Rect, sel: bool| {
+                let row = &rows[i];
                 let tc = if sel { Color::WHITE } else { theme.text };
                 let sc = if sel { Color::gray(255, 0.8) } else { theme.text_secondary };
                 let icon_r = Rect::new(r.x + 10.0, r.cy() - 12.0, 24.0, 24.0);
@@ -631,8 +656,28 @@ impl Spotlight {
                     let sub = Rect::new(icon_r.right() + 12.0 + title_w + 8.0, r.y, r.right() - 12.0 - (icon_r.right() + 20.0 + title_w), r.h);
                     p.text(&row.subtitle, &sub_font, sub, sc);
                 }
+            };
+            for &(i, r, header) in &layout {
+                if header {
+                    let hr = Rect::new(body.x + 18.0, r.y - HEADER_H, W - 36.0, HEADER_H);
+                    p.text(rows[i].section, &header_font, hr, theme.text_secondary);
+                }
+                draw_row(p, i, r, false);
                 hits.push((r, i));
-                y += ROW_H;
+            }
+            // The selection glides between rows; what it covers is redrawn in its
+            // colours, clipped to it, so text turns exactly where the highlight is.
+            if let Some((g, a)) = glide {
+                p.faded(a, || {
+                    p.fill_round(g, 7.0, theme.accent);
+                    p.clipped(g, || {
+                        for &(i, r, _) in &layout {
+                            if r.bottom() > g.y && r.y < g.bottom() {
+                                draw_row(p, i, r, true);
+                            }
+                        }
+                    });
+                });
             }
         });
         self.hits = hits;
@@ -703,6 +748,8 @@ fn command_action(c: commands::Command) -> Option<Action> {
 
 impl Drop for Spotlight {
     fn drop(&mut self) {
-        SPOTLIGHT_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
+        // A panel fading out may outlive the next one to open: only clear our own handle.
+        let me = self.surface.content.0 as isize;
+        let _ = SPOTLIGHT_HWND.compare_exchange(me, 0, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
     }
 }

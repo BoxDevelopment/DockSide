@@ -13,7 +13,8 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::chrome::{self, SHADOW};
+use crate::anim::{feel, lerp, Glide, Motion, Scroll};
+use crate::chrome::{self, WindowAnim, SHADOW};
 use crate::config::{Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandStyle, ShortcutStyle};
 use crate::finder::text::TextField;
 use crate::geom::{Color, Rect};
@@ -34,7 +35,7 @@ const TITLE_H: f32 = 52.0;
 pub(crate) const ROW_H: f32 = 40.0;
 const CONTENT_PAD: f32 = 24.0;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Page {
     General,
     Appearance,
@@ -101,7 +102,7 @@ pub(crate) fn installed_fonts(gfx: &Gfx) -> Vec<String> {
     FONT_CHOICES.iter().filter(|f| gfx.font_exists(f)).map(|f| f.to_string()).collect()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Key {
     StartAtLogin,
     HideTaskbar,
@@ -220,7 +221,7 @@ impl Key {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Hit {
     Close,
     Minimize,
@@ -241,6 +242,24 @@ pub(crate) enum Hit {
     Onboarding,
     RunAsAdmin,
 }
+
+/// Springs behind the controls: hover fades, switch knobs, segment pills.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Anim {
+    Hover(Hit),
+    Knob(Key),
+    SegX(Key),
+    SegW(Key),
+    Swatch(usize),
+    Lights,
+    /// Setup Assistant: progress dots (current, hovered) and footer buttons.
+    Dot(usize),
+    DotHover(usize),
+    Button(usize),
+}
+
+/// Switches flick across quickly, with a touch of give at the end.
+const KNOB_FEEL: (f32, f32) = (0.2, 0.86);
 
 pub(crate) enum Row {
     Toggle(&'static str, Key),
@@ -381,6 +400,20 @@ pub(crate) struct RowCtx<'a> {
     /// Pinned-app icons (Dock page only).
     pub bitmaps: Option<&'a HashMap<String, Option<ID2D1Bitmap>>>,
     pub editing: Option<&'a Editing>,
+    /// The window's springs; without them controls jump straight to their state.
+    pub motion: Option<&'a Motion<Anim>>,
+}
+
+impl RowCtx<'_> {
+    fn anim(&self, key: Anim, target: f32, feel: (f32, f32)) -> f32 {
+        self.motion.map_or(target, |m| m.get(key, target, feel))
+    }
+
+    /// 0..1 hover highlight for `hit`.
+    fn hover_t(&self, hit: Hit) -> f32 {
+        let on = self.hover == Some(hit);
+        self.motion.map_or(if on { 1.0 } else { 0.0 }, |m| m.fade(Anim::Hover(hit), on))
+    }
 }
 
 /// A card holding `rows`, `ROW_H` each, with hairlines between them.
@@ -427,7 +460,8 @@ pub struct SettingsWindow {
     canvas: Canvas,
     scale: f32,
     page: Page,
-    scroll: f32,
+    /// Smooth (eased) scrolling of the page content.
+    scroll: Scroll,
     max_scroll: f32,
     hits: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
@@ -443,6 +477,18 @@ pub struct SettingsWindow {
     admin: bool,
     fonts: Vec<String>,
     shown: bool,
+    /// Open / minimize zoom, the control springs, and the sidebar's hover
+    /// highlight gliding between pages. Page switches themselves are instant.
+    window: WindowAnim,
+    motion: Motion<Anim>,
+    side_glide: Glide,
+    /// The selected page's highlight, gliding to a newly chosen page.
+    sel_glide: Glide,
+    /// Set when only this area is animating (the page scrolling, a sidebar
+    /// highlight gliding): the next frame repaints just that.
+    part: Option<Rect>,
+    /// The region the last frame repainted (device pixels; `None`: all of it).
+    drawn_part: Option<RECT>,
     pub tracking: bool,
     pub dirty: bool,
 }
@@ -466,7 +512,7 @@ impl SettingsWindow {
             canvas: Canvas::new(gfx, w, h, s)?,
             scale: s,
             page,
-            scroll: 0.0,
+            scroll: Scroll::default(),
             max_scroll: 0.0,
             hits: Vec::new(),
             hover: None,
@@ -479,9 +525,61 @@ impl SettingsWindow {
             admin: win::elevation::task_enabled(),
             fonts,
             shown: false,
+            window: WindowAnim::opening(),
+            motion: Motion::default(),
+            side_glide: Glide::default(),
+            sel_glide: Glide::selection(),
+            part: None,
+            drawn_part: None,
             tracking: false,
             dirty: true,
         })
+    }
+
+    /// Advances animations; returns true while frames are still needed.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        // The page scrolling or a sidebar highlight gliding repaints only its own
+        // area; anything else (or a redraw already asked for) repaints it all.
+        let was_dirty = self.dirty;
+        let full = self.window.tick(dt, self.hwnd) | self.motion.tick(dt);
+        let mut part: Option<Rect> = None;
+        if self.scroll.tick(dt) {
+            part = Some(Self::viewport());
+        }
+        if self.side_glide.tick(dt) | self.sel_glide.tick(dt) {
+            let b = Self::body();
+            let side = Rect::new(b.x, b.y, SIDEBAR, b.h);
+            part = Some(part.map_or(side, |p| p.union(side)));
+        }
+        let moving = full || part.is_some();
+        if moving {
+            let pending_full = was_dirty && self.part.is_none();
+            self.part = match (full || pending_full, part, self.part) {
+                (true, ..) => None,
+                (false, Some(p), Some(q)) => Some(p.union(q)),
+                (false, p, q) => p.or(q),
+            };
+            self.dirty = true;
+        }
+        moving
+    }
+
+    /// The scrolling page area.
+    fn viewport() -> Rect {
+        let b = Self::body();
+        Rect::new(b.x + SIDEBAR, b.y + TITLE_H, b.w - SIDEBAR, b.h - TITLE_H)
+    }
+
+    pub fn animating(&self) -> bool {
+        self.window.moving() || self.motion.moving() || self.scroll.moving() || self.side_glide.moving() || self.sel_glide.moving()
+    }
+
+    fn go_to(&mut self, page: Page) {
+        if page != self.page {
+            self.page = page;
+            self.scroll.jump(0.0);
+        }
+        self.dirty = true;
     }
 
     pub fn scale(&self) -> f32 {
@@ -495,23 +593,13 @@ impl SettingsWindow {
 
     pub fn show_page(&mut self, page: Option<Page>) {
         if let Some(p) = page {
-            if p != self.page {
-                self.page = p;
-                self.scroll = 0.0;
-                self.dirty = true;
-            }
+            self.go_to(p);
         }
         unsafe {
             if IsIconic(self.hwnd).as_bool() {
                 let _ = ShowWindow(self.hwnd, SW_RESTORE);
             }
             let _ = SetForegroundWindow(self.hwnd);
-        }
-    }
-
-    pub fn minimize(&self) {
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_MINIMIZE);
         }
     }
 
@@ -1018,11 +1106,13 @@ impl SettingsWindow {
     }
 
     pub fn on_wheel(&mut self, delta: i32) {
-        let s = (self.scroll - delta as f32 / 120.0 * 48.0).clamp(0.0, self.max_scroll);
-        if s != self.scroll {
-            self.scroll = s;
-            self.dirty = true;
+        self.scroll.wheel(delta, 56.0, self.max_scroll);
+        // Only the page moved: unless a whole redraw is already due, repaint just it.
+        if !self.dirty || self.part.is_some() {
+            let vp = Self::viewport();
+            self.part = Some(self.part.map_or(vp, |p| p.union(vp)));
         }
+        self.dirty = true;
     }
 
     pub fn on_down(&mut self, x: f32, y: f32, cfg: &Config) {
@@ -1065,12 +1155,11 @@ impl SettingsWindow {
             }
             Hit::Close => return SettingsEvent::Close,
             Hit::Minimize => {
-                self.minimize();
+                self.window.minimize();
                 return SettingsEvent::None;
             }
             Hit::Page(p) => {
-                self.page = p;
-                self.scroll = 0.0;
+                self.go_to(p);
                 return SettingsEvent::None;
             }
             Hit::Toggle(_) | Hit::Segment(..) | Hit::Swatch(_) => match control_action(hit, &mut self.login, &self.fonts, cfg) {
@@ -1104,6 +1193,10 @@ impl SettingsWindow {
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme, cfg: &Config, icons: &mut IconStore) {
         self.dirty = false;
+        if !self.window.begin_render(self.hwnd) {
+            return;
+        }
+        self.motion.sweep();
         let style = Style::new(gfx, theme);
         let (regular, control_bg) = (&style.regular, style.control_bg);
         let title_font = gfx.format(&theme.font, 15.0, Weight::Bold, Align::Leading);
@@ -1127,7 +1220,7 @@ impl SettingsWindow {
         let body = Self::body();
         let content_x = body.x + SIDEBAR + CONTENT_PAD;
         let content_w = body.w - SIDEBAR - 2.0 * CONTENT_PAD;
-        let viewport = Rect::new(body.x + SIDEBAR, body.y + TITLE_H, body.w - SIDEBAR, body.h - TITLE_H);
+        let viewport = Self::viewport();
 
         // Measure content height for scrolling.
         let content_h: f32 = groups
@@ -1136,7 +1229,12 @@ impl SettingsWindow {
             .sum::<f32>()
             + 8.0;
         self.max_scroll = (content_h - viewport.h).max(0.0);
-        self.scroll = self.scroll.min(self.max_scroll);
+        self.scroll.clamp(self.max_scroll);
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.hwnd, &mut rc);
+        }
+        let (zoom_x, zoom_y, zoom, window_alpha) = self.window.transform(body);
 
         if let Some((key, v)) = self.pending {
             if Self::slider_spec(key, cfg).0.round() == v {
@@ -1145,7 +1243,16 @@ impl SettingsWindow {
         }
 
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
-        let (hover, page, scroll, slider, pending) = (self.hover, self.page, self.scroll, self.slider, self.pending);
+        let motion = &self.motion;
+        let scroll = self.scroll.offset_px(self.scale);
+        let page_row = |k: usize| Rect::new(body.x + 10.0, body.y + TITLE_H + k as f32 * 32.0, SIDEBAR - 20.0, 30.0);
+        let side_target = match self.hover {
+            Some(Hit::Page(pg)) if pg != self.page => PAGES.iter().position(|(p, _)| *p == pg).map(page_row),
+            _ => None,
+        };
+        let side_glide = self.side_glide.update(side_target);
+        let sel_glide = self.sel_glide.update(PAGES.iter().position(|(p, _)| *p == self.page).map(page_row));
+        let (hover, page, slider, pending) = (self.hover, self.page, self.slider, self.pending);
         let page_title = PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("");
         let ctx = RowCtx {
             theme,
@@ -1158,32 +1265,43 @@ impl SettingsWindow {
             fonts: &self.fonts,
             bitmaps: Some(&self.bitmaps),
             editing: self.editing.as_ref(),
+            motion: Some(motion),
         };
 
         let r = {
-            let draw = |p: &Painter| {
+            let draw = |p: &Painter| p.scaled_about(zoom_x, zoom_y, zoom, || {
                 chrome::window(p, body, SIDEBAR, theme, &chrome::Palette::new(theme));
-                let group_hover = matches!(hover, Some(Hit::Close | Hit::Minimize));
+                let group_hover = motion.fade(Anim::Lights, matches!(hover, Some(Hit::Close | Hit::Minimize)));
                 for (r, light) in chrome::traffic_lights(p, body, group_hover, false) {
                     hits.push((r, if light == chrome::Light::Close { Hit::Close } else { Hit::Minimize }));
                 }
 
-                // Sidebar.
-                let mut y = body.y + TITLE_H;
-                for (pg, name) in PAGES {
-                    let row = Rect::new(body.x + 10.0, y, SIDEBAR - 20.0, 30.0);
-                    let selected = pg == page;
-                    if selected {
-                        p.fill_round(row, 6.0, theme.accent);
-                    } else if hover == Some(Hit::Page(pg)) {
-                        p.fill_round(row, 6.0, control_bg);
-                    }
-                    let icon = Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0);
-                    draw_page_icon(p, pg, icon, &glyph_font);
-                    let text_c = if selected { Color::WHITE } else { theme.text };
-                    p.text(name, regular, Rect::new(icon.right() + 8.0, row.y, row.w - 40.0, row.h), text_c);
+                // Sidebar: the hover highlight and the selection both glide from
+                // page to page. Names under the selection are redrawn white, clipped
+                // to it, so they turn exactly where the highlight is.
+                if let Some((g, a)) = side_glide {
+                    p.fill_round(g, 6.0, control_bg.alpha(control_bg.a * a));
+                }
+                let name_rect = |row: Rect| Rect::new(row.x + 34.0, row.y, row.w - 40.0, row.h);
+                for (k, (pg, name)) in PAGES.into_iter().enumerate() {
+                    let row = page_row(k);
+                    draw_page_icon(p, pg, Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0), &glyph_font);
+                    p.text(name, regular, name_rect(row), theme.text);
                     hits.push((row, Hit::Page(pg)));
-                    y += 32.0;
+                }
+                if let Some((g, a)) = sel_glide {
+                    p.faded(a, || {
+                        p.fill_round(g, 6.0, theme.accent);
+                        p.clipped(g, || {
+                            for (k, (pg, name)) in PAGES.into_iter().enumerate() {
+                                let row = page_row(k);
+                                if row.bottom() > g.y && row.y < g.bottom() {
+                                    draw_page_icon(p, pg, Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0), &glyph_font);
+                                    p.text(name, regular, name_rect(row), Color::WHITE);
+                                }
+                            }
+                        });
+                    });
                 }
 
                 // Toolbar title.
@@ -1202,22 +1320,16 @@ impl SettingsWindow {
                         y += card.h + 20.0;
                     }
                 });
-            };
-            self.canvas.draw(gfx, draw)
+            });
+            let part = self.part.take().filter(|_| zoom == 1.0 && window_alpha == 1.0).and_then(|r| self.canvas.part_px(r));
+            self.drawn_part = part;
+            self.canvas.draw_part(gfx, part, draw)
         };
         // Content hits outside the viewport (scrolled away) must not be clickable.
         hits.retain(|(r, h)| matches!(h, Hit::Close | Hit::Minimize | Hit::Page(_)) || (r.y >= viewport.y - 1.0 && r.bottom() <= viewport.bottom() + 1.0));
         self.hits = hits;
 
-        let presented = r.and_then(|_| {
-            if self.shown {
-                self.canvas.present_in_place(self.hwnd)
-            } else {
-                let mut rc = RECT::default();
-                unsafe { GetWindowRect(self.hwnd, &mut rc)? };
-                self.canvas.present(self.hwnd, rc.left, rc.top)
-            }
-        });
+        let presented = r.and_then(|_| self.canvas.present_part(self.hwnd, rc.left, rc.top, window_alpha, self.drawn_part));
         if let Err(e) = presented {
             log!("settings render failed: {e}");
         }
@@ -1233,7 +1345,8 @@ impl SettingsWindow {
 
 impl Drop for SettingsWindow {
     fn drop(&mut self) {
-        SETTINGS_HWND.store(0, Ordering::Relaxed);
+        // A window fading out may outlive the next one to open: only clear our own handle.
+        let _ = SETTINGS_HWND.compare_exchange(self.hwnd.0 as isize, 0, Ordering::Relaxed, Ordering::Relaxed);
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }
@@ -1246,16 +1359,17 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
     let (regular, right, center, button_font) = (&st.regular, &st.right, &st.center, &st.button);
     let (card_border, control_bg, selected_seg, switch_off, field_bg) =
         (st.card_border, st.control_bg, st.selected_seg, st.switch_off, st.field_bg);
-    let (hover, slider, pending, login, fonts, editing) = (ctx.hover, ctx.slider, ctx.pending, ctx.login, ctx.fonts, ctx.editing);
+    let (slider, pending, login, fonts, editing) = (ctx.slider, ctx.pending, ctx.login, ctx.fonts, ctx.editing);
     let label_r = Rect::new(r.x + 14.0, r.y, r.w * 0.5, r.h);
     let right_edge = r.right() - 14.0;
     match row {
         Row::Toggle(label, key) => {
             p.text(label, &regular, Rect::new(label_r.x, r.y, r.w - 80.0, r.h), theme.text);
             let on = SettingsWindow::toggle_on(login, *key, cfg);
+            let t = ctx.anim(Anim::Knob(*key), if on { 1.0 } else { 0.0 }, KNOB_FEEL);
             let track = Rect::new(right_edge - 34.0, r.cy() - 10.0, 34.0, 20.0);
-            p.fill_round(track, 10.0, if on { theme.accent } else { switch_off });
-            let kx = if on { track.right() - 10.0 } else { track.x + 10.0 };
+            p.fill_round(track, 10.0, switch_off.mix(theme.accent, t));
+            let kx = lerp(track.x + 10.0, track.right() - 10.0, t);
             p.fill_circle(kx, r.cy() + 0.5, 8.5, Color::gray(0, 0.12));
             p.fill_circle(kx, r.cy(), 8.5, Color::WHITE);
             hits.push((track.inset(-4.0, -6.0), Hit::Toggle(*key)));
@@ -1267,15 +1381,24 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
             let total: f32 = widths.iter().sum::<f32>() + 4.0;
             let outer = Rect::new(right_edge - total, r.cy() - 12.0, total, 24.0);
             p.fill_round(outer, 7.0, control_bg);
+            let seg_x = |i: usize| outer.x + 2.0 + widths[..i].iter().sum::<f32>();
+            for (i, w) in widths.iter().enumerate() {
+                let t = if sel == Some(i) { 0.0 } else { ctx.hover_t(Hit::Segment(*key, i)) };
+                if t > 0.0 {
+                    p.fill_round(Rect::new(seg_x(i), outer.y + 2.0, *w, 20.0), 5.0, control_bg.alpha(control_bg.a * t));
+                }
+            }
+            // The selected pill slides (and resizes) to the new choice.
+            if let Some(s) = sel {
+                let x = ctx.anim(Anim::SegX(*key), seg_x(s), feel::SLIDE);
+                let w = ctx.anim(Anim::SegW(*key), widths[s], feel::SLIDE);
+                let pill = Rect::new(x, outer.y + 2.0, w, 20.0);
+                p.fill_round(pill.offset(0.0, 0.5), 5.0, Color::gray(0, 0.08));
+                p.fill_round(pill, 5.0, selected_seg);
+            }
             let mut sx = outer.x + 2.0;
             for (i, (l, w)) in labels.iter().zip(&widths).enumerate() {
                 let seg = Rect::new(sx, outer.y + 2.0, *w, 20.0);
-                if sel == Some(i) {
-                    p.fill_round(seg.offset(0.0, 0.5), 5.0, Color::gray(0, 0.08));
-                    p.fill_round(seg, 5.0, selected_seg);
-                } else if hover == Some(Hit::Segment(*key, i)) {
-                    p.fill_round(seg, 5.0, control_bg);
-                }
                 p.text(l, &center, seg, theme.text);
                 hits.push((seg, Hit::Segment(*key, i)));
                 sx += w;
@@ -1308,12 +1431,14 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 let c = Color::parse(hex).unwrap_or(theme.accent);
                 let cx = right_edge - 9.0 - (ACCENTS.len() - 1 - i) as f32 * 26.0;
                 let selected = cfg.general.accent.eq_ignore_ascii_case(hex);
-                if selected {
-                    p.stroke_circle(cx, r.cy(), 11.5, c, 2.0);
+                // The ring and dot grow onto the chosen colour and shrink off the old one.
+                let t = ctx.anim(Anim::Swatch(i), if selected { 1.0 } else { 0.0 }, feel::SLIDE).max(0.0);
+                if t > 0.01 {
+                    p.stroke_circle(cx, r.cy(), lerp(8.5, 11.5, t), c.alpha(c.a * t.min(1.0)), 2.0);
                 }
                 p.fill_circle(cx, r.cy(), 8.5, c);
-                if selected {
-                    p.fill_circle(cx, r.cy(), 3.0, Color::WHITE);
+                if t > 0.01 {
+                    p.fill_circle(cx, r.cy(), 3.0 * t, Color::WHITE);
                 }
                 hits.push((Rect::new(cx - 12.0, r.cy() - 12.0, 24.0, 24.0), Hit::Swatch(i)));
             }
@@ -1330,9 +1455,9 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 let path_r = Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55 - 52.0, r.h);
                 p.text(&app.path, &right, path_r, theme.text_disabled);
                 let (cx, cy) = (right_edge - 9.0, r.cy());
-                let hot = hover == Some(Hit::Remove(*i));
-                p.fill_circle(cx, cy, 9.0, if hot { Color::rgba(255, 82, 87, 1.0) } else { control_bg });
-                p.line(cx - 4.0, cy, cx + 4.0, cy, if hot { Color::WHITE } else { theme.text_secondary }, 1.6);
+                let hot = ctx.hover_t(Hit::Remove(*i));
+                p.fill_circle(cx, cy, 9.0, control_bg.mix(Color::rgba(255, 82, 87, 1.0), hot));
+                p.line(cx - 4.0, cy, cx + 4.0, cy, theme.text_secondary.mix(Color::WHITE, hot), 1.6);
                 hits.push((Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), Hit::Remove(*i)));
             }
         }
@@ -1343,7 +1468,7 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 let bw = p.gfx.measure(text, &button_font) + 24.0;
                 bx -= bw;
                 let b = Rect::new(bx, r.cy() - 12.0, bw, 24.0);
-                let bg = if hover == Some(*hit) { selected_seg } else { control_bg };
+                let bg = control_bg.mix(selected_seg, ctx.hover_t(*hit));
                 p.fill_round(b, 6.0, bg);
                 p.stroke_round(b.inset(0.25, 0.25), 6.0, card_border, 0.5);
                 p.text(text, &button_font, b, theme.text);
@@ -1460,5 +1585,73 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             p.line(r.x + r.w * 0.3, r.y + r.h * 0.66, r.x + r.w * 0.5, r.y + r.h * 0.72, ink, 1.2);
             p.line(r.x + r.w * 0.5, r.y + r.h * 0.72, r.x + r.w * 0.72, r.y + r.h * 0.64, ink, 1.2);
         }
+    }
+}
+
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_settings() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc_(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let _ = crate::win::register_class(Some(proc_));
+        let gfx = Gfx::new().unwrap();
+        let cfg = crate::config::defaults();
+        let theme = Theme::new(&cfg, &gfx);
+        let mut icons = IconStore::default();
+        let mut s = SettingsWindow::new(&gfx, &Monitor::primary(), Page::Appearance).unwrap();
+        s.shown = true;
+        s.render(&gfx, &theme, &cfg, &mut icons);
+        unsafe {
+            let _ = ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
+        }
+        let t = std::time::Instant::now();
+        for k in 0..120 {
+            s.on_wheel(if k % 20 < 10 { -120 } else { 120 });
+            s.tick(1.0 / 165.0);
+            s.render(&gfx, &theme, &cfg, &mut icons);
+            unsafe {
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
+        }
+        println!("on screen: {:.0} fps", 120.0 / t.elapsed().as_secs_f64());
+        // Partial frames (scrolling, then a sidebar glide) must match a full repaint.
+        s.on_wheel(-240);
+        s.hover = Some(Hit::Page(Page::Dock));
+        s.dirty = true;
+        s.render(&gfx, &theme, &cfg, &mut icons);
+        s.hover = Some(Hit::Page(Page::General));
+        let mut partial = 0;
+        for _ in 0..60 {
+            if s.tick(1.0 / 165.0) {
+                partial += s.part.is_some() as u32;
+                s.render(&gfx, &theme, &cfg, &mut icons);
+            }
+        }
+        let after = s.canvas.pixels();
+        s.dirty = true;
+        s.render(&gfx, &theme, &cfg, &mut icons);
+        let full = s.canvas.pixels();
+        let differing = after.chunks(4).zip(full.chunks(4)).filter(|(a, b)| a != b).count();
+        println!("{partial} partial frames; pixels differing from a full repaint: {differing}");
+        // Antialiasing on curves may shift a level or two; nothing may be stale.
+        let worst = after.iter().zip(&full).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        println!("largest difference: {worst} / 255");
+        assert!(partial > 0);
+        assert!(worst <= 2);
+        let t = std::time::Instant::now();
+        for _ in 0..60 {
+            s.render(&gfx, &theme, &cfg, &mut icons);
+        }
+        println!("settings render {:.2} ms, device context: {}", t.elapsed().as_secs_f64() * 1000.0 / 60.0, windows::core::Interface::cast::<windows::Win32::Graphics::Direct2D::ID2D1DeviceContext>(s.canvas.target()).is_ok());
     }
 }

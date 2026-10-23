@@ -8,6 +8,7 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::UI::Shell::ABE_TOP;
 
+use crate::anim::{feel, Motion};
 use crate::config::{Backdrop, Config, MenuBarCfg};
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
@@ -50,6 +51,13 @@ const FONT_SIZE: f32 = 13.0;
 /// The bar is laid out at this height and scaled up to the configured one.
 const DESIGN_H: f32 = 24.0;
 
+/// The bar's springs: the highlight capsule's fade and the tray chevron's turn.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Anim {
+    Pill,
+    Tray,
+}
+
 pub struct MenuBar {
     pub surface: Surface,
     cfg: MenuBarCfg,
@@ -66,6 +74,9 @@ pub struct MenuBar {
     reserved: bool,
     /// With a clear bar: whether the wallpaper under it is dark (light text).
     on_dark: Option<bool>,
+    /// The highlight capsule: shown the instant a menu opens, let go as it closes.
+    motion: Motion<Anim>,
+    pill_last: Option<Rect>,
     pub dirty: bool,
 }
 
@@ -100,6 +111,8 @@ impl MenuBar {
             logo: None,
             reserved: m.reserve_space,
             on_dark: (m.backdrop == Backdrop::Clear).then(|| wallpaper_top_is_dark(gfx).unwrap_or(theme.dark)),
+            motion: Motion::default(),
+            pill_last: None,
             dirty: true,
         };
         bar.tick();
@@ -130,6 +143,17 @@ impl MenuBar {
             self.app_name = name;
             self.dirty = true;
         }
+    }
+
+    /// Advances the highlight; returns true while it's moving.
+    pub fn animate(&mut self, dt: f32) -> bool {
+        let moving = self.motion.tick(dt);
+        self.dirty |= moving;
+        moving
+    }
+
+    pub fn animating(&self) -> bool {
+        self.motion.moving()
     }
 
     /// Content scale: a taller bar draws everything proportionally bigger.
@@ -248,6 +272,17 @@ impl MenuBar {
         let has_backdrop = self.surface.backdrop.is_some();
         let clear = self.on_dark.is_some();
         let (hits, open, pressed) = (&self.hits, self.open, self.pressed);
+        // Tahoe highlights with a capsule: there the instant a menu opens, and
+        // letting go with the menu's fade when it closes.
+        self.motion.sweep();
+        let want = open.or(pressed).and_then(|h| hits.iter().find(|(_, hh)| *hh == h).map(|(r, _)| *r));
+        let alpha = self.motion.fade(Anim::Pill, want.is_some());
+        // The tray chevron turns over while its menu is open, like a disclosure.
+        let tray_turn = self.motion.get(Anim::Tray, if open == Some(Hit::Tray) { 1.0 } else { 0.0 }, feel::SLIDE);
+        if want.is_some() {
+            self.pill_last = want;
+        }
+        let pill = self.pill_last.map(|r| r.inset(0.0, 2.5));
         let (app_name, clock, battery, logo) = (&self.app_name, &self.clock, self.battery, &self.logo);
         let show_pct = self.cfg.show_battery_percent;
         // A clear bar takes its colours from the wallpaper, not the app theme.
@@ -261,12 +296,10 @@ impl MenuBar {
             // Paint every pixel so the whole bar hit-tests.
             p.fill_rect(Rect::new(0.0, 0.0, w, h), if has_backdrop || clear { Color::HIT } else { theme.menubar_tint.alpha(1.0) });
 
+            if let Some(pill) = pill.filter(|_| alpha > 0.005) {
+                p.fill_round(pill, pill.h / 2.0, highlight.alpha(highlight.a * alpha.clamp(0.0, 1.0)));
+            }
             for &(r, hit) in hits {
-                if open == Some(hit) || pressed == Some(hit) {
-                    // Tahoe highlights with a capsule.
-                    let pill = r.inset(0.0, 2.5);
-                    p.fill_round(pill, pill.h / 2.0, highlight);
-                }
                 match hit {
                     Hit::Logo => match (logo_kind.as_str(), logo) {
                         ("apple", _) => draw_apple(p, r, c),
@@ -278,7 +311,7 @@ impl MenuBar {
                     Hit::Title(i) => p.text(MENU_TITLES[i], &regular, r, c),
                     Hit::Clock => p.text(clock, &regular, r, c),
                     Hit::ControlCenter => draw_control_center(p, r, c),
-                    Hit::Tray => draw_tray(p, r, c),
+                    Hit::Tray => draw_tray(p, r, c, tray_turn),
                     Hit::Search => draw_search(p, r, c),
                     Hit::Wifi => draw_wifi(p, r, c),
                     Hit::Battery => {
@@ -418,10 +451,14 @@ fn draw_search(p: &Painter, r: Rect, c: Color) {
 }
 
 /// The Windows "show hidden icons" chevron.
-fn draw_tray(p: &Painter, r: Rect, c: Color) {
-    let (cx, cy) = (r.cx(), r.cy() + 1.5);
-    p.line(cx - 5.0, cy, cx, cy - 5.0, c, 1.6);
-    p.line(cx, cy - 5.0, cx + 5.0, cy, c, 1.6);
+/// The tray chevron: "^" at `turn` 0, rotated half a turn (through ">") to "v" at 1.
+fn draw_tray(p: &Painter, r: Rect, c: Color, turn: f32) {
+    let (cx, cy) = (r.cx(), r.cy() - 1.0);
+    let (sin, cos) = (std::f32::consts::PI * turn).sin_cos();
+    let at = |x: f32, y: f32| (cx + x * cos - y * sin, cy + x * sin + y * cos);
+    let (l, apex, rt) = (at(-5.0, 2.5), at(0.0, -2.5), at(5.0, 2.5));
+    p.line(l.0, l.1, apex.0, apex.1, c, 1.6);
+    p.line(apex.0, apex.1, rt.0, rt.1, c, 1.6);
 }
 
 fn draw_control_center(p: &Painter, r: Rect, c: Color) {

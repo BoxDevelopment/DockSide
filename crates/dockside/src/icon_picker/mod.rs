@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 use self::library::{Done, Entry, Hit, Library, Source};
+use crate::anim::{feel, Glide, Motion, Scroll};
 use crate::chrome::SHADOW;
 use crate::config::Config;
 use crate::finder::text::{KeyResult, TextField};
@@ -24,7 +25,7 @@ use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconPixels;
 use crate::gfx::{Align, Gfx, Painter, Weight};
 use crate::menu::Action;
-use crate::surface::Surface;
+use crate::surface::{Fading, Surface};
 use crate::theme::Theme;
 use crate::win::Monitor;
 
@@ -52,7 +53,7 @@ pub struct IconTarget {
     pub exe: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Tab {
     All,
     Mac,
@@ -64,7 +65,7 @@ enum Load<T> {
     Failed(String),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Button {
     ChooseFile,
     Default,
@@ -72,12 +73,18 @@ enum Button {
     Set,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Target {
     Cell(usize),
     Tab(Tab),
     Button(Button),
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Anim {
+    Hover(Target),
+    TabPill,
 }
 
 pub enum PickerEvent {
@@ -101,15 +108,29 @@ pub struct IconPicker {
     /// The query the Mac Style results are for, and which search is current.
     mac_query: String,
     mac_generation: u32,
-    /// First visible grid row.
-    scroll: usize,
+    /// Smooth (eased) scrolling of the grid, in points.
+    scroll: Scroll,
     selected: Option<usize>,
     hover: Option<Target>,
     thumbs: HashMap<String, Option<IconPixels>>,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     hits: Vec<(Rect, Target)>,
+    /// The tab pill slides; hovers let go quickly. (Opens instantly, fades out once closed.)
+    motion: Motion<Anim>,
+    /// The hover and selection highlights, gliding from cell to cell.
+    hover_glide: Glide,
+    sel_glide: Glide,
+    /// Set when only the grid is animating (scrolling, a highlight gliding):
+    /// the next frame repaints just that.
+    part: Option<Rect>,
     pub tracking: bool,
     pub dirty: bool,
+}
+
+impl Fading for IconPicker {
+    fn surface_mut(&mut self) -> &mut Surface {
+        &mut self.surface
+    }
 }
 
 impl IconPicker {
@@ -138,15 +159,56 @@ impl IconPicker {
             mac: None,
             mac_query: String::new(),
             mac_generation: 0,
-            scroll: 0,
+            scroll: Scroll::default(),
             selected: None,
             hover: None,
             thumbs: HashMap::new(),
             bitmaps: HashMap::new(),
             hits: Vec::new(),
+            motion: Motion::default(),
+            hover_glide: Glide::default(),
+            sel_glide: Glide::default(),
+            part: None,
             tracking: false,
             dirty: true,
         })
+    }
+
+    /// Advances the springs; returns true while anything moves.
+    pub fn tick(&mut self, dt: f32) -> bool {
+        // The grid scrolling or its highlights gliding repaint only the grid.
+        let was_dirty = self.dirty;
+        let full = self.motion.tick(dt);
+        let grid = self.scroll.tick(dt) | self.hover_glide.tick(dt) | self.sel_glide.tick(dt);
+        let moving = full || grid;
+        if moving {
+            let pending_full = was_dirty && self.part.is_none();
+            self.part = (!full && !pending_full).then(Self::grid_rect);
+            self.dirty = true;
+        }
+        moving
+    }
+
+    /// The scrolling grid, with room for the selection's outline.
+    fn grid_rect() -> Rect {
+        Rect::new(SHADOW + GRID_PAD - 2.0, SHADOW + SEARCH_H + TABS_H - 2.0, W - 2.0 * GRID_PAD + 4.0, ROWS as f32 * CELL_H + 4.0)
+    }
+
+    pub fn animating(&self) -> bool {
+        self.motion.moving() || self.scroll.moving() || self.hover_glide.moving() || self.sel_glide.moving()
+    }
+
+    /// Scroll range of the grid, in points.
+    fn max_scroll(&self) -> f32 {
+        (self.results().len().div_ceil(COLS) as f32 * CELL_H - ROWS as f32 * CELL_H).max(0.0)
+    }
+
+    /// A result's cell, drawn `offset` points scrolled.
+    fn cell_rect(body: Rect, i: usize, offset: f32) -> Rect {
+        let grid = Rect::new(body.x + GRID_PAD, body.y + SEARCH_H + TABS_H, W - 2.0 * GRID_PAD, ROWS as f32 * CELL_H);
+        let cell_w = grid.w / COLS as f32;
+        let (col, row) = (i % COLS, i / COLS);
+        Rect::new(grid.x + col as f32 * cell_w, grid.y + row as f32 * CELL_H - offset, cell_w, CELL_H).inset(3.0, 3.0)
     }
 
     /// Gives the panel keyboard focus (allowed: we're handling a click).
@@ -175,7 +237,10 @@ impl IconPicker {
     }
 
     fn reset_view(&mut self) {
-        self.scroll = 0;
+        self.scroll.jump(0.0);
+        // New results: the highlights start where they land.
+        self.hover_glide.reset();
+        self.sel_glide.reset();
         self.selected = (!self.results().is_empty()).then_some(0);
         self.request_visible();
         self.dirty = true;
@@ -196,7 +261,7 @@ impl IconPicker {
 
     /// Starts downloading the thumbnails in view (and the next row).
     fn request_visible(&mut self) {
-        let from = self.scroll * COLS;
+        let from = (self.scroll.target() / CELL_H).floor() as usize * COLS;
         let urls: Vec<String> = self.results().iter().skip(from).take(COLS * (ROWS + 1)).map(|h| h.url.clone()).collect();
         for url in urls {
             if !self.thumbs.contains_key(&url) && !self.bitmaps.contains_key(&url) {
@@ -307,11 +372,12 @@ impl IconPicker {
         }
         let i = (self.selected.unwrap_or(0) as isize + delta).clamp(0, n as isize - 1) as usize;
         self.selected = Some(i);
-        let row = i / COLS;
-        if row < self.scroll {
-            self.scroll = row;
-        } else if row >= self.scroll + ROWS {
-            self.scroll = row + 1 - ROWS;
+        let top = (i / COLS) as f32 * CELL_H;
+        let s = self.scroll.target();
+        if top < s {
+            self.scroll.to(top);
+        } else if top + CELL_H > s + ROWS as f32 * CELL_H {
+            self.scroll.to(top + CELL_H - ROWS as f32 * CELL_H);
         }
         self.request_visible();
     }
@@ -355,15 +421,14 @@ impl IconPicker {
     }
 
     pub fn on_wheel(&mut self, delta: i16) {
-        let rows = self.results().len().div_ceil(COLS);
-        let max = rows.saturating_sub(ROWS);
-        let step = if delta > 0 { -1 } else { 1 };
-        let next = (self.scroll as isize + step).clamp(0, max as isize) as usize;
-        if next != self.scroll {
-            self.scroll = next;
-            self.request_visible();
-            self.dirty = true;
+        let max = self.max_scroll();
+        self.scroll.wheel(delta as i32, CELL_H * 0.75, max);
+        self.request_visible();
+        // Only the grid moved: unless a whole redraw is already due, repaint just it.
+        if !self.dirty || self.part.is_some() {
+            self.part = Some(Self::grid_rect());
         }
+        self.dirty = true;
     }
 
     pub fn on_move(&mut self, x: f32, y: f32) {
@@ -445,17 +510,26 @@ impl IconPicker {
             (Tab::Mac, Some(c)) => format!("By {c} \u{00B7} macOSicons"),
             (Tab::Mac, None) => "macOSicons.com".to_string(),
         };
-        let (tab, scroll, selected, hover, app, show_key_button) =
-            (self.tab, self.scroll, self.selected, self.hover, &self.app, self.tab == Tab::Mac && self.key.is_empty());
+        let max = self.max_scroll();
+        self.scroll.clamp(max);
+        let offset = self.scroll.offset_px(self.surface.scale);
+        let hover_target = match self.hover {
+            Some(Target::Cell(i)) if Some(i) != self.selected => Some(Self::cell_rect(body, i, offset)),
+            _ => None,
+        };
+        let hover_glide = self.hover_glide.update(hover_target);
+        let sel_glide = self.sel_glide.update(self.selected.filter(|&i| i < results.len()).map(|i| Self::cell_rect(body, i, offset)));
+        let (tab, hover, app, show_key_button) =
+            (self.tab, self.hover, &self.app, self.tab == Tab::Mac && self.key.is_empty());
         let bitmaps = &self.bitmaps;
         let mut hits = Vec::new();
+        self.motion.sweep();
+        let motion = &self.motion;
+        let hv = |t: Target| motion.fade(Anim::Hover(t), hover == Some(t));
 
-        let r = self.surface.render(gfx, |p: &Painter| {
-            for i in 0..12 {
-                let grow = i as f32 * 2.0;
-                let alpha = 0.03 * (12 - i) as f32 / 12.0;
-                p.fill_round(body.inset(-grow, -grow).offset(0.0, 6.0), RADIUS + grow, theme.shadow.alpha(alpha));
-            }
+        let part = self.part.take();
+        let r = self.surface.render_part(gfx, part, |p: &Painter| {
+            p.soft_shadow(body, RADIUS, 12, 2.0, 0.03, 6.0, theme.shadow);
             p.clear_rect(body.inset(3.0, 3.0));
             p.fill_round(body, RADIUS, if has_backdrop { theme.menu_tint.alpha(0.3) } else { theme.menu_tint.alpha(1.0) });
             p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
@@ -480,18 +554,19 @@ impl IconPicker {
             // Tabs: a segmented control.
             let seg = Rect::new(body.cx() - 130.0, body.y + SEARCH_H + 8.0, 260.0, 26.0);
             p.fill_round(seg, 7.0, if theme.dark { Color::gray(255, 0.08) } else { Color::gray(0, 0.06) });
-            for (i, (label, t)) in [("All Icons", Tab::All), ("Mac Style", Tab::Mac)].into_iter().enumerate() {
+            let tabs = [("All Icons", Tab::All), ("Mac Style", Tab::Mac)];
+            let current = tabs.iter().position(|(_, t)| *t == tab).unwrap_or(0) as f32;
+            let k = motion.get(Anim::TabPill, current, feel::SLIDE);
+            let pill = Rect::new(seg.x + 2.0 + k * 128.0, seg.y + 2.0, 128.0, seg.h - 4.0);
+            p.fill_round(pill, 6.0, if theme.dark { Color::gray(255, 0.2) } else { Color::WHITE });
+            for (i, (label, t)) in tabs.into_iter().enumerate() {
                 let r = Rect::new(seg.x + 2.0 + i as f32 * 128.0, seg.y + 2.0, 128.0, seg.h - 4.0);
-                if t == tab {
-                    p.fill_round(r, 6.0, if theme.dark { Color::gray(255, 0.2) } else { Color::WHITE });
-                }
                 p.text(label, &regular, r, theme.text);
                 hits.push((r, Target::Tab(t)));
             }
 
             // Grid.
             let grid = Rect::new(body.x + GRID_PAD, body.y + SEARCH_H + TABS_H, W - 2.0 * GRID_PAD, ROWS as f32 * CELL_H);
-            let cell_w = grid.w / COLS as f32;
             if let Some(note) = &note {
                 let r = Rect::new(grid.x + 60.0, grid.y + grid.h * 0.3, grid.w - 120.0, 60.0);
                 p.text(note, &message, r, theme.text_secondary);
@@ -502,16 +577,20 @@ impl IconPicker {
                     hits.push((b, Target::Settings));
                 }
             } else {
-                for (slot, i) in (scroll * COLS..results.len()).take(ROWS * COLS).enumerate() {
+                // Rows scroll smoothly under a clip; highlights glide between cells.
+                p.push_clip(grid);
+                if let Some((g, a)) = hover_glide {
+                    p.fill_round(g, 10.0, if theme.dark { Color::gray(255, 0.08 * a) } else { Color::gray(0, 0.05 * a) });
+                }
+                if let Some((g, a)) = sel_glide {
+                    p.fill_round(g, 10.0, theme.accent.alpha(0.22 * a));
+                    p.stroke_round(g.inset(0.75, 0.75), 10.0, theme.accent.alpha(a), 1.5);
+                }
+                let first = (offset / CELL_H).floor().max(0.0) as usize * COLS;
+                let last = (((offset + grid.h) / CELL_H).ceil().max(0.0) as usize * COLS).min(results.len());
+                for i in first..last {
                     let hit = &results[i];
-                    let (col, row) = (slot % COLS, slot / COLS);
-                    let cell = Rect::new(grid.x + col as f32 * cell_w, grid.y + row as f32 * CELL_H, cell_w, CELL_H).inset(3.0, 3.0);
-                    if selected == Some(i) {
-                        p.fill_round(cell, 10.0, theme.accent.alpha(0.22));
-                        p.stroke_round(cell.inset(0.75, 0.75), 10.0, theme.accent, 1.5);
-                    } else if hover == Some(Target::Cell(i)) {
-                        p.fill_round(cell, 10.0, if theme.dark { Color::gray(255, 0.08) } else { Color::gray(0, 0.05) });
-                    }
+                    let cell = Self::cell_rect(body, i, offset);
                     let icon = Rect::new(cell.cx() - ICON / 2.0, cell.y + 10.0, ICON, ICON);
                     match bitmaps.get(&hit.url) {
                         Some(Some(bmp)) => {
@@ -526,8 +605,12 @@ impl IconPicker {
                     }
                     let label = Rect::new(cell.x + 4.0, icon.bottom() + 4.0, cell.w - 8.0, 18.0);
                     p.text(&hit.label, &small, label, theme.text);
-                    hits.push((cell, Target::Cell(i)));
+                    let (top, bottom) = (cell.y.max(grid.y), cell.bottom().min(grid.bottom()));
+                    if bottom > top {
+                        hits.push((Rect::new(cell.x, top, cell.w, bottom - top), Target::Cell(i)));
+                    }
                 }
+                p.pop_clip();
             }
 
             // Footer.
@@ -539,12 +622,13 @@ impl IconPicker {
                 bx -= w + 8.0;
                 let primary = button == Button::Set;
                 let enabled = !primary || can_set;
+                let t = hv(Target::Button(button));
                 let fill = if primary && enabled {
                     theme.accent
                 } else if theme.dark {
-                    Color::gray(255, if hover == Some(Target::Button(button)) { 0.16 } else { 0.1 })
+                    Color::gray(255, 0.1 + 0.06 * t)
                 } else {
-                    Color::gray(0, if hover == Some(Target::Button(button)) { 0.1 } else { 0.06 })
+                    Color::gray(0, 0.06 + 0.04 * t)
                 };
                 p.fill_round(r, 7.0, fill);
                 let ink = if primary && enabled { Color::WHITE } else if enabled { theme.text } else { theme.text_disabled };
@@ -564,7 +648,9 @@ impl IconPicker {
 
 impl Drop for IconPicker {
     fn drop(&mut self) {
-        PICKER_HWND.store(0, std::sync::atomic::Ordering::Relaxed);
+        // A picker fading out may outlive the next one to open: only clear our own handle.
+        let me = self.surface.content.0 as isize;
+        let _ = PICKER_HWND.compare_exchange(me, 0, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

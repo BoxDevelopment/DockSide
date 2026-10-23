@@ -192,6 +192,26 @@ pub fn activate(hwnd: HWND) {
     }
 }
 
+/// For one of our windows about to fade away: if it has the focus, hands it to
+/// the next app window below (or the desktop), as Windows would on destroy, so
+/// typing doesn't go into a window that's on its way out.
+pub fn pass_focus_from(hwnd: HWND) {
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            return;
+        }
+        let mut next = GetWindow(hwnd, GW_HWNDNEXT).unwrap_or_default();
+        while !next.is_invalid() {
+            if is_app_window(next) && !IsIconic(next).as_bool() {
+                let _ = SetForegroundWindow(next);
+                return;
+            }
+            next = GetWindow(next, GW_HWNDNEXT).unwrap_or_default();
+        }
+        let _ = SetForegroundWindow(GetShellWindow());
+    }
+}
+
 pub fn minimize(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_MINIMIZE);

@@ -22,7 +22,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, ABN_FULLSCREENAPP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::anim::{FrameClock, FRAME_PENDING};
+use crate::anim::{approach, FrameClock, FRAME_PENDING};
 use crate::config::{self, Config, DockApp};
 use crate::dock::Dock;
 use crate::gfx::icons::IconStore;
@@ -36,6 +36,7 @@ use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
+use crate::surface::Fading;
 use crate::theme::Theme;
 use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
@@ -323,7 +324,7 @@ fn execute(action: Action) {
         }
         // The file dialog runs a modal loop: outside the App borrow.
         Action::PickIconFile(target) => {
-            with_app(|app| app.icon_picker = None);
+            with_app(|app| app.close_icon_picker());
             if let Some(path) = system::pick_image(HWND::default()) {
                 with_app(|app| app.set_app_icon(&target, Some(path)));
             }
@@ -658,6 +659,12 @@ pub struct App {
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
     finders: Vec<FinderWindow>,
+    /// Closed Finder windows, still fading out.
+    closing_finders: Vec<FinderWindow>,
+    /// Closed menus and panels, still fading out (click-through meanwhile).
+    fading: Vec<Box<dyn Fading>>,
+    /// Closed app windows (Settings, Setup Assistant), fading out: the owner, its window and opacity.
+    closing_windows: Vec<(Box<dyn std::any::Any>, HWND, f32)>,
     next_finder_id: u32,
     loader: finder::loader::IconLoader,
     kinds: finder::fs::KindCache,
@@ -691,6 +698,7 @@ pub struct App {
 
 impl App {
     fn new(msg_hwnd: HWND) -> anyhow::Result<Self> {
+        crate::anim::set_motion(system::animations_enabled());
         let gfx = Gfx::new()?;
         let cfg_path = config::ensure_exists().unwrap_or_else(|e| {
             log!("could not create config: {e:#}");
@@ -749,6 +757,9 @@ impl App {
             settings: None,
             onboarding: None,
             finders: Vec::new(),
+            closing_finders: Vec::new(),
+            fading: Vec::new(),
+            closing_windows: Vec::new(),
             next_finder_id: 1,
             loader: finder::loader::IconLoader::new(msg_hwnd.0 as isize, WM_APP_ICONS),
             kinds: finder::fs::KindCache::default(),
@@ -1085,7 +1096,10 @@ impl App {
         match &self.onboarding {
             Some(o) => o.show(),
             None => match Onboarding::new(&self.gfx, &self.monitor) {
-                Ok(o) => self.onboarding = Some(o),
+                Ok(o) => {
+                    self.onboarding = Some(o);
+                    self.animate();
+                }
                 Err(e) => log!("setup assistant failed: {e}"),
             },
         }
@@ -1094,9 +1108,30 @@ impl App {
 
     /// Closes the Setup Assistant and remembers not to open it on launch again.
     fn finish_onboarding(&mut self) {
-        self.onboarding = None;
+        if let Some(o) = self.onboarding.take() {
+            let hwnd = o.hwnd;
+            self.fade_out_window(Box::new(o), hwnd);
+        }
         if !self.cfg.general.onboarding_done {
             push(Action::SetConfig { table: "general", key: "onboarding_done", value: config::ConfigValue::Bool(true) });
+        }
+    }
+
+    /// Fades a closed app window away (its pixels, no redraws), then drops it.
+    fn fade_out_window(&mut self, owner: Box<dyn std::any::Any>, hwnd: HWND) {
+        apps::pass_focus_from(hwnd);
+        unsafe {
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as i32);
+        }
+        self.closing_windows.push((owner, hwnd, 1.0));
+        self.animate();
+    }
+
+    fn close_settings(&mut self) {
+        if let Some(s) = self.settings.take() {
+            let hwnd = s.hwnd;
+            self.fade_out_window(Box::new(s), hwnd);
         }
     }
 
@@ -1104,7 +1139,10 @@ impl App {
         match &mut self.settings {
             Some(s) => s.show_page(page),
             None => match SettingsWindow::new(&self.gfx, &self.monitor, page.unwrap_or(Page::General)) {
-                Ok(s) => self.settings = Some(s),
+                Ok(s) => {
+                    self.settings = Some(s);
+                    self.animate();
+                }
                 Err(e) => log!("settings window failed: {e}"),
             },
         }
@@ -1149,6 +1187,53 @@ impl App {
         if let Some(i) = &mut self.island {
             still |= i.tick(dt);
         }
+        if let Some(mb) = &mut self.menubar {
+            still |= mb.animate(dt);
+        }
+        if let Some(m) = &mut self.menu {
+            if m.tick(dt) {
+                m.render(&self.gfx, &self.theme);
+                still = true;
+            }
+        }
+        if let Some(s) = &mut self.spotlight {
+            still |= s.tick(dt);
+        }
+        if let Some(p) = &mut self.icon_picker {
+            still |= p.tick(dt);
+        }
+        if let Some(s) = &mut self.settings {
+            still |= s.tick(dt);
+        }
+        if let Some(o) = &mut self.onboarding {
+            still |= o.tick(dt);
+        }
+        if let Some(w) = &mut self.widgets {
+            still |= w.animate(dt);
+        }
+        for f in &mut self.finders {
+            still |= f.tick(dt);
+        }
+        for f in &mut self.closing_finders {
+            f.tick(dt);
+        }
+        self.closing_finders.retain(|f| !f.closed());
+        still |= !self.closing_finders.is_empty();
+        // Closed menus and panels fade out, quick at first and easing off, like AppKit
+        // (about a tenth of a second; they're click-through meanwhile).
+        self.fading.retain_mut(|f| {
+            let s = f.surface_mut();
+            let o = approach(s.opacity(), 0.0, dt, 26.0);
+            s.set_opacity(o);
+            o > 0.0
+        });
+        still |= !self.fading.is_empty();
+        self.closing_windows.retain_mut(|(_, hwnd, a)| {
+            *a = approach(*a, 0.0, dt, 24.0);
+            crate::gfx::set_window_alpha(*hwnd, *a);
+            *a > 0.0
+        });
+        still |= !self.closing_windows.is_empty();
         if !still {
             self.animating = false;
             self.clock.stop();
@@ -1330,16 +1415,34 @@ impl App {
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
         }
-        for f in self.finders.iter_mut().filter(|f| f.dirty) {
+        for f in self.finders.iter_mut().chain(&mut self.closing_finders).filter(|f| f.dirty) {
             let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
             f.render(&mut ctx);
         }
+        // A render can start an animation (a hover fading in, a pill sliding over).
+        if self.wants_frames() {
+            self.animate();
+        }
+    }
+
+    fn wants_frames(&self) -> bool {
+        self.menubar.as_ref().is_some_and(|m| m.animating())
+            || self.menu.as_ref().is_some_and(|m| m.animating())
+            || self.spotlight.as_ref().is_some_and(|s| s.animating())
+            || self.icon_picker.as_ref().is_some_and(|p| p.animating())
+            || self.settings.as_ref().is_some_and(|s| s.animating())
+            || self.onboarding.as_ref().is_some_and(|o| o.animating())
+            || self.widgets.as_ref().is_some_and(|w| w.animating())
+            || self.finders.iter().any(|f| f.animating())
+            || !self.closing_finders.is_empty()
+            || !self.fading.is_empty()
+            || !self.closing_windows.is_empty()
     }
 
     // --- Spotlight ---------------------------------------------------------
 
     fn toggle_spotlight(&mut self) {
-        if self.spotlight.take().is_some() || !self.cfg.spotlight.enabled {
+        if self.close_spotlight() || !self.cfg.spotlight.enabled {
             return;
         }
         self.close_menu();
@@ -1355,6 +1458,26 @@ impl App {
             }
             Err(e) => log!("spotlight failed: {e}"),
         }
+    }
+
+    fn close_icon_picker(&mut self) {
+        let Some(p) = self.icon_picker.take() else { return };
+        PICKER_HWND.store(0, Ordering::Relaxed);
+        apps::pass_focus_from(p.surface.content);
+        p.surface.set_click_through();
+        self.fading.push(Box::new(p));
+        self.animate();
+    }
+
+    /// Fades Spotlight away; returns whether it was open.
+    fn close_spotlight(&mut self) -> bool {
+        let Some(s) = self.spotlight.take() else { return false };
+        SPOTLIGHT_HWND.store(0, Ordering::Relaxed);
+        apps::pass_focus_from(s.surface.content);
+        s.surface.set_click_through();
+        self.fading.push(Box::new(s));
+        self.animate();
+        true
     }
 
     /// Re-indexes apps and the user's folders in the background.
@@ -1452,9 +1575,11 @@ impl App {
         drop(idx);
         match event {
             SpotlightEvent::None => {}
-            SpotlightEvent::Close => self.spotlight = None,
+            SpotlightEvent::Close => {
+                self.close_spotlight();
+            }
             SpotlightEvent::Run(action) => {
-                self.spotlight = None;
+                self.close_spotlight();
                 push(action);
             }
         }
@@ -1465,7 +1590,7 @@ impl App {
 
     fn open_icon_picker(&mut self, target: IconTarget, name: &str) {
         self.close_menu();
-        self.spotlight = None;
+        self.close_spotlight();
         let hwnd = self.msg_hwnd.0 as isize;
         match IconPicker::new(&self.gfx, &self.theme, &self.cfg, &self.monitor, target, name, hwnd, WM_APP_ICON_PICKER) {
             Ok(mut p) => {
@@ -1480,7 +1605,7 @@ impl App {
     /// Writes a Dock app's custom icon (`None` resets it) and applies it. A
     /// pinned app keeps it in its `[[dock.apps]]` entry; others in `[app_icons]`.
     fn set_app_icon(&mut self, target: &IconTarget, icon: Option<String>) {
-        self.icon_picker = None;
+        self.close_icon_picker();
         let path = self.cfg_path.clone();
         let written = (|| -> anyhow::Result<()> {
             if let Some(pinned) = &target.pinned {
@@ -1540,7 +1665,7 @@ impl App {
         };
         match event {
             PickerEvent::None => {}
-            PickerEvent::Close => self.icon_picker = None,
+            PickerEvent::Close => self.close_icon_picker(),
             PickerEvent::Run(action) => push(action),
         }
         Some(LRESULT(0))
@@ -1563,6 +1688,7 @@ impl App {
                     let _ = SetForegroundWindow(f.hwnd);
                 }
                 self.finders.push(f);
+                self.animate();
                 self.refresh_windows();
             }
             Err(e) => log!("finder window failed: {e}"),
@@ -1570,7 +1696,13 @@ impl App {
     }
 
     fn close_finder(&mut self, id: u32) {
-        self.finders.retain(|f| f.id != id);
+        if let Some(i) = self.finders.iter().position(|f| f.id == id) {
+            let mut f = self.finders.remove(i);
+            apps::pass_focus_from(f.hwnd);
+            f.begin_close();
+            self.closing_finders.push(f);
+            self.animate();
+        }
         self.refresh_windows();
     }
 
@@ -1702,7 +1834,17 @@ impl App {
     // --- menus -------------------------------------------------------------
 
     fn open_menu(&mut self, entries: Vec<Entry>, placement: Placement, source: MenuSource) {
-        self.close_menu();
+        // Sliding across the menu bar swaps menus instantly, like macOS; anything else fades.
+        let switching = matches!(source, MenuSource::MenuBar(_))
+            && self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::MenuBar(_)));
+        if switching {
+            OPEN_MENU_HWND.store(0, Ordering::Relaxed);
+            self.menu = None;
+            self.remove_hooks();
+            self.reset_menu_openers();
+        } else {
+            self.close_menu();
+        }
         if entries.is_empty() {
             return;
         }
@@ -1731,12 +1873,23 @@ impl App {
         }
     }
 
+    /// Runs a chosen menu item right away; the menu fades out behind it.
+    fn activate_menu(&mut self, action: Action) {
+        self.close_menu();
+        push(action);
+    }
+
     fn close_menu(&mut self) {
         OPEN_MENU_HWND.store(0, Ordering::Relaxed);
-        if self.menu.take().is_none() {
-            return;
-        }
+        let Some(m) = self.menu.take() else { return };
+        m.surface.set_click_through();
+        self.fading.push(Box::new(m));
+        self.animate();
         self.remove_hooks();
+        self.reset_menu_openers();
+    }
+
+    fn reset_menu_openers(&mut self) {
         if let Some(mb) = &mut self.menubar {
             mb.set_open(None);
         }
@@ -1818,10 +1971,7 @@ impl App {
         }
         let source = m.source;
         match event {
-            MenuEvent::Activate(a) => {
-                self.close_menu();
-                push(a);
-            }
+            MenuEvent::Activate(a) => self.activate_menu(a),
             MenuEvent::Close => self.close_menu(),
             MenuEvent::Step(dir) => {
                 if let MenuSource::MenuBar(hit) = source {
@@ -1916,8 +2066,10 @@ impl App {
                     win::post_wp(self.msg_hwnd.0 as isize, msg, value);
                 }
                 WM_APP_ADMIN_TASK => self.on_admin_task(wp.0 & 1 != 0, wp.0 & 2 != 0),
-                WM_APP_CLOSE_SPOTLIGHT => self.spotlight = None,
-                WM_APP_CLOSE_PICKER => self.icon_picker = None,
+                WM_APP_CLOSE_SPOTLIGHT => {
+                    self.close_spotlight();
+                }
+                WM_APP_CLOSE_PICKER => self.close_icon_picker(),
                 WM_APP_ICON_PICKER => {
                     if let Some(p) = &mut self.icon_picker {
                         p.poll();
@@ -2013,6 +2165,7 @@ impl App {
             return None;
         }
         if msg == WM_SETTINGCHANGE {
+            crate::anim::set_motion(system::animations_enabled());
             if wp.0 as u32 == SPI_SETDESKWALLPAPER.0 {
                 self.timer(TIMER_WALLPAPER, 300);
             }
@@ -2109,7 +2262,7 @@ impl App {
                 }
                 match s.on_up(x, y, &self.cfg) {
                     SettingsEvent::Action(a) => push(a),
-                    SettingsEvent::Close => self.settings = None,
+                    SettingsEvent::Close => self.close_settings(),
                     SettingsEvent::None => {}
                 }
             }
@@ -2119,7 +2272,7 @@ impl App {
                 let (ctrl, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };
                 match s.on_key(wp.0 as u16, ctrl, shift, &self.cfg) {
                     SettingsEvent::Action(a) => push(a),
-                    SettingsEvent::Close => self.settings = None,
+                    SettingsEvent::Close => self.close_settings(),
                     SettingsEvent::None => {}
                 }
             }
@@ -2128,7 +2281,7 @@ impl App {
                     s.on_char(c);
                 }
             }
-            WM_CLOSE => self.settings = None,
+            WM_CLOSE => self.close_settings(),
             _ => return None,
         }
         Some(LRESULT(0))
@@ -2207,10 +2360,7 @@ impl App {
                 }
             }
             WM_LBUTTONUP | WM_RBUTTONUP => match m.on_click(x, y, msg == WM_RBUTTONUP) {
-                MenuEvent::Activate(a) => {
-                    self.close_menu();
-                    push(a);
-                }
+                MenuEvent::Activate(a) => self.activate_menu(a),
                 MenuEvent::Close => self.close_menu(),
                 _ => {}
             },

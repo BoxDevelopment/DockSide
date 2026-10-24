@@ -6,7 +6,7 @@ A fast, open-source macOS-style desktop shell for Windows 11, written in Rust.
 Ai Assisted. Couldn't find a good alternative so I made my own.
 Feel free to contribute.
 
-Discord: boxeth
+Discord: https://discord.gg/AWN9STaAXx
 
 It runs **on top of Explorer** (nothing is replaced): the Windows taskbar is
 hidden while DockSide runs and is always restored when it exits.

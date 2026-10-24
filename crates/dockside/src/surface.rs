@@ -37,6 +37,8 @@ pub struct Surface {
     shadow: Option<Shadow>,
     /// Whole-surface fade (0..1), for appearing and disappearing.
     opacity: f32,
+    /// The opacity last pushed to the windows (lags `opacity` by imperceptible steps).
+    applied: f32,
 }
 
 /// Something built on a [`Surface`] that can fade away after it's closed.
@@ -132,7 +134,7 @@ impl Surface {
             glass::exclude_from_capture(content, true);
         }
         let canvas = Canvas::new(gfx, w, h, scale)?;
-        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0 })
+        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0, applied: 1.0 })
     }
 
     /// Casts a soft drop shadow under the backdrop shape. `strength` is the
@@ -330,12 +332,16 @@ impl Surface {
     /// Fades the content, backdrop and shadow together, without redrawing.
     pub fn set_opacity(&mut self, opacity: f32) {
         let opacity = opacity.clamp(0.0, 1.0);
+        // Always keep the new value: fades read it back for their next step, and
+        // dropping small steps would stall them just short of zero (still there,
+        // invisible, swallowing clicks).
+        self.opacity = opacity;
         // Skip imperceptible steps, but always land exactly on the ends.
         let end = opacity == 0.0 || opacity == 1.0;
-        if opacity == self.opacity || (!end && (opacity - self.opacity).abs() < 0.002) {
+        if opacity == self.applied || (!end && (opacity - self.applied).abs() < 0.002) {
             return;
         }
-        self.opacity = opacity;
+        self.applied = opacity;
         if let Some(c) = &self.composition {
             c.set_opacity(opacity);
         }

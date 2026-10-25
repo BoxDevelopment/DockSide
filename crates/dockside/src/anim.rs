@@ -312,6 +312,10 @@ impl Glide {
 /// comes to rest about 0.12s after the last one.
 const SCROLL_RESPONSE: f32 = 0.15;
 
+/// Rate of the browser-style ease-out: a notch covers most of its distance in
+/// the first ~80ms and settles by ~250ms, like Chromium's wheel animation.
+const SCROLL_EASE_OUT: f32 = 22.0;
+
 /// Smooth scrolling, the macOS way. A wheel notch glides the content to its new
 /// spot along a smooth curve that starts on the very next frame; notches in
 /// quick succession keep it moving rather than restarting it. A touchpad's
@@ -323,11 +327,13 @@ pub struct Scroll {
     shown: f32,
     velocity: f32,
     bounce: Spring,
+    /// Glides the browser way ([`Self::wheel_smooth`]) rather than on the spring.
+    ease_out: bool,
 }
 
 impl Default for Scroll {
     fn default() -> Self {
-        Self { target: 0.0, shown: 0.0, velocity: 0.0, bounce: Spring::new(0.0, 0.32, 1.0) }
+        Self { target: 0.0, shown: 0.0, velocity: 0.0, bounce: Spring::new(0.0, 0.32, 1.0), ease_out: false }
     }
 }
 
@@ -350,6 +356,7 @@ impl Scroll {
 
     /// Applies a `WM_MOUSEWHEEL` delta: `per_notch` points per 120, within `0..=max`.
     pub fn wheel(&mut self, delta: i32, per_notch: f32, max: f32) {
+        self.ease_out = false;
         let amount = delta as f32 / 120.0 * per_notch;
         let want = self.target - amount;
         self.target = want.clamp(0.0, max.max(0.0));
@@ -365,6 +372,24 @@ impl Scroll {
             let push = if touchpad { 8.0 } else { 4.0 };
             self.bounce.velocity = (self.bounce.velocity + amount * push).clamp(-900.0, 900.0);
             self.bounce.set(0.0);
+        }
+    }
+
+    /// Browser-style scrolling: a wheel notch sets off at full speed and eases
+    /// out to its new spot, and notches in quick succession just push the
+    /// destination further. It stops at the ends rather than stretching. A
+    /// touchpad's fine-grained deltas follow the fingers directly.
+    pub fn wheel_smooth(&mut self, delta: i32, per_notch: f32, max: f32) {
+        self.ease_out = true;
+        let amount = delta as f32 / 120.0 * per_notch;
+        self.target = (self.target - amount).clamp(0.0, max.max(0.0));
+        self.velocity = 0.0;
+        self.bounce.snap(0.0);
+        if delta % 120 != 0 || !motion_enabled() {
+            self.shown = self.target;
+        } else {
+            // Draw the first step now rather than a frame late.
+            self.glide(1.0 / 120.0);
         }
     }
 
@@ -409,6 +434,12 @@ impl Scroll {
         if !motion_enabled() {
             self.shown = self.target;
             self.velocity = 0.0;
+            return;
+        }
+        if self.ease_out {
+            let rest = self.target - self.shown;
+            let left = rest * (-dt * SCROLL_EASE_OUT).exp();
+            self.shown = if left.abs() < 0.25 { self.target } else { self.target - left };
             return;
         }
         let omega = std::f32::consts::TAU / SCROLL_RESPONSE;
@@ -524,6 +555,33 @@ mod tests {
         for _ in 0..120 {
             s.tick(1.0 / 60.0);
         }
+        assert_eq!(s.offset(), 0.0);
+    }
+
+    #[test]
+    fn smooth_wheel_eases_out_and_stops_at_ends() {
+        let mut s = super::Scroll::default();
+        s.wheel_smooth(-120, 60.0, 1000.0);
+        // Sets off at once, fastest first, never overshooting.
+        assert!(s.offset() > 5.0, "{}", s.offset());
+        let mut last = s.offset();
+        let mut step = f32::MAX;
+        for _ in 0..60 {
+            s.tick(1.0 / 165.0);
+            assert!(s.offset() >= last && s.offset() - last <= step + 0.25 && s.offset() <= 60.0);
+            step = s.offset() - last;
+            last = s.offset();
+        }
+        assert_eq!(s.offset(), 60.0);
+        // A second notch mid-glide carries on from where it is.
+        s.wheel_smooth(-120, 60.0, 1000.0);
+        s.wheel_smooth(-120, 60.0, 1000.0);
+        assert_eq!(s.target(), 180.0);
+        assert!(s.offset() > 60.0 && s.offset() < 180.0);
+        // Past the top: no stretch.
+        s.jump(0.0);
+        s.wheel_smooth(120, 60.0, 1000.0);
+        s.tick(1.0 / 165.0);
         assert_eq!(s.offset(), 0.0);
     }
 

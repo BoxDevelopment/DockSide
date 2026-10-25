@@ -307,7 +307,7 @@ pub struct FinderWindow {
     ql_bitmap: Option<(String, Option<ID2D1Bitmap>)>,
     typed: String,
     typed_at: Instant,
-    bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
+    bitmaps: HashMap<(String, (u32, u32)), Option<ID2D1Bitmap>>,
     favorites: Vec<Place>,
     drives: Vec<Place>,
     watcher: Option<notify::RecommendedWatcher>,
@@ -339,6 +339,8 @@ pub struct FinderWindow {
     /// Set by `tick` when only this area is animating (the list scrolling, a
     /// sidebar highlight gliding): the next frame repaints just that.
     part: Option<Rect>,
+    /// Icons finished loading: the next frame repaints the list to show them.
+    icons_ready: bool,
     /// View, sort or hidden files changed: the App saves them as the defaults for new windows.
     pub prefs_dirty: bool,
     pub focused: bool,
@@ -440,6 +442,7 @@ impl FinderWindow {
             xf: (0.0, 0.0, 1.0, 1.0),
             backdrop_for: None,
             part: None,
+            icons_ready: false,
             prefs_dirty: false,
             focused: true,
             tracking: false,
@@ -497,6 +500,13 @@ impl FinderWindow {
     // --- animation ---------------------------------------------------------
 
     /// On `WM_SIZE`: redraw when restored from minimized, so it zooms back in.
+    /// Icons arrived from the loader. Shown on the next frame, so a stream of
+    /// them while scrolling a big folder doesn't add whole-window repaints
+    /// between frames.
+    pub fn on_icons(&mut self) {
+        self.icons_ready = true;
+    }
+
     pub fn on_size(&mut self) {
         if self.window.restored(self.hwnd) {
             self.dirty = true;
@@ -527,7 +537,7 @@ impl FinderWindow {
         for c in &mut self.columns {
             list |= c.scroll.tick(dt);
         }
-        if list {
+        if list || std::mem::take(&mut self.icons_ready) {
             touch(vr);
         }
         if self.side_glide.tick(dt) | self.sel_glide.tick(dt) {
@@ -565,6 +575,7 @@ impl FinderWindow {
             || self.columns.iter().any(|c| c.scroll.moving())
             || self.quicklook.as_ref().is_some_and(|q| q.scroll.moving())
             || self.scrollbar_up
+            || self.icons_ready
     }
 
     /// Fades and zooms the window away; the App drops it once [`Self::closed`].
@@ -1178,17 +1189,17 @@ impl FinderWindow {
     pub fn on_wheel(&mut self, x: f32, delta: i32) {
         self.scrolled_at = Instant::now();
         if let Some(ql) = &mut self.quicklook {
-            ql.scroll.wheel(delta, 60.0, ql.max_scroll);
+            ql.scroll.wheel_smooth(delta, 60.0, ql.max_scroll);
         } else if self.view == View::Columns {
             let vr = self.view_rect();
             let offset = self.column_offset(vr);
             let c = ((x - vr.x + offset) / COL_W).floor().max(0.0) as usize;
             if let Some(col) = self.columns.get_mut(c) {
                 let max = (col.entries.len() as f32 * ROW + 8.0 - vr.h).max(0.0);
-                col.scroll.wheel(delta, 60.0, max);
+                col.scroll.wheel_smooth(delta, 60.0, max);
             }
         } else {
-            self.scroll.wheel(delta, 60.0, self.max_scroll);
+            self.scroll.wheel_smooth(delta, 60.0, self.max_scroll);
         }
         // Only the list moved: unless a whole redraw is already due, repaint just it.
         if self.quicklook.is_none() && (!self.dirty || self.part.is_some()) {
@@ -1988,13 +1999,19 @@ impl FinderWindow {
             // Hover highlights fade in and out rather than blinking.
             let hv = |h: Hit| motion.fade(Anim::Hover(h), hover == Some(h));
             let soft_t = |t: f32| soft.alpha(soft.a * t);
-            let mut icon_for = |p: &Painter, e: &FileEntry| -> Option<ID2D1Bitmap> {
+            // An item's icon, pre-scaled to fit `fit` (or full size for Quick Look).
+            let mut icon_for = |p: &Painter, e: &FileEntry, fit: Option<Rect>| -> Option<ID2D1Bitmap> {
                 let (key, _) = IconLoader::key_for(e);
+                let size = fit.map_or((0, 0), |r| ((r.w * px).round() as u32, (r.h * px).round() as u32));
+                let key = (key, size);
                 if let Some(b) = bitmaps.get(&key) {
                     return b.clone();
                 }
-                let px = loader.get_entry(e)?;
-                let bmp = px.to_bitmap(p.rt);
+                let full = loader.get_entry(e)?.to_bitmap(p.rt);
+                let bmp = match fit {
+                    Some(r) => full.and_then(|b| p.fitted(&b, r.w, r.h)),
+                    None => full,
+                };
                 bitmaps.insert(key, bmp.clone());
                 bmp
             };
@@ -2005,7 +2022,11 @@ impl FinderWindow {
                     let (bw, bh) = (size.width.max(1.0), size.height.max(1.0));
                     let k = (r.w / bw).min(r.h / bh);
                     let (w, h) = (bw * k, bh * k);
-                    p.bitmap(&b, Rect::new(r.cx() - w / 2.0, r.bottom() - h, w, h), 1.0);
+                    if (k - 1.0).abs() < 0.01 {
+                        p.stamp(&b, r.cx() - w / 2.0, r.bottom() - h, px);
+                    } else {
+                        p.bitmap(&b, Rect::new(r.cx() - w / 2.0, r.bottom() - h, w, h), 1.0);
+                    }
                 }
             };
             // Editable text in `r` (scrolled to keep the caret visible); returns each caret index's x.
@@ -2258,7 +2279,7 @@ impl FinderWindow {
                         } else if sel {
                             p.fill_round(icon_r.inset(-6.0, -5.0), 6.0, soft);
                         }
-                        let bmp = icon_for(p, e);
+                        let bmp = icon_for(p, e, Some(icon_r));
                         draw_icon(p, bmp, icon_r);
                         let label = Rect::new(cell.x + 4.0, icon_r.bottom() + 6.0, cell.w - 8.0, 32.0);
                         match rename.as_ref().filter(|r| r.target == e.path) {
@@ -2303,8 +2324,9 @@ impl FinderWindow {
                             }
                             let tc = if sel { sel_text } else { theme.text };
                             let sc = if sel { sel_text } else { theme.text_secondary };
-                            let bmp = icon_for(p, e);
-                            draw_icon(p, bmp, Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0));
+                            let icon_r = Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
+                            let bmp = icon_for(p, e, Some(icon_r));
+                            draw_icon(p, bmp, icon_r);
                             let name_r = Rect::new(r.x + 28.0, r.y, cols[0].3 - 34.0, r.h);
                             match rename.as_ref().filter(|ren| ren.target == e.path) {
                                 Some(ren) => draw_field(p, name_r.inset(0.0, 1.0), ren),
@@ -2361,8 +2383,9 @@ impl FinderWindow {
                                 p.stroke_round(r.inset(1.0, 1.0), 5.0, theme.accent, 2.0);
                             }
                             let tc = if sel && active { sel_text } else { theme.text };
-                            let bmp = icon_for(p, e);
-                            draw_icon(p, bmp, Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0));
+                            let icon_r = Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
+                            let bmp = icon_for(p, e, Some(icon_r));
+                            draw_icon(p, bmp, icon_r);
                             let name_r = Rect::new(r.x + 28.0, r.y, r.w - 46.0, r.h);
                             match rename.as_ref().filter(|ren| ren.target == e.path) {
                                 Some(ren) => draw_field(p, name_r.inset(0.0, 1.0), ren),
@@ -2384,7 +2407,7 @@ impl FinderWindow {
                         let x = vr.x + columns.len() as f32 * COL_W - column_offset;
                         let area = Rect::new(x, vr.y, PREVIEW_W, vr.h);
                         let icon = Rect::new(area.cx() - 64.0, area.y + 30.0, 128.0, 128.0);
-                        let bmp = icon_for(p, e);
+                        let bmp = icon_for(p, e, Some(icon));
                         draw_icon(p, bmp, icon);
                         p.text(&e.name, &preview_title, Rect::new(area.x + 16.0, icon.bottom() + 14.0, area.w - 32.0, 22.0), theme.text);
                         let info = format!("{} - {}", kinds.kind(e), fs::format_size(e.size));
@@ -2466,7 +2489,7 @@ impl FinderWindow {
                     }
                 };
                 // Until the large preview arrives, show the small icon.
-                let image = large.or_else(|| icon_for(p, &e));
+                let image = large.or_else(|| icon_for(p, &e, None));
                 let mut info = kinds.kind(&e);
                 if !e.is_dir {
                     info += &format!("  ·  {}", fs::format_size(e.size));
@@ -2680,7 +2703,7 @@ mod bench {
         for view in [View::List, View::Icons] {
             let prefs = FinderCfg { view, ..cfg.finder.clone() };
             let mut ctx = Ctx { gfx: &gfx, theme: &theme, loader: &mut loader, kinds: &mut kinds };
-            let mut f = FinderWindow::new(&mut ctx, &Monitor::primary(), 1, PathBuf::from(r"C:\Windows\System32"), 0, 0, 0, &prefs).unwrap();
+            let mut f = FinderWindow::new(&mut ctx, &Monitor::primary(), 1, PathBuf::from(std::env::var("BENCH_DIR").unwrap_or(r"C:\Windows\System32".into())), 0, 0, 0, &prefs).unwrap();
             f.render(&mut ctx);
             unsafe {
                 let _ = ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
@@ -2694,9 +2717,12 @@ mod bench {
             let n = 150;
             let t = Instant::now();
             let mut work = 0.0;
+            let mut input = 0.0;
             for k in 0..n {
+                let t0 = Instant::now();
                 f.on_wheel(500.0, if k % 50 < 25 { -120 } else { 120 });
                 f.tick(1.0 / 165.0);
+                input += t0.elapsed().as_secs_f64() * 1000.0;
                 let t0 = Instant::now();
                 f.render(&mut ctx);
                 work += t0.elapsed().as_secs_f64() * 1000.0;
@@ -2704,7 +2730,34 @@ mod bench {
                     let _ = windows::Win32::Graphics::Dwm::DwmFlush();
                 }
             }
-            println!("{view:?}: {:.0} fps on screen, render {:.2} ms", n as f64 / t.elapsed().as_secs_f64(), work / n as f64);
+            println!("{view:?} ({} items): {:.0} fps on screen, render {:.2} ms, wheel+tick {:.2} ms", f.entries.len(), n as f64 / t.elapsed().as_secs_f64(), work / n as f64, input / n as f64);
+
+            // A steady spin from top to bottom, a notch every few frames, with
+            // icons for newly revealed rows streaming in as it goes.
+            f.scroll.jump(0.0);
+            let (mut frames, mut worst, mut slow) = (0, 0.0f64, 0);
+            let t = Instant::now();
+            while f.scroll.offset() < f.max_scroll && frames < 3000 {
+                let t0 = Instant::now();
+                if frames % 4 == 0 {
+                    f.on_wheel(500.0, -120);
+                }
+                if ctx.loader.drain() {
+                    f.on_icons();
+                }
+                f.tick(1.0 / 165.0);
+                if f.dirty {
+                    f.render(&mut ctx);
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                worst = worst.max(ms);
+                slow += (ms > 1000.0 / 165.0) as u32;
+                frames += 1;
+                unsafe {
+                    let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+                }
+            }
+            println!("  spin: {frames} frames, {:.0} fps on screen, worst frame {worst:.2} ms, {slow} over budget", frames as f64 / t.elapsed().as_secs_f64());
 
             // Partial frames must leave exactly what a full repaint would.
             f.on_wheel(500.0, -360);

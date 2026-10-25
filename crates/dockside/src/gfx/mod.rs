@@ -694,6 +694,38 @@ impl Painter<'_> {
         }
     }
 
+    /// `bmp` scaled (keeping its aspect ratio) to fit `w` x `h` points, at this
+    /// target's resolution and in high quality: done once, so the copy can be
+    /// stamped 1:1 every frame (scaling on the fly is slow in software).
+    pub fn fitted(&self, bmp: &ID2D1Bitmap, w: f32, h: f32) -> Option<ID2D1Bitmap> {
+        unsafe {
+            let size = bmp.GetSize();
+            let k = (w / size.width.max(1.0)).min(h / size.height.max(1.0));
+            let size = D2D_SIZE_F { width: (size.width * k).max(1.0), height: (size.height * k).max(1.0) };
+            let brt = self.rt.CreateCompatibleRenderTarget(Some(&size), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE).ok()?;
+            let dst = D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: size.height };
+            brt.BeginDraw();
+            brt.Clear(Some(&Color::TRANSPARENT.d2d()));
+            match brt.cast::<ID2D1DeviceContext>() {
+                Ok(ctx) => ctx.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None),
+                Err(_) => brt.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+            }
+            brt.EndDraw(None, None).ok()?;
+            brt.GetBitmap().ok()
+        }
+    }
+
+    /// Draws `bmp` at its own size with its top-left at (x, y), snapped to whole
+    /// device pixels so a [`Self::fitted`] copy lands 1:1.
+    pub fn stamp(&self, bmp: &ID2D1Bitmap, x: f32, y: f32, scale: f32) {
+        unsafe {
+            let size = bmp.GetSize();
+            let (x, y) = ((x * scale).round() / scale, (y * scale).round() / scale);
+            let r = D2D_RECT_F { left: x, top: y, right: x + size.width, bottom: y + size.height };
+            self.rt.DrawBitmap(bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+        }
+    }
+
     /// Draws `f` (which covers `bounds`) once into a bitmap kept under `key`, then
     /// just stamps that bitmap: for artwork that's costly and rarely changes. The
     /// key must capture everything `f` depends on except its position.

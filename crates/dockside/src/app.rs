@@ -2189,7 +2189,8 @@ impl App {
                 }
                 WM_APP_ICONS => {
                     if self.loader.drain() {
-                        self.finders.iter_mut().for_each(|f| f.dirty = true);
+                        self.finders.iter_mut().for_each(|f| f.on_icons());
+                        self.animate();
                         if let Some(s) = &mut self.spotlight {
                             s.dirty = true;
                         }

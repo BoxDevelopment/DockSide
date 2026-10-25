@@ -76,6 +76,7 @@ fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
         "calendar" => c.calendar,
         "claude_code" => c.claude_code,
         "shelf" => c.shelf,
+        "shelf_clear_on_start" => c.shelf_clear_on_start,
         "volume" => c.volume,
         "brightness" => c.brightness,
         "charging" => c.charging,
@@ -135,6 +136,7 @@ pub(crate) enum Key {
     Island(&'static str),
     IslandIcs,
     IslandStyle,
+    IslandShelfExpiry,
     IslandOffset,
     DockEnabled,
     DockSize,
@@ -191,6 +193,7 @@ impl Key {
             Key::Island(name) => ("island", name),
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::IslandStyle => ("island", "style"),
+            Key::IslandShelfExpiry => ("island", "shelf_expire_minutes"),
             Key::IslandOffset => ("island", "vertical_offset"),
             Key::DockEnabled => ("dock", "enabled"),
             Key::DockSize => ("dock", "tile_size"),
@@ -447,7 +450,11 @@ pub(crate) fn control_action(hit: Hit, login: &mut bool, fonts: &[String], cfg: 
             if sel == Some(i) {
                 return None;
             }
-            key.set(ConfigValue::Str(values[i].clone()))
+            match (key, values[i].parse()) {
+                // Numeric settings offered as a few choices.
+                (Key::IslandShelfExpiry, Ok(n)) => key.set(ConfigValue::Int(n)),
+                _ => key.set(ConfigValue::Str(values[i].clone())),
+            }
         }
         Hit::Swatch(i) => Action::SetConfig {
             table: "general",
@@ -747,7 +754,20 @@ impl SettingsWindow {
                         Row::Text("Calendar link", Key::IslandIcs, "https://…/basic.ics or webcal://…"),
                         Row::Toggle("Claude Code", Key::Island("claude_code")),
                         Row::Toggle("File shelf", Key::Island("shelf")),
-                    ],
+                    ]
+                    .into_iter()
+                    // Holding-folder options, only while the shelf is on.
+                    .chain(
+                        cfg.island
+                            .shelf
+                            .then_some([
+                                Row::Toggle("Empty the shelf when DockSide starts", Key::Island("shelf_clear_on_start")),
+                                Row::Segmented("Remove held files after", Key::IslandShelfExpiry),
+                            ])
+                            .into_iter()
+                            .flatten(),
+                    )
+                    .collect(),
                 },
                 Group {
                     title: Some("Alerts"),
@@ -1009,6 +1029,11 @@ impl SettingsWindow {
                 &[("Pill", "pill"), ("Notch", "notch")],
                 Some((cfg.island.style == IslandStyle::Notch) as usize),
             ),
+            Key::IslandShelfExpiry => {
+                const AFTER: [(&str, &str); 5] = [("1 Hour", "60"), ("1 Day", "1440"), ("1 Week", "10080"), ("30 Days", "43200"), ("Never", "0")];
+                let current = cfg.island.shelf_expire_minutes.to_string();
+                fixed(&AFTER, AFTER.iter().position(|a| a.1 == current))
+            }
             Key::DockIconStyle => fixed(
                 &[("Native", "native"), ("Squircle", "squircle")],
                 Some((cfg.dock.icon_style == IconStyle::Squircle) as usize),

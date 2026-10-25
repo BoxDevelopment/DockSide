@@ -194,8 +194,12 @@ pub struct IslandCfg {
     pub calendar_ics: String,
     /// Show what Claude Code is doing (needs "Connect Claude Code" in Settings).
     pub claude_code: bool,
-    /// Files dropped on the island are held on a shelf.
+    /// Files dropped on the island are copied to a holding folder and shown on a shelf.
     pub shelf: bool,
+    /// Empty the holding folder when DockSide starts.
+    pub shelf_clear_on_start: bool,
+    /// Minutes a held file stays before it's removed (0 = until you remove it).
+    pub shelf_expire_minutes: u32,
 
     // Alerts: brief pop-ups when something changes.
     /// Volume keys and scrolling over the island, instead of the Windows popup.

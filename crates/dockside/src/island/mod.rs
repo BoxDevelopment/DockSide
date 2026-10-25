@@ -2,7 +2,8 @@
 //! screen that morphs between live activities.
 //!
 //! * **Idle**: a small pill in the menu bar. Click it for a home panel (time,
-//!   next event, quick timers); drop files on it to hold them on the shelf.
+//!   next event, quick timers); drop files on it to hold them on the shelf
+//!   (copied to a holding folder, where they expire; right-click to convert).
 //! * **Compact activities** (persistent): timer / stopwatch, Now Playing,
 //!   downloads, an upcoming meeting and the file shelf. When two are running,
 //!   the second splits off into a bubble beside the pill.
@@ -19,7 +20,10 @@
 pub mod bluetooth;
 pub mod calendar;
 pub mod claude;
+mod convert;
+mod encode;
 pub mod glyphs;
+mod holding;
 mod ics;
 pub mod media;
 mod notifications;
@@ -30,7 +34,7 @@ mod views;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::RECT;
@@ -52,6 +56,8 @@ use crate::theme::Theme;
 use crate::win::system::Battery;
 use crate::win::Monitor;
 use calendar::CalEvent;
+pub use convert::Format;
+use holding::Item;
 use media::{Cmd, Media, NowPlaying};
 use notifications::Note;
 use sources::{Inbox, Privacy, Signal, Stop, VolumeKey};
@@ -86,6 +92,9 @@ const COLLAPSE_DELAY: f32 = 0.9;
 const HOVER_EXPAND_DELAY: f32 = 0.35;
 /// How far the pointer moves before a press on a file becomes a drag.
 const DRAG_THRESHOLD: f32 = 5.0;
+/// Held files dragged off the shelf stay in the folder this long (the drop
+/// target may still be copying them), then they're deleted.
+const ORPHAN_GRACE: Duration = Duration::from_secs(300);
 
 const GREEN: Color = Color::rgba(48, 209, 88, 1.0);
 const RED: Color = Color::rgba(255, 69, 58, 1.0);
@@ -192,6 +201,8 @@ pub enum Hit {
     Chip(u32),
     ShelfItem(usize),
     ShelfRemove(usize),
+    /// A held file's expiry badge (hover for the time left).
+    ShelfTimer(usize),
     ShelfClear,
     Event(usize),
     AlertBody,
@@ -207,6 +218,10 @@ pub enum IslandCmd {
     ToggleClock,
     CancelClock,
     ClearShelf,
+    /// Take one file off the shelf (deleting its held copy).
+    RemoveShelf(PathBuf),
+    /// Convert a held file; the result joins the shelf beside it.
+    Convert(PathBuf, Format),
 }
 
 pub enum IslandEvent {
@@ -278,8 +293,10 @@ pub struct Island {
     old_art: Option<ID2D1Bitmap>,
     art_fade: Spring,
     clock: Option<Clock>,
-    shelf: Vec<PathBuf>,
+    shelf: Vec<Item>,
     shelf_icons: HashMap<PathBuf, ID2D1Bitmap>,
+    /// Held files dragged off the shelf, deleted after `ORPHAN_GRACE`.
+    orphans: Vec<(PathBuf, Instant)>,
     events: Vec<CalEvent>,
     downloads: Vec<Download>,
     privacy: Privacy,
@@ -298,6 +315,8 @@ pub struct Island {
 
     // Shape and motion.
     expanded: Option<Panel>,
+    /// A menu is open (the island's context menu): don't fold away under it.
+    pub hold_open: bool,
     drag_over: bool,
     dragging_out: bool,
     shown: Content,
@@ -376,6 +395,7 @@ impl Island {
             bluetooth::watch(inbox.clone(), stop.clone());
         }
         shelf::register(surface.content);
+        holding::set_notify(hwnd, msg_signal);
 
         let mut island = Self {
             surface,
@@ -396,8 +416,9 @@ impl Island {
             old_art: None,
             art_fade: Spring::new(1.0, 0.45, 1.0),
             clock: None,
-            shelf: Vec::new(),
+            shelf: holding::load(ic.shelf_clear_on_start),
             shelf_icons: HashMap::new(),
+            orphans: Vec::new(),
             events: Vec::new(),
             downloads: Vec::new(),
             privacy: sources::privacy(),
@@ -412,6 +433,7 @@ impl Island {
             queue: VecDeque::new(),
             next_alert_id: 0,
             expanded: None,
+            hold_open: false,
             drag_over: false,
             dragging_out: false,
             shown: Content::Idle,
@@ -914,6 +936,16 @@ impl Island {
                 Signal::Calendar(events) => self.events = events,
             }
         }
+        for done in holding::drain() {
+            match done {
+                holding::Done::Ready(p) => match self.shelf.iter_mut().find(|i| i.path == p) {
+                    Some(i) => i.pending = false,
+                    // Finished for an island that was rebuilt since.
+                    None => self.shelf.push(Item { path: p, source: None, added: SystemTime::now(), pending: false }),
+                },
+                holding::Done::Failed(p) => self.shelf.retain(|i| i.path != p),
+            }
+        }
         self.retarget();
         self.dirty = true;
     }
@@ -953,11 +985,46 @@ impl Island {
             d.size = std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(d.size);
         }
         self.claude.prune();
+        self.expire_shelf();
         // A missed rename event must not leave a download spinning forever.
         self.downloads.retain(|d| d.path.exists());
         self.retarget();
         self.dirty = true;
         self.presence.value > 0.0
+    }
+
+    /// How long held files last (`None`: until removed).
+    fn shelf_lifetime(&self) -> Option<Duration> {
+        (self.cfg.shelf_expire_minutes > 0).then(|| Duration::from_secs(self.cfg.shelf_expire_minutes as u64 * 60))
+    }
+
+    /// Removes expired held files, files deleted behind our back, and dragged-off
+    /// copies past their grace period.
+    fn expire_shelf(&mut self) {
+        let now = SystemTime::now();
+        let life = self.shelf_lifetime();
+        let mut gone = Vec::new();
+        self.shelf.retain(|i| {
+            let expired = !i.pending && life.is_some_and(|l| i.added + l <= now);
+            if expired {
+                gone.push(i.path.clone());
+            }
+            !expired && (i.pending || i.path.exists())
+        });
+        let (old, keep): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.orphans).into_iter().partition(|(_, t)| t.elapsed() >= ORPHAN_GRACE);
+        self.orphans = keep;
+        gone.extend(old.into_iter().map(|(p, _)| p).filter(|p| !self.shelf.iter().any(|i| i.path == *p)));
+        if !gone.is_empty() {
+            holding::discard(gone);
+        }
+    }
+
+    /// Takes items off the shelf (those `keep` rejects) and deletes their held copies.
+    fn remove_shelf(&mut self, keep: impl Fn(&Item) -> bool) {
+        let (kept, gone): (Vec<Item>, Vec<Item>) = std::mem::take(&mut self.shelf).into_iter().partition(|i| keep(i));
+        self.shelf = kept;
+        holding::discard(gone.into_iter().map(|i| i.path).collect());
     }
 
     /// A Claude Code hook event relayed by `dockside --claude-hook`.
@@ -1062,7 +1129,17 @@ impl Island {
                 }
             }
             IslandCmd::CancelClock => self.clock = None,
-            IslandCmd::ClearShelf => self.shelf.clear(),
+            IslandCmd::ClearShelf => self.remove_shelf(|_| false),
+            IslandCmd::RemoveShelf(ref p) => self.remove_shelf(|i| i.path != *p),
+            IslandCmd::Convert(ref p, to) => {
+                if let Some(item) = holding::convert(p, to) {
+                    let at = self.shelf.iter().position(|i| i.path == *p).map_or(self.shelf.len(), |i| i + 1);
+                    self.shelf.insert(at, item);
+                    // Show it arriving, then fold away unless the pointer stays.
+                    self.expanded = Some(Panel::Shelf);
+                    self.leave_at = Some(Instant::now() + Duration::from_millis(1200));
+                }
+            }
         }
         if matches!(cmd, IslandCmd::Timer(_) | IslandCmd::Stopwatch) {
             self.expanded = None;
@@ -1088,8 +1165,11 @@ impl Island {
             Phase::Drop(..) => {
                 self.drag_over = false;
                 for p in paths {
-                    if !self.shelf.contains(p) {
-                        self.shelf.push(p.clone());
+                    let held = self.shelf.iter().any(|i| i.path == *p || i.source.as_ref() == Some(p));
+                    if !held {
+                        if let Some(item) = holding::hold(p) {
+                            self.shelf.push(item);
+                        }
                     }
                 }
                 // Show what landed, then fold away unless the pointer stays.
@@ -1106,9 +1186,13 @@ impl Island {
     pub fn drag_done(&mut self, paths: &[PathBuf], dropped: bool) {
         self.dragging_out = false;
         if dropped {
-            self.shelf.retain(|p| !paths.contains(p));
+            // Moved out, or copied: either way it's off the shelf. A copy stays
+            // in the folder a while, in case the drop target is still reading it.
+            self.shelf.retain(|i| !paths.contains(&i.path));
+            let now = Instant::now();
+            self.orphans.extend(paths.iter().filter(|p| p.exists()).map(|p| (p.clone(), now)));
         }
-        self.shelf.retain(|p| p.exists());
+        self.shelf.retain(|i| i.pending || i.path.exists());
         self.retarget();
         self.dirty = true;
     }
@@ -1156,8 +1240,11 @@ impl Island {
 
     fn drag_paths(&self, hit: Hit) -> Option<Vec<PathBuf>> {
         match hit {
-            Hit::ShelfItem(usize::MAX) => Some(self.shelf.clone()),
-            Hit::ShelfItem(i) => self.shelf.get(i).map(|p| vec![p.clone()]),
+            Hit::ShelfItem(usize::MAX) => {
+                let all: Vec<PathBuf> = self.shelf.iter().filter(|i| !i.pending).map(|i| i.path.clone()).collect();
+                (!all.is_empty()).then_some(all)
+            }
+            Hit::ShelfItem(i) | Hit::ShelfTimer(i) => self.shelf.get(i).filter(|i| !i.pending).map(|i| vec![i.path.clone()]),
             Hit::AlertBody => match self.alert.as_ref().map(|s| &s.alert) {
                 Some(Alert::Screenshot(p) | Alert::Downloaded(p)) => Some(vec![p.clone()]),
                 _ => None,
@@ -1274,14 +1361,16 @@ impl Island {
             Hit::Chip(secs) => self.command(IslandCmd::Timer(secs)),
             Hit::ShelfItem(usize::MAX) => {}
             Hit::ShelfItem(i) => {
-                return self.shelf.get(i).map(|p| IslandEvent::Run(Action::Open(p.to_string_lossy().into_owned())));
+                let item = self.shelf.get(i).filter(|i| !i.pending)?;
+                return Some(IslandEvent::Run(Action::Open(item.path.to_string_lossy().into_owned())));
             }
             Hit::ShelfRemove(i) => {
-                if i < self.shelf.len() {
-                    self.shelf.remove(i);
+                if let Some(p) = self.shelf.get(i).map(|i| i.path.clone()) {
+                    self.remove_shelf(|i| i.path != p);
                 }
             }
-            Hit::ShelfClear => self.shelf.clear(),
+            Hit::ShelfTimer(_) => {}
+            Hit::ShelfClear => self.remove_shelf(|_| false),
             Hit::Event(_) => return Some(IslandEvent::Run(Action::Open("outlookcal:".into()))),
             Hit::AlertBody => return self.alert_click(),
             Hit::Progress | Hit::Slider => {}
@@ -1303,8 +1392,33 @@ impl Island {
         event
     }
 
-    /// Right-click: timers, the shelf and settings.
-    pub fn context_menu(&self) -> IslandEvent {
+    /// Right-click on a held file: open, convert, remove.
+    fn item_menu(&self, item: &Item) -> Vec<Entry> {
+        let path = item.path.clone();
+        let convert: Vec<Entry> = convert::targets(&path)
+            .into_iter()
+            .map(|f| Entry::item(f.label(), Action::Island(IslandCmd::Convert(path.clone(), f))))
+            .collect();
+        vec![
+            Entry::item("Open", Action::Open(path.to_string_lossy().into_owned())),
+            Entry::item("Show in Finder", Action::OpenFinder(Some(holding::dir()))),
+            Entry::Separator,
+            Entry::submenu("Convert to", convert),
+            Entry::Separator,
+            Entry::item("Remove from Shelf", Action::Island(IslandCmd::RemoveShelf(path))),
+            Entry::item("Clear Shelf", Action::Island(IslandCmd::ClearShelf)),
+        ]
+    }
+
+    /// Right-click at `(x, y)`: a held file's menu, or timers, the shelf and settings.
+    pub fn context_menu(&self, x: f32, y: f32) -> IslandEvent {
+        let s = self.surface.scale;
+        let (ox, oy) = (self.surface.rect.left as f32 / s, self.surface.rect.top as f32 / s);
+        if let Some(Hit::ShelfItem(i) | Hit::ShelfTimer(i)) = self.hit_at(x, y) {
+            if let Some(item) = self.shelf.get(i).filter(|i| !i.pending) {
+                return IslandEvent::Menu(self.item_menu(item), Placement::Below { x: ox + x, y: oy + y });
+            }
+        }
         let mut entries = Vec::new();
         if self.cfg.timers {
             for (secs, label) in [(60, "1 Minute"), (300, "5 Minutes"), (600, "10 Minutes"), (1500, "25 Minutes"), (3600, "1 Hour")] {
@@ -1332,10 +1446,7 @@ impl Island {
             "Hide Dynamic Island",
             Action::SetConfig { table: "island", key: "enabled", value: ConfigValue::Bool(false) },
         ));
-        let s = self.surface.scale;
-        let x = self.surface.rect.left as f32 / s + self.pill_rect.x;
-        let y = self.surface.rect.top as f32 / s + self.pill_rect.bottom() + 6.0;
-        IslandEvent::Menu(entries, Placement::Below { x, y })
+        IslandEvent::Menu(entries, Placement::Below { x: ox + self.pill_rect.x, y: oy + self.pill_rect.bottom() + 6.0 })
     }
 
     // --- animation -----------------------------------------------------------
@@ -1365,6 +1476,9 @@ impl Island {
             self.expanded = self.expanded.filter(|p| *p != Panel::Timer);
             self.show_alert(Alert::TimerDone, 8.0);
             play_sound();
+        }
+        if self.hold_open && self.leave_at.is_some() {
+            self.leave_at = Some(now);
         }
         if !self.drag_over && self.leave_at.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > COLLAPSE_DELAY) {
             self.expanded = None;
@@ -1416,7 +1530,8 @@ impl Island {
 
         // Periodic redraws for things that change by themselves, throttled.
         let ticking = self.clock.is_some_and(|c| c.running) || !self.downloads.is_empty();
-        let spinning = self.claude.current().is_some();
+        let converting = self.shown == Content::Panel(Panel::Shelf) && self.shelf.iter().any(|i| i.pending);
+        let spinning = self.claude.current().is_some() || converting;
         let period = if waving || spinning { Some(1.0 / 30.0) } else if ticking { Some(0.1) } else { None };
         self.since_draw += dt;
         if moving || period.is_some_and(|p| visible && self.since_draw >= p) {
@@ -1454,11 +1569,11 @@ impl Island {
                 _ => None,
             };
         }
-        self.shelf_icons.retain(|p, _| self.shelf.contains(p));
-        for p in &self.shelf {
-            if !self.shelf_icons.contains_key(p) {
-                if let Some(b) = load_shell_image(&p.to_string_lossy(), 96, true).and_then(|px| px.to_bitmap(&rt)) {
-                    self.shelf_icons.insert(p.clone(), b);
+        self.shelf_icons.retain(|p, _| self.shelf.iter().any(|i| i.path == *p && !i.pending));
+        for i in self.shelf.iter().filter(|i| !i.pending) {
+            if !self.shelf_icons.contains_key(&i.path) {
+                if let Some(b) = load_shell_image(&i.path.to_string_lossy(), 96, true).and_then(|px| px.to_bitmap(&rt)) {
+                    self.shelf_icons.insert(i.path.clone(), b);
                 }
             }
         }
@@ -1523,6 +1638,8 @@ impl Island {
             clock: self.clock.as_ref(),
             shelf: &self.shelf,
             shelf_icons: &self.shelf_icons,
+            shelf_lifetime: self.shelf_lifetime(),
+            wall: SystemTime::now(),
             drag_over: self.drag_over,
             events: &self.events,
             downloads: &self.downloads,

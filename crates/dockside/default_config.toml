@@ -177,8 +177,15 @@ calendar_ics = ""
 # Show what Claude Code is doing, and when it finishes or needs you. Click
 # "Connect Claude Code" in System Settings > Dynamic Island to add its hooks.
 claude_code = true
-# Drop files on the island to hold them on a shelf.
+# Drop files on the island to hold them on a shelf. They're copied to a
+# holding folder (%LOCALAPPDATA%\DockSide\Shelf), so you can drag them back
+# out later; right-click one to convert it to another format.
 shelf = true
+# Empty the holding folder each time DockSide starts.
+shelf_clear_on_start = true
+# Minutes a held file stays on the shelf before it's removed (0 = keep until
+# you remove it). 60 = an hour, 1440 = a day, 10080 = a week.
+shelf_expire_minutes = 1440
 
 # Alerts: brief pop-ups when something changes.
 # Volume (media keys, or scroll over the island) and brightness, shown in the

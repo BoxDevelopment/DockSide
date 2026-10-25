@@ -1196,6 +1196,7 @@ impl App {
             still |= d.tick(dt);
         }
         if let Some(i) = &mut self.island {
+            i.hold_open = self.menu.is_some();
             still |= i.tick(dt);
         }
         if let Some(mb) = &mut self.menubar {
@@ -2585,7 +2586,7 @@ impl App {
             }
             WM_MOUSEHWHEEL => i.on_hwheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
             WM_RBUTTONUP => {
-                let e = i.context_menu();
+                let e = i.context_menu(x, y);
                 self.island_event(e);
             }
             WM_LBUTTONDOWN => {

@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 
 use super::calendar::CalEvent;
 use super::claude::{Session, State};
 use super::glyphs as g;
+use super::holding::{self, Item};
 use super::media::NowPlaying;
 use super::timer::Clock;
 use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, Persist, BLUE, CLAUDE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
@@ -41,8 +43,11 @@ pub struct View<'a> {
     pub home_timers: bool,
     pub home_events: bool,
     pub clock: Option<&'a Clock>,
-    pub shelf: &'a [PathBuf],
+    pub shelf: &'a [Item],
     pub shelf_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
+    /// How long held files last (`None`: no expiry badges).
+    pub shelf_lifetime: Option<Duration>,
+    pub wall: SystemTime,
     pub drag_over: bool,
     pub events: &'a [CalEvent],
     pub downloads: &'a [Download],
@@ -481,20 +486,44 @@ pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     let max = ((body.w / tile_w) as usize).max(1);
     let overflow = v.shelf.len() > max;
     let shown = if overflow { max - 1 } else { v.shelf.len() };
-    for (i, path) in v.shelf.iter().take(shown).enumerate() {
+    // The hovered expiry badge's tooltip, drawn over everything after the tiles.
+    let mut tip: Option<(f32, f32, String)> = None;
+    for (i, item) in v.shelf.iter().take(shown).enumerate() {
         let tile = Rect::new(body.x + i as f32 * tile_w, body.y, tile_w, body.h);
-        let hot = matches!(v.hot, Some(Hit::ShelfItem(j)) | Some(Hit::ShelfRemove(j)) if j == i);
-        if hot {
+        let hot = matches!(v.hot, Some(Hit::ShelfItem(j) | Hit::ShelfRemove(j) | Hit::ShelfTimer(j)) if j == i);
+        if hot && !item.pending {
             p.fill_round(tile.inset(2.0, 0.0), 10.0, Color::gray(255, 0.1 * a));
         }
         let icon = Rect::new(tile.cx() - 20.0, tile.y + 6.0, 40.0, 40.0);
-        match v.shelf_icons.get(path) {
-            Some(bmp) => p.bitmap(bmp, icon, a),
-            None => p.fill_round(icon, 8.0, Color::gray(255, 0.15 * a)),
+        match v.shelf_icons.get(&item.path) {
+            Some(bmp) if !item.pending => p.bitmap(bmp, icon, a),
+            _ => p.fill_round(icon, 8.0, Color::gray(255, 0.15 * a)),
         }
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        p.text(&name, &f.small_c, Rect::new(tile.x + 3.0, icon.bottom() + 4.0, tile.w - 6.0, 15.0), Color::gray(255, 0.85 * a));
+        if item.pending {
+            spinner(p, icon.cx(), icon.cy(), 9.0, v.time, WHITE.alpha(a));
+        }
+        let name = item.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let fade = if item.pending { 0.5 } else { 0.85 };
+        p.text(&name, &f.small_c, Rect::new(tile.x + 3.0, icon.bottom() + 4.0, tile.w - 6.0, 15.0), Color::gray(255, fade * a));
         hits.push((tile, Hit::ShelfItem(i)));
+        if item.pending {
+            continue;
+        }
+        // Expiry badge: a ring that empties as the item's time runs out.
+        if let Some(life) = v.shelf_lifetime {
+            let left = (item.added + life).duration_since(v.wall).unwrap_or_default();
+            let frac = left.as_secs_f32() / life.as_secs_f32().max(1.0);
+            let urgent = frac < 0.1 || left.as_secs() < 300;
+            let (cx, cy) = (icon.x + 1.0, icon.bottom() - 1.0);
+            let badge_hot = v.hot == Some(Hit::ShelfTimer(i));
+            p.fill_circle(cx, cy, 8.0, Color::gray(if badge_hot { 78 } else { 52 }, a));
+            g::timer(p, cx, cy, 15.0, frac, if urgent { ORANGE } else { WHITE }.alpha(a));
+            let badge = Rect::new(cx - 9.0, cy - 9.0, 18.0, 18.0);
+            hits.push((badge, Hit::ShelfTimer(i)));
+            if badge_hot {
+                tip = Some((cx, badge.bottom() + 4.0, format!("Expires in {}", holding::remaining_label(left.as_secs()))));
+            }
+        }
         if hot {
             let x = Rect::new(icon.right() - 6.0, icon.y - 6.0, 16.0, 16.0);
             p.fill_circle(x.cx(), x.cy(), 8.0, Color::gray(90, a));
@@ -508,6 +537,15 @@ pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         p.fill_round(Rect::new(tile.cx() - 20.0, tile.y + 6.0, 40.0, 40.0), 10.0, Color::gray(255, 0.12 * a));
         p.text(&more, &f.chip, Rect::new(tile.cx() - 20.0, tile.y + 6.0, 40.0, 40.0), WHITE.alpha(a));
         hits.push((tile, Hit::ShelfItem(usize::MAX)));
+    }
+    if let Some((cx, y, label)) = tip {
+        let w = p.gfx.measure(&label, &f.small_c) + 18.0;
+        let x = (cx - w / 2.0).clamp(r.x + 8.0, r.right() - 8.0 - w);
+        let bubble = Rect::new(x, y, w, 20.0);
+        p.fill_round(bubble.offset(0.0, 1.0), 10.0, Color::BLACK.alpha(0.4 * a));
+        p.fill_round(bubble, 10.0, Color::gray(62, a));
+        p.stroke_round(bubble.inset(0.25, 0.25), 10.0, Color::gray(255, 0.12 * a), 0.5);
+        p.text(&label, &f.small_c, bubble, WHITE.alpha(a));
     }
 }
 

@@ -4,8 +4,11 @@
 //!
 //! A worker thread owns the session manager. WinRT events (on arbitrary
 //! threads) only nudge it through a channel; it then rebuilds a snapshot,
-//! decodes album art, and posts a message to the UI thread.
+//! decodes album art, and posts a message to the UI thread. The island and
+//! the Now Playing widget share one worker (see [`Media::shared`]).
 
+use std::cell::RefCell;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -79,14 +82,40 @@ pub enum Cmd {
 
 pub type Shared = Arc<Mutex<Option<NowPlaying>>>;
 
-pub struct Media {
+struct Handle {
     tx: Sender<Cmd>,
     shared: Shared,
 }
 
+impl Drop for Handle {
+    fn drop(&mut self) {
+        // Event handlers hold senders too, so the channel never closes on its own.
+        let _ = self.tx.send(Cmd::Quit);
+    }
+}
+
+thread_local! {
+    static WORKER: RefCell<Weak<Handle>> = const { RefCell::new(Weak::new()) };
+}
+
+/// A handle on the Now Playing worker. Clones share it; it stops with the last one.
+#[derive(Clone)]
+pub struct Media(Rc<Handle>);
+
 impl Media {
-    /// Starts the worker; it posts `msg` to `hwnd` whenever Now Playing changes.
-    pub fn start(hwnd: isize, msg: u32) -> Self {
+    /// The worker everything showing Now Playing shares (the island and the
+    /// widget), started on first use. It posts `WM_APP_MEDIA` to `hwnd` whenever
+    /// Now Playing changes.
+    pub fn shared(hwnd: isize) -> Self {
+        if let Some(w) = WORKER.with(|w| w.borrow().upgrade()) {
+            return Self(w);
+        }
+        let worker = Rc::new(Self::start(hwnd, crate::win::WM_APP_MEDIA));
+        WORKER.with(|w| *w.borrow_mut() = Rc::downgrade(&worker));
+        Self(worker)
+    }
+
+    fn start(hwnd: isize, msg: u32) -> Handle {
         let (tx, rx) = channel();
         let shared: Shared = Arc::default();
         let (tx2, shared2) = (tx.clone(), shared.clone());
@@ -98,22 +127,15 @@ impl Media {
         if let Err(e) = spawned {
             log!("media thread failed: {e}");
         }
-        Self { tx, shared }
+        Handle { tx, shared }
     }
 
     pub fn send(&self, cmd: Cmd) {
-        let _ = self.tx.send(cmd);
+        let _ = self.0.tx.send(cmd);
     }
 
     pub fn snapshot(&self) -> Option<NowPlaying> {
-        self.shared.lock().ok().and_then(|s| s.clone())
-    }
-}
-
-impl Drop for Media {
-    fn drop(&mut self) {
-        // Event handlers hold senders too, so the channel never closes on its own.
-        let _ = self.tx.send(Cmd::Quit);
+        self.0.shared.lock().ok().and_then(|s| s.clone())
     }
 }
 
@@ -173,9 +195,27 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, shared: Shared, hwnd: isize, msg: u32
     };
     let _ = tx.send(Cmd::Refresh);
 
-    while let Ok(cmd) = rx.recv() {
+    let mut next = None;
+    loop {
+        let cmd = match next.take() {
+            Some(cmd) => cmd,
+            None => match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            },
+        };
         if matches!(cmd, Cmd::Quit) {
             break;
+        }
+        if matches!(cmd, Cmd::Refresh) {
+            // Change events come in bursts (some players report the timeline many times
+            // a second): one snapshot covers every refresh already queued.
+            while let Ok(c) = rx.try_recv() {
+                if !matches!(c, Cmd::Refresh) {
+                    next = Some(c);
+                    break;
+                }
+            }
         }
         let r = match cmd {
             Cmd::Refresh => w.refresh(&manager, &tx).map(|snap| {

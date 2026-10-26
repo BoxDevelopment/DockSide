@@ -18,13 +18,15 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
+use std::time::{Duration, Instant};
 
 use windows::core::{s, Interface, Result};
-use windows::Foundation::TypedEventHandler;
+use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
+use windows::System::{DispatcherQueue, DispatcherQueueTimer};
 use windows::Win32::Foundation::{HMODULE, HWND, RECT};
 use crate::win::wallpaper;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -36,12 +38,17 @@ use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HMONITOR
 use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowRect, IsIconic, IsWindowVisible, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+};
 
 use crate::geom::Color;
 
 /// Captured pixels kept around each pane, for the frost to sample past its edges.
 const MARGIN: i32 = 16;
+/// Shortest time between renders of one monitor's panes (about 60 Hz): a busy
+/// screen (video, scrolling) sends a frame every refresh, up to 144+ a second.
+const MIN_INTERVAL: Duration = Duration::from_millis(16);
 
 /// How assertive a pane's glass is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -213,6 +220,38 @@ struct Monitor {
     _item: GraphicsCaptureItem,
     /// Latest captured frame.
     frame: Option<ID3D11Texture2D>,
+    /// When its panes were last rendered from a new frame.
+    last: Option<Instant>,
+    /// Renders a frame that arrived too soon after the last one, once it's due.
+    timer: Option<DispatcherQueueTimer>,
+}
+
+impl Monitor {
+    /// Renders `key`'s waiting frame after `wait`. False when no timer could be made.
+    fn defer(&mut self, key: isize, wait: Duration) -> bool {
+        if self.timer.is_none() {
+            let timer = (|| -> Result<DispatcherQueueTimer> {
+                let t = DispatcherQueue::GetForCurrentThread()?.CreateTimer()?;
+                t.SetIsRepeating(false)?;
+                t.Tick(&TypedEventHandler::new(move |_, _| {
+                    with_engine(|engine| {
+                        engine.prune();
+                        engine.present(key);
+                    });
+                    Ok(())
+                }))?;
+                Ok(t)
+            })();
+            self.timer = timer.map_err(|e| log!("glass timer failed: {e}")).ok();
+        }
+        let Some(t) = &self.timer else { return false };
+        // Already waiting: that render takes the newest frame.
+        if t.IsRunning().unwrap_or(false) {
+            return true;
+        }
+        let _ = t.SetInterval(TimeSpan { Duration: (wait.as_nanos() / 100) as i64 });
+        t.Start().is_ok()
+    }
 }
 
 /// A monitor's wallpaper, as `Source::Wallpaper` panes see it.
@@ -221,6 +260,22 @@ struct Wallpaper {
     rect: RECT,
     /// None when it couldn't be loaded (not retried until the wallpaper changes).
     tex: Option<ID3D11Texture2D>,
+}
+
+/// Whether `hwnd` shows any of itself: visible, not minimized, and not sized to
+/// nothing or moved off its monitor (the Dock slides off the screen to auto-hide).
+fn on_screen(hwnd: HWND) -> bool {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(hwnd, &mut wr).is_err() {
+            return false;
+        }
+        let m = monitor_rect(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
+        wr.left.max(m.left) < wr.right.min(m.right) && wr.top.max(m.top) < wr.bottom.min(m.bottom)
+    }
 }
 
 fn monitor_rect(handle: HMONITOR) -> RECT {
@@ -381,6 +436,8 @@ impl Engine {
             session,
             _item: item,
             frame: None,
+            last: None,
+            timer: None,
         })
     }
 
@@ -426,7 +483,12 @@ impl Engine {
     /// Takes the newest frame for a monitor; true when there was one.
     fn take_frame(&mut self, key: isize) -> bool {
         let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return false };
-        let Ok(frame) = m.pool.TryGetNextFrame() else { return false };
+        let Ok(mut frame) = m.pool.TryGetNextFrame() else { return false };
+        // Frames queue up while a render waits; only the newest matters.
+        while let Ok(newer) = m.pool.TryGetNextFrame() {
+            let _ = frame.Close();
+            frame = newer;
+        }
         let result = (|| -> Result<()> {
             let size = frame.ContentSize()?;
             let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
@@ -466,18 +528,27 @@ impl Engine {
         result.is_ok()
     }
 
-    /// Stops captures no live pane needs.
+    /// Stops captures no pane on screen needs. A pane that shows again starts its
+    /// capture back up when it next renders (see `Surface::show_windows`).
     fn prune(&mut self) {
         self.panes.retain(|p| p.strong_count() > 0);
         let used: Vec<isize> = self
             .panes
             .iter()
             .filter_map(|p| p.upgrade())
-            .filter_map(|p| p.try_borrow().ok().filter(|s| s.source == Source::Screen).map(|s| s.monitor.0 as isize))
+            .filter_map(|p| {
+                p.try_borrow()
+                    .ok()
+                    .filter(|s| s.source == Source::Screen && on_screen(s.hwnd))
+                    .map(|s| s.monitor.0 as isize)
+            })
             .collect();
         self.monitors.retain(|m| {
             let keep = used.contains(&(m.handle.0 as isize));
             if !keep {
+                if let Some(t) = &m.timer {
+                    let _ = t.Stop();
+                }
                 let _ = m.session.Close();
                 let _ = m.pool.Close();
             }
@@ -485,8 +556,32 @@ impl Engine {
         });
     }
 
+    /// Takes `key`'s newest frame and re-renders the screen panes it shows through.
+    fn present(&mut self, key: isize) {
+        if !self.take_frame(key) {
+            return;
+        }
+        if let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) {
+            m.last = Some(Instant::now());
+        }
+        let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
+        for pane in panes {
+            let Ok(mut state) = pane.try_borrow_mut() else { continue };
+            // Wallpaper panes redraw when they move or the wallpaper changes, not per frame.
+            if state.source == Source::Screen && (state.monitor.0 as isize == key || !state.shown) {
+                if let Err(e) = self.render(&mut state) {
+                    log!("glass render failed: {e}");
+                }
+            }
+        }
+    }
+
     fn render(&mut self, pane: &mut PaneState) -> Result<()> {
         if pane.size.0 == 0 || pane.size.1 == 0 {
+            return Ok(());
+        }
+        // Hidden, minimized or slid away: nothing to show, and no capture to keep running.
+        if pane.source == Source::Screen && !on_screen(pane.hwnd) {
             return Ok(());
         }
         let monitor = unsafe { MonitorFromWindow(pane.hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -658,19 +753,15 @@ fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
 fn on_frame(key: isize) {
     with_engine(|engine| {
         engine.prune();
-        if !engine.take_frame(key) {
-            return;
-        }
-        let panes: Vec<_> = engine.panes.iter().filter_map(|p| p.upgrade()).collect();
-        for pane in panes {
-            let Ok(mut state) = pane.try_borrow_mut() else { continue };
-            // Wallpaper panes redraw when they move or the wallpaper changes, not per frame.
-            if state.source == Source::Screen && (state.monitor.0 as isize == key || !state.shown) {
-                if let Err(e) = engine.render(&mut state) {
-                    log!("glass render failed: {e}");
-                }
+        let Some(m) = engine.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return };
+        // Too soon after the last render: the frame waits in the pool (which holds
+        // back newer ones until it's taken) and is rendered once it's due.
+        if let Some(wait) = m.last.and_then(|t| MIN_INTERVAL.checked_sub(t.elapsed())) {
+            if m.defer(key, wait) {
+                return;
             }
         }
+        engine.present(key);
     });
 }
 

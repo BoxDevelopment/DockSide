@@ -291,7 +291,12 @@ pub fn watch_devices(shared: SharedDevices, stop: Stop, hwnd: isize, msg: u32) {
         }
         let mut last = None;
         while !stop.stopped() {
+            let started = Instant::now();
             let now = crate::island::bluetooth::batteries();
+            // Enumerates every present device: worth knowing when it's slow.
+            if started.elapsed() > Duration::from_millis(500) {
+                log!("device batteries took {:?}", started.elapsed());
+            }
             if last.as_ref() != Some(&now) {
                 if let Ok(mut s) = shared.lock() {
                     *s = now.clone();

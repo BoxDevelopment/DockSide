@@ -44,7 +44,7 @@ use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
-    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
+    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
 };
 
 thread_local! {
@@ -81,8 +81,12 @@ const TIMER_RETIRE: usize = 8;
 const TIMER_WALLPAPER: usize = 9;
 /// Another appbar (usually the taskbar) moved or changed state: re-hide it and re-reserve.
 const TIMER_APPBAR: usize = 10;
+/// TaskbarCreated broadcast: rebuild only if Explorer's taskbar window was replaced.
+const TIMER_TASKBAR: usize = 11;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
+/// Messages handled slower than this are logged.
+const SLOW_MESSAGE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Energy Saver and battery saver on/off, reported via WM_POWERBROADCAST.
 const GUID_ENERGY_SAVER_STATUS: windows::core::GUID = windows::core::GUID::from_u128(0x550e8400_e29b_41d4_a716_446655440000);
@@ -515,8 +519,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         _ => {}
     }
+    let started = Instant::now();
     let handled = with_app(|app| app.on_message(hwnd, msg, wp, lp)).flatten();
     drain_actions();
+    // Anything holding up the UI thread (a CPU spike, or a modal dialog) shows in the log.
+    let took = started.elapsed();
+    if took >= SLOW_MESSAGE {
+        log!("slow: message {msg:#06x} (wparam {:#x}) took {took:?}", wp.0);
+    }
     handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
 }
 
@@ -729,14 +739,23 @@ pub struct App {
     /// Hides Windows' own desktop switch popup.
     desktop_popup: Option<win::desktops::PopupHider>,
     win_hooks: Vec<HWINEVENTHOOK>,
+    /// The registered "SHELLHOOK" message: app windows shown, hidden or destroyed.
+    shell_hook: u32,
     _watcher: Option<notify::RecommendedWatcher>,
     taskbar_created: u32,
+    /// Explorer's taskbar window when the surfaces were last built. TaskbarCreated
+    /// is also broadcast by other apps (to refresh tray icons); only a new window
+    /// (Explorer restarted) drops our appbars and needs a rebuild.
+    explorer_tray: Option<HWND>,
     /// Edge the taskbar was last seen on, to notice it being moved while we run.
     taskbar_edge: Option<u32>,
     /// Windows' last ABN_FULLSCREENAPP report (checked against the foreground window).
     fullscreen_reported: bool,
     /// Shell surfaces are currently hidden for a fullscreen app.
     fullscreen_hidden: bool,
+    /// Sources of a retired island / widgets, for their replacements to take over.
+    island_handover: Option<crate::island::Handover>,
+    widgets_handover: Option<crate::widgets::Handover>,
     /// `backdrop_state()` when the surfaces were last built.
     backdrop_state: (bool, bool),
     /// Replaced surfaces, left on screen under their replacements until
@@ -761,13 +780,15 @@ impl App {
             .map_err(|e| log!("config watcher failed: {e}"))
             .ok();
 
+        // Foreground and minimize changes only: those are rare. App windows coming and
+        // going arrive through the shell hook, which reports just taskbar-worthy windows;
+        // object show / hide / destroy events fire for every window in the system, and
+        // each one wakes this thread.
         let mut win_hooks = Vec::new();
         unsafe {
             for (min, max) in [
                 (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
                 (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
-                (EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE),
-                (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
             ] {
                 let h = SetWinEventHook(
                     min,
@@ -783,6 +804,15 @@ impl App {
                 }
             }
         }
+
+        let shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
+        unsafe {
+            if !RegisterShellHookWindow(msg_hwnd).as_bool() {
+                log!("shell hook failed");
+            }
+        }
+        // Explorer sends it, unelevated.
+        win::elevation::allow_messages(msg_hwnd, &[shell_hook]);
 
         Ok(Self {
             gfx,
@@ -822,11 +852,15 @@ impl App {
             desktop_watch: None,
             desktop_popup: None,
             win_hooks,
+            shell_hook,
             _watcher: watcher,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            explorer_tray: None,
             taskbar_edge: None,
             fullscreen_reported: false,
             fullscreen_hidden: false,
+            island_handover: None,
+            widgets_handover: None,
             backdrop_state: backdrop_state(),
             retired: Vec::new(),
         })
@@ -834,6 +868,7 @@ impl App {
 
     /// (Re)creates every surface from the current config.
     fn build(&mut self) {
+        let started = Instant::now();
         crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
         self.close_menu();
         self.retire_island();
@@ -874,6 +909,7 @@ impl App {
         // Explorer releases the auto-hidden taskbar's work area after we've already
         // reserved ours; catch up even if no ABN_POSCHANGED arrives.
         self.taskbar_edge = taskbar::edge();
+        self.explorer_tray = win::tray::explorer_tray();
         self.timer(TIMER_APPBAR, 1000);
         // After the menu bar, so it stacks above it.
         self.rebuild_island();
@@ -888,7 +924,7 @@ impl App {
         if self.index.lock().is_ok_and(|i| i.built.is_none()) {
             self.rebuild_index();
         }
-        log!("built surfaces (scale {}, font {})", self.monitor.scale, self.theme.font);
+        log!("built surfaces in {:?} (scale {}, font {})", started.elapsed(), self.monitor.scale, self.theme.font);
     }
 
     /// Applies a changed config with the least disruption: unchanged surfaces
@@ -1014,7 +1050,8 @@ impl App {
     }
 
     fn retire_island(&mut self) {
-        if let Some(i) = self.island.take() {
+        if let Some(mut i) = self.island.take() {
+            self.island_handover = i.hand_over();
             self.retire(i);
         }
     }
@@ -1022,15 +1059,18 @@ impl App {
     fn retire_widgets(&mut self) {
         if let Some(mut w) = self.widgets.take() {
             w.save_state();
+            self.widgets_handover = Some(w.hand_over());
             self.retire(w);
         }
     }
 
     fn rebuild_island(&mut self) {
         self.retire_island();
+        // Taken even when the island is now off, so its sources stop.
+        let handover = self.island_handover.take();
         if self.cfg.island.enabled {
             let hwnd = self.msg_hwnd.0 as isize;
-            match Island::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_MEDIA, WM_APP_ISLAND) {
+            match Island::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_ISLAND, handover) {
                 Ok(i) => self.island = Some(i),
                 Err(e) => log!("island failed: {e}"),
             }
@@ -1058,9 +1098,10 @@ impl App {
 
     fn rebuild_widgets(&mut self) {
         self.retire_widgets();
+        let handover = self.widgets_handover.take();
         if self.cfg.widgets.enabled {
             let hwnd = self.msg_hwnd.0 as isize;
-            self.widgets = Some(Widgets::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_WIDGETS, WM_APP_WIDGET_MEDIA));
+            self.widgets = Some(Widgets::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_WIDGETS, handover));
         }
     }
 
@@ -1126,6 +1167,8 @@ impl App {
     /// After any desktop switch: focus that desktop's top window (the internal
     /// switch leaves focus behind), and show it in the island.
     fn on_desktop_changed(&mut self) {
+        // The windows on other desktops are cloaked, which no hook reports.
+        self.timer(TIMER_REFRESH, 150);
         if let Some(top) = apps::list_windows().first() {
             push(Action::Activate(top.hwnd));
         }
@@ -2156,6 +2199,13 @@ impl App {
     // --- message routing ---------------------------------------------------
 
     fn on_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        if hwnd == self.msg_hwnd && msg == self.shell_hook {
+            // Sent when an app window is shown (created), hidden or destroyed, or swapped for another.
+            if matches!(wp.0 as u32, HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED | HSHELL_WINDOWREPLACED) {
+                self.timer(TIMER_REFRESH, 150);
+            }
+            return Some(LRESULT(0));
+        }
         if hwnd == self.msg_hwnd {
             match msg {
                 WM_COPYDATA => {
@@ -2183,7 +2233,16 @@ impl App {
                         TIMER_TICK => self.on_tick(),
                         TIMER_REFRESH => self.refresh_windows(),
                         TIMER_RELOAD => self.reload(),
-                        TIMER_REBUILD => self.build(),
+                        TIMER_REBUILD => {
+                            log!("rebuilding: dark mode set");
+                            self.build()
+                        }
+                        TIMER_TASKBAR if win::tray::explorer_tray() != self.explorer_tray => {
+                            log!("rebuilding: Explorer's taskbar was recreated");
+                            self.build()
+                        }
+                        // Same taskbar: just make sure it's still hidden and our space reserved.
+                        TIMER_TASKBAR => self.on_appbar_change(),
                         TIMER_RETIRE => self.retired.clear(),
                         TIMER_WALLPAPER => win::glass::wallpaper_changed(),
                         TIMER_APPBAR => self.on_appbar_change(),
@@ -2193,9 +2252,13 @@ impl App {
                             if crate::theme::wants_dark(&self.cfg) != self.theme.dark
                                 || backdrop_state() != self.backdrop_state =>
                         {
+                            log!("rebuilding: theme or backdrop state changed");
                             self.build()
                         }
-                        TIMER_DISPLAY if Monitor::primary() != self.monitor => self.build(),
+                        TIMER_DISPLAY if Monitor::primary() != self.monitor => {
+                            log!("rebuilding: primary monitor changed");
+                            self.build()
+                        }
                         TIMER_DISPLAY => {
                             self.raise_surfaces();
                             if let Some(w) = &self.widgets {
@@ -2269,10 +2332,14 @@ impl App {
                     self.timer(TIMER_FINDER, 200);
                 }
                 WM_APP_MENU_KEY => self.on_menu_key(wp.0 as u16),
+                // One worker feeds both.
                 WM_APP_MEDIA => {
                     if let Some(i) = &mut self.island {
                         i.on_media();
                         self.animate();
+                    }
+                    if let Some(w) = &mut self.widgets {
+                        w.on_media();
                     }
                 }
                 WM_APP_ISLAND => {
@@ -2284,11 +2351,6 @@ impl App {
                 WM_APP_WIDGETS => {
                     if let Some(w) = &mut self.widgets {
                         w.on_data();
-                    }
-                }
-                WM_APP_WIDGET_MEDIA => {
-                    if let Some(w) = &mut self.widgets {
-                        w.on_media();
                     }
                 }
                 WM_APP_UPDATE => {
@@ -2330,7 +2392,7 @@ impl App {
 
         // Broadcasts reach every one of our top-level windows; debounce into one rebuild.
         if msg == self.taskbar_created {
-            self.timer(TIMER_REBUILD, 400);
+            self.timer(TIMER_TASKBAR, 400);
             return None;
         }
         if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
@@ -2826,6 +2888,9 @@ impl Drop for App {
             unsafe {
                 let _ = UnhookWinEvent(h);
             }
+        }
+        unsafe {
+            let _ = DeregisterShellHookWindow(self.msg_hwnd);
         }
         self.menu = None;
         self.island = None;

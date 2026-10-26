@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::w;
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, IEnumShellItems, IShellItem, SHCreateItemFromParsingName, SIGDN, SIGDN_NORMALDISPLAY,
     SIGDN_PARENTRELATIVEPARSING,
@@ -74,6 +75,9 @@ pub fn rebuild(shared: Shared, roots: Vec<PathBuf>, notify: isize, msg: u32) {
     let spawned = std::thread::Builder::new().name("spotlight-index".into()).spawn(move || {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            // Low CPU, I/O and memory priority: walking the user's folders takes a
+            // second or two of a core and lots of disk, and nothing waits on it.
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
         }
         let started = Instant::now();
         let apps = apps();

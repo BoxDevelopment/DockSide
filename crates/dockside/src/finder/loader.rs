@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
@@ -36,6 +38,8 @@ pub struct IconLoader {
     cache: HashMap<String, Option<Rc<IconPixels>>>,
     /// Large preview keys, oldest first.
     large: VecDeque<String>,
+    /// A ping is on its way that `drain` hasn't handled yet.
+    pinged: Arc<AtomicBool>,
 }
 
 impl IconLoader {
@@ -43,6 +47,8 @@ impl IconLoader {
     pub fn new(notify: isize, msg: u32) -> Self {
         let (req_tx, req_rx) = channel::<(String, PathBuf, bool, i32)>();
         let (res_tx, res_rx) = channel();
+        let pinged = Arc::new(AtomicBool::new(false));
+        let flag = pinged.clone();
         std::thread::Builder::new()
             .name("finder-icons".into())
             .spawn(move || {
@@ -54,11 +60,14 @@ impl IconLoader {
                     if res_tx.send((key, px)).is_err() {
                         break;
                     }
-                    crate::win::post(notify, msg);
+                    // Cached shell icons come back hundreds a second; ping once per batch.
+                    if !flag.swap(true, Ordering::AcqRel) {
+                        crate::win::post(notify, msg);
+                    }
                 }
             })
             .expect("spawn icon loader");
-        Self { tx: req_tx, rx: res_rx, pending: HashSet::new(), cache: HashMap::new(), large: VecDeque::new() }
+        Self { tx: req_tx, rx: res_rx, pending: HashSet::new(), cache: HashMap::new(), large: VecDeque::new(), pinged }
     }
 
     /// Cache key and whether to ask for a content thumbnail. Ordinary files share
@@ -110,6 +119,8 @@ impl IconLoader {
     /// Moves finished results into the cache; true if anything arrived.
     pub fn drain(&mut self) -> bool {
         let mut any = false;
+        // Before receiving: a result sent after this pings again.
+        self.pinged.store(false, Ordering::Release);
         while let Ok((key, px)) = self.rx.try_recv() {
             self.pending.remove(&key);
             self.cache.insert(key, px.map(Rc::new));

@@ -411,6 +411,10 @@ impl Surface {
             }
             let _ = ShowWindow(self.content, cmd);
         }
+        // Glass stops capturing behind hidden panes; showing again starts it back up.
+        if let Some(c) = self.composition.as_ref().filter(|_| show) {
+            c.refresh();
+        }
     }
 }
 

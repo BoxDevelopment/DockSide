@@ -46,10 +46,18 @@ impl Inbox {
     }
 
     pub fn push(&self, s: Signal) {
-        if let Ok(mut q) = self.queue.lock() {
-            q.push(s);
+        // One message per batch: a growing download reports hundreds of writes a second,
+        // and an undrained queue already has its message on the way.
+        let first = match self.queue.lock() {
+            Ok(mut q) => {
+                q.push(s);
+                q.len() == 1
+            }
+            Err(_) => true,
+        };
+        if first {
+            post(self.hwnd, self.msg);
         }
-        post(self.hwnd, self.msg);
     }
 
     pub fn drain(&self) -> Vec<Signal> {

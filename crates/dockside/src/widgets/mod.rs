@@ -354,6 +354,16 @@ impl Drop for Sources {
     }
 }
 
+/// Passed from rebuilt widgets to their replacement: the running sources and
+/// what they've reported (sources only report changes, so it isn't sent again).
+pub struct Handover {
+    sources: Option<Sources>,
+    weather: WeatherState,
+    events: Vec<CalEvent>,
+    devices: Vec<(String, u8)>,
+    now: Option<NowPlaying>,
+}
+
 /// The top-level window that holds the desktop icons (Progman, or a WorkerW
 /// on older builds or with a live wallpaper).
 fn desktop_window() -> Option<HWND> {
@@ -437,7 +447,6 @@ pub struct Widgets {
     minute: u32,
     hwnd: isize,
     msg_data: u32,
-    msg_media: u32,
     /// Removed (or replaced, when resized) widgets fading out.
     leaving: Vec<Surface>,
 }
@@ -451,7 +460,15 @@ const VK_UP: u16 = 0x26;
 const VK_DOWN: u16 = 0x28;
 
 impl Widgets {
-    pub fn new(gfx: &Gfx, theme: &Theme, cfg: &Config, monitor: Monitor, hwnd: isize, msg_data: u32, msg_media: u32) -> Widgets {
+    pub fn new(
+        gfx: &Gfx,
+        theme: &Theme,
+        cfg: &Config,
+        monitor: Monitor,
+        hwnd: isize,
+        msg_data: u32,
+        handover: Option<Handover>,
+    ) -> Widgets {
         let top = if cfg.menubar.enabled { cfg.menubar.height } else { 0.0 };
         let screen = Rect::new(0.0, top, monitor.width_pt(), (monitor.rect.bottom - monitor.rect.top) as f32 / monitor.scale - top);
         let mut w = Widgets {
@@ -479,11 +496,18 @@ impl Widgets {
             minute: chrono::Local::now().minute(),
             hwnd,
             msg_data,
-            msg_media,
             leaving: Vec::new(),
         };
         for item in cfg.widgets.items.clone() {
             w.add_widget(gfx, theme, item);
+        }
+        // Keep the old sources if they're the ones needed; otherwise they stop as they're dropped.
+        if let Some(h) = handover.filter(|h| h.sources.as_ref().is_some_and(|s| s.key == w.source_key())) {
+            w.sources = h.sources;
+            w.data.weather = h.weather;
+            w.data.events = h.events;
+            w.data.devices = h.devices;
+            w.data.now = h.now;
         }
         w.restart_sources();
         if w.has(WidgetKind::System) {
@@ -630,11 +654,22 @@ impl Widgets {
             sources::watch_devices(shared.clone(), stop.clone(), self.hwnd, self.msg_data);
             shared
         });
-        let media = key.media.then(|| Media::start(self.hwnd, self.msg_media));
+        let media = key.media.then(|| Media::shared(self.hwnd));
         if key.weather.is_some() {
             self.data.weather = WeatherState::Loading;
         }
         self.sources = Some(Sources { key, stop, calendar, weather, devices, media });
+    }
+
+    /// Gives up the running sources (and their data) for the widgets replacing these.
+    pub fn hand_over(&mut self) -> Handover {
+        Handover {
+            sources: self.sources.take(),
+            weather: std::mem::replace(&mut self.data.weather, WeatherState::Loading),
+            events: std::mem::take(&mut self.data.events),
+            devices: std::mem::take(&mut self.data.devices),
+            now: self.data.now.take(),
+        }
     }
 
     /// Re-asserts the desktop layer (after Show Desktop, Explorer changes...).

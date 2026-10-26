@@ -267,6 +267,74 @@ impl Fonts {
     }
 }
 
+/// What the background sources were started for; they restart when it changes.
+#[derive(Clone, PartialEq, Debug)]
+struct FeedKey {
+    folders: bool,
+    brightness: bool,
+    calendar: Option<String>,
+    notifications: bool,
+    bluetooth: bool,
+}
+
+impl FeedKey {
+    fn new(ic: &IslandCfg) -> Self {
+        Self {
+            folders: ic.screenshots || ic.downloads || ic.download_alerts,
+            brightness: ic.brightness,
+            calendar: ic.calendar.then(|| ic.calendar_ics.clone()),
+            notifications: ic.notifications,
+            bluetooth: ic.bluetooth,
+        }
+    }
+}
+
+/// The island's background sources. They outlive a rebuild (see [`Island::hand_over`]):
+/// a theme or taskbar change shouldn't restart every thread and fetch everything again.
+struct Feeds {
+    key: FeedKey,
+    media: Media,
+    inbox: Inbox,
+    stop: Stop,
+    _watcher: Option<notify::RecommendedWatcher>,
+}
+
+impl Feeds {
+    fn start(ic: &IslandCfg, hwnd: isize, msg_signal: u32) -> Self {
+        let inbox = Inbox::new(hwnd, msg_signal);
+        let stop = Stop::default();
+        let watcher =
+            if ic.screenshots || ic.downloads || ic.download_alerts { sources::watch_folders(inbox.clone()) } else { None };
+        if ic.brightness {
+            sources::watch_brightness(inbox.clone(), stop.clone());
+        }
+        if ic.calendar {
+            calendar::watch(inbox.clone(), stop.clone(), calendar::links(&ic.calendar_ics), calendar::ISLAND_HORIZON);
+        }
+        if ic.notifications {
+            notifications::watch(inbox.clone(), stop.clone());
+        }
+        if ic.bluetooth {
+            bluetooth::watch(inbox.clone(), stop.clone());
+        }
+        Self { key: FeedKey::new(ic), media: Media::shared(hwnd), inbox, stop, _watcher: watcher }
+    }
+}
+
+impl Drop for Feeds {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
+
+/// Passed from a rebuilt island to its replacement: the running sources and
+/// what they've reported that isn't sent again.
+pub struct Handover {
+    feeds: Feeds,
+    events: Vec<CalEvent>,
+    downloads: Vec<Download>,
+}
+
 pub struct Island {
     pub surface: Surface,
     cfg: IslandCfg,
@@ -280,11 +348,8 @@ pub struct Island {
     notch: bool,
     lip: f32,
 
-    // Sources.
-    media: Media,
-    inbox: Inbox,
-    stop: Stop,
-    _watcher: Option<notify::RecommendedWatcher>,
+    /// None only once handed over to a replacement.
+    feeds: Option<Feeds>,
 
     // Activities.
     now: Option<NowPlaying>,
@@ -366,7 +431,15 @@ pub struct Island {
 }
 
 impl Island {
-    pub fn new(gfx: &Gfx, theme: &Theme, cfg: &Config, monitor: Monitor, hwnd: isize, msg_media: u32, msg_signal: u32) -> Result<Self> {
+    pub fn new(
+        gfx: &Gfx,
+        theme: &Theme,
+        cfg: &Config,
+        monitor: Monitor,
+        hwnd: isize,
+        msg_signal: u32,
+        handover: Option<Handover>,
+    ) -> Result<Self> {
         let bar_h = if cfg.menubar.enabled { cfg.menubar.height } else { 0.0 };
         let (top, compact_h) =
             if bar_h > 0.0 { let h = (bar_h - 2.0).clamp(18.0, 36.0); ((bar_h - h) / 2.0, h) } else { (6.0, 30.0) };
@@ -378,22 +451,12 @@ impl Island {
         let rect = window_rect(&monitor, top, iw, ih + lip);
         let surface = Surface::new(gfx, rect, monitor.scale, Backdrop::None, Color::TRANSPARENT)?;
         let ic = &cfg.island;
-        let inbox = Inbox::new(hwnd, msg_signal);
-        let stop = Stop::default();
-        let watcher =
-            if ic.screenshots || ic.downloads || ic.download_alerts { sources::watch_folders(inbox.clone()) } else { None };
-        if ic.brightness {
-            sources::watch_brightness(inbox.clone(), stop.clone());
-        }
-        if ic.calendar {
-            calendar::watch(inbox.clone(), stop.clone(), calendar::links(&ic.calendar_ics), calendar::ISLAND_HORIZON);
-        }
-        if ic.notifications {
-            notifications::watch(inbox.clone(), stop.clone());
-        }
-        if ic.bluetooth {
-            bluetooth::watch(inbox.clone(), stop.clone());
-        }
+        let (feeds, events, downloads) = match handover {
+            Some(h) if h.feeds.key == FeedKey::new(ic) => (h.feeds, h.events, h.downloads),
+            // Sources changed: the old ones stop as they're dropped.
+            _ => (Feeds::start(ic, hwnd, msg_signal), Vec::new(), Vec::new()),
+        };
+        let now = feeds.media.snapshot();
         shelf::register(surface.content);
         holding::set_notify(hwnd, msg_signal);
 
@@ -406,11 +469,8 @@ impl Island {
             compact_h,
             notch,
             lip,
-            media: Media::start(hwnd, msg_media),
-            inbox,
-            stop,
-            _watcher: watcher,
-            now: None,
+            feeds: Some(feeds),
+            now,
             paused_since: None,
             art: None,
             old_art: None,
@@ -419,8 +479,8 @@ impl Island {
             shelf: holding::load(ic.shelf_clear_on_start),
             shelf_icons: HashMap::new(),
             orphans: Vec::new(),
-            events: Vec::new(),
-            downloads: Vec::new(),
+            events,
+            downloads,
             privacy: sources::privacy(),
             battery: crate::win::system::battery(),
             volume: sources::volume().unwrap_or((0.5, false)),
@@ -870,8 +930,20 @@ impl Island {
     // --- inputs from the app -------------------------------------------------------
 
     /// Now Playing changed (posted by the media worker).
+    /// Gives up the running sources (and their data) for the island replacing this one.
+    pub fn hand_over(&mut self) -> Option<Handover> {
+        let feeds = self.feeds.take()?;
+        Some(Handover { feeds, events: std::mem::take(&mut self.events), downloads: std::mem::take(&mut self.downloads) })
+    }
+
+    fn media(&self, cmd: Cmd) {
+        if let Some(f) = &self.feeds {
+            f.media.send(cmd);
+        }
+    }
+
     pub fn on_media(&mut self) {
-        let next = self.media.snapshot();
+        let next = self.feeds.as_ref().and_then(|f| f.media.snapshot());
         if let (Some(a), Some(b)) = (&self.now, &next) {
             if !a.same_track(b) || a.playing != b.playing {
                 self.nudge();
@@ -892,7 +964,17 @@ impl Island {
 
     /// Signals from the background sources.
     pub fn on_signals(&mut self) {
-        for s in self.inbox.drain() {
+        let mut changed = false;
+        let signals = self.feeds.as_ref().map(|f| f.inbox.drain()).unwrap_or_default();
+        for s in signals {
+            // A known download growing only changes its size, which the periodic redraw shows.
+            if let Signal::DownloadActive(p) = &s {
+                if let Some(d) = self.downloads.iter_mut().find(|d| d.path == *p) {
+                    d.size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(d.size);
+                    continue;
+                }
+            }
+            changed = true;
             match s {
                 Signal::Brightness(b) => {
                     if self.cfg.brightness {
@@ -937,6 +1019,7 @@ impl Island {
             }
         }
         for done in holding::drain() {
+            changed = true;
             match done {
                 holding::Done::Ready(p) => match self.shelf.iter_mut().find(|i| i.path == p) {
                     Some(i) => i.pending = false,
@@ -946,8 +1029,10 @@ impl Island {
                 holding::Done::Failed(p) => self.shelf.retain(|i| i.path != p),
             }
         }
-        self.retarget();
-        self.dirty = true;
+        if changed {
+            self.retarget();
+            self.dirty = true;
+        }
     }
 
     /// Called every second: battery, mic / camera, Do Not Disturb, download sizes.
@@ -1299,7 +1384,7 @@ impl Island {
                 let secs = f * n.duration;
                 n.position = secs;
                 n.at = Instant::now();
-                self.media.send(Cmd::Seek(secs));
+                self.media(Cmd::Seek(secs));
             }
         } else if down.is_some() && down == hit {
             event = self.click(hit.unwrap_or(Hit::Pill));
@@ -1348,10 +1433,10 @@ impl Island {
                     n.playing = !n.playing;
                     self.paused_since = (!n.playing).then(Instant::now);
                 }
-                self.media.send(Cmd::TogglePlay);
+                self.media(Cmd::TogglePlay);
             }
-            Hit::Next => self.media.send(Cmd::Next),
-            Hit::Prev => self.media.send(Cmd::Prev),
+            Hit::Next => self.media(Cmd::Next),
+            Hit::Prev => self.media(Cmd::Prev),
             Hit::TimerToggle => self.command(IslandCmd::ToggleClock),
             Hit::TimerCancel => {
                 self.command(IslandCmd::CancelClock);
@@ -1770,7 +1855,6 @@ impl Island {
 
 impl Drop for Island {
     fn drop(&mut self) {
-        self.stop.stop();
         shelf::revoke(self.surface.content);
     }
 }

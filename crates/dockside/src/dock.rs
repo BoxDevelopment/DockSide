@@ -2,7 +2,8 @@
 //! indicators, tooltips, context menus, drag-to-reorder and auto-hide.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -34,6 +35,24 @@ const DRAG_THRESHOLD: f32 = 5.0;
 const EASE_TIME: f32 = 0.35;
 /// Delay before an auto-hiding Dock slides away.
 const HIDE_DELAY: f32 = 0.3;
+/// How long a file dragged onto a running app's icon waits before that app
+/// comes forward, so the drag can carry on into its window (macOS spring-loading).
+const SPRING_DELAY: f32 = 0.7;
+
+/// What dropping the dragged files at the pointer would do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileDrop {
+    None,
+    Open,
+    Trash,
+}
+
+/// A drag from another app over the Dock.
+struct FileHover {
+    item: Option<usize>,
+    since: Instant,
+    sprung: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {
@@ -343,6 +362,7 @@ pub struct Dock {
     pressed: Option<usize>,
     press_at: (f32, f32),
     drag: Option<Drag>,
+    file_hover: Option<FileHover>,
     /// Eased icon centers (screen points) by launch target, used while slots are moving.
     eased: HashMap<String, f32>,
     ease_left: f32,
@@ -398,6 +418,7 @@ impl Dock {
             pressed: None,
             press_at: (0.0, 0.0),
             drag: None,
+            file_hover: None,
             eased: HashMap::new(),
             ease_left: 0.0,
             hide_t: if d.autohide && !(d.show_on_desktop && on_desktop) { 1.0 } else { 0.0 },
@@ -410,6 +431,7 @@ impl Dock {
             dirty: true,
         };
         dock.fit_window()?;
+        crate::dock_drop::register(dock.surface.content);
         Ok(dock)
     }
 
@@ -669,6 +691,7 @@ impl Dock {
         if self.cfg.autohide {
             let wants_shown = self.hovering
                 || self.drag.is_some()
+                || self.file_hover.is_some()
                 || self.menu_item.is_some()
                 || self.pressed.is_some()
                 || (self.cfg.show_on_desktop && self.on_desktop);
@@ -774,6 +797,68 @@ impl Dock {
         self.hovering = false;
         self.dirty = true;
         changed || self.cfg.autohide
+    }
+
+    /// What dropping `paths` on item `i` would do.
+    fn file_drop_on(&self, i: usize, paths: &[PathBuf]) -> FileDrop {
+        let item = &self.items[i];
+        match item.kind {
+            _ if paths.is_empty() => FileDrop::None,
+            Kind::Trash => FileDrop::Trash,
+            Kind::Separator => FileDrop::None,
+            Kind::App if item.launch == FINDER_PATH => {
+                if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
+            }
+            Kind::App if [SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH].contains(&item.launch.as_str()) => FileDrop::None,
+            Kind::App => FileDrop::Open,
+        }
+    }
+
+    /// A drag from another app moved to (x, y): the Dock shows and magnifies as
+    /// for the mouse, and resting on a running app's icon brings that app forward.
+    /// Returns what a drop here would do, plus an action to run now.
+    pub fn on_file_drag(&mut self, x: f32, y: f32, paths: &[PathBuf]) -> (FileDrop, Option<Action>) {
+        self.on_move(x, y);
+        let item = self.item_at(x, y);
+        let hover = self.file_hover.get_or_insert(FileHover { item, since: Instant::now(), sprung: false });
+        if hover.item != item {
+            *hover = FileHover { item, since: Instant::now(), sprung: false };
+        }
+        let mut spring = None;
+        if let Some(i) = item.filter(|&i| !self.items[i].windows.is_empty()) {
+            if !hover.sprung && hover.since.elapsed().as_secs_f32() >= SPRING_DELAY {
+                hover.sprung = true;
+                spring = Some(Action::BringToFront(self.items[i].windows.iter().map(|w| w.hwnd).collect()));
+            }
+        }
+        (item.map_or(FileDrop::None, |i| self.file_drop_on(i, paths)), spring)
+    }
+
+    pub fn on_file_leave(&mut self) -> bool {
+        self.file_hover = None;
+        self.on_leave()
+    }
+
+    pub fn on_file_drop(&mut self, x: f32, y: f32, paths: &[PathBuf]) -> (FileDrop, Option<Action>) {
+        let item = self.item_at(x, y);
+        self.on_file_leave();
+        let Some(i) = item else { return (FileDrop::None, None) };
+        let drop = self.file_drop_on(i, paths);
+        let item = &self.items[i];
+        let action = match drop {
+            FileDrop::None => None,
+            FileDrop::Trash => Some(Action::TrashFiles(paths.to_vec())),
+            FileDrop::Open if item.launch == FINDER_PATH => Some(Action::OpenFinder(Some(paths[0].clone()))),
+            FileDrop::Open => {
+                let files = paths.iter().map(|p| format!("\"{}\"", p.display())).collect::<Vec<_>>().join(" ");
+                let args = match item.args.as_deref().map(str::trim) {
+                    Some(a) if !a.is_empty() => format!("{a} {files}"),
+                    _ => files,
+                };
+                Some(Action::Launch { path: item.launch.clone(), args: Some(args) })
+            }
+        };
+        (drop, action)
     }
 
     pub fn on_down(&mut self, x: f32, y: f32) {
@@ -1068,6 +1153,7 @@ impl Dock {
 
 impl Drop for Dock {
     fn drop(&mut self) {
+        crate::dock_drop::revoke(self.surface.content);
         self.release_space();
     }
 }

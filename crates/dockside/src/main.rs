@@ -8,6 +8,7 @@ mod app;
 mod chrome;
 mod config;
 mod dock;
+mod dock_drop;
 mod finder;
 mod geom;
 mod gfx;

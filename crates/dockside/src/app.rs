@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{approach, FrameClock, FRAME_PENDING};
 use crate::config::{self, Config, DockApp};
-use crate::dock::Dock;
+use crate::dock::{Dock, FileDrop};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
@@ -203,6 +203,41 @@ pub fn finder_transfer(id: u32, paths: Vec<PathBuf>, dest: PathBuf, copy: bool) 
     win::post(MSG_HWND.load(Ordering::Relaxed), WM_NULL);
 }
 
+/// A drag from any app over the Dock (its OLE drop target): returns what a drop would do.
+pub fn dock_drag(phase: finder::dnd::Phase, paths: &[PathBuf]) -> FileDrop {
+    use finder::dnd::Phase;
+    let (drop, action) = with_app(|app| {
+        let d = app.dock.as_mut()?;
+        let (left, top, s) = (d.surface.rect.left, d.surface.rect.top, d.surface.scale);
+        let at = |x: i32, y: i32| ((x - left) as f32 / s, (y - top) as f32 / s);
+        let r = match phase {
+            Phase::Over(x, y) => {
+                let (x, y) = at(x, y);
+                d.on_file_drag(x, y, paths)
+            }
+            Phase::Leave => {
+                d.on_file_leave();
+                (FileDrop::None, None)
+            }
+            Phase::Drop(x, y) => {
+                let (x, y) = at(x, y);
+                d.on_file_drop(x, y, paths)
+            }
+        };
+        app.animate();
+        app.flush();
+        Some(r)
+    })
+    .flatten()
+    .unwrap_or((FileDrop::None, None));
+    // Runs once the drop callback has returned.
+    if let Some(a) = action {
+        push(a);
+        win::post(MSG_HWND.load(Ordering::Relaxed), WM_NULL);
+    }
+    drop
+}
+
 fn drain_actions() {
     loop {
         // Never run actions from a nested (re-entrant) dispatch.
@@ -275,6 +310,9 @@ fn execute(action: Action) {
         Action::BringToFront(hwnds) => hwnds.into_iter().rev().for_each(apps::activate),
         Action::CloseWindows(hwnds) => hwnds.into_iter().for_each(apps::close),
         Action::Reveal(path) => system::reveal(&path),
+        Action::TrashFiles(paths) => {
+            finder::fs::trash(&paths, HWND::default());
+        }
         Action::TogglePin { path, name, pin } => {
             with_app(|app| app.toggle_pin(&path, &name, pin));
         }
@@ -959,6 +997,8 @@ impl App {
 
     fn retire_dock(&mut self) {
         if let Some(mut d) = self.dock.take() {
+            // A fading-out Dock mustn't take drops meant for its replacement.
+            crate::dock_drop::revoke(d.surface.content);
             d.release_space();
             self.retire(d);
         }

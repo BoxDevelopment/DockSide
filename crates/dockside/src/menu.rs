@@ -53,6 +53,8 @@ pub enum Action {
     ToggleSpotlight,
     /// A command for one Finder window (from its context menu).
     Finder { window: u32, cmd: crate::finder::FinderCmd },
+    /// Move files to the Recycle Bin (dropped on the Dock's Trash).
+    TrashFiles(Vec<std::path::PathBuf>),
     EmptyTrash,
     Sleep,
     Restart,

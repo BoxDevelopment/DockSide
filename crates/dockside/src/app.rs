@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, RegisterHotKey, ReleaseCapture, SetCapture, TrackMouseEvent, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT,
     MOD_CONTROL, MOD_NOREPEAT, MOD_WIN, TME_LEAVE, TRACKMOUSEEVENT, VK_LEFT, VK_RIGHT,
 };
-use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, ABN_FULLSCREENAPP};
+use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, ABN_FULLSCREENAPP, ABN_POSCHANGED, ABN_STATECHANGE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{approach, FrameClock, FRAME_PENDING};
@@ -79,6 +79,8 @@ const TIMER_DISPLAY: usize = 7;
 const TIMER_RETIRE: usize = 8;
 /// Wallpaper broadcast: reload what wallpaper-backed glass refracts.
 const TIMER_WALLPAPER: usize = 9;
+/// Another appbar (usually the taskbar) moved or changed state: re-hide it and re-reserve.
+const TIMER_APPBAR: usize = 10;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
 
@@ -729,6 +731,8 @@ pub struct App {
     win_hooks: Vec<HWINEVENTHOOK>,
     _watcher: Option<notify::RecommendedWatcher>,
     taskbar_created: u32,
+    /// Edge the taskbar was last seen on, to notice it being moved while we run.
+    taskbar_edge: Option<u32>,
     /// Windows' last ABN_FULLSCREENAPP report (checked against the foreground window).
     fullscreen_reported: bool,
     /// Shell surfaces are currently hidden for a fullscreen app.
@@ -820,6 +824,7 @@ impl App {
             win_hooks,
             _watcher: watcher,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            taskbar_edge: None,
             fullscreen_reported: false,
             fullscreen_hidden: false,
             backdrop_state: backdrop_state(),
@@ -866,6 +871,10 @@ impl App {
                 Err(e) => log!("dock failed: {e}"),
             }
         }
+        // Explorer releases the auto-hidden taskbar's work area after we've already
+        // reserved ours; catch up even if no ABN_POSCHANGED arrives.
+        self.taskbar_edge = taskbar::edge();
+        self.timer(TIMER_APPBAR, 1000);
         // After the menu bar, so it stacks above it.
         self.rebuild_island();
         self.rebuild_widgets();
@@ -1290,6 +1299,20 @@ impl App {
             self.animating = false;
             self.clock.stop();
         }
+    }
+
+    fn on_appbar_change(&mut self) {
+        let edge = taskbar::edge();
+        if edge != self.taskbar_edge {
+            log!("taskbar edge: {:?} -> {:?}", self.taskbar_edge, edge);
+            self.taskbar_edge = edge;
+        }
+        if self.cfg.general.hide_taskbar {
+            // Moving the taskbar can turn auto-hide back off and re-show it.
+            taskbar::enforce();
+            taskbar::reapply();
+        }
+        crate::win::appbar::refresh();
     }
 
     fn on_tick(&mut self) {
@@ -2163,6 +2186,7 @@ impl App {
                         TIMER_REBUILD => self.build(),
                         TIMER_RETIRE => self.retired.clear(),
                         TIMER_WALLPAPER => win::glass::wallpaper_changed(),
+                        TIMER_APPBAR => self.on_appbar_change(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
                         TIMER_THEME
@@ -2318,6 +2342,9 @@ impl App {
             if wp.0 as u32 == SPI_SETDESKWALLPAPER.0 {
                 self.timer(TIMER_WALLPAPER, 300);
             }
+            if wp.0 as u32 == SPI_SETWORKAREA.0 {
+                self.timer(TIMER_APPBAR, 200);
+            }
             let area = if lp.0 != 0 { unsafe { PCWSTR(lp.0 as *const u16).to_string().unwrap_or_default() } } else { String::new() };
             if area == "ImmersiveColorSet" {
                 self.timer(TIMER_THEME, 400);
@@ -2329,6 +2356,10 @@ impl App {
                 self.fullscreen_reported = lp.0 != 0;
                 self.update_fullscreen();
                 self.flush();
+            }
+            // Sent to both of our bars, and in bursts while the taskbar moves; debounce.
+            if wp.0 as u32 == ABN_POSCHANGED || wp.0 as u32 == ABN_STATECHANGE {
+                self.timer(TIMER_APPBAR, 200);
             }
             return Some(LRESULT(0));
         }

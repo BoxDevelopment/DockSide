@@ -62,10 +62,37 @@ pub fn hide() {
         if !state_file().exists() {
             let _ = std::fs::write(state_file(), appbar_state(main).to_string());
         }
-        // Auto-hide releases the taskbar's reserved work area.
-        set_appbar_state(main, ABS_AUTOHIDE);
     }
+    enforce();
     reapply();
+}
+
+/// Re-applies auto-hide if Explorer dropped it (restarted, or the taskbar was moved to
+/// another edge). Auto-hide is what releases the taskbar's reserved work area: without it
+/// the hidden taskbar's strip stays reserved and leaves a gap beside the menu bar or Dock.
+/// Returns whether anything changed.
+pub fn enforce() -> bool {
+    if !HIDDEN.load(Ordering::SeqCst) {
+        return false;
+    }
+    let Some(&main) = tray_windows().first() else { return false };
+    if appbar_state(main) & ABS_AUTOHIDE != 0 {
+        return false;
+    }
+    set_appbar_state(main, ABS_AUTOHIDE);
+    true
+}
+
+/// The screen edge the taskbar is docked to (ABE_TOP, ABE_BOTTOM, ...), if there is one.
+pub fn edge() -> Option<u32> {
+    let main = *tray_windows().first()?;
+    let mut abd = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        hWnd: main,
+        ..Default::default()
+    };
+    let ok = super::tray::explorer_first(|| unsafe { SHAppBarMessage(ABM_GETTASKBARPOS, &mut abd) != 0 });
+    ok.then_some(abd.uEdge)
 }
 
 /// Explorer re-shows the taskbar on some events (Win key, explorer restart); call periodically.

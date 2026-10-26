@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{feel, lerp, Glide, Motion, Scroll};
 use crate::chrome::{self, WindowAnim, SHADOW};
-use crate::config::{Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandStyle, ShortcutStyle};
+use crate::config::{AnimSpeed, Appearance, Backdrop, CloseEffect, Config, ConfigValue, IconStyle, IslandStyle, MinimizeEffect, ShortcutStyle};
 use crate::finder::text::TextField;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
@@ -44,18 +44,20 @@ pub enum Page {
     Appearance,
     MenuBar,
     Dock,
+    Windows,
     Finder,
     Desktops,
     Island,
     Widgets,
 }
 
-const PAGES: [(Page, &str); 8] = [
+const PAGES: [(Page, &str); 9] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
     (Page::Island, "Dynamic Island"),
     (Page::Dock, "Dock"),
+    (Page::Windows, "Windows"),
     (Page::Widgets, "Widgets"),
     (Page::Finder, "Finder"),
     (Page::Desktops, "Desktops"),
@@ -153,6 +155,10 @@ pub(crate) enum Key {
     DockShadow,
     DockBorder,
     DockMacIconsKey,
+    MinimizeEffect,
+    WinRestore,
+    CloseEffect,
+    WinSpeed,
     SpotlightEnabled,
     SpotlightHotkey,
     SearchEngine,
@@ -211,6 +217,10 @@ impl Key {
             Key::DockShadow => ("dock", "shadow"),
             Key::DockBorder => ("dock", "border"),
             Key::DockMacIconsKey => ("dock", "macosicons_key"),
+            Key::MinimizeEffect => ("windows", "minimize_effect"),
+            Key::WinRestore => ("windows", "animate_restore"),
+            Key::CloseEffect => ("windows", "close_effect"),
+            Key::WinSpeed => ("windows", "speed"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
             Key::SearchEngine => ("spotlight", "search_engine"),
@@ -843,6 +853,27 @@ impl SettingsWindow {
                         .collect(),
                 },
             ],
+            Page::Windows => {
+                let custom_min = cfg.windows.minimize_effect != MinimizeEffect::Windows;
+                vec![
+                    Group {
+                        title: Some("Minimizing"),
+                        rows: std::iter::once(Row::Segmented("Minimize windows using", Key::MinimizeEffect))
+                            // Restoring plays the minimize backwards, so only with one of ours.
+                            .chain(custom_min.then_some(Row::Toggle("Animate windows restoring from the Dock", Key::WinRestore)))
+                            .chain(custom_min.then_some(Row::Info("Slow motion", "Hold Shift while minimizing".into())))
+                            .collect(),
+                    },
+                    Group {
+                        title: Some("Opening and closing"),
+                        rows: vec![
+                            Row::Segmented("Closing windows", Key::CloseEffect),
+                            Row::Info("Opening windows", "Windows' own zoom".into()),
+                        ],
+                    },
+                    Group { title: None, rows: vec![Row::Segmented("Animation speed", Key::WinSpeed)] },
+                ]
+            }
             Page::Finder => vec![
                 Group {
                     title: None,
@@ -935,6 +966,7 @@ impl SettingsWindow {
             Key::DockTrash => d.show_trash,
             Key::DockShadow => d.shadow,
             Key::DockBorder => d.border,
+            Key::WinRestore => cfg.windows.animate_restore,
             Key::SpotlightEnabled => cfg.spotlight.enabled,
             Key::WidgetsEnabled => cfg.widgets.enabled,
             _ => false,
@@ -1041,6 +1073,30 @@ impl SettingsWindow {
             Key::DockIconStyle => fixed(
                 &[("Native", "native"), ("Squircle", "squircle")],
                 Some((cfg.dock.icon_style == IconStyle::Squircle) as usize),
+            ),
+            Key::MinimizeEffect => fixed(
+                &[("Genie", "genie"), ("Scale", "scale"), ("Windows", "windows")],
+                Some(match cfg.windows.minimize_effect {
+                    MinimizeEffect::Genie => 0,
+                    MinimizeEffect::Scale => 1,
+                    MinimizeEffect::Windows => 2,
+                }),
+            ),
+            Key::CloseEffect => fixed(
+                &[("Zoom and fade", "fade"), ("None", "none"), ("Windows", "windows")],
+                Some(match cfg.windows.close_effect {
+                    CloseEffect::Fade => 0,
+                    CloseEffect::None => 1,
+                    CloseEffect::Windows => 2,
+                }),
+            ),
+            Key::WinSpeed => fixed(
+                &[("Slow", "slow"), ("Normal", "normal"), ("Fast", "fast")],
+                Some(match cfg.windows.speed {
+                    AnimSpeed::Slow => 0,
+                    AnimSpeed::Normal => 1,
+                    AnimSpeed::Fast => 2,
+                }),
             ),
             _ => (vec![], vec![], None),
         }
@@ -1601,6 +1657,16 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             let screen = r.inset(4.0, 5.0);
             p.stroke_round(screen, 1.5, white, 1.2);
             p.fill_round(Rect::new(screen.cx() - 4.0, screen.bottom() - 3.5, 8.0, 2.0), 1.0, white);
+        }
+        Page::Windows => {
+            // Two overlapping windows.
+            p.fill_round(r, 5.0, Color::rgba(52, 199, 89, 1.0));
+            let (w, h) = (r.w * 0.5, r.h * 0.4);
+            let back = Rect::new(r.cx() - w / 2.0 + 2.5, r.cy() - h / 2.0 - 2.5, w, h);
+            p.stroke_round(back, 1.5, white.alpha(0.65), 1.1);
+            let front = back.offset(-5.0, 5.0);
+            p.fill_round(front, 1.5, white);
+            p.fill_rect(Rect::new(front.x, front.y + 2.5, front.w, 0.8), Color::rgba(52, 199, 89, 1.0));
         }
         Page::Desktops => {
             p.fill_round(r, 5.0, Color::rgba(88, 86, 214, 1.0));

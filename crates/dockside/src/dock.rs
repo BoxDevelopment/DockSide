@@ -657,6 +657,22 @@ impl Dock {
         }
     }
 
+    /// Where the icon of the app owning `hwnd` is on screen, in physical pixels
+    /// (under the screen's bottom edge while auto-hidden), for windows minimizing into it.
+    pub fn icon_rect(&self, hwnd: HWND) -> Option<RECT> {
+        let i = self.items.iter().position(|it| it.windows.iter().any(|w| w.hwnd == hwnd))?;
+        let (cx, size) = self.slots().get(i)?;
+        let bottom = self.icon_bottom();
+        let (s, r) = (self.surface.scale, self.surface.rect);
+        let px = |v: f32| (v * s).round() as i32;
+        Some(RECT {
+            left: r.left + px(cx - size / 2.0),
+            top: r.top + px(bottom - size),
+            right: r.left + px(cx + size / 2.0),
+            bottom: r.top + px(bottom),
+        })
+    }
+
     /// Records whether the desktop has focus; returns true when an animation should start.
     pub fn set_on_desktop(&mut self, on: bool) -> bool {
         let changed = self.on_desktop != on;

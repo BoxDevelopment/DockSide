@@ -60,7 +60,7 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     TRUE
 }
 
-fn is_app_window(hwnd: HWND) -> bool {
+pub fn is_app_window(hwnd: HWND) -> bool {
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
             return false;

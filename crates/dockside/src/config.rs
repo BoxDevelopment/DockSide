@@ -18,6 +18,7 @@ pub struct Config {
     pub island: IslandCfg,
     pub desktops: DesktopsCfg,
     pub widgets: WidgetsCfg,
+    pub windows: WindowsCfg,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
     /// Custom Dock icons by exe file name, for apps that aren't pinned.
@@ -88,6 +89,46 @@ pub enum IslandStyle {
 #[serde(rename_all = "lowercase")]
 pub enum ShortcutStyle {
     Mac,
+    Windows,
+}
+
+/// How other apps' windows animate.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct WindowsCfg {
+    pub minimize_effect: MinimizeEffect,
+    /// Restoring from the Dock plays the minimize backwards.
+    pub animate_restore: bool,
+    pub close_effect: CloseEffect,
+    pub speed: AnimSpeed,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AnimSpeed {
+    Slow,
+    Normal,
+    Fast,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MinimizeEffect {
+    /// macOS's default: the window pours into its Dock icon.
+    Genie,
+    /// The window shrinks straight into its Dock icon.
+    Scale,
+    /// Windows' own animation.
+    Windows,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CloseEffect {
+    /// The window recedes a little as it fades out.
+    Fade,
+    /// Gone at once.
+    None,
+    /// Windows' own animation.
     Windows,
 }
 

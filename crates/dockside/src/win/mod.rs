@@ -172,6 +172,8 @@ pub const PING_REPLY: usize = 0x444F_434B; // "DOCK"
 pub const WM_APP_UPDATE: u32 = WM_APP + 19;
 /// A desktop widget source (weather, calendar, device batteries) has news.
 pub const WM_APP_WIDGETS: u32 = WM_APP + 20;
+/// A window minimized, was restored or finished moving (wParam: the WinEvent, lParam: the window).
+pub const WM_APP_WINDOW_FX: u32 = WM_APP + 21;
 /// The icon picker's background workers finished something.
 pub const WM_APP_ICON_PICKER: u32 = WM_APP + 22;
 /// The icon picker lost focus: close it.

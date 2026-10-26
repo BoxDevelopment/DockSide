@@ -23,6 +23,20 @@ glass_refraction = true
 # false to see it on the next launch (or open it from System Settings > General).
 onboarding_done = false
 
+[windows]
+# How app windows minimize into their Dock icon: "genie" or "scale" like
+# macOS, or "windows" for Windows' own animation.
+# Hold Shift while minimizing for slow motion.
+minimize_effect = "genie"
+# Windows restored from the Dock come back out of their icon.
+animate_restore = true
+# "fade" zooms a closing window out as it fades, "none" closes it at once,
+# "windows" keeps Windows' own. "fade" and "none" also turn off Windows'
+# minimize animation for app windows, so pair them with "genie" or "scale".
+close_effect = "fade"
+# "slow", "normal" or "fast".
+speed = "normal"
+
 [menubar]
 enabled = true
 # Bar height in points (22-40); text and icons scale with it.

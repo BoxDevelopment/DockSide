@@ -70,6 +70,11 @@ pub fn shutdown() {
     });
 }
 
+/// The UI thread's compositor (started on first use), for other modules' visual trees.
+pub fn compositor() -> Option<Compositor> {
+    SHARED.with(|s| s.as_ref().map(|s| s.compositor.clone()))
+}
+
 fn init() -> Result<Shared> {
     STARTED.with(|s| s.set(true));
     let options = DispatcherQueueOptions {

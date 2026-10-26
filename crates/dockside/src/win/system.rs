@@ -173,7 +173,19 @@ pub fn send_keys(keys: &[VIRTUAL_KEY]) {
 }
 
 pub fn open(target: &str) {
-    super::elevation::shell_open(target, None, None);
+    super::elevation::shell_open(target, None, start_dir(target).as_deref());
+}
+
+/// The folder a file should run in, like Explorer: its own. Scripts (.bat,
+/// .cmd, ...) otherwise resolve relative paths against DockSide's folder.
+/// Shortcuts keep their own "Start in", and URLs / shell: paths have none.
+pub fn start_dir(target: &str) -> Option<String> {
+    let path = std::path::Path::new(target);
+    let is_lnk = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk"));
+    if is_lnk || !path.is_absolute() || !path.is_file() {
+        return None;
+    }
+    path.parent().map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Opens a folder in File Explorer (not whatever the default folder handler is).
@@ -270,4 +282,25 @@ pub fn shut_down() {
 
 pub fn log_out() {
     shutdown_exe(&["/l"]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_start_in_their_own_folder() {
+        let dir = std::env::temp_dir().join("dockside-start-dir-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bat = dir.join("run.bat");
+        let lnk = dir.join("app.lnk");
+        std::fs::write(&bat, "@echo off").unwrap();
+        std::fs::write(&lnk, "").unwrap();
+        assert_eq!(start_dir(&bat.to_string_lossy()), Some(dir.to_string_lossy().into_owned()));
+        assert_eq!(start_dir(&lnk.to_string_lossy()), None);
+        assert_eq!(start_dir(&dir.to_string_lossy()), None);
+        assert_eq!(start_dir("shell:RecycleBinFolder"), None);
+        assert_eq!(start_dir("https://example.com"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -236,7 +236,7 @@ pub fn close(hwnd: HWND) {
 }
 
 pub fn launch(path: &str, args: Option<&str>) -> bool {
-    let ok = super::elevation::shell_open(path, args, None);
+    let ok = super::elevation::shell_open(path, args, super::system::start_dir(path).as_deref());
     if !ok {
         log!("launch failed for {path}");
     }

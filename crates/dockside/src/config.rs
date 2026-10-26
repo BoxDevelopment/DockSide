@@ -128,6 +128,8 @@ pub struct DockCfg {
     pub show_trash: bool,
     /// A soft drop shadow under the shelf.
     pub shadow: bool,
+    /// A thin outline around the shelf's edge.
+    pub border: bool,
     /// macOSicons.com API key, for Mac-style results in Change Icon… ("" = off).
     pub macosicons_key: String,
     pub autohide: bool,

@@ -1054,6 +1054,7 @@ impl Dock {
         let has_backdrop = self.surface.backdrop.is_some();
         let squircle = self.cfg.icon_style == IconStyle::Squircle;
         let autohide = self.cfg.autohide;
+        let border = self.cfg.border;
         let fully_hidden = self.hide_t >= 0.999;
         let win_w = self.surface.width_pt();
         let (items, bitmaps, pressed, menu_item) = (&self.items, &self.bitmaps, self.pressed, self.menu_item);
@@ -1088,7 +1089,9 @@ impl Dock {
             if !fully_hidden {
                 p.fill_rect(hit, Color::HIT);
                 p.fill_round(shelf, m.radius, if has_backdrop { theme.dock_tint.alpha(0.0) } else { theme.dock_tint.alpha(1.0) });
-                p.stroke_round(shelf.inset(0.5, 0.5), m.radius - 0.5, theme.dock_border, 1.0);
+                if border {
+                    p.stroke_round(shelf.inset(0.5, 0.5), m.radius - 0.5, theme.dock_border, 1.0);
+                }
             }
             if autohide {
                 p.fill_rect(reveal, Color::HIT);

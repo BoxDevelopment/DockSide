@@ -67,6 +67,8 @@ show_running = true
 show_trash = true
 # A soft drop shadow under the Dock.
 shadow = true
+# A thin outline around the Dock's edge.
+border = true
 # Optional macOSicons.com API key: adds Mac-style results to the Dock's
 # Change Icon… picker (each search uses one of the key's monthly requests).
 macosicons_key = ""

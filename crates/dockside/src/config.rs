@@ -98,7 +98,9 @@ pub struct WindowsCfg {
     pub minimize_effect: MinimizeEffect,
     /// Restoring from the Dock plays the minimize backwards.
     pub animate_restore: bool,
-    pub close_effect: CloseEffect,
+    /// A window's first show.
+    pub open_effect: WindowEffect,
+    pub close_effect: WindowEffect,
     pub speed: AnimSpeed,
 }
 
@@ -115,21 +117,28 @@ pub enum AnimSpeed {
 pub enum MinimizeEffect {
     /// macOS's default: the window pours into its Dock icon.
     Genie,
+    /// The original genie: the window funnels down into the Dock, row by row.
+    Classic,
     /// The window shrinks straight into its Dock icon.
     Scale,
     /// Windows' own animation.
     Windows,
 }
 
+/// How windows open (first show) and close.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum CloseEffect {
-    /// The window recedes a little as it fades out.
-    Fade,
-    /// Gone at once.
-    None,
+pub enum WindowEffect {
     /// Windows' own animation.
+    #[serde(alias = "none")]
     Windows,
+    /// Out of / into its Dock icon.
+    #[serde(alias = "fade")]
+    Genie,
+    /// The window breaks into shards (opening: they fly together).
+    Shatter,
+    /// The same with a few big pieces, each flying its own way.
+    Fragments,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]

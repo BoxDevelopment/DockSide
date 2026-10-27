@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{feel, lerp, Glide, Motion, Scroll};
 use crate::chrome::{self, WindowAnim, SHADOW};
-use crate::config::{AnimSpeed, Appearance, Backdrop, CloseEffect, Config, ConfigValue, IconStyle, IslandStyle, MinimizeEffect, ShortcutStyle};
+use crate::config::{AnimSpeed, Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandStyle, MinimizeEffect, ShortcutStyle, WindowEffect};
 use crate::finder::text::TextField;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
@@ -157,6 +157,7 @@ pub(crate) enum Key {
     DockMacIconsKey,
     MinimizeEffect,
     WinRestore,
+    OpenEffect,
     CloseEffect,
     WinSpeed,
     SpotlightEnabled,
@@ -219,6 +220,7 @@ impl Key {
             Key::DockMacIconsKey => ("dock", "macosicons_key"),
             Key::MinimizeEffect => ("windows", "minimize_effect"),
             Key::WinRestore => ("windows", "animate_restore"),
+            Key::OpenEffect => ("windows", "open_effect"),
             Key::CloseEffect => ("windows", "close_effect"),
             Key::WinSpeed => ("windows", "speed"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
@@ -861,14 +863,13 @@ impl SettingsWindow {
                         rows: std::iter::once(Row::Segmented("Minimize windows using", Key::MinimizeEffect))
                             // Restoring plays the minimize backwards, so only with one of ours.
                             .chain(custom_min.then_some(Row::Toggle("Animate windows restoring from the Dock", Key::WinRestore)))
-                            .chain(custom_min.then_some(Row::Info("Slow motion", "Hold Shift while minimizing".into())))
                             .collect(),
                     },
                     Group {
                         title: Some("Opening and closing"),
                         rows: vec![
+                            Row::Segmented("Opening windows", Key::OpenEffect),
                             Row::Segmented("Closing windows", Key::CloseEffect),
-                            Row::Info("Opening windows", "Windows' own zoom".into()),
                         ],
                     },
                     Group { title: None, rows: vec![Row::Segmented("Animation speed", Key::WinSpeed)] },
@@ -1075,19 +1076,21 @@ impl SettingsWindow {
                 Some((cfg.dock.icon_style == IconStyle::Squircle) as usize),
             ),
             Key::MinimizeEffect => fixed(
-                &[("Genie", "genie"), ("Scale", "scale"), ("Windows", "windows")],
+                &[("Genie", "genie"), ("Classic", "classic"), ("Scale", "scale"), ("Windows", "windows")],
                 Some(match cfg.windows.minimize_effect {
                     MinimizeEffect::Genie => 0,
-                    MinimizeEffect::Scale => 1,
-                    MinimizeEffect::Windows => 2,
+                    MinimizeEffect::Classic => 1,
+                    MinimizeEffect::Scale => 2,
+                    MinimizeEffect::Windows => 3,
                 }),
             ),
-            Key::CloseEffect => fixed(
-                &[("Zoom and fade", "fade"), ("None", "none"), ("Windows", "windows")],
-                Some(match cfg.windows.close_effect {
-                    CloseEffect::Fade => 0,
-                    CloseEffect::None => 1,
-                    CloseEffect::Windows => 2,
+            Key::OpenEffect | Key::CloseEffect => fixed(
+                &[("Genie", "genie"), ("Shatter", "shatter"), ("Fragments", "fragments"), ("Windows", "windows")],
+                Some(match if key == Key::OpenEffect { cfg.windows.open_effect } else { cfg.windows.close_effect } {
+                    WindowEffect::Genie => 0,
+                    WindowEffect::Shatter => 1,
+                    WindowEffect::Fragments => 2,
+                    WindowEffect::Windows => 3,
                 }),
             ),
             Key::WinSpeed => fixed(

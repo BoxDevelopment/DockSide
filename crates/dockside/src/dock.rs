@@ -659,8 +659,12 @@ impl Dock {
 
     /// Where the icon of the app owning `hwnd` is on screen, in physical pixels
     /// (under the screen's bottom edge while auto-hidden), for windows minimizing into it.
+    /// A window the Dock hasn't listed yet (one just opening) gets its app's icon.
     pub fn icon_rect(&self, hwnd: HWND) -> Option<RECT> {
-        let i = self.items.iter().position(|it| it.windows.iter().any(|w| w.hwnd == hwnd))?;
+        let i = self.items.iter().position(|it| it.windows.iter().any(|w| w.hwnd == hwnd)).or_else(|| {
+            let exe = apps::exe_name(&apps::process_path(apps::effective_pid(hwnd))?);
+            self.items.iter().position(|it| it.kind == Kind::App && it.match_name.as_deref() == Some(exe.as_str()))
+        })?;
         let (cx, size) = self.slots().get(i)?;
         let bottom = self.icon_bottom();
         let (s, r) = (self.surface.scale, self.surface.rect);

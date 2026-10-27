@@ -32,7 +32,7 @@ use crate::island::sources::VolumeKey;
 use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
-use crate::winfx::WindowFx;
+use crate::genie::Genie;
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
@@ -45,7 +45,7 @@ use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
-    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK, WM_APP_WINDOW_FX,
+    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
 };
 
 thread_local! {
@@ -190,6 +190,11 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|cell| cell.try_borrow_mut().ok().and_then(|mut guard| guard.as_mut().map(f)))
 }
 
+/// Where `hwnd`'s Dock icon is on screen, for the genie to go into.
+fn dock_icon(hwnd: HWND) -> Option<RECT> {
+    with_app(|app| app.dock.as_ref().and_then(|d| d.icon_rect(hwnd))).flatten()
+}
+
 fn push(action: Action) {
     PENDING.with(|p| p.borrow_mut().push(action));
 }
@@ -293,12 +298,8 @@ fn execute(action: Action) {
             apps::launch(&path, args.as_deref());
         }
         Action::Keys(sc) => sc.send(),
-        // A minimized window restoring from the Dock animates out of its icon first.
-        Action::Activate(h) => {
-            if !with_app(|app| app.restore_window(h)).unwrap_or(false) {
-                apps::activate(h);
-            }
-        }
+        // A minimized window restores (the genie DLL animates it out of its Dock icon).
+        Action::Activate(h) => apps::activate(h),
         Action::Minimize(h) => apps::minimize(h),
         Action::MinimizeWindows(hwnds) => hwnds.into_iter().for_each(apps::minimize),
         Action::Zoom(h) => apps::toggle_zoom(h),
@@ -319,13 +320,7 @@ fn execute(action: Action) {
                 }
             }
         }
-        Action::BringToFront(hwnds) => {
-            for h in hwnds.into_iter().rev() {
-                if !with_app(|app| app.restore_window(h)).unwrap_or(false) {
-                    apps::activate(h);
-                }
-            }
-        }
+        Action::BringToFront(hwnds) => hwnds.into_iter().rev().for_each(apps::activate),
         Action::CloseWindows(hwnds) => hwnds.into_iter().for_each(apps::close),
         Action::Reveal(path) => system::reveal(&path),
         Action::TrashFiles(paths) => {
@@ -545,7 +540,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 unsafe extern "system" fn win_event(
     _hook: HWINEVENTHOOK,
     event: u32,
-    hwnd: HWND,
+    _hwnd: HWND,
     id_object: i32,
     id_child: i32,
     _thread: u32,
@@ -554,24 +549,8 @@ unsafe extern "system" fn win_event(
     if id_object != OBJID_WINDOW.0 || id_child != 0 {
         return;
     }
-    let target = MSG_HWND.load(Ordering::Relaxed);
-    if event == EVENT_SYSTEM_MINIMIZESTART {
-        // The window has just gone: its animation starts here and now, not after
-        // whatever is queued ahead of a posted message.
-        if with_app(|app| app.on_window_fx(event, hwnd)).is_some() {
-            win::post(target, WM_APP_WINDOWS_CHANGED);
-            return;
-        }
-    }
-    if event != EVENT_SYSTEM_FOREGROUND {
-        // For window animations, which need to know which window.
-        let _ = PostMessageW(HWND(target as _), WM_APP_WINDOW_FX, WPARAM(event as usize), LPARAM(hwnd.0 as isize));
-    }
-    match event {
-        EVENT_SYSTEM_FOREGROUND => win::post(target, WM_APP_FOREGROUND),
-        EVENT_SYSTEM_MOVESIZEEND => {}
-        _ => win::post(target, WM_APP_WINDOWS_CHANGED),
-    }
+    let msg = if event == EVENT_SYSTEM_FOREGROUND { WM_APP_FOREGROUND } else { WM_APP_WINDOWS_CHANGED };
+    win::post(MSG_HWND.load(Ordering::Relaxed), msg);
 }
 
 /// While a menu is open: clicks outside our windows close it.
@@ -789,8 +768,9 @@ pub struct App {
     /// Replaced surfaces, left on screen under their replacements until
     /// `TIMER_RETIRE` so a rebuild never shows a gap.
     retired: Vec<Box<dyn std::any::Any>>,
-    /// Minimize / restore / close animations for other apps' windows.
-    winfx: WindowFx,
+    /// Minimize / restore / open / close animations for other apps' windows; None
+    /// while they're all Windows' own (or the genie couldn't start).
+    genie: Option<Genie>,
 }
 
 impl App {
@@ -810,7 +790,7 @@ impl App {
             .map_err(|e| log!("config watcher failed: {e}"))
             .ok();
 
-        // Foreground, minimize and move/resize-end changes only: those are rare. App windows coming and
+        // Foreground and minimize changes only: those are rare. App windows coming and
         // going arrive through the shell hook, which reports just taskbar-worthy windows;
         // object show / hide / destroy events fire for every window in the system, and
         // each one wakes this thread.
@@ -819,8 +799,6 @@ impl App {
             for (min, max) in [
                 (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
                 (EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND),
-                // Rare too; keeps the window animations' idea of where windows are current.
-                (EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZEEND),
             ] {
                 let h = SetWinEventHook(
                     min,
@@ -837,7 +815,7 @@ impl App {
             }
         }
 
-        let winfx = WindowFx::new(&cfg.windows);
+        let genie = Genie::wanted(&cfg.windows).then(|| Genie::new(&cfg.windows, dock_icon)).flatten();
         let shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
         unsafe {
             if !RegisterShellHookWindow(msg_hwnd).as_bool() {
@@ -896,7 +874,7 @@ impl App {
             widgets_handover: None,
             backdrop_state: backdrop_state(),
             retired: Vec::new(),
-            winfx,
+            genie,
         })
     }
 
@@ -1009,7 +987,7 @@ impl App {
             self.register_hotkey();
         }
         if old.windows != self.cfg.windows {
-            self.winfx.configure(&self.cfg.windows);
+            self.configure_genie();
         }
         if old.desktops != self.cfg.desktops {
             self.setup_desktops();
@@ -1321,13 +1299,6 @@ impl App {
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         let mut still = false;
-        if self.winfx.busy() {
-            let tick = self.winfx.tick();
-            still |= tick.busy;
-            for h in tick.activate {
-                apps::activate(h);
-            }
-        }
         if let Some(d) = &mut self.dock {
             still |= d.tick(dt);
         }
@@ -1388,36 +1359,16 @@ impl App {
         }
     }
 
-    /// A window minimized, came back or finished moving.
-    fn on_window_fx(&mut self, event: u32, hwnd: HWND) {
-        match event {
-            EVENT_SYSTEM_MINIMIZESTART => {
-                let icon = self.dock.as_ref().and_then(|d| d.icon_rect(hwnd));
-                if self.winfx.on_minimize_start(hwnd, icon) {
-                    self.window_fx_started();
-                }
-            }
-            EVENT_SYSTEM_MINIMIZEEND => self.winfx.on_minimize_end(hwnd),
-            EVENT_SYSTEM_MOVESIZEEND => self.winfx.on_move_end(hwnd),
-            _ => {}
+    /// Starts, reconfigures or stops the window animations for a new `[windows]`.
+    fn configure_genie(&mut self) {
+        let cfg = &self.cfg.windows;
+        if !Genie::wanted(cfg) {
+            self.genie = None;
+        } else if let Some(g) = &mut self.genie {
+            g.configure(cfg);
+        } else {
+            self.genie = Genie::new(cfg, dock_icon);
         }
-    }
-
-    /// Restores a minimized window out of its Dock icon; false when it isn't animated.
-    fn restore_window(&mut self, hwnd: HWND) -> bool {
-        let icon = self.dock.as_ref().and_then(|d| d.icon_rect(hwnd));
-        let started = self.winfx.restore(hwnd, icon);
-        if started {
-            self.window_fx_started();
-        }
-        started
-    }
-
-    /// The animation overlay is up: it goes under the Dock and menu bar, as
-    /// windows do on a Mac, and frames start.
-    fn window_fx_started(&mut self) {
-        self.raise_surfaces();
-        self.animate();
     }
 
     fn on_appbar_change(&mut self) {
@@ -2280,13 +2231,6 @@ impl App {
             if matches!(wp.0 as u32, HSHELL_WINDOWCREATED | HSHELL_WINDOWDESTROYED | HSHELL_WINDOWREPLACED) {
                 self.timer(TIMER_REFRESH, 150);
             }
-            let window = HWND(lp.0 as _);
-            match wp.0 as u32 {
-                HSHELL_WINDOWCREATED => self.winfx.on_shown(window),
-                // Handled straight away: the window has just vanished, and its image steps in.
-                HSHELL_WINDOWDESTROYED if self.winfx.on_hidden(window) => self.window_fx_started(),
-                _ => {}
-            }
             return Some(LRESULT(0));
         }
         if hwnd == self.msg_hwnd {
@@ -2360,12 +2304,10 @@ impl App {
                 }
                 WM_APP_RELOAD => self.timer(TIMER_RELOAD, 150),
                 WM_APP_FOREGROUND => {
-                    self.winfx.on_foreground(unsafe { GetForegroundWindow() });
                     self.update_foreground();
                     self.timer(TIMER_REFRESH, 100);
                 }
                 WM_APP_WINDOWS_CHANGED => self.timer(TIMER_REFRESH, 150),
-                WM_APP_WINDOW_FX => self.on_window_fx(wp.0 as u32, HWND(lp.0 as _)),
                 WM_APP_CLOSE_MENU => self.close_menu(),
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),

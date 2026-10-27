@@ -6,7 +6,7 @@ use std::path::Path;
 
 use windows::core::{w, Interface, HSTRING, PWSTR};
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWM_CLOAKED_APP};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ};
 use windows::Win32::System::Threading::*;
@@ -60,7 +60,7 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     TRUE
 }
 
-pub fn is_app_window(hwnd: HWND) -> bool {
+fn is_app_window(hwnd: HWND) -> bool {
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
             return false;
@@ -75,7 +75,8 @@ pub fn is_app_window(hwnd: HWND) -> bool {
         if ex & WS_EX_NOACTIVATE.0 != 0 && ex & WS_EX_APPWINDOW.0 == 0 {
             return false;
         }
-        if is_cloaked(hwnd) {
+        // The genie DLL cloaks a window while its animation stands in for it: still there.
+        if is_cloaked(hwnd) && !(crate::genie::stands_in_for(hwnd) && cloak_flags(hwnd) == DWM_CLOAKED_APP) {
             return false;
         }
         if GetWindowTextLengthW(hwnd) == 0 {
@@ -89,11 +90,20 @@ pub fn is_app_window(hwnd: HWND) -> bool {
 }
 
 fn is_cloaked(hwnd: HWND) -> bool {
+    cloak_flags(hwnd) != 0
+}
+
+/// DWM_CLOAKED_* (0: not cloaked).
+fn cloak_flags(hwnd: HWND) -> u32 {
     let mut cloaked: u32 = 0;
     let ok = unsafe {
         DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut c_void, std::mem::size_of::<u32>() as u32)
     };
-    ok.is_ok() && cloaked != 0
+    if ok.is_ok() {
+        cloaked
+    } else {
+        0
+    }
 }
 
 pub fn is_desktop(hwnd: HWND) -> bool {
@@ -176,7 +186,7 @@ pub fn process_path(pid: u32) -> Option<String> {
 pub fn activate(hwnd: HWND) {
     unsafe {
         if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            syscommand(hwnd, SC_RESTORE, SW_RESTORE);
         }
         if SetForegroundWindow(hwnd).as_bool() {
             return;
@@ -213,8 +223,18 @@ pub fn pass_focus_from(hwnd: HWND) {
 }
 
 pub fn minimize(hwnd: HWND) {
+    syscommand(hwnd, SC_MINIMIZE, SW_MINIMIZE);
+}
+
+/// Minimizes / restores the way the window's own title bar buttons do: the app
+/// handles the command itself, so the genie DLL inside it animates the window (a
+/// `ShowWindow` from here never runs through the app). A hung app would never get
+/// to the command, so it is shown the plain way.
+fn syscommand(hwnd: HWND, command: u32, fallback: SHOW_WINDOW_CMD) {
     unsafe {
-        let _ = ShowWindow(hwnd, SW_MINIMIZE);
+        if IsHungAppWindow(hwnd).as_bool() || PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(command as usize), LPARAM(0)).is_err() {
+            let _ = ShowWindow(hwnd, fallback);
+        }
     }
 }
 

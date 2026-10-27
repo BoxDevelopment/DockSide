@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dockside"]
+members = ["crates/dockside", "crates/dockside-hook"]
 
 [workspace.package]
 version = "0.2.4"

@@ -25,7 +25,7 @@ mod theme;
 mod update;
 mod widgets;
 mod win;
-mod winfx;
+mod genie;
 
 use windows::core::w;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};

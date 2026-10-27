@@ -176,6 +176,9 @@ pub struct DockCfg {
     pub icon_style: IconStyle,
     pub show_running: bool,
     pub show_trash: bool,
+    /// Custom Trash icons (.png / .ico) for when it's empty and full ("" = the Recycle Bin's own).
+    pub trash_icon: String,
+    pub trash_icon_full: String,
     /// A soft drop shadow under the shelf.
     pub shadow: bool,
     /// A thin outline around the shelf's edge.
@@ -388,6 +391,8 @@ fn parse(user: &str) -> Result<Config> {
         }
         app.icon = app.icon.as_deref().map(expand_env);
     }
+    cfg.dock.trash_icon = expand_env(&cfg.dock.trash_icon);
+    cfg.dock.trash_icon_full = expand_env(&cfg.dock.trash_icon_full);
     if cfg.menubar.logo.contains('%') {
         cfg.menubar.logo = expand_env(&cfg.menubar.logo);
     }

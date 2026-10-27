@@ -80,6 +80,10 @@ icon_style = "native"
 # Show running apps that aren't pinned.
 show_running = true
 show_trash = true
+# Custom Trash icons (.png / .ico) for when it's empty and when it's full; "" uses
+# the Recycle Bin's own. Right-click the Trash > Change Icon… sets the current one.
+trash_icon = ""
+trash_icon_full = ""
 # A soft drop shadow under the Dock.
 shadow = true
 # A thin outline around the Dock's edge.
@@ -96,12 +100,17 @@ reserve_space = true
 
 # Pinned apps, left to right.
 #   path  - .exe, .lnk, folder, URI, "shell:AppsFolder\<AUMID>" for Store apps,
-#           or "dockside:finder" for the built-in Finder
+#           "dockside:finder" for the built-in Finder, or "dockside:start" for
+#           a Windows logo that opens the Start menu
 #   name  - tooltip label (optional)
 #   args  - launch arguments (optional)
 #   icon  - custom .png / .ico, e.g. a macOS-style icon (optional)
 #   match - exe file name used to detect the running app (optional)
 # Environment variables like %LOCALAPPDATA% are expanded.
+
+[[dock.apps]]
+name = "Start"
+path = "dockside:start"
 
 [[dock.apps]]
 name = "Finder"

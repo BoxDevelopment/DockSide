@@ -15,8 +15,8 @@ use crate::anim::approach;
 use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
 use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
-use crate::gfx::icons::{IconStore, RECYCLE_BIN};
-use crate::gfx::{finder_icon, Align, Gfx, Weight};
+use crate::gfx::icons::{load_shell_icon, IconStore, RECYCLE_BIN};
+use crate::gfx::{finder_icon, start_icon, Align, Gfx, Weight};
 use crate::icon_picker::{IconTarget, PICKER_PATH};
 use crate::onboarding::ONBOARDING_PATH;
 use crate::settings::SETTINGS_PATH;
@@ -38,6 +38,11 @@ const HIDE_DELAY: f32 = 0.3;
 /// How long a file dragged onto a running app's icon waits before that app
 /// comes forward, so the drag can carry on into its window (macOS spring-loading).
 const SPRING_DELAY: f32 = 0.7;
+/// A pinned item that opens the Start menu.
+pub const START_PATH: &str = "dockside:start";
+/// Icon-store keys for the Trash's shell icon, empty and full.
+const TRASH_EMPTY: &str = "dockside:trash-empty";
+const TRASH_FULL: &str = "dockside:trash-full";
 
 /// What dropping the dragged files at the pointer would do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,7 +116,7 @@ impl Item {
             .or_else(|| {
                 lower.ends_with(".lnk").then(|| apps::resolve_lnk(&app.path)).flatten().map(|t| apps::exe_name(&t))
             });
-        let name = app.name.clone().unwrap_or_else(|| {
+        let name = app.name.clone().or_else(|| (app.path == START_PATH).then(|| "Start".into())).unwrap_or_else(|| {
             Path::new(&app.path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         });
         Item {
@@ -148,14 +153,31 @@ impl Item {
         self.custom_icon.as_deref().unwrap_or(&self.icon_key)
     }
 
-    fn special(kind: Kind) -> Item {
+    fn separator() -> Item {
         Item {
-            kind,
-            name: if kind == Kind::Trash { "Trash".into() } else { String::new() },
-            launch: if kind == Kind::Trash { "shell:RecycleBinFolder".into() } else { "|separator|".into() },
+            kind: Kind::Separator,
+            name: String::new(),
+            launch: "|separator|".into(),
             args: None,
-            icon_key: RECYCLE_BIN.into(),
+            icon_key: String::new(),
             custom_icon: None,
+            match_name: None,
+            pinned: None,
+            windows: Vec::new(),
+            bounce: None,
+        }
+    }
+
+    /// The Trash, showing its full or empty icon (`trash_icon` / `trash_icon_full` when set).
+    fn trash(cfg: &DockCfg, full: bool) -> Item {
+        let custom = if full { &cfg.trash_icon_full } else { &cfg.trash_icon };
+        Item {
+            kind: Kind::Trash,
+            name: "Trash".into(),
+            launch: "shell:RecycleBinFolder".into(),
+            args: None,
+            icon_key: if full { TRASH_FULL } else { TRASH_EMPTY }.into(),
+            custom_icon: (!custom.is_empty()).then(|| custom.clone()),
             match_name: None,
             pinned: None,
             windows: Vec::new(),
@@ -289,16 +311,22 @@ fn is_library_logo(path: &str) -> bool {
     Path::new(path).file_name().is_some_and(|f| f.to_string_lossy().starts_with("dash-"))
 }
 
-/// Finder is our own window, with an icon we draw ourselves; our other
-/// windows show DockSide's own icon.
+/// Finder and Start have icons we draw ourselves; our other windows show
+/// DockSide's own icon.
 fn icon_source(path: &str) -> String {
     match path {
         FINDER_PATH => finder_icon::KEY.to_string(),
+        START_PATH => start_icon::KEY.to_string(),
         SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH => {
             std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
         }
         _ => path.to_string(),
     }
+}
+
+/// Our drawn icons are already tiles.
+fn is_drawn_icon(key: &str) -> bool {
+    key == finder_icon::KEY || key == start_icon::KEY
 }
 
 /// Names for DockSide's own windows, which show in the Dock like apps.
@@ -376,6 +404,8 @@ pub struct Dock {
     reserved: bool,
     /// `[app_icons]`: custom icons by exe file name.
     app_icons: BTreeMap<String, String>,
+    /// The Recycle Bin has something in it.
+    trash_full: bool,
     pub dirty: bool,
 }
 
@@ -383,9 +413,10 @@ impl Dock {
     pub fn new(gfx: &Gfx, theme: &Theme, cfg: &Config, monitor: Monitor) -> Result<Self> {
         let d = &cfg.dock;
         let mut items: Vec<Item> = d.apps.iter().filter(|a| pin_exists(a)).map(|a| Item::pinned(a, &cfg.app_icons)).collect();
+        let trash_full = d.show_trash && crate::win::system::trash_full();
         if d.show_trash {
-            items.push(Item::special(Kind::Separator));
-            items.push(Item::special(Kind::Trash));
+            items.push(Item::separator());
+            items.push(Item::trash(d, trash_full));
         }
 
         let metrics = Metrics::new(d);
@@ -428,6 +459,7 @@ impl Dock {
             tracking: false,
             reserved,
             app_icons: cfg.app_icons.clone(),
+            trash_full,
             dirty: true,
         };
         dock.fit_window()?;
@@ -462,8 +494,8 @@ impl Dock {
             items.push(item);
         }
         if self.cfg.show_trash {
-            items.push(Item::special(Kind::Separator));
-            items.push(Item::special(Kind::Trash));
+            items.push(Item::separator());
+            items.push(Item::trash(&self.cfg, self.trash_full));
         }
         self.items = items;
         if let Err(e) = self.fit_window() {
@@ -677,6 +709,21 @@ impl Dock {
         })
     }
 
+    /// Switches the Trash between its empty and full icons; returns true when it changed.
+    pub fn set_trash_full(&mut self, full: bool) -> bool {
+        if full == self.trash_full {
+            return false;
+        }
+        self.trash_full = full;
+        let trash = Item::trash(&self.cfg, full);
+        for item in self.items.iter_mut().filter(|i| i.kind == Kind::Trash) {
+            item.icon_key = trash.icon_key.clone();
+            item.custom_icon = trash.custom_icon.clone();
+        }
+        self.dirty = true;
+        true
+    }
+
     /// Records whether the desktop has focus; returns true when an animation should start.
     pub fn set_on_desktop(&mut self, on: bool) -> bool {
         let changed = self.on_desktop != on;
@@ -829,7 +876,7 @@ impl Dock {
             Kind::App if item.launch == FINDER_PATH => {
                 if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
             }
-            Kind::App if [SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH].contains(&item.launch.as_str()) => FileDrop::None,
+            Kind::App if [START_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH].contains(&item.launch.as_str()) => FileDrop::None,
             Kind::App => FileDrop::Open,
         }
     }
@@ -973,11 +1020,16 @@ impl Dock {
         let item = &self.items[idx];
         let entries = match item.kind {
             Kind::Separator => return None,
-            Kind::Trash => vec![
-                Entry::item("Open", Action::Open(item.launch.clone())),
-                Entry::Separator,
-                Entry::item("Empty Trash", Action::EmptyTrash),
-            ],
+            Kind::Trash => {
+                // Sets the icon for the state the Trash is in now (empty or full).
+                let target = IconTarget { pinned: None, exe: None, trash: Some(self.trash_full) };
+                vec![
+                    Entry::item("Open", Action::Open(item.launch.clone())),
+                    Entry::item("Change Icon\u{2026}", Action::ChangeIcon { target, name: item.name.clone() }),
+                    Entry::Separator,
+                    Entry::item("Empty Trash", Action::EmptyTrash),
+                ]
+            }
             Kind::App => {
                 let mut v = Vec::new();
                 for w in &item.windows {
@@ -1005,6 +1057,7 @@ impl Dock {
                 let target = IconTarget {
                     pinned: item.pinned.as_ref().map(|p| p.path.clone()),
                     exe: item.match_name.clone().filter(|m| m.ends_with(".exe")),
+                    trash: None,
                 };
                 if target.pinned.is_some() || target.exe.is_some() {
                     v.push(Entry::item("Change Icon\u{2026}", Action::ChangeIcon { target, name: item.name.clone() }));
@@ -1034,10 +1087,14 @@ impl Dock {
             if item.kind == Kind::Separator || self.bitmaps.contains_key(item.bitmap_key()) {
                 continue;
             }
-            let px = if item.icon_key == finder_icon::KEY && item.custom_icon.is_none() {
-                icons.builtin(finder_icon::KEY, || finder_icon::render(gfx))
-            } else {
-                icons.get(&gfx.wic, &item.icon_key, item.custom_icon.as_deref())
+            let key = item.icon_key.as_str();
+            let px = match (key, item.custom_icon.as_deref()) {
+                (finder_icon::KEY, None) => icons.builtin(key, || finder_icon::render(gfx)),
+                (start_icon::KEY, None) => icons.builtin(key, || start_icon::render(gfx)),
+                // The shell's Recycle Bin icon follows its state: cache one per state.
+                (TRASH_EMPTY | TRASH_FULL, None) => icons.builtin(key, || load_shell_icon(RECYCLE_BIN)),
+                (TRASH_EMPTY | TRASH_FULL, custom) => icons.get(&gfx.wic, RECYCLE_BIN, custom),
+                (_, custom) => icons.get(&gfx.wic, key, custom),
             };
             let bmp = px.and_then(|px| px.to_bitmap(self.surface.canvas.target()));
             self.bitmaps.insert(item.bitmap_key().to_string(), bmp);
@@ -1084,8 +1141,8 @@ impl Dock {
                 p.fill_round(rect.inset(rect.w * 0.08, rect.w * 0.08), rect.w * 0.2, theme.text_disabled);
                 return;
             };
-            // The Finder icon and most custom icons are already tiles; library logos aren't.
-            let tiled = item.icon_key != finder_icon::KEY && item.custom_icon.as_deref().is_none_or(is_library_logo);
+            // Our drawn icons and most custom icons are already tiles; library logos aren't.
+            let tiled = !is_drawn_icon(&item.icon_key) && item.custom_icon.as_deref().is_none_or(is_library_logo);
             let draw_rect = if squircle && tiled {
                 let tile = rect.inset(rect.w * 0.06, rect.w * 0.06);
                 p.fill_round(tile.offset(0.0, rect.w * 0.01), tile.w * 0.225, Color::gray(0, 0.12 * opacity));

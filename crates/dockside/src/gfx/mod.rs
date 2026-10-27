@@ -6,6 +6,7 @@
 
 pub mod finder_icon;
 pub mod icons;
+pub mod start_icon;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

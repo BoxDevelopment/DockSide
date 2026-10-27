@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{approach, FrameClock, FRAME_PENDING};
 use crate::config::{self, Config, DockApp};
-use crate::dock::{Dock, FileDrop};
+use crate::dock::{Dock, FileDrop, START_PATH};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
@@ -274,6 +274,7 @@ fn execute(action: Action) {
         Action::Launch { path, .. } if path == FINDER_PATH => {
             with_app(|app| app.open_finder(None));
         }
+        Action::Launch { path, .. } if path == START_PATH => system::open_start(),
         Action::Launch { path, .. } if path == SETTINGS_PATH => {
             with_app(|app| app.open_settings(None));
         }
@@ -1404,6 +1405,9 @@ impl App {
         if self.cfg.general.hide_taskbar {
             taskbar::reapply();
         }
+        if self.cfg.dock.show_trash && self.dock.as_mut().is_some_and(|d| d.set_trash_full(system::trash_full())) {
+            self.animate();
+        }
         self.refresh_windows();
     }
 
@@ -1517,13 +1521,14 @@ impl App {
         let mut list = self.cfg.dock.apps.clone();
         if pin {
             if !list.iter().any(|a| a.path.eq_ignore_ascii_case(path)) {
-                list.push(DockApp {
-                    name: Some(name.to_string()),
-                    path: path.to_string(),
-                    args: None,
-                    icon: None,
-                    match_exe: None,
-                });
+                let app = DockApp { name: Some(name.to_string()), path: path.to_string(), args: None, icon: None, match_exe: None };
+                // Start goes back to the front, where it began, and Finder right after it.
+                let at = match path {
+                    START_PATH => 0,
+                    FINDER_PATH => list.iter().position(|a| a.path != START_PATH).unwrap_or(list.len()),
+                    _ => list.len(),
+                };
+                list.insert(at, app);
             }
         } else {
             list.retain(|a| !a.path.eq_ignore_ascii_case(path));
@@ -1762,6 +1767,13 @@ impl App {
         self.close_icon_picker();
         let path = self.cfg_path.clone();
         let written = (|| -> anyhow::Result<()> {
+            if let Some(full) = target.trash {
+                let key = if full { "trash_icon_full" } else { "trash_icon" };
+                match &icon {
+                    Some(i) => config::save_value(&path, "dock", key, &config::ConfigValue::Str(i.clone()))?,
+                    None => config::remove_value(&path, "dock", key)?,
+                }
+            }
             if let Some(pinned) = &target.pinned {
                 let mut apps = self.cfg.dock.apps.clone();
                 for a in apps.iter_mut().filter(|a| a.path == *pinned) {

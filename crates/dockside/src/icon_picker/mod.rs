@@ -54,6 +54,8 @@ pub struct IconTarget {
     pub pinned: Option<String>,
     /// The app's exe file name (`[app_icons]`, for apps that aren't pinned).
     pub exe: Option<String>,
+    /// The Trash, empty (`false`: `[dock] trash_icon`) or full (`true`: `trash_icon_full`).
+    pub trash: Option<bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -679,7 +681,7 @@ mod tests {
         let gfx = Gfx::new().unwrap();
         let cfg = crate::config::defaults();
         let theme = Theme::new(&cfg, &gfx);
-        let target = IconTarget { pinned: None, exe: Some("discord.exe".into()) };
+        let target = IconTarget { pinned: None, exe: Some("discord.exe".into()), trash: None };
         let mut p = IconPicker::new(&gfx, &theme, &cfg, &Monitor::primary(), target, "Discord", 0, 0).unwrap();
         p.surface.set_hidden(true);
         // Wait for the index, then for the first page of thumbnails.

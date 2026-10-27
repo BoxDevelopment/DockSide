@@ -172,6 +172,19 @@ pub fn send_keys(keys: &[VIRTUAL_KEY]) {
     }
 }
 
+/// Opens the Start menu, as the Windows key does. (Posting to `Shell_TrayWnd`
+/// could reach our own tray window, see `win::tray`, not Explorer's.)
+pub fn open_start() {
+    send_keys(&[VK_LWIN]);
+}
+
+/// Whether the Recycle Bin has anything in it, on any drive.
+pub fn trash_full() -> bool {
+    use windows::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
+    let mut info = SHQUERYRBINFO { cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
+    unsafe { SHQueryRecycleBinW(PCWSTR::null(), &mut info) }.is_ok() && info.i64NumItems > 0
+}
+
 pub fn open(target: &str) {
     super::elevation::shell_open(target, None, start_dir(target).as_deref());
 }

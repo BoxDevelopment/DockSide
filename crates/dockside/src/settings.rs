@@ -16,10 +16,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::anim::{feel, lerp, Glide, Motion, Scroll};
 use crate::chrome::{self, WindowAnim, SHADOW};
 use crate::config::{AnimSpeed, Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandStyle, MinimizeEffect, ShortcutStyle, WindowEffect};
+use crate::dock::START_PATH;
 use crate::finder::text::TextField;
+use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
-use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
+use crate::gfx::{finder_icon, start_icon, Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::Action;
 use crate::spotlight::web;
 use crate::theme::Theme;
@@ -252,6 +254,8 @@ pub(crate) enum Hit {
     Swatch(usize),
     Remove(usize),
     AddApp,
+    AddStart,
+    AddFinder,
     OpenConfig,
     OpenLog,
     OpenUpdate,
@@ -843,7 +847,7 @@ impl SettingsWindow {
                 Group {
                     title: Some("Custom icons"),
                     rows: vec![
-                        Row::Info("Change an app's icon", "Right-click it in the Dock, then Change Icon\u{2026}".into()),
+                        Row::Info("Change an app's icon", "Right-click it (or the Trash) in the Dock, then Change Icon\u{2026}".into()),
                         Row::Text("macOSicons.com API key", Key::DockMacIconsKey, "Optional: adds Mac-style icons"),
                     ],
                 },
@@ -851,7 +855,14 @@ impl SettingsWindow {
                     title: Some("Pinned apps"),
                     rows: (0..cfg.dock.apps.len())
                         .map(Row::App)
-                        .chain(std::iter::once(Row::Buttons("", vec![("Add App…", Hit::AddApp)])))
+                        .chain(std::iter::once(Row::Buttons(
+                            "",
+                            // Start and Finder can't be picked as files: offer them back once they're unpinned.
+                            std::iter::once(("Add App…", Hit::AddApp))
+                                .chain((!cfg.dock.apps.iter().any(|a| a.path == FINDER_PATH)).then_some(("Add Finder", Hit::AddFinder)))
+                                .chain((!cfg.dock.apps.iter().any(|a| a.path == START_PATH)).then_some(("Add Start", Hit::AddStart)))
+                                .collect(),
+                        )))
                         .collect(),
                 },
             ],
@@ -1276,6 +1287,8 @@ impl SettingsWindow {
                 Action::SetDockApps(apps)
             }
             Hit::AddApp => Action::AddDockApp,
+            Hit::AddStart => Action::TogglePin { path: START_PATH.into(), name: "Start".into(), pin: true },
+            Hit::AddFinder => Action::TogglePin { path: FINDER_PATH.into(), name: "Finder".into(), pin: true },
             Hit::OpenConfig => Action::OpenConfig,
             Hit::OpenUpdate => Action::Open(
                 crate::update::available().map_or_else(|| crate::update::REPO_URL.to_string() + "/releases", |r| r.url),
@@ -1308,9 +1321,12 @@ impl SettingsWindow {
             for app in &cfg.dock.apps {
                 let key = app.icon.clone().unwrap_or_else(|| app.path.clone());
                 if !self.bitmaps.contains_key(&key) {
-                    let bmp = icons
-                        .get(&gfx.wic, &app.path, app.icon.as_deref())
-                        .and_then(|px| px.to_bitmap(self.canvas.target()));
+                    let px = match (app.path.as_str(), app.icon.as_deref()) {
+                        (FINDER_PATH, None) => icons.builtin(finder_icon::KEY, || finder_icon::render(gfx)),
+                        (START_PATH, None) => icons.builtin(start_icon::KEY, || start_icon::render(gfx)),
+                        (path, custom) => icons.get(&gfx.wic, path, custom),
+                    };
+                    let bmp = px.and_then(|px| px.to_bitmap(self.canvas.target()));
                     self.bitmaps.insert(key, bmp);
                 }
             }

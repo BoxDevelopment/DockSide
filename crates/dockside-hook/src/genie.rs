@@ -27,7 +27,7 @@ use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONT
 use windows::Win32::UI::Shell::{ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::loader::{effects_active_here, local_stop_event, peer_animates_itself, settings, spawn_worker};
+use crate::loader::{effects_active_here, is_host_process, local_stop_event, peer_animates_itself, settings, spawn_worker};
 use crate::shared::*;
 use crate::{capture_to_section, create_user32_hook, host_ipc_window, send_anim_request, HookScope, UNLOADING};
 
@@ -370,7 +370,7 @@ fn is_launch_window(hwnd: HWND) -> bool {
         if GetAncestor(hwnd, GA_ROOT) != hwnd {
             return false;
         }
-        if GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CAPTION.0 as isize == 0 {
+        if GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CAPTION.0 as isize == 0 && !is_host_app_window(hwnd) {
             return false;
         }
         if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize != 0 {
@@ -378,6 +378,30 @@ fn is_launch_window(hwnd: HWND) -> bool {
         }
     }
     should_animate(hwnd)
+}
+
+/// In DockSide itself: one of its app windows (Finder, Settings, ...). They draw their
+/// own title bar, so they have no WS_CAPTION - a minimize box marks them instead. The
+/// Dock, menu bar, popups and the genie's own window have none.
+fn is_host_app_window(hwnd: HWND) -> bool {
+    if !is_host_process() {
+        return false;
+    }
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        pid == GetCurrentProcessId()
+            && GetAncestor(hwnd, GA_ROOT) == hwnd
+            && GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_MINIMIZEBOX.0 as isize != 0
+            && GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize == 0
+    }
+}
+
+/// Effects on for `hwnd` here. In DockSide itself only its own app windows: the Dock
+/// minimizing / restoring other programs' windows keeps going straight to Windows
+/// (their own DLL animates them).
+fn active_for(hwnd: HWND) -> bool {
+    effects_active_here() && (!is_host_process() || is_host_app_window(hwnd))
 }
 
 /// Geometry and capture in physical pixels whatever the app's own DPI awareness, so
@@ -666,7 +690,10 @@ fn start_anim(hwnd: HWND, rising: bool, original_ex_style: isize, cloak_hidden: 
     unsafe {
         let _ = QueryPerformanceCounter(&mut c0);
     }
-    let mut section = if rising { None } else { capture_to_section(hwnd, raw_w, raw_h) };
+    // DockSide's own windows are layered: PrintWindow sees only black there, and the
+    // host has their pixels anyway.
+    let own_pixels = is_host_app_window(hwnd);
+    let mut section = if rising || own_pixels { None } else { capture_to_section(hwnd, raw_w, raw_h) };
     if let Some(sec) = section {
         unsafe {
             let _ = QueryPerformanceCounter(&mut c1);
@@ -677,7 +704,7 @@ fn start_anim(hwnd: HWND, rising: bool, original_ex_style: isize, cloak_hidden: 
         req.h_section = sec.0 as u64;
     }
     let mut reply = send_anim_request(host, &req);
-    if rising && reply == REPLY_NEED_SNAPSHOT {
+    if rising && reply == REPLY_NEED_SNAPSHOT && !own_pixels {
         // No cached minimize snapshot (e.g. minimized before DockSide started): capture
         // the freshly restored, still cloaked window.
         section = capture_to_section(hwnd, raw_w, raw_h);
@@ -748,7 +775,13 @@ fn try_close_anim(hwnd: HWND) -> bool {
     }
     let _src = SourceScope::new(SRC_CLOSE);
     set_dwm_transitions(hwnd, false);
-    start_anim(hwnd, false, unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }, false, false, false, HWND::default())
+    let animated = start_anim(hwnd, false, unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) }, false, false, false, HWND::default());
+    if animated && is_host_app_window(hwnd) {
+        // DockSide's layered windows flash black when destroyed at full opacity: the
+        // genie's first frame covers the window now, so take it out of composition.
+        set_cloak(hwnd, true);
+    }
+    animated
 }
 
 /// After an animated hide: the next show of the window opens with the open effect
@@ -823,7 +856,8 @@ fn launch_prepare(hwnd: HWND, cmd: i32) -> Option<(isize, bool)> {
             return None;
         }
     }
-    if !is_launch_window(hwnd) {
+    // DockSide's own windows zoom in by themselves.
+    if !is_launch_window(hwnd) || is_host_app_window(hwnd) {
         return None;
     }
     if !state().launch_seen.insert(hwnd.0 as isize) {
@@ -941,6 +975,7 @@ fn show_window_slow(hwnd: HWND, cmd: i32) -> BOOL {
         let animated = try_close_anim(hwnd);
         let res = show_window_original(hwnd, cmd);
         if animated {
+            set_cloak(hwnd, false); // hidden now; a later show must be seen
             forget_shown(hwnd);
         }
         return res;
@@ -959,7 +994,7 @@ unsafe extern "system" fn show_window_hook(hwnd: HWND, cmd: i32) -> BOOL {
     if !is_minimize_cmd(cmd) {
         forget_pending_minimize(hwnd);
     }
-    if !effects_active_here() {
+    if !active_for(hwnd) {
         return show_window_original(hwnd, cmd);
     }
     catch_unwind(|| show_window_slow(hwnd, cmd)).unwrap_or_else(|_| show_window_original(hwnd, cmd))
@@ -976,7 +1011,7 @@ fn def_window_proc_slow(original: DefWindowProcFn, hwnd: HWND, msg: u32, wp: WPA
         }
         if msg == WM_CLOSE {
             // The default close: DefWindowProc destroys the window right away.
-            if effects_active_here() {
+            if active_for(hwnd) {
                 try_close_anim(hwnd);
             }
             return original(hwnd, msg, wp, lp);
@@ -988,7 +1023,7 @@ fn def_window_proc_slow(original: DefWindowProcFn, hwnd: HWND, msg: u32, wp: WPA
             if !GetPropW(hwnd, BYPASS_PROP).is_invalid() {
                 return original(hwnd, msg, wp, lp);
             }
-            if effects_active_here() && should_animate(hwnd) {
+            if active_for(hwnd) && should_animate(hwnd) {
                 // Sent from another thread (Explorer's "Show desktop" sends it to one
                 // window after another): WM_SYSCOMMAND's result means nothing, so let the
                 // sender go on now instead of waiting out our capture and the first frame.
@@ -1041,7 +1076,7 @@ fn def_window_proc_slow(original: DefWindowProcFn, hwnd: HWND, msg: u32, wp: WPA
             return original(hwnd, msg, wp, lp);
         }
 
-        if cmd == SC_RESTORE && real_is_iconic(hwnd) && effects_active_here() && restore_enabled() && should_animate(hwnd) {
+        if cmd == SC_RESTORE && real_is_iconic(hwnd) && active_for(hwnd) && restore_enabled() && should_animate(hwnd) {
             set_dwm_transitions(hwnd, false);
             set_cloak(hwnd, true);
             let res = original(hwnd, msg, wp, lp);
@@ -1115,7 +1150,7 @@ unsafe extern "system" fn show_window_async_hook(hwnd: HWND, cmd: i32) -> BOOL {
     if !is_minimize_cmd(cmd) {
         forget_pending_minimize(hwnd);
     }
-    if is_minimize_cmd(cmd) || !effects_active_here() || !launch_enabled() {
+    if is_minimize_cmd(cmd) || !active_for(hwnd) || !launch_enabled() {
         return show_window_async_original(hwnd, cmd);
     }
     catch_unwind(|| show_window_async_slow(hwnd, cmd)).unwrap_or_else(|_| show_window_async_original(hwnd, cmd))
@@ -1127,7 +1162,7 @@ unsafe extern "system" fn set_window_placement_hook(hwnd: HWND, wp: *const WINDO
     if !wp.is_null() && !is_minimize_cmd(cmd) {
         forget_pending_minimize(hwnd);
     }
-    if wp.is_null() || !is_minimize_cmd(cmd) || !effects_active_here() {
+    if wp.is_null() || !is_minimize_cmd(cmd) || !active_for(hwnd) {
         return original(hwnd, wp);
     }
     let _ = catch_unwind(|| {
@@ -1142,7 +1177,7 @@ unsafe extern "system" fn set_window_placement_hook(hwnd: HWND, wp: *const WINDO
 
 unsafe extern "system" fn close_window_hook(hwnd: HWND) -> BOOL {
     let original = orig::<CloseWindowFn>(&CLOSE_WINDOW);
-    if !effects_active_here() {
+    if !active_for(hwnd) {
         return original(hwnd);
     }
     let _ = catch_unwind(|| {
@@ -1163,6 +1198,7 @@ fn set_window_pos_slow(original: SetWindowPosFn, hwnd: HWND, after: HWND, x: i32
             let animated = try_close_anim(hwnd);
             let res = original(hwnd, after, x, y, cx, cy, flags);
             if animated {
+                set_cloak(hwnd, false); // hidden now; a later show must be seen
                 forget_shown(hwnd);
             }
             return res;
@@ -1181,7 +1217,7 @@ fn set_window_pos_slow(original: SetWindowPosFn, hwnd: HWND, after: HWND, x: i32
 unsafe extern "system" fn set_window_pos_hook(hwnd: HWND, after: HWND, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> BOOL {
     let original = orig::<SetWindowPosFn>(&SET_WINDOW_POS);
     let show_hide = flags & (SWP_SHOWWINDOW.0 | SWP_HIDEWINDOW.0);
-    if show_hide == 0 || !effects_active_here() || !(if flags & SWP_SHOWWINDOW.0 != 0 { launch_enabled() } else { close_enabled() }) {
+    if show_hide == 0 || !active_for(hwnd) || !(if flags & SWP_SHOWWINDOW.0 != 0 { launch_enabled() } else { close_enabled() }) {
         return original(hwnd, after, x, y, cx, cy, flags);
     }
     catch_unwind(|| set_window_pos_slow(original, hwnd, after, x, y, cx, cy, flags)).unwrap_or_else(|_| original(hwnd, after, x, y, cx, cy, flags))
@@ -1191,7 +1227,7 @@ unsafe extern "system" fn set_window_pos_hook(hwnd: HWND, after: HWND, x: i32, y
 // WM_CLOSE ends in; that one is caught in DefWindowProc already).
 unsafe extern "system" fn destroy_window_hook(hwnd: HWND) -> BOOL {
     let original = orig::<DestroyWindowFn>(&DESTROY_WINDOW);
-    if !effects_active_here() || !close_enabled() {
+    if !active_for(hwnd) || !close_enabled() {
         return original(hwnd);
     }
     let _ = catch_unwind(|| {
@@ -1280,7 +1316,7 @@ pub fn on_min_max(hwnd: HWND, cmd: i32) {
     if OWN_STATE_CHANGE.with(|c| c.get()) > 0 {
         return; // one of our hooked calls on this thread
     }
-    if !effects_active_here() {
+    if !active_for(hwnd) {
         return;
     }
     let _scope = HookScope::new();

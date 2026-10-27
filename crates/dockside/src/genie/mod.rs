@@ -19,6 +19,7 @@ mod shared;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -74,6 +75,28 @@ pub struct Settings {
     pub mesh_quality: i32,
     pub corner_radius: i32,
     pub corner_smoothing: i32,
+}
+
+/// What a genie animates in our own app windows right now (see `animates`).
+static OWN_MINIMIZE: AtomicBool = AtomicBool::new(false);
+static OWN_RESTORE: AtomicBool = AtomicBool::new(false);
+static OWN_CLOSE: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Own {
+    Minimize,
+    Restore,
+    Close,
+}
+
+/// True when a genie plays this for our own app windows (Finder, Settings, ...): they
+/// then skip their own zoom / fade, so the genie starts from the whole window.
+pub fn animates(what: Own) -> bool {
+    match what {
+        Own::Minimize => OWN_MINIMIZE.load(Ordering::Relaxed),
+        Own::Restore => OWN_RESTORE.load(Ordering::Relaxed),
+        Own::Close => OWN_CLOSE.load(Ordering::Relaxed),
+    }
 }
 
 fn effect_id(e: WindowEffect) -> i32 {
@@ -393,8 +416,12 @@ impl Genie {
         if self.view.is_null() {
             return;
         }
-        use std::sync::atomic::{fence, AtomicI32, Ordering};
+        use std::sync::atomic::{fence, AtomicI32};
         let s = &self.settings;
+        let on = enabled && s.enabled;
+        OWN_MINIMIZE.store(on && s.minimize, Ordering::Relaxed);
+        OWN_RESTORE.store(on && s.minimize && s.restore, Ordering::Relaxed);
+        OWN_CLOSE.store(on && s.close_effect != EFFECT_SYSTEM, Ordering::Relaxed);
         unsafe {
             let v = &mut *self.view;
             let seq = &*(std::ptr::addr_of_mut!(v.seq) as *const AtomicI32);

@@ -132,7 +132,7 @@ fn should_load_into_this_process(is_host: &mut bool) -> bool {
         return false;
     }
     // The host loads the DLL itself (to hand its hook procedures to Windows); it keeps
-    // it, but never activates anything in it.
+    // it, and the effects there touch only its own app windows (Finder, Settings, ...).
     if eq_ascii(&names.base, HOST_EXE) {
         *is_host = true;
         return true;

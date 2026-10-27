@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, GetWindowRgnBox, MonitorFromPoint, MonitorFromRect, MonitorFromWindow, OffsetRect, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, RGN_ERROR};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Memory::{MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcess, PROCESS_DUP_HANDLE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongW, GetWindowPlacement, GetWindowRect, IsWindow, IsZoomed, GWL_EXSTYLE, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_EX_TOOLWINDOW};
 
@@ -139,11 +139,20 @@ impl Server {
 
         let rising = r.kind == ANIM_RESTORE || r.kind == ANIM_LAUNCH;
         let has_snapshot = r.flags & REQ_HAS_SNAPSHOT != 0 && r.h_section != 0;
+        // One of our own windows: PrintWindow only sees black in a layered window, so
+        // the DLL leaves the picture to us - the canvas it last presented.
+        let own = !has_snapshot && r.pid == unsafe { GetCurrentProcessId() };
+        let own_size = if own { crate::gfx::with_presented(hwnd, |_, w, h| (w, h)) } else { None };
+        if own && own_size.is_none() && !rising {
+            log!("genie: no canvas for our own window {:#x}, left to Windows", r.hwnd);
+            return REPLY_FAIL;
+        }
+        let (raw_w, raw_h) = own_size.unwrap_or((r.raw_w, r.raw_h));
         // Crop of the extended frame in snapshot pixels.
-        let crop_x = (r.crop_u0 * r.raw_w as f32).round() as i32;
-        let crop_y = (r.crop_v0 * r.raw_h as f32).round() as i32;
-        let crop_w = (r.crop_u1 * r.raw_w as f32).round() as i32 - crop_x;
-        let crop_h = (r.crop_v1 * r.raw_h as f32).round() as i32 - crop_y;
+        let crop_x = (r.crop_u0 * raw_w as f32).round() as i32;
+        let crop_y = (r.crop_v0 * raw_h as f32).round() as i32;
+        let crop_w = (r.crop_u1 * raw_w as f32).round() as i32 - crop_x;
+        let crop_h = (r.crop_v1 * raw_h as f32).round() as i32 - crop_y;
         if crop_w < 1 || crop_h < 1 {
             return REPLY_FAIL;
         }
@@ -153,7 +162,7 @@ impl Server {
         // window is always captured fresh: a cached minimize snapshot of the same handle
         // would be an old picture.
         let active = self.renderer.is_active(hwnd);
-        if rising && !has_snapshot && !active && (opening || !self.renderer.has_snapshot(hwnd, crop_w, crop_h)) {
+        if rising && !has_snapshot && own_size.is_none() && !active && (opening || !self.renderer.has_snapshot(hwnd, crop_w, crop_h)) {
             return REPLY_NEED_SNAPSHOT;
         }
 
@@ -197,6 +206,9 @@ impl Server {
         // Uploaded even for an active window: its genie may end before this job is picked up.
         if ok && has_snapshot {
             ok = !section.is_invalid() && self.upload_snapshot(section, &mut job, r.raw_w, r.raw_h);
+        } else if ok && own_size.is_some() {
+            // Real per-pixel alpha (the window's own soft shadow): never forced opaque.
+            ok = crate::gfx::with_presented(hwnd, |px, w, h| self.upload_pixels(px, &mut job, w, h)).unwrap_or(false);
         }
         if !section.is_invalid() {
             unsafe {
@@ -217,7 +229,8 @@ impl Server {
             return REPLY_FAIL;
         };
         job.win_rect = rect;
-        if !unsafe { IsZoomed(hwnd).as_bool() } {
+        // Our own windows draw their shadow and rounded corners into the canvas.
+        if own_size.is_none() && !unsafe { IsZoomed(hwnd).as_bool() } {
             let (mut dpi_x, mut dpi_y) = (96, 96);
             unsafe {
                 let _ = GetDpiForMonitor(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
@@ -328,6 +341,15 @@ impl Server {
         }
         job.force_opaque = samples > 0 && zero * 2 > samples;
 
+        let ok = self.upload_pixels(px, job, raw_w, raw_h);
+        unsafe {
+            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
+        }
+        ok
+    }
+
+    /// Uploads a `raw_w` x `raw_h` premultiplied BGRA picture as the job's snapshot.
+    fn upload_pixels(&self, px: &[u32], job: &mut Job, raw_w: i32, raw_h: i32) -> bool {
         let mut ok = false;
         if let Some(device) = self.renderer.device() {
             let desc = D3D11_TEXTURE2D_DESC {
@@ -346,9 +368,6 @@ impl Server {
                 Ok(()) => ok = job.raw.is_some(),
                 Err(e) => log!("genie: snapshot upload {raw_w} x {raw_h} failed: {e}"),
             }
-        }
-        unsafe {
-            let _ = UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.Value });
         }
         ok
     }

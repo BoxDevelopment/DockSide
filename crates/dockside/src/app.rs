@@ -1236,6 +1236,11 @@ impl App {
     /// Fades a closed app window away (its pixels, no redraws), then drops it.
     fn fade_out_window(&mut self, owner: Box<dyn std::any::Any>, hwnd: HWND) {
         apps::pass_focus_from(hwnd);
+        // The close effect plays from the window as it is: no fade of our own first.
+        if crate::genie::animates(crate::genie::Own::Close) {
+            drop(owner);
+            return;
+        }
         unsafe {
             let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
             SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT.0 as i32);

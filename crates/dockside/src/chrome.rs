@@ -7,6 +7,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{lerp, Spring};
 use crate::config::Backdrop;
+use crate::genie::{self, Own};
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 use crate::theme::Theme;
@@ -42,6 +43,9 @@ pub struct WindowAnim {
     exit: Option<Exit>,
     /// Was minimized at the last render: zoom back in when restored.
     was_iconic: bool,
+    /// The exit is the genie's: the window stays as it is (the genie's snapshot is
+    /// its last frame) and goes right away.
+    handoff: bool,
 }
 
 impl WindowAnim {
@@ -50,14 +54,15 @@ impl WindowAnim {
     pub fn opening() -> Self {
         let mut appear = Spring::new(OPEN_FROM, OPEN.0, OPEN.1);
         appear.set(1.0);
-        Self { appear, exit: None, was_iconic: false }
+        Self { appear, exit: None, was_iconic: false, handoff: false }
     }
 
     /// Advances; returns true while moving. Minimizes `hwnd` once it has shrunk away.
     pub fn tick(&mut self, dt: f32, hwnd: HWND) -> bool {
         let moving = self.appear.step(dt);
-        if self.exit == Some(Exit::Minimize) && self.appear.value <= 0.02 {
+        if self.exit == Some(Exit::Minimize) && (self.handoff || self.appear.value <= 0.02) {
             self.exit = None;
+            self.handoff = false;
             // Set here, not left to a render while minimized: the messages
             // ShowWindow sends arrive mid-frame, when the App can't take them.
             self.was_iconic = true;
@@ -70,24 +75,32 @@ impl WindowAnim {
     }
 
     pub fn moving(&self) -> bool {
-        !self.appear.settled()
+        !self.appear.settled() || self.handoff
     }
 
     pub fn close(&mut self) {
         self.exit = Some(Exit::Close);
+        self.handoff = genie::animates(Own::Close);
+        if self.handoff {
+            return;
+        }
         self.appear = self.appear.with(0.14, 1.0);
         self.appear.set(0.0);
     }
 
     pub fn minimize(&mut self) {
         self.exit = Some(Exit::Minimize);
+        self.handoff = genie::animates(Own::Minimize);
+        if self.handoff {
+            return;
+        }
         self.appear = self.appear.with(0.2, 1.0);
         self.appear.set(0.0);
     }
 
     /// Faded all the way out after [`Self::close`]: the window can go.
     pub fn closed(&self) -> bool {
-        self.exit == Some(Exit::Close) && self.appear.value <= 0.02
+        self.exit == Some(Exit::Close) && (self.handoff || self.appear.value <= 0.02)
     }
 
     /// Back from minimized but not yet redrawn: it needs a frame to zoom in again.
@@ -102,7 +115,8 @@ impl WindowAnim {
             self.was_iconic = true;
             return false;
         }
-        if std::mem::take(&mut self.was_iconic) && self.exit.is_none() {
+        // The genie brings it back whole: no zoom of our own on top.
+        if std::mem::take(&mut self.was_iconic) && self.exit.is_none() && !genie::animates(Own::Restore) {
             self.appear = self.appear.with(OPEN.0, OPEN.1);
             self.appear.snap(OPEN_FROM);
             self.appear.set(1.0);

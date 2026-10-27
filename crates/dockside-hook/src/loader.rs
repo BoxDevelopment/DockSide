@@ -25,7 +25,7 @@ const UNINIT: i32 = 0; // nothing installed yet
 const INITING: i32 = 1; // one thread is activating
 const ACTIVE: i32 = 2; // hooks installed, watcher running
 const WAIT_HOST: i32 = 3; // shut down cleanly; re-activates for a new host instance
-const DEAD: i32 = 4; // never activate in this process (host process, or failed shutdown)
+const DEAD: i32 = 4; // never activate in this process (failed shutdown)
 
 static STATE: AtomicI32 = AtomicI32::new(UNINIT);
 static IS_HOST_PROCESS: AtomicBool = AtomicBool::new(false);
@@ -196,7 +196,9 @@ fn activate() -> i32 {
         H_STOP.store(stop.0, Ordering::Release);
         // Host already gone or going: don't install anything for it.
         let mut host_gone = WaitForSingleObject(shutdown, 0) == WAIT_OBJECT_0;
-        if !host_gone {
+        // In the host the mutex is held by its UI thread: a wait from that same thread
+        // would succeed (it is recursive) and read as "host died".
+        if !host_gone && !is_host_process() {
             let r = WaitForSingleObject(alive, 0);
             if r == WAIT_OBJECT_0 || r == WAIT_ABANDONED {
                 let _ = ReleaseMutex(alive);
@@ -292,6 +294,12 @@ pub fn set_host_process(is_host: bool) {
     IS_HOST_PROCESS.store(is_host, Ordering::Relaxed);
 }
 
+/// Running inside DockSide itself: only its own app windows are animated (see
+/// `genie::active_for`).
+pub fn is_host_process() -> bool {
+    IS_HOST_PROCESS.load(Ordering::Relaxed)
+}
+
 pub fn on_process_detach() {
     // Process exit (the module is pinned, so never a dynamic unload): only the
     // settings view may still be mapped.
@@ -315,10 +323,6 @@ pub fn ensure_init() {
             Some(i) if i != WAIT_INSTANCE.load(Ordering::Relaxed) => {}
             _ => return,
         }
-    }
-    if IS_HOST_PROCESS.load(Ordering::Relaxed) {
-        STATE.store(DEAD, Ordering::Release);
-        return;
     }
     if let Err(now) = STATE.compare_exchange(s, INITING, Ordering::AcqRel, Ordering::Acquire) {
         s = now;

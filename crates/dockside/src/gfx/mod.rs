@@ -258,6 +258,8 @@ pub struct Canvas {
     layers: RefCell<HashMap<u64, ID2D1Bitmap>>,
     dc: HDC,
     bitmap: HBITMAP,
+    /// The DIB's pixels (premultiplied BGRA, top-down), valid while `bitmap` is.
+    bits: *mut c_void,
     old: HGDIOBJ,
     pub width: i32,
     pub height: i32,
@@ -294,6 +296,7 @@ impl Canvas {
                 layers: RefCell::default(),
                 dc,
                 bitmap: HBITMAP::default(),
+                bits: std::ptr::null_mut(),
                 old: HGDIOBJ::default(),
                 width: 0,
                 height: 0,
@@ -331,6 +334,7 @@ impl Canvas {
             let bitmap = CreateDIBSection(self.dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
             self.old = SelectObject(self.dc, bitmap);
             self.bitmap = bitmap;
+            self.bits = bits;
         }
         self.width = width;
         self.height = height;
@@ -363,9 +367,12 @@ impl Canvas {
 
     unsafe fn free_bitmap(&mut self) {
         if !self.bitmap.is_invalid() {
+            let bits = self.bits as usize;
+            PRESENTED.with(|p| p.borrow_mut().retain(|_, f| f.bits != bits));
             SelectObject(self.dc, self.old);
             let _ = DeleteObject(self.bitmap);
             self.bitmap = HBITMAP::default();
+            self.bits = std::ptr::null_mut();
         }
     }
 
@@ -410,6 +417,7 @@ impl Canvas {
     /// the window already is: the compositor re-uploads just that region.
     pub fn present_part(&self, hwnd: HWND, x: i32, y: i32, alpha: f32, part: Option<RECT>) -> Result<()> {
         let Some(dirty) = part else { return self.present_alpha(hwnd, x, y, alpha) };
+        self.record(hwnd);
         unsafe {
             let screen = GetDC(None);
             let blend = blend(alpha);
@@ -438,6 +446,7 @@ impl Canvas {
 
     /// Presents with the whole window faded to `alpha` (0..1).
     pub fn present_alpha(&self, hwnd: HWND, x: i32, y: i32, alpha: f32) -> Result<()> {
+        self.record(hwnd);
         unsafe {
             let screen = GetDC(None);
             let blend = blend(alpha);
@@ -455,6 +464,46 @@ impl Canvas {
             ReleaseDC(None, screen);
             r
         }
+    }
+}
+
+impl Canvas {
+    fn record(&self, hwnd: HWND) {
+        let frame = Presented { bits: self.bits as usize, width: self.width, height: self.height };
+        PRESENTED.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.get(&(hwnd.0 as isize)) != Some(&frame) {
+                p.insert(hwnd.0 as isize, frame);
+            }
+        });
+    }
+}
+
+/// The canvas a layered window last showed. Windows can't hand these pixels out
+/// (PrintWindow returns black for an UpdateLayeredWindow window), so the genie
+/// takes its snapshots of our own windows from here.
+#[derive(Clone, Copy, PartialEq)]
+struct Presented {
+    bits: usize,
+    width: i32,
+    height: i32,
+}
+
+thread_local! {
+    static PRESENTED: RefCell<HashMap<isize, Presented>> = RefCell::default();
+}
+
+/// What `hwnd` last presented (premultiplied BGRA, top-down) and its size, if it
+/// is one of our layered windows and its canvas is still alive.
+pub fn with_presented<R>(hwnd: HWND, f: impl FnOnce(&[u32], i32, i32) -> R) -> Option<R> {
+    let frame = PRESENTED.with(|p| p.borrow().get(&(hwnd.0 as isize)).copied())?;
+    if frame.bits == 0 || frame.width <= 0 || frame.height <= 0 {
+        return None;
+    }
+    unsafe {
+        let _ = GdiFlush();
+        let px = std::slice::from_raw_parts(frame.bits as *const u32, frame.width as usize * frame.height as usize);
+        Some(f(px, frame.width, frame.height))
     }
 }
 

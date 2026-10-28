@@ -180,6 +180,8 @@ pub const WM_APP_ICON_PICKER: u32 = WM_APP + 22;
 pub const WM_APP_CLOSE_PICKER: u32 = WM_APP + 23;
 /// The elevated `--admin-task` helper finished (wParam bit 0: turned on, bit 1: succeeded).
 pub const WM_APP_ADMIN_TASK: u32 = WM_APP + 24;
+/// A Finder window's background listing or search has results (`wParam`: window id).
+pub const WM_APP_FINDER_ASYNC: u32 = WM_APP + 25;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
 

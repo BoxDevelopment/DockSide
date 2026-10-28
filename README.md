@@ -34,23 +34,31 @@ hidden while DockSide runs and is always restored when it exits.
 - Config changes apply in place: editing pinned apps updates the Dock without redrawing anything else
 - Store apps (`shell:AppsFolder\...`), `.lnk` shortcuts and custom PNG/ICO icons
 
-**Finder**
-- Opens from the Dock's Finder icon (`path = "dockside:finder"`) or with `dockside --finder`
-- Sidebar with Favorites (Home, Desktop, Documents, Downloads, Pictures, Music, Movies) and drives,
-  with macOS-style vibrancy (the desktop blurs through it; `[finder] sidebar_vibrancy`)
-- Icon, list (sortable Name / Date Modified / Size / Kind) and column views with a preview pane;
-  the view, sort order and hidden-files choice are remembered for new windows
-- Tabs: Ctrl+T, the tab bar's +, "Open in New Tab" or middle-click a folder; Ctrl+Tab / Ctrl+Shift+Tab
-  (or Ctrl+Shift+[ / ]) switch, Ctrl+W or middle-click closes; drop files on a tab to move them there
-- Search the current folder (Ctrl+F), Quick Look (Space) with text, image and video previews
-- Drag and drop: drag items out to other apps, drop files onto folders, the sidebar or the view.
-  Like macOS, items move on the same drive and copy across drives (Ctrl forces a copy, Shift a move)
-- Background icon and thumbnail loading; folders refresh when their contents change on disk
-- Back/forward, resizable window, zoom, inline rename, New Folder, Move to Trash (Recycle Bin)
-- Context menus: Open, Rename, Copy Path, Show in File Explorer, New Terminal at Folder, view and sort options
-- Shortcuts (Ctrl stands in for ⌘): Ctrl+1/2/3 views, Ctrl+N new window, Ctrl+Shift+N new folder,
-  Ctrl+↑ parent, Alt+←/→ back/forward, Enter open, F2 rename, Delete trash, Ctrl+Shift+. hidden files,
-  type to select
+**Finder** (everything File Explorer does, in Finder's clothes)
+- Opens from the Dock's Finder icon (`path = "dockside:finder"`) or with `dockside --finder`; the Dock's Trash opens the Recycle Bin in it
+- Sidebar: Favorites (Recents, Home, Desktop, Documents, Downloads, Pictures, Music, Movies, OneDrive and folders you
+  "Add to Sidebar") and Locations (This PC, every drive, Network, Libraries, Recycle Bin), with macOS-style vibrancy
+- Every shell location: This PC, network shares, the Recycle Bin (Put Back, Empty Trash), libraries, phones and cameras,
+  zip files (browse into them), shortcuts to folders
+- Path bar breadcrumbs that turn into an address field (click beside them, Ctrl+L, Alt+D, F4 or Ctrl+Shift+G): paths,
+  `%VARIABLES%`, `shell:` folders, `\\server\share`, "This PC"; Tab completes; anything else runs like Explorer's Run
+- Icon (any size: Ctrl+wheel, Ctrl+Plus/Minus), list (choose columns: Date Modified / Created, Size, Kind, Location),
+  column and gallery views; sort by any column, group by Name / Kind / Date / Size; preview pane (Alt+P) and details pane
+  (Alt+Shift+P) with the shell's properties; hidden files and file name extensions toggles
+- Search below the folder (or all of This PC) as you type, with Kind / Date Modified / Size filters
+  (or `kind:image date:thisweek size:large ext:pdf`)
+- Right-click: Open, Open With (registered apps and "Choose Another App…"), Run as Administrator, Move to Trash,
+  Delete Immediately, Get Info (Properties), Rename, Compress, Extract All, Duplicate, Make Shortcut, Quick Look, Cut,
+  Copy, Paste, Copy as Path, Share, Add to Sidebar, New Folder and New ▸ file types, Undo, view options, and
+  "More Options ▸" with the whole Windows menu, app extensions included (7-Zip, Git, …)
+- Copy / move / delete through Windows' own progress, "Replace or Skip" and permission dialogs; Ctrl+Z / Ctrl+Y undo
+  and redo moves, copies, renames, deletes (back out of the Recycle Bin), new items, shortcuts and archives
+- Drag and drop to and from other apps: move on the same drive and copy across drives (Ctrl copies, Shift moves,
+  Alt makes shortcuts); a right-button drag asks Move / Copy / Create Shortcuts Here
+- Tabs (Ctrl+T, middle-click a folder, Ctrl+Tab), windows (Ctrl+N opens the current folder), Quick Look (Space)
+- Shortcuts: macOS's with Ctrl for ⌘ plus Explorer's — Ctrl+C/X/V, Ctrl+Z/Y, Delete / Shift+Delete, F2, Alt+Enter,
+  Ctrl+E / F3 search, Alt+↑ / Backspace, Alt+←/→, Ctrl+1–4 views, Ctrl+Shift+1–8 Explorer layouts, Ctrl+Shift+N,
+  Ctrl+Shift+C copy as path, Ctrl+Shift+., Shift+F10 / Menu key, F5, F11, mouse back / forward buttons
 
 **Dynamic Island**
 - An always-present black pill at the top center of the menu bar that morphs between activities on

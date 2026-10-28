@@ -101,6 +101,11 @@ pub fn load_shell_image(parse_name: &str, size: i32, thumbnail: bool) -> Option<
     }
 }
 
+/// Pixels of a bitmap someone else owns (e.g. a shell context menu item's).
+pub fn hbitmap_pixels(hbmp: HBITMAP) -> Option<IconPixels> {
+    unsafe { read_hbitmap(hbmp) }
+}
+
 unsafe fn read_hbitmap(hbmp: HBITMAP) -> Option<IconPixels> {
     let mut bm = BITMAP::default();
     if GetObjectW(hbmp, std::mem::size_of::<BITMAP>() as i32, Some(&mut bm as *mut _ as *mut c_void)) == 0 {

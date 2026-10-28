@@ -8,8 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
-use windows::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW, FILE_ATTRIBUTE_NORMAL};
+use windows::Win32::Foundation::{HANDLE, HGLOBAL};
+use windows::Win32::Storage::FileSystem::{
+    GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, FILE_ATTRIBUTE_NORMAL,
+};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -17,17 +19,55 @@ use windows::Win32::System::Ole::CF_UNICODETEXT;
 use windows::Win32::UI::Shell::*;
 
 const HIDDEN: u32 = 0x2;
+// GetDriveTypeW results.
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_CDROM: u32 = 5;
 const SYSTEM: u32 = 0x4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Entry {
     pub name: String,
+    /// A filesystem path, or a shell parsing name for virtual items (see [`super::shell`]).
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    pub created: Option<SystemTime>,
     /// Lower-case extension without the dot ("" for none / folders).
     pub ext: String,
+    /// A real file or folder that `std::fs` can work on (not a phone's photo or a recycled file).
+    pub fs: bool,
+    pub hidden: bool,
+    /// Recycle Bin items: where they were deleted from (search results: their folder).
+    pub location: Option<String>,
+    pub deleted: Option<SystemTime>,
+    /// Drives: "120 GB free of 512 GB".
+    pub extra: Option<String>,
+    /// The shell's own type name for virtual items ("Local Disk", "Phone").
+    pub type_text: Option<String>,
+}
+
+impl Entry {
+    /// The name as shown: shortcuts never show ".lnk" (like Explorer), other
+    /// extensions only when `show_ext`.
+    pub fn label(&self, show_ext: bool) -> &str {
+        if self.is_dir || self.ext.is_empty() {
+            return &self.name;
+        }
+        let always_hide = matches!(self.ext.as_str(), "lnk" | "url" | "appref-ms");
+        if show_ext && !always_hide {
+            return &self.name;
+        }
+        match self.name.rfind('.') {
+            Some(i) if i > 0 && self.name[i + 1..].eq_ignore_ascii_case(&self.ext) => &self.name[..i],
+            _ => &self.name,
+        }
+    }
+
+    /// The folder an entry is in, for search results' Location column.
+    pub fn folder(&self) -> String {
+        self.location.clone().unwrap_or_else(|| self.path.parent().map(|p| p.display().to_string()).unwrap_or_default())
+    }
 }
 
 /// Hidden/system files and dotfiles are skipped unless `show_hidden`.
@@ -47,7 +87,19 @@ pub fn list(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
         } else {
             path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default()
         };
-        out.push(Entry { name, path, is_dir, size: md.len(), modified: md.modified().ok(), ext });
+        let attrs = md.file_attributes();
+        out.push(Entry {
+            name,
+            path,
+            is_dir,
+            size: md.len(),
+            modified: md.modified().ok(),
+            created: md.created().ok(),
+            ext,
+            fs: true,
+            hidden: attrs & (HIDDEN | SYSTEM) != 0,
+            ..Default::default()
+        });
     }
     Ok(out)
 }
@@ -57,8 +109,12 @@ pub fn list(dir: &Path, show_hidden: bool) -> std::io::Result<Vec<Entry>> {
 pub enum SortKey {
     Name,
     Modified,
+    Created,
     Size,
     Kind,
+    /// Search results' folder, or where a recycled item came from.
+    Location,
+    Deleted,
 }
 
 impl SortKey {
@@ -67,8 +123,11 @@ impl SortKey {
         match self {
             SortKey::Name => "name",
             SortKey::Modified => "modified",
+            SortKey::Created => "created",
             SortKey::Size => "size",
             SortKey::Kind => "kind",
+            SortKey::Location => "location",
+            SortKey::Deleted => "deleted",
         }
     }
 }
@@ -114,6 +173,9 @@ pub fn sort(entries: &mut [Entry], key: SortKey, ascending: bool, kinds: &mut Ki
         let ord = match key {
             SortKey::Name => natural_cmp(&a.name, &b.name),
             SortKey::Modified => a.modified.cmp(&b.modified),
+            SortKey::Created => a.created.cmp(&b.created),
+            SortKey::Location => natural_cmp(&a.folder(), &b.folder()),
+            SortKey::Deleted => a.deleted.cmp(&b.deleted),
             // Folders have no size; keep them together at the top.
             SortKey::Size => (!a.is_dir).cmp(&!b.is_dir).then(a.size.cmp(&b.size)),
             SortKey::Kind => kinds.kind(a).cmp(&kinds.kind(b)),
@@ -169,6 +231,9 @@ pub struct KindCache {
 
 impl KindCache {
     pub fn kind(&mut self, e: &Entry) -> String {
+        if let Some(t) = &e.type_text {
+            return t.clone();
+        }
         if e.is_dir {
             return "Folder".into();
         }
@@ -199,10 +264,33 @@ impl KindCache {
     }
 }
 
+/// What a sidebar row is, for its glyph and context menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaceKind {
+    Recents,
+    Home,
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Movies,
+    Cloud,
+    /// A folder added with "Add to Sidebar".
+    Pinned,
+    ThisPc,
+    Drive,
+    Removable,
+    Network,
+    Libraries,
+    Trash,
+}
+
 #[derive(Clone, Debug)]
 pub struct Place {
     pub name: String,
     pub path: PathBuf,
+    pub kind: PlaceKind,
 }
 
 pub fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
@@ -218,22 +306,43 @@ pub fn home() -> PathBuf {
     known_folder(&FOLDERID_Profile).unwrap_or_else(|| PathBuf::from("C:\\"))
 }
 
-pub fn favorites() -> Vec<Place> {
+/// The sidebar's Favorites: Recents, the user's folders, OneDrive, then folders they pinned.
+pub fn favorites(pins: &[PathBuf]) -> Vec<Place> {
     let mut out = Vec::new();
+    if let Some(path) = known_folder(&FOLDERID_Recent) {
+        out.push(Place { name: "Recents".into(), path, kind: PlaceKind::Recents });
+    }
     let user = std::env::var("USERNAME").unwrap_or_else(|_| "Home".into());
-    for (id, name) in [
-        (&FOLDERID_Profile, user.as_str()),
-        (&FOLDERID_Desktop, "Desktop"),
-        (&FOLDERID_Documents, "Documents"),
-        (&FOLDERID_Downloads, "Downloads"),
-        (&FOLDERID_Pictures, "Pictures"),
-        (&FOLDERID_Music, "Music"),
-        (&FOLDERID_Videos, "Movies"),
+    for (id, name, kind) in [
+        (&FOLDERID_Profile, user.as_str(), PlaceKind::Home),
+        (&FOLDERID_Desktop, "Desktop", PlaceKind::Desktop),
+        (&FOLDERID_Documents, "Documents", PlaceKind::Documents),
+        (&FOLDERID_Downloads, "Downloads", PlaceKind::Downloads),
+        (&FOLDERID_Pictures, "Pictures", PlaceKind::Pictures),
+        (&FOLDERID_Music, "Music", PlaceKind::Music),
+        (&FOLDERID_Videos, "Movies", PlaceKind::Movies),
+        (&FOLDERID_SkyDrive, "OneDrive", PlaceKind::Cloud),
     ] {
         if let Some(path) = known_folder(id).filter(|p| p.exists()) {
-            out.push(Place { name: name.to_string(), path });
+            out.push(Place { name: name.to_string(), path, kind });
         }
     }
+    for p in pins {
+        if !out.iter().any(|o| o.path == *p) {
+            out.push(Place { name: super::shell::title(p), path: p.clone(), kind: PlaceKind::Pinned });
+        }
+    }
+    out
+}
+
+/// The sidebar's Locations: This PC, each drive, Network, Libraries and the Recycle Bin.
+pub fn locations() -> Vec<Place> {
+    use super::shell::{LIBRARIES, NETWORK, RECYCLE_BIN, THIS_PC};
+    let mut out = vec![Place { name: "This PC".into(), path: THIS_PC.into(), kind: PlaceKind::ThisPc }];
+    out.extend(drives());
+    out.push(Place { name: "Network".into(), path: NETWORK.into(), kind: PlaceKind::Network });
+    out.push(Place { name: "Libraries".into(), path: LIBRARIES.into(), kind: PlaceKind::Libraries });
+    out.push(Place { name: "Recycle Bin".into(), path: RECYCLE_BIN.into(), kind: PlaceKind::Trash });
     out
 }
 
@@ -249,8 +358,16 @@ pub fn drives() -> Vec<Place> {
                 GetVolumeInformationW(&HSTRING::from(root.as_str()), Some(&mut label), None, None, None, None).is_ok()
             };
             let label = if ok { crate::win::from_wide(&label) } else { String::new() };
-            let name = if label.is_empty() { format!("Local Disk ({letter}:)") } else { format!("{label} ({letter}:)") };
-            Place { name, path: PathBuf::from(root) }
+            let kind = match unsafe { GetDriveTypeW(&HSTRING::from(root.as_str())) } {
+                DRIVE_REMOVABLE | DRIVE_CDROM => PlaceKind::Removable,
+                _ => PlaceKind::Drive,
+            };
+            let name = match (label.is_empty(), kind) {
+                (false, _) => format!("{label} ({letter}:)"),
+                (true, PlaceKind::Removable) => format!("USB Drive ({letter}:)"),
+                _ => format!("Local Disk ({letter}:)"),
+            };
+            Place { name, path: PathBuf::from(root), kind }
         })
         .collect()
 }
@@ -261,28 +378,6 @@ pub fn free_space(path: &Path) -> Option<u64> {
         GetDiskFreeSpaceExW(&HSTRING::from(path.as_os_str()), Some(&mut free), None, None).ok()?;
     }
     Some(free)
-}
-
-/// Moves to the Recycle Bin (undoable). Windows warns before it would ever
-/// delete permanently, e.g. for files too large for the bin.
-pub fn trash(paths: &[PathBuf], owner: HWND) -> bool {
-    if paths.is_empty() {
-        return false;
-    }
-    let mut from: Vec<u16> = Vec::new();
-    for p in paths {
-        from.extend(p.as_os_str().to_string_lossy().encode_utf16());
-        from.push(0);
-    }
-    from.push(0);
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: owner,
-        wFunc: FO_DELETE,
-        pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING).0 as u16,
-        ..Default::default()
-    };
-    unsafe { SHFileOperationW(&mut op) == 0 && !op.fAnyOperationsAborted.as_bool() }
 }
 
 /// Creates "untitled folder" (or "untitled folder 2", ...) like macOS.
@@ -354,39 +449,6 @@ pub fn paste_text() -> Option<String> {
 pub fn same_volume(a: &Path, b: &Path) -> bool {
     let root = |p: &Path| p.components().next().map(|c| c.as_os_str().to_string_lossy().to_lowercase());
     root(a).is_some() && root(a) == root(b)
-}
-
-fn double_null<P: AsRef<Path>>(paths: &[P]) -> Vec<u16> {
-    let mut out: Vec<u16> = Vec::new();
-    for p in paths {
-        out.extend(p.as_ref().as_os_str().to_string_lossy().encode_utf16());
-        out.push(0);
-    }
-    out.push(0);
-    out
-}
-
-/// Copies or moves `paths` into `dest` with the shell's progress, conflict and undo
-/// handling. Copies into the items' own folder get "- Copy" names (⌥-drag on macOS).
-pub fn transfer(paths: &[PathBuf], dest: &Path, copy: bool, owner: HWND) -> bool {
-    if paths.is_empty() {
-        return false;
-    }
-    let from = double_null(paths);
-    let to = double_null(&[dest]);
-    let mut flags = FOF_ALLOWUNDO;
-    if copy && paths.iter().all(|p| p.parent() == Some(dest)) {
-        flags |= FOF_RENAMEONCOLLISION;
-    }
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: owner,
-        wFunc: if copy { FO_COPY } else { FO_MOVE },
-        pFrom: PCWSTR(from.as_ptr()),
-        pTo: PCWSTR(to.as_ptr()),
-        fFlags: flags.0 as u16,
-        ..Default::default()
-    };
-    unsafe { SHFileOperationW(&mut op) == 0 && !op.fAnyOperationsAborted.as_bool() }
 }
 
 /// Extensions Quick Look shows as plain text.

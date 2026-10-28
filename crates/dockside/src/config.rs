@@ -207,6 +207,14 @@ pub struct FinderCfg {
     pub sort: crate::finder::fs::SortKey,
     pub ascending: bool,
     pub show_hidden: bool,
+    pub show_extensions: bool,
+    pub group: crate::finder::Group,
+    /// List view columns after Name.
+    pub columns: Vec<crate::finder::Col>,
+    pub pane: crate::finder::Pane,
+    pub icon_size: f32,
+    /// Folders the user added to the sidebar's Favorites.
+    pub sidebar_pins: Vec<std::path::PathBuf>,
     /// Sidebar material. Anything but "none" floats it as a rounded pane, like macOS Tahoe.
     pub sidebar: Backdrop,
 }

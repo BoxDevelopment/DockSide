@@ -151,10 +151,18 @@ custom_search_url = ""
 
 [finder]
 # Saved automatically when you change them in a Finder window.
-view = "icons"          # "icons", "list" or "columns"
-sort = "name"           # "name", "modified", "size" or "kind"
+view = "icons"          # "icons", "list", "columns" or "gallery"
+sort = "name"           # "name", "modified", "created", "size" or "kind"
 ascending = true
 show_hidden = false
+show_extensions = true
+group = "none"          # "none", "name", "kind", "modified" or "size"
+# List view columns after Name: "modified", "created", "size", "kind", "location".
+columns = ["modified", "size", "kind"]
+pane = "none"           # "none", "preview" or "details" (Alt+P / Alt+Shift+P)
+icon_size = 64          # Icon view icon size in points (32 - 256; Ctrl+Plus / Ctrl+Minus)
+# Folders added with "Add to Sidebar".
+sidebar_pins = []
 # Sidebar material: "glass" (Liquid Glass), "acrylic", "blur" or "none" (solid).
 # All but "none" float the sidebar as a rounded pane, like macOS Tahoe; acrylic
 # and blur need Transparency effects on.

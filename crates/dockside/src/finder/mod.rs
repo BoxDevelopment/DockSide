@@ -1,10 +1,16 @@
 //! Finder: a macOS-style file manager window with a sidebar, back/forward,
-//! tabs, and icon / list / column views.
+//! tabs, and icon / list / column / gallery views. It covers what File
+//! Explorer does: shell locations (This PC, Network, the Recycle Bin, phones),
+//! the shell's context menus, Open With, the clipboard, undo and search.
 
 pub mod dnd;
 pub mod fs;
 mod glyphs;
 pub mod loader;
+mod menus;
+pub mod ops;
+pub mod search;
+pub mod shell;
 pub mod text;
 
 use std::collections::{BTreeSet, HashMap};
@@ -21,7 +27,8 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use self::fs::{Entry as FileEntry, KindCache, Place, SortKey};
+use self::fs::{Entry as FileEntry, KindCache, Place, PlaceKind, SortKey};
+use self::ops::DropOp;
 use self::loader::IconLoader;
 use self::text::{KeyResult, TextField};
 use crate::anim::{feel, lerp, Glide, Motion, Scroll, Spring};
@@ -54,11 +61,17 @@ const CONTROL_H: f32 = 34.0;
 const CONTROL_CY: f32 = 28.0;
 const ROW: f32 = 24.0;
 const HEADER: f32 = 26.0;
-const CELL_W: f32 = 104.0;
-const CELL_H: f32 = 108.0;
-const ICON: f32 = 64.0;
 const COL_W: f32 = 240.0;
 const PREVIEW_W: f32 = 300.0;
+/// The preview / details pane beside the icon, list and gallery views.
+const PANE_W: f32 = 260.0;
+/// A group's heading in grouped icon and list views.
+const GROUP_H: f32 = 30.0;
+/// Gallery view: the strip of thumbnails under the big preview.
+const STRIP_H: f32 = 96.0;
+const STRIP_CELL: f32 = 76.0;
+/// The scope and filter row under the toolbar while searching.
+const SEARCHBAR: f32 = 30.0;
 const SEARCH_W: f32 = 180.0;
 /// Inner padding of the icon grid.
 const GRID_PAD: f32 = 12.0;
@@ -75,8 +88,15 @@ const UP: u16 = 0x26;
 const RIGHT: u16 = 0x27;
 const DOWN: u16 = 0x28;
 const DEL: u16 = 0x2E;
+const APPS: u16 = 0x5D;
 const F2: u16 = 0x71;
+const F3: u16 = 0x72;
+const F4: u16 = 0x73;
 const F5: u16 = 0x74;
+const F10: u16 = 0x79;
+const F11: u16 = 0x7A;
+const PLUS: u16 = 0xBB;
+const MINUS: u16 = 0xBD;
 const LBRACKET: u16 = 0xDB;
 const RBRACKET: u16 = 0xDD;
 const PERIOD: u16 = 0xBE;
@@ -103,6 +123,7 @@ pub enum View {
     Icons,
     List,
     Columns,
+    Gallery,
 }
 
 impl View {
@@ -112,6 +133,114 @@ impl View {
             View::Icons => "icons",
             View::List => "list",
             View::Columns => "columns",
+            View::Gallery => "gallery",
+        }
+    }
+}
+
+/// Grouping in the icon and list views (macOS "Use Groups", Explorer "Group by").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Group {
+    None,
+    Name,
+    Kind,
+    Modified,
+    Size,
+}
+
+impl Group {
+    pub fn name(self) -> &'static str {
+        match self {
+            Group::None => "none",
+            Group::Name => "name",
+            Group::Kind => "kind",
+            Group::Modified => "modified",
+            Group::Size => "size",
+        }
+    }
+}
+
+/// A list view column after Name.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Col {
+    Modified,
+    Created,
+    Size,
+    Kind,
+    Location,
+    Deleted,
+    /// Drives in This PC: free space.
+    Space,
+}
+
+impl Col {
+    pub fn name(self) -> &'static str {
+        match self {
+            Col::Modified => "modified",
+            Col::Created => "created",
+            Col::Size => "size",
+            Col::Kind => "kind",
+            Col::Location => "location",
+            Col::Deleted => "deleted",
+            Col::Space => "space",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Col::Modified => "Date Modified",
+            Col::Created => "Date Created",
+            Col::Size => "Size",
+            Col::Kind => "Kind",
+            Col::Location => "Location",
+            Col::Deleted => "Date Deleted",
+            Col::Space => "Free Space",
+        }
+    }
+
+    /// Share of the row's width (Name takes what's left).
+    fn weight(self) -> f32 {
+        match self {
+            Col::Modified | Col::Created | Col::Deleted => 0.22,
+            Col::Size => 0.11,
+            Col::Kind => 0.16,
+            Col::Location => 0.26,
+            Col::Space => 0.24,
+        }
+    }
+
+    fn sort_key(self) -> Option<SortKey> {
+        Some(match self {
+            Col::Modified => SortKey::Modified,
+            Col::Created => SortKey::Created,
+            Col::Size => SortKey::Size,
+            Col::Kind => SortKey::Kind,
+            Col::Location => SortKey::Location,
+            Col::Deleted => SortKey::Deleted,
+            Col::Space => return None,
+        })
+    }
+}
+
+/// The pane at the right of the icon, list and gallery views.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Pane {
+    None,
+    /// A big preview with the details under it (Alt+P, macOS's Show Preview).
+    Preview,
+    /// Just the details (Alt+Shift+P, Explorer's details pane).
+    Details,
+}
+
+impl Pane {
+    pub fn name(self) -> &'static str {
+        match self {
+            Pane::None => "none",
+            Pane::Preview => "preview",
+            Pane::Details => "details",
         }
     }
 }
@@ -121,48 +250,137 @@ pub enum FinderCmd {
     Open(PathBuf),
     /// Open a folder in a new tab of this window.
     OpenTab(PathBuf),
+    OpenWindow(PathBuf),
     Reveal(PathBuf),
     /// Open a folder in File Explorer itself.
     Explorer(PathBuf),
-    CopyPath(Vec<PathBuf>),
-    Trash(Vec<PathBuf>),
+    /// Copy paths as text; `quoted` like Explorer's "Copy as path".
+    CopyPath { paths: Vec<PathBuf>, quoted: bool },
+    Copy(Vec<PathBuf>),
+    Cut(Vec<PathBuf>),
+    Paste(PathBuf),
+    PasteShortcut(PathBuf),
+    /// To the Recycle Bin, or (`recycle: false`) deleted for good.
+    Delete { paths: Vec<PathBuf>, recycle: bool },
+    Undo,
+    Redo,
+    Duplicate(Vec<PathBuf>),
+    MakeShortcut(Vec<PathBuf>),
+    Compress(Vec<PathBuf>),
+    Extract(PathBuf),
     NewFolder,
+    /// A file from the New menu ([`shell::new_types`] index).
+    NewFile(usize),
     Rename,
+    /// Open with handler `n` of the menu's Open With list.
+    OpenWith(usize, Vec<PathBuf>),
+    ChooseApp(PathBuf),
+    RunAsAdmin(PathBuf),
+    Properties(Vec<PathBuf>),
+    /// A canonical shell verb ("Windows.ModernShare", "eject", "undelete", ...).
+    Verb(Vec<PathBuf>, &'static str),
+    /// An item of the shell menu under "More Options".
+    ShellCommand(u32),
+    EmptyTrash,
+    Pin(PathBuf),
+    Unpin(PathBuf),
     SetView(View),
     Sort(SortKey),
+    GroupBy(Group),
+    ToggleColumn(Col),
+    SetPane(Pane),
+    ToggleHidden,
+    ToggleExtensions,
     Terminal(PathBuf),
+    QuickLook,
+    EditAddress,
+    /// Set a search filter (`kind:`, `date:`, `size:`), replacing any with the same prefix.
+    SearchFilter(&'static str, Option<&'static str>),
+    /// Search all of This PC (true) or the folder the search started in.
+    SearchScope(bool),
     /// Drag the items out with OLE drag and drop (modal).
     Drag(Vec<PathBuf>),
-    /// Copy or move dropped items into a folder (modal: the shell shows progress).
-    Transfer { paths: Vec<PathBuf>, dest: PathBuf, copy: bool },
-    /// Re-list and reset mouse state, e.g. after a modal drag.
-    Reload,
+    /// Copy, move or link dropped items into a folder (modal: the shell shows progress).
+    Transfer { paths: Vec<PathBuf>, dest: PathBuf, op: DropOp },
+    /// A drop of items without paths (kept by [`ops::keep_dropped`]).
+    TransferDropped { dest: PathBuf, copy: bool },
+    /// A right-button drop: ask what to do (at screen points x, y).
+    DropMenu { paths: Vec<PathBuf>, dest: PathBuf, x: f32, y: f32 },
+    /// Re-list after a modal command and reset mouse state, selecting what it produced.
+    Settle(Vec<PathBuf>),
 }
 
 impl FinderCmd {
     /// Commands that run a modal loop and so must run outside the App borrow (see [`run_modal`]).
     pub fn is_modal(&self) -> bool {
-        matches!(self, FinderCmd::Drag(_) | FinderCmd::Transfer { .. })
+        use FinderCmd::*;
+        matches!(
+            self,
+            Drag(_)
+                | Transfer { .. }
+                | TransferDropped { .. }
+                | Paste(_)
+                | Delete { .. }
+                | Undo
+                | Redo
+                | Duplicate(_)
+                | Compress(_)
+                | Extract(_)
+                | OpenWith(..)
+                | ChooseApp(_)
+                | RunAsAdmin(_)
+                | Properties(_)
+                | Verb(..)
+                | ShellCommand(_)
+                | EmptyTrash
+        )
     }
 }
 
-/// Runs a modal command for the Finder window `hwnd`; follow up with [`FinderCmd::Reload`].
-pub fn run_modal(hwnd: HWND, cmd: FinderCmd) {
+/// Runs a modal command for the Finder window `hwnd`; returns what to select
+/// afterwards. Follow up with [`FinderCmd::Settle`].
+pub fn run_modal(hwnd: HWND, cmd: FinderCmd) -> Vec<PathBuf> {
+    use FinderCmd::*;
     match cmd {
-        FinderCmd::Drag(paths) => {
+        Drag(paths) => {
             dnd::drag_out(hwnd, &paths);
         }
-        FinderCmd::Transfer { paths, dest, copy } => {
-            fs::transfer(&paths, &dest, copy, hwnd);
+        // Dropping onto the Recycle Bin deletes.
+        Transfer { paths, dest, .. } if dest.as_os_str().eq_ignore_ascii_case(shell::RECYCLE_BIN) => {
+            ops::delete(hwnd, &paths, true);
         }
+        Transfer { paths, dest, op } => return ops::transfer(hwnd, &paths, &dest, op),
+        TransferDropped { dest, copy } => return ops::transfer_dropped(hwnd, &dest, copy),
+        Paste(dest) => return ops::paste(hwnd, &dest),
+        Delete { paths, recycle } => {
+            ops::delete(hwnd, &paths, recycle);
+        }
+        Undo => return ops::undo(hwnd),
+        Redo => return ops::redo(hwnd),
+        Duplicate(paths) => return ops::duplicate(hwnd, &paths),
+        Compress(paths) => return ops::compress(hwnd, &paths).into_iter().collect(),
+        Extract(path) => return ops::extract(hwnd, &path).into_iter().collect(),
+        OpenWith(i, paths) => shell::open_with(i, &paths),
+        ChooseApp(path) => shell::choose_app(hwnd, &path),
+        RunAsAdmin(path) => shell::run_as_admin(hwnd, &path),
+        Properties(paths) => {
+            shell::invoke_verb(hwnd, &paths, "properties");
+        }
+        Verb(paths, verb) => {
+            shell::invoke_verb(hwnd, &paths, verb);
+        }
+        ShellCommand(id) => shell::invoke(hwnd, id, None),
+        EmptyTrash => shell::empty_recycle_bin(hwnd),
         _ => {}
     }
+    Vec::new()
 }
 
 pub enum FinderEvent {
     None,
     Close,
-    NewWindow,
+    /// Open another Finder window (at a folder, or Home).
+    NewWindow(Option<PathBuf>),
     /// Context menu entries and the screen point (points) to show them at.
     Menu(Vec<Entry>, f32, f32),
     /// A modal command to run once the current message is handled.
@@ -193,6 +411,13 @@ enum Hit {
     NewTab,
     /// Path bar segment: the cwd ancestor at this depth (0 = root).
     Crumb(usize),
+    /// The path bar outside its segments (a click edits the path), and the address field itself.
+    PathBar,
+    Address,
+    /// Search scope buttons, and filter pill `n` (kind, date, size).
+    ScopeAll,
+    ScopeHere,
+    Filter(u8),
 }
 
 struct Column {
@@ -252,6 +477,33 @@ struct Tab {
     search: TextField,
 }
 
+/// View settings new windows start with (saved to config.toml when they change).
+#[derive(Clone, PartialEq, Debug)]
+pub struct Prefs {
+    pub view: View,
+    pub sort: SortKey,
+    pub ascending: bool,
+    pub show_hidden: bool,
+    pub show_ext: bool,
+    pub group: Group,
+    pub columns: Vec<Col>,
+    pub pane: Pane,
+    pub icon_size: f32,
+}
+
+/// Where items sit in the icon, list and gallery views, from the last render:
+/// window points with the view scrolled to the top (or, in the gallery, the strip to the left).
+#[derive(Default)]
+struct Layout {
+    /// Each entry's cell (icons), row (list) or thumbnail (gallery strip).
+    cells: Vec<Rect>,
+    /// Group headings: their top and group index.
+    headers: Vec<(f32, usize)>,
+    /// Content height (gallery: the strip's width).
+    extent: f32,
+    cols: usize,
+}
+
 /// Per-render context the App lends to a Finder window.
 pub struct Ctx<'a> {
     pub gfx: &'a Gfx,
@@ -305,12 +557,46 @@ pub struct FinderWindow {
     drop_hit: Option<Hit>,
     quicklook: Option<QuickLook>,
     ql_bitmap: Option<(String, Option<ID2D1Bitmap>)>,
+    /// The big preview in the pane or gallery, for the item it shows.
+    focus_bitmap: Option<(String, Option<ID2D1Bitmap>)>,
     typed: String,
     typed_at: Instant,
     bitmaps: HashMap<(String, (u32, u32)), Option<ID2D1Bitmap>>,
-    favorites: Vec<Place>,
-    drives: Vec<Place>,
+    /// Sidebar rows: Favorites (the first `fav_count`), then Locations.
+    places: Vec<Place>,
+    fav_count: usize,
+    pins: Vec<PathBuf>,
+    /// Pinned sidebar folders changed: the App saves them.
+    pub pins_dirty: bool,
+    side_scroll: Scroll,
+    side_max: f32,
     watcher: Option<notify::RecommendedWatcher>,
+    /// Where background listings and searches post their results.
+    notify: isize,
+    /// A shell folder being listed in the background (Network, phones, ...).
+    pending: Option<shell::Pending>,
+    /// The folder search running below the toolbar's search field.
+    searching: Option<search::Search>,
+    /// Search all drives rather than the current folder.
+    search_all: bool,
+    group: Group,
+    /// Where each group starts in `entries`, and its heading.
+    groups: Vec<(usize, String)>,
+    list_cols: Vec<Col>,
+    pane: Pane,
+    /// The pane's details, for the item they were read for.
+    details: Option<(PathBuf, Vec<(String, String)>)>,
+    icon_size: f32,
+    show_ext: bool,
+    /// Item positions from the last render.
+    layout: Layout,
+    /// The path bar, while it's being edited as an address field.
+    address: Option<TextField>,
+    address_xs: Vec<f32>,
+    /// A message in the status bar for a few seconds ("Windows can't find ...").
+    flash: Option<(String, Instant)>,
+    /// Events from commands (menus to open, windows to create), for the App to collect.
+    outbox: Vec<FinderEvent>,
     zoom_restore: Option<RECT>,
     show_hidden: bool,
     /// One slot per tab, in order; the active tab's state lives in the fields above (its slot is `None`).
@@ -420,12 +706,33 @@ impl FinderWindow {
             drop_hit: None,
             quicklook: None,
             ql_bitmap: None,
+            focus_bitmap: None,
             typed: String::new(),
             typed_at: Instant::now(),
             bitmaps: HashMap::new(),
-            favorites: fs::favorites(),
-            drives: fs::drives(),
+            places: Vec::new(),
+            fav_count: 0,
+            pins: prefs.sidebar_pins.clone(),
+            pins_dirty: false,
+            side_scroll: Scroll::default(),
+            side_max: 0.0,
             watcher,
+            notify,
+            pending: None,
+            searching: None,
+            search_all: false,
+            group: prefs.group,
+            groups: Vec::new(),
+            list_cols: if prefs.columns.is_empty() { vec![Col::Modified, Col::Size, Col::Kind] } else { prefs.columns.clone() },
+            pane: prefs.pane,
+            details: None,
+            icon_size: prefs.icon_size.clamp(32.0, 256.0),
+            show_ext: prefs.show_extensions,
+            layout: Layout::default(),
+            address: None,
+            address_xs: Vec::new(),
+            flash: None,
+            outbox: Vec::new(),
             zoom_restore: None,
             show_hidden: prefs.show_hidden,
             tabs: vec![None],
@@ -448,9 +755,46 @@ impl FinderWindow {
             tracking: false,
             dirty: true,
         };
+        f.refresh_places();
         f.navigate(path, true, ctx.kinds);
         dnd::register(hwnd, id);
         Ok(f)
+    }
+
+    /// The window came to the front: drives may have changed, and shell places
+    /// (the Recycle Bin, phones) have no change notifications, so re-list them.
+    pub fn on_focus(&mut self, kinds: &mut KindCache) {
+        self.refresh_places();
+        if Self::needs_shell(&self.cwd) && self.searching.is_none() {
+            self.reload(kinds);
+        }
+    }
+
+    /// Re-reads the sidebar (drives come and go; pins change).
+    pub fn refresh_places(&mut self) {
+        let fav = fs::favorites(&self.pins);
+        self.fav_count = fav.len();
+        self.places = fav;
+        self.places.extend(fs::locations());
+        self.dirty = true;
+    }
+
+    /// Events queued by commands (menus to open, windows to create).
+    pub fn take_events(&mut self) -> Vec<FinderEvent> {
+        std::mem::take(&mut self.outbox)
+    }
+
+    /// Pinned sidebar folders, to save.
+    pub fn pins(&self) -> &[PathBuf] {
+        &self.pins
+    }
+
+    /// Takes new pins from another window's change.
+    pub fn set_pins(&mut self, pins: &[PathBuf]) {
+        if self.pins != pins {
+            self.pins = pins.to_vec();
+            self.refresh_places();
+        }
     }
 
     pub fn scale(&self) -> f32 {
@@ -458,19 +802,32 @@ impl FinderWindow {
     }
 
     pub fn title(&self) -> String {
+        if self.searching.is_some() {
+            return format!("Searching “{}”", if self.search_all { "This PC".to_string() } else { self.title_for(&self.cwd) });
+        }
         self.title_for(&self.cwd)
     }
 
     fn title_for(&self, dir: &Path) -> String {
-        if let Some(p) = self.favorites.iter().chain(&self.drives).find(|p| p.path == dir) {
+        if let Some(p) = self.places.iter().find(|p| p.path == dir && p.kind != PlaceKind::Pinned) {
             return p.name.clone();
         }
-        dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| dir.display().to_string())
+        shell::title(dir)
     }
 
-    /// Settings that new windows start with: view, sort key, ascending, hidden files.
-    pub fn prefs(&self) -> (View, SortKey, bool, bool) {
-        (self.view, self.sort, self.ascending, self.show_hidden)
+    /// Settings that new windows start with.
+    pub fn prefs(&self) -> Prefs {
+        Prefs {
+            view: self.view,
+            sort: self.sort,
+            ascending: self.ascending,
+            show_hidden: self.show_hidden,
+            show_ext: self.show_ext,
+            group: self.group,
+            columns: self.list_cols.clone(),
+            pane: self.pane,
+            icon_size: self.icon_size,
+        }
     }
 
     fn new_backdrop(hwnd: HWND, prefs: &crate::config::FinderCfg, theme: &Theme) -> Option<SidebarBackdrop> {
@@ -540,7 +897,7 @@ impl FinderWindow {
         if list || std::mem::take(&mut self.icons_ready) {
             touch(vr);
         }
-        if self.side_glide.tick(dt) | self.sel_glide.tick(dt) {
+        if self.side_glide.tick(dt) | self.sel_glide.tick(dt) | self.side_scroll.tick(dt) {
             touch(side);
         }
         // While the scrollbar lingers, keep ticking without redrawing; once
@@ -572,6 +929,7 @@ impl FinderWindow {
             || self.scroll.moving()
             || self.side_glide.moving()
             || self.sel_glide.moving()
+            || self.side_scroll.moving()
             || self.columns.iter().any(|c| c.scroll.moving())
             || self.quicklook.as_ref().is_some_and(|q| q.scroll.moving())
             || self.scrollbar_up
@@ -674,6 +1032,9 @@ impl FinderWindow {
         self.quicklook = None;
         self.search_focus = false;
         self.drop_hit = None;
+        self.pending = None;
+        self.searching = None;
+        self.address = None;
         if let Some(w) = &mut self.watcher {
             let _ = w.unwatch(&self.cwd);
         }
@@ -745,21 +1106,98 @@ impl FinderWindow {
 
     // --- navigation & listing ----------------------------------------------
 
+    /// Shell places, zip files and the like are listed through the shell; real folders with `std::fs`.
+    fn needs_shell(dir: &Path) -> bool {
+        !shell::is_fs_path(dir) || !dir.is_dir()
+    }
+
+    /// Lists `dir` right away (column view, and folders `std::fs` reads).
     fn list_sorted(&self, dir: &Path, kinds: &mut KindCache) -> (Vec<FileEntry>, Option<String>) {
-        match fs::list(dir, self.show_hidden) {
+        let listed = if Self::needs_shell(dir) {
+            shell::list(dir, self.show_hidden)
+        } else {
+            fs::list(dir, self.show_hidden).map_err(|e| match e.kind() {
+                std::io::ErrorKind::PermissionDenied => "You don't have permission to see this folder's contents.".to_string(),
+                _ => format!("The folder can't be opened: {e}"),
+            })
+        };
+        match listed {
             Ok(mut entries) => {
                 fs::sort(&mut entries, self.sort, self.ascending, kinds);
                 (entries, None)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                (Vec::new(), Some("You don't have permission to see this folder's contents.".into()))
+            Err(e) => (Vec::new(), Some(e)),
+        }
+    }
+
+    fn start_pending(&mut self) {
+        self.pending = Some(shell::Pending::start(self.cwd.clone(), self.show_hidden, self.notify, crate::win::WM_APP_FINDER_ASYNC, self.id));
+    }
+
+    /// Background results arrived (a shell listing or search matches).
+    pub fn poll_async(&mut self, kinds: &mut KindCache) {
+        if let Some(r) = self.pending.as_ref().and_then(|p| p.take().map(|r| (p.dir.clone(), r))) {
+            self.pending = None;
+            let (dir, result) = r;
+            if dir == self.cwd && self.searching.is_none() {
+                match result {
+                    Ok(mut entries) => {
+                        fs::sort(&mut entries, self.sort, self.ascending, kinds);
+                        self.listing = entries;
+                        self.error = None;
+                    }
+                    Err(e) => {
+                        self.listing.clear();
+                        self.error = Some(e);
+                    }
+                }
+                self.apply_filter(kinds);
             }
-            Err(e) => (Vec::new(), Some(format!("The folder can't be opened: {e}"))),
+        }
+        if let Some(s) = &self.searching {
+            let found = s.take();
+            if !found.is_empty() {
+                self.listing.extend(found);
+                fs::sort(&mut self.listing, self.sort, self.ascending, kinds);
+                self.apply_filter(kinds);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// The search field changed: (re)start the search below the folder, or end it.
+    fn search_changed(&mut self, kinds: &mut KindCache) {
+        let query = search::Query::parse(&self.search.string());
+        if query.is_empty() {
+            if self.searching.take().is_some() {
+                self.reload(kinds);
+            } else {
+                self.apply_filter(kinds);
+            }
+            return;
+        }
+        // Shell places can't be walked: search every drive from them.
+        let roots = if self.search_all || !shell::is_fs_path(&self.cwd) {
+            fs::drives().into_iter().filter(|d| d.kind == PlaceKind::Drive).map(|d| d.path).collect()
+        } else {
+            vec![self.cwd.clone()]
+        };
+        self.searching = Some(search::Search::start(roots, query, self.show_hidden, self.notify, crate::win::WM_APP_FINDER_ASYNC, self.id));
+        self.pending = None;
+        self.listing.clear();
+        self.error = None;
+        self.apply_filter(kinds);
+        unsafe {
+            let _ = SetWindowTextW(self.hwnd, &HSTRING::from(self.title()));
         }
     }
 
     pub fn navigate(&mut self, path: PathBuf, push: bool, kinds: &mut KindCache) {
-        let (entries, error) = self.list_sorted(&path, kinds);
+        let shell_listed = Self::needs_shell(&path);
+        let (entries, error) = if shell_listed { (Vec::new(), None) } else { self.list_sorted(&path, kinds) };
+        self.searching = None;
+        self.address = None;
+        self.details = None;
         if let Some(w) = &mut self.watcher {
             let _ = w.unwatch(&self.cwd);
             let _ = w.watch(&path, RecursiveMode::NonRecursive);
@@ -771,6 +1209,10 @@ impl FinderWindow {
         }
         self.free = fs::free_space(&path);
         self.cwd = path;
+        self.pending = None;
+        if shell_listed {
+            self.start_pending();
+        }
         self.listing = entries.clone();
         self.entries = entries;
         self.error = error.clone();
@@ -791,6 +1233,7 @@ impl FinderWindow {
             error,
         }];
         self.active_col = 0;
+        self.apply_filter(kinds);
         unsafe {
             let _ = SetWindowTextW(self.hwnd, &HSTRING::from(self.title()));
         }
@@ -799,10 +1242,26 @@ impl FinderWindow {
 
     /// Re-lists after on-disk changes, keeping selections by path.
     pub fn reload(&mut self, kinds: &mut KindCache) {
-        let (entries, error) = self.list_sorted(&self.cwd.clone(), kinds);
-        self.listing = entries;
-        self.error = error;
+        if self.searching.is_some() {
+            // Results stay; a change on disk doesn't restart the search.
+            return;
+        }
+        if !self.search.is_empty() {
+            // Back in a tab that was searching.
+            return self.search_changed(kinds);
+        }
+        if Self::needs_shell(&self.cwd) {
+            // Keep showing what's there until the new listing arrives.
+            self.start_pending();
+        } else {
+            let (entries, error) = self.list_sorted(&self.cwd.clone(), kinds);
+            self.listing = entries;
+            self.error = error;
+        }
         for c in 0..self.columns.len() {
+            if c == 0 && self.pending.is_some() {
+                continue;
+            }
             let sel = self.columns[c].selected.and_then(|i| self.columns[c].entries.get(i)).map(|e| e.path.clone());
             let (entries, error) = self.list_sorted(&self.columns[c].dir.clone(), kinds);
             let col = &mut self.columns[c];
@@ -818,21 +1277,19 @@ impl FinderWindow {
             self.columns.truncate(cut + 1);
             self.active_col = self.active_col.min(cut);
         }
-        self.apply_filter();
+        self.apply_filter(kinds);
         self.free = fs::free_space(&self.cwd);
         self.dirty = true;
     }
 
-    /// Rebuilds `entries` from `listing` and the search text, keeping selections by path.
-    fn apply_filter(&mut self) {
+    /// Rebuilds `entries` from `listing`, the search filters and the grouping, keeping selections by path.
+    fn apply_filter(&mut self, kinds: &mut KindCache) {
         let keep: Vec<PathBuf> = self.selected.iter().filter_map(|&i| self.entries.get(i)).map(|e| e.path.clone()).collect();
-        let query = self.search.string().to_lowercase();
-        let query = query.trim();
-        self.entries = if query.is_empty() {
-            self.listing.clone()
-        } else {
-            self.listing.iter().filter(|e| e.name.to_lowercase().contains(query)).cloned().collect()
-        };
+        let query = search::Query::parse(&self.search.string());
+        let mut entries: Vec<FileEntry> =
+            if query.is_empty() { self.listing.clone() } else { self.listing.iter().filter(|e| query.matches(e)).cloned().collect() };
+        self.groups = self.group_entries(&mut entries, kinds);
+        self.entries = entries;
         self.reselect(&keep);
         // Column view: the root column shows the same results.
         if let Some(root) = self.columns.first_mut().filter(|c| c.dir == self.cwd) {
@@ -876,22 +1333,40 @@ impl FinderWindow {
     }
 
     fn go_parent(&mut self, kinds: &mut KindCache) {
-        if let Some(parent) = self.cwd.parent().map(Path::to_path_buf) {
+        if let Some(parent) = shell::parent(&self.cwd) {
             let from = self.cwd.clone();
             self.navigate(parent, true, kinds);
             self.reselect(&[from]);
         }
     }
 
-    fn open_path(&mut self, path: &Path, is_dir: bool, kinds: &mut KindCache) {
-        if is_dir {
-            self.navigate(path.to_path_buf(), true, kinds);
-        } else {
-            crate::win::system::open(&path.to_string_lossy());
+    fn go_home(&mut self, kind: PlaceKind, kinds: &mut KindCache) {
+        if let Some(p) = self.places.iter().find(|p| p.kind == kind).map(|p| p.path.clone()) {
+            self.navigate(p, true, kinds);
         }
     }
 
-    fn set_view(&mut self, view: View) {
+    /// Opens an item: folders (and zip files, and shortcuts to folders) open
+    /// here, like Explorer; everything else with its default app.
+    fn open_path(&mut self, path: &Path, is_dir: bool, kinds: &mut KindCache) {
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if is_dir || shell::opens_as_folder(&ext) {
+            return self.navigate(path.to_path_buf(), true, kinds);
+        }
+        if ext == "lnk" {
+            if let Some(target) = shell::folder_link_target(path) {
+                return self.navigate(target, true, kinds);
+            }
+        }
+        shell::open(path);
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        let known = self.entries.iter().chain(self.columns.iter().flat_map(|c| &c.entries)).find(|e| e.path == path);
+        known.map_or_else(|| path.is_dir() || !shell::is_fs_path(path), |e| e.is_dir)
+    }
+
+    fn set_view(&mut self, view: View, kinds: &mut KindCache) {
         if self.view != view {
             // Carry the selection between views.
             if view == View::Columns {
@@ -900,7 +1375,16 @@ impl FinderWindow {
             } else if self.view == View::Columns {
                 self.selected = self.columns[0].selected.into_iter().collect();
             }
+            let was_grouped = self.groups_apply();
             self.view = view;
+            if was_grouped != self.groups_apply() {
+                self.apply_filter(kinds);
+            }
+            if view == View::Gallery && self.selected.is_empty() && !self.entries.is_empty() {
+                self.selected = [0].into();
+                self.cursor = Some(0);
+                self.anchor = Some(0);
+            }
             self.scroll.jump(0.0);
             self.prefs_dirty = true;
             self.dirty = true;
@@ -912,10 +1396,35 @@ impl FinderWindow {
             self.ascending = !self.ascending;
         } else {
             self.sort = key;
-            self.ascending = true;
+            // Dates and sizes start newest / largest first, like Explorer.
+            self.ascending = matches!(key, SortKey::Name | SortKey::Kind | SortKey::Location);
         }
         self.prefs_dirty = true;
+        fs::sort(&mut self.listing, self.sort, self.ascending, kinds);
+        self.apply_filter(kinds);
         self.reload(kinds);
+    }
+
+    /// Grouping shows in the icon and list views.
+    fn groups_apply(&self) -> bool {
+        self.group != Group::None && matches!(self.view, View::Icons | View::List)
+    }
+
+    /// Orders entries by group (keeping the sort inside each) and returns where each group starts.
+    fn group_entries(&self, entries: &mut Vec<FileEntry>, kinds: &mut KindCache) -> Vec<(usize, String)> {
+        if !self.groups_apply() {
+            return Vec::new();
+        }
+        let mut keyed: Vec<((u32, String), FileEntry)> = entries.drain(..).map(|e| (group_key(self.group, &e, kinds), e)).collect();
+        keyed.sort_by(|a, b| a.0 .0.cmp(&b.0 .0).then_with(|| fs::natural_cmp(&a.0 .1, &b.0 .1)));
+        let mut groups: Vec<(usize, String)> = Vec::new();
+        for (i, (key, e)) in keyed.into_iter().enumerate() {
+            if groups.last().map(|g| &g.1) != Some(&key.1) {
+                groups.push((i, key.1));
+            }
+            entries.push(e);
+        }
+        groups
     }
 
     /// Selected paths in the current view.
@@ -952,35 +1461,162 @@ impl FinderWindow {
     pub fn command(&mut self, cmd: FinderCmd, kinds: &mut KindCache) {
         match cmd {
             FinderCmd::Open(p) => {
-                let is_dir = p.is_dir();
+                let is_dir = self.is_dir(&p);
                 self.open_path(&p, is_dir, kinds);
             }
             FinderCmd::OpenTab(p) => self.new_tab(p, kinds),
+            FinderCmd::OpenWindow(p) => self.outbox.push(FinderEvent::NewWindow(Some(p))),
             FinderCmd::Reveal(p) => crate::win::system::reveal(&p.to_string_lossy()),
             FinderCmd::Explorer(p) => crate::win::system::open_in_explorer(&p.to_string_lossy()),
-            FinderCmd::CopyPath(paths) => {
-                let text: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            FinderCmd::CopyPath { paths, quoted } => {
+                let text: Vec<String> = paths.iter().map(|p| if quoted { format!("\"{}\"", p.display()) } else { p.display().to_string() }).collect();
                 fs::copy_text(&text.join("\r\n"));
             }
-            FinderCmd::Trash(paths) => {
-                if fs::trash(&paths, self.hwnd) {
-                    self.reload(kinds);
-                    self.selected.clear();
-                }
+            FinderCmd::Copy(paths) => {
+                shell::set_clipboard(&paths, false);
+            }
+            FinderCmd::Cut(paths) => {
+                shell::set_clipboard(&paths, true);
+            }
+            FinderCmd::PasteShortcut(dest) => {
+                let paths = shell::clipboard().map(|(d, _)| dnd::hdrop_paths(&d)).unwrap_or_default();
+                let made = ops::shortcuts(&paths, &dest);
+                self.reload(kinds);
+                self.reselect(&made);
+            }
+            FinderCmd::MakeShortcut(paths) => {
+                let dir = paths.first().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_else(|| self.target_dir());
+                let made = ops::shortcuts(&paths, &dir);
+                self.reload(kinds);
+                self.reselect(&made);
             }
             FinderCmd::NewFolder => self.new_folder(kinds),
+            FinderCmd::NewFile(i) => self.new_file(i, kinds),
             FinderCmd::Rename => self.begin_rename(),
-            FinderCmd::SetView(v) => self.set_view(v),
+            FinderCmd::Pin(p) => {
+                if !self.pins.contains(&p) {
+                    self.pins.push(p);
+                    self.pins_dirty = true;
+                    self.refresh_places();
+                }
+            }
+            FinderCmd::Unpin(p) => {
+                self.pins.retain(|x| *x != p);
+                self.pins_dirty = true;
+                self.refresh_places();
+            }
+            FinderCmd::SetView(v) => self.set_view(v, kinds),
             FinderCmd::Sort(k) => self.set_sort(k, kinds),
+            FinderCmd::GroupBy(g) => {
+                self.group = g;
+                self.prefs_dirty = true;
+                self.apply_filter(kinds);
+            }
+            FinderCmd::ToggleColumn(c) => {
+                if !self.list_cols.contains(&c) {
+                    self.list_cols.push(c);
+                    // Keep Explorer's usual order.
+                    self.list_cols.sort_by_key(|c| *c as u8);
+                } else {
+                    self.list_cols.retain(|x| *x != c);
+                }
+                self.prefs_dirty = true;
+            }
+            FinderCmd::SetPane(p) => {
+                self.pane = if self.pane == p { Pane::None } else { p };
+                self.prefs_dirty = true;
+            }
+            FinderCmd::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                self.prefs_dirty = true;
+                self.reload(kinds);
+            }
+            FinderCmd::ToggleExtensions => {
+                self.show_ext = !self.show_ext;
+                self.prefs_dirty = true;
+            }
             FinderCmd::Terminal(p) => fs::open_terminal(&p),
-            FinderCmd::Reload => {
-                // A modal drag swallowed the button release.
+            FinderCmd::QuickLook => self.toggle_quicklook(),
+            FinderCmd::EditAddress => self.begin_address(),
+            FinderCmd::SearchFilter(prefix, value) => {
+                let kept: Vec<String> = self.search.string().split_whitespace().filter(|t| !t.to_lowercase().starts_with(prefix)).map(String::from).collect();
+                let mut text = kept.join(" ");
+                if let Some(v) = value {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text += &format!("{prefix}{v}");
+                }
+                self.search = TextField::new(&text);
+                self.search_focus = true;
+                self.search_changed(kinds);
+            }
+            FinderCmd::SearchScope(all) => {
+                if self.search_all != all {
+                    self.search_all = all;
+                    self.search_changed(kinds);
+                }
+            }
+            FinderCmd::DropMenu { paths, dest, x, y } => {
+                let id = self.id;
+                let t = |op: DropOp| Action::Finder { window: id, cmd: FinderCmd::Transfer { paths: paths.clone(), dest: dest.clone(), op } };
+                let entries = vec![
+                    Entry::item("Move Here", t(DropOp::Move)),
+                    Entry::item("Copy Here", t(DropOp::Copy)),
+                    Entry::item("Create Shortcuts Here", t(DropOp::Link)),
+                ];
+                self.outbox.push(FinderEvent::Menu(entries, x, y));
+            }
+            FinderCmd::Settle(select) => {
+                // A modal loop swallowed the button release.
                 self.end_press();
                 self.drop_hit = None;
                 self.reload(kinds);
+                if !select.is_empty() {
+                    if self.view == View::Columns {
+                        self.columns.truncate(1);
+                        self.columns[0].selected = self.columns[0].entries.iter().position(|e| select.contains(&e.path));
+                    }
+                    self.reselect(&select);
+                    self.ensure_visible();
+                }
             }
-            FinderCmd::Drag(_) | FinderCmd::Transfer { .. } => {}
+            // Modal: see `run_modal`.
+            _ => {}
         }
+        self.dirty = true;
+    }
+
+    fn new_file(&mut self, i: usize, kinds: &mut KindCache) {
+        let Some(t) = shell::new_types().into_iter().nth(i) else { return };
+        let dir = self.target_dir();
+        match shell::create_new(&dir, &t) {
+            Ok(path) => {
+                ops::record_created(&format!("New {}", t.name), &[path.clone()]);
+                self.after_create(&dir, path, kinds);
+            }
+            Err(e) => self.show_flash(format!("The file can't be created: {e}")),
+        }
+    }
+
+    /// Selects a just-created item and starts renaming it, like Explorer.
+    fn after_create(&mut self, dir: &Path, path: PathBuf, kinds: &mut KindCache) {
+        self.reload(kinds);
+        if self.view == View::Columns {
+            let c = self.columns.iter().position(|c| c.dir == dir).unwrap_or(0);
+            if let Some(j) = self.columns[c].entries.iter().position(|e| e.path == path) {
+                self.columns.truncate(c + 1);
+                self.columns[c].selected = Some(j);
+                self.active_col = c;
+            }
+        } else {
+            self.reselect(&[path]);
+        }
+        self.begin_rename();
+    }
+
+    fn show_flash(&mut self, msg: String) {
+        self.flash = Some((msg, Instant::now()));
         self.dirty = true;
     }
 
@@ -1001,31 +1637,26 @@ impl FinderWindow {
         let dir = self.target_dir();
         match fs::new_folder(&dir) {
             Ok(path) => {
-                self.reload(kinds);
-                if self.view == View::Columns {
-                    let c = self.columns.iter().position(|c| c.dir == dir).unwrap_or(0);
-                    if let Some(j) = self.columns[c].entries.iter().position(|e| e.path == path) {
-                        self.columns.truncate(c + 1);
-                        self.columns[c].selected = Some(j);
-                        self.active_col = c;
-                    }
-                } else {
-                    self.reselect(&[path]);
-                }
-                self.begin_rename();
+                ops::record_created("New Folder", &[path.clone()]);
+                self.after_create(&dir, path, kinds);
             }
-            Err(e) => log!("new folder failed: {e}"),
+            Err(e) => self.show_flash(format!("The folder can't be created: {e}")),
         }
     }
 
     fn begin_rename(&mut self) {
         let Some(entry) = self.selection().first().map(|e| (*e).clone()) else { return };
-        let mut field = TextField::new(&entry.name);
+        if !entry.fs {
+            // Drives, phones' files and recycled items rename through their own properties.
+            return;
+        }
+        let shown = entry.label(self.show_ext).to_string();
+        let mut field = TextField::new(&shown);
         // Like macOS, preselect the name without its extension.
         let stem = if entry.is_dir {
             field.text.len()
         } else {
-            entry.name.rfind('.').filter(|&i| i > 0).map(|i| entry.name[..i].chars().count()).unwrap_or(field.text.len())
+            shown.rfind('.').filter(|&i| i > 0).map(|i| shown[..i].chars().count()).unwrap_or(field.text.len())
         };
         field.anchor = 0;
         field.caret = stem;
@@ -1039,8 +1670,20 @@ impl FinderWindow {
     fn commit_rename(&mut self, kinds: &mut KindCache) {
         let Some(r) = self.rename.take() else { return };
         let name = r.field.string();
+        let old_name = r.target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        // Renaming without the extension showing keeps the extension.
+        let hidden_ext = self.entries.iter().chain(self.columns.iter().flat_map(|c| &c.entries)).find(|e| e.path == r.target)
+            .filter(|e| e.label(self.show_ext).len() < e.name.len())
+            .map(|e| e.name[e.label(self.show_ext).len()..].to_string());
+        let name = match hidden_ext {
+            Some(ext) if !name.to_lowercase().ends_with(&ext.to_lowercase()) => format!("{name}{ext}"),
+            _ => name,
+        };
         match fs::rename(&r.target, &name) {
             Ok(new_path) => {
+                if new_path != r.target {
+                    ops::record_rename(&new_path, &old_name);
+                }
                 self.reload(kinds);
                 if self.view == View::Columns {
                     for c in 0..self.columns.len() {
@@ -1053,7 +1696,7 @@ impl FinderWindow {
                     self.reselect(&[new_path]);
                 }
             }
-            Err(e) => log!("rename failed: {e}"),
+            Err(e) => self.show_flash(format!("“{name}” can't be used: {e}")),
         }
         self.dirty = true;
     }
@@ -1098,8 +1741,100 @@ impl FinderWindow {
 
     fn view_rect(&self) -> Rect {
         let b = self.body();
-        let top = TOOLBAR + self.tab_h();
-        Rect::new(b.x + SIDEBAR, b.y + top, b.w - SIDEBAR, b.h - top - STATUS - PATHBAR)
+        let top = TOOLBAR + self.tab_h() + self.search_h();
+        let pane = if self.pane_shown() { PANE_W } else { 0.0 };
+        Rect::new(b.x + SIDEBAR, b.y + top, b.w - SIDEBAR - pane, b.h - top - STATUS - PATHBAR)
+    }
+
+    /// The scope and filter bar shows while searching.
+    fn search_h(&self) -> f32 {
+        if self.searching.is_some() || !self.search.is_empty() {
+            SEARCHBAR
+        } else {
+            0.0
+        }
+    }
+
+    /// The preview / details pane, when on and there's room (column view has its own preview).
+    fn pane_shown(&self) -> bool {
+        self.pane != Pane::None && self.view != View::Columns && self.body().w - SIDEBAR > 2.0 * PANE_W
+    }
+
+    /// List columns after Name: the Recycle Bin and This PC have their own, and search adds Location.
+    fn shown_cols(&self) -> Vec<Col> {
+        let here = self.cwd.as_os_str();
+        if here.eq_ignore_ascii_case(shell::RECYCLE_BIN) {
+            return vec![Col::Location, Col::Deleted, Col::Size, Col::Kind];
+        }
+        if here.eq_ignore_ascii_case(shell::THIS_PC) {
+            return vec![Col::Kind, Col::Size, Col::Space];
+        }
+        let mut c = self.list_cols.clone();
+        if self.searching.is_some() && !c.contains(&Col::Location) {
+            c.insert(0, Col::Location);
+        }
+        c
+    }
+
+    /// Icon view cell size for the current icon size.
+    fn cell_size(&self) -> (f32, f32) {
+        ((self.icon_size + 40.0).max(84.0), self.icon_size + 44.0)
+    }
+
+    /// Places every entry for the icon, list and gallery views.
+    fn compute_layout(&mut self) {
+        let vr = self.view_rect();
+        let n = self.entries.len();
+        let mut l = Layout { cells: Vec::with_capacity(n), headers: Vec::new(), extent: 0.0, cols: 1 };
+        // Ungrouped views are one group without a heading.
+        let groups: Vec<usize> = if self.groups.is_empty() { vec![0] } else { self.groups.iter().map(|g| g.0).collect() };
+        let headed = !self.groups.is_empty();
+        let ends: Vec<usize> = groups.iter().skip(1).copied().chain(std::iter::once(n)).collect();
+        match self.view {
+            View::Icons => {
+                let (cell_w, cell_h) = self.cell_size();
+                let cols = (((vr.w - 2.0 * GRID_PAD) / cell_w).floor() as usize).max(1);
+                let cw = (vr.w - 2.0 * GRID_PAD) / cols as f32;
+                let mut y = vr.y + GRID_PAD;
+                for (k, (&start, &end)) in groups.iter().zip(&ends).enumerate() {
+                    if headed {
+                        l.headers.push((y, k));
+                        y += GROUP_H;
+                    }
+                    for i in start..end {
+                        let local = i - start;
+                        l.cells.push(Rect::new(vr.x + GRID_PAD + (local % cols) as f32 * cw, y + (local / cols) as f32 * cell_h, cw, cell_h));
+                    }
+                    y += (end - start).div_ceil(cols) as f32 * cell_h;
+                }
+                l.cols = cols;
+                l.extent = y - vr.y + GRID_PAD;
+            }
+            View::List => {
+                let mut y = vr.y + HEADER + 4.0;
+                for (k, (&start, &end)) in groups.iter().zip(&ends).enumerate() {
+                    if headed {
+                        l.headers.push((y, k));
+                        y += GROUP_H;
+                    }
+                    for _ in start..end {
+                        l.cells.push(Rect::new(vr.x + 8.0, y, vr.w - 16.0, ROW));
+                        y += ROW;
+                    }
+                }
+                l.extent = y - vr.y + 4.0;
+            }
+            View::Gallery => {
+                let top = vr.bottom() - STRIP_H;
+                for i in 0..n {
+                    l.cells.push(Rect::new(vr.x + 12.0 + i as f32 * STRIP_CELL, top + 8.0, STRIP_CELL, STRIP_H - 16.0));
+                }
+                l.extent = n as f32 * STRIP_CELL + 24.0;
+            }
+            View::Columns => {}
+        }
+        self.grid_cols = l.cols;
+        self.layout = l;
     }
 
     /// Hit-test result for WM_NCHITTEST, from window-local points.
@@ -1151,6 +1886,10 @@ impl FinderWindow {
                         | Hit::Tab(_)
                         | Hit::TabClose(_)
                         | Hit::NewTab
+                        | Hit::Crumb(_)
+                        | Hit::ScopeAll
+                        | Hit::ScopeHere
+                        | Hit::Filter(_)
                 )
             )
         };
@@ -1166,6 +1905,12 @@ impl FinderWindow {
             let i = self.search_index(x);
             self.search.set_caret(i, true);
             self.dirty = true;
+        } else if self.pressed == Some(Hit::Address) {
+            let i = nearest(&self.address_xs, x);
+            if let Some(a) = &mut self.address {
+                a.set_caret(i.min(a.text.len()), true);
+                self.dirty = true;
+            }
         } else if let Some((x0, y0)) = self.drag_from {
             let (dx, dy) = unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
             if (x - x0).abs() * self.scale > dx as f32 || (y - y0).abs() * self.scale > dy as f32 {
@@ -1186,8 +1931,19 @@ impl FinderWindow {
         }
     }
 
-    pub fn on_wheel(&mut self, x: f32, delta: i32) {
+    /// `x`: window points. Ctrl+wheel changes the icon size, like Explorer.
+    pub fn on_wheel(&mut self, x: f32, delta: i32, ctrl: bool) {
         self.scrolled_at = Instant::now();
+        let body = self.body();
+        if ctrl && self.quicklook.is_none() {
+            self.zoom_icons(if delta > 0 { 1 } else { -1 });
+            return;
+        }
+        if self.quicklook.is_none() && x < body.x + SIDEBAR {
+            self.side_scroll.wheel_smooth(delta, 40.0, self.side_max);
+            self.dirty = true;
+            return;
+        }
         if let Some(ql) = &mut self.quicklook {
             ql.scroll.wheel_smooth(delta, 60.0, ql.max_scroll);
         } else if self.view == View::Columns {
@@ -1209,6 +1965,16 @@ impl FinderWindow {
         self.dirty = true;
     }
 
+    /// Steps the icon size (Ctrl+wheel, Ctrl+Plus / Minus).
+    fn zoom_icons(&mut self, step: i32) {
+        const SIZES: [f32; 8] = [32.0, 48.0, 64.0, 96.0, 128.0, 160.0, 192.0, 256.0];
+        let i = SIZES.iter().position(|s| *s >= self.icon_size - 0.5).unwrap_or(2) as i32;
+        self.icon_size = SIZES[(i + step).clamp(0, SIZES.len() as i32 - 1) as usize];
+        self.prefs_dirty = true;
+        self.dirty = true;
+        self.ensure_visible();
+    }
+
     /// Starts tracking a press that may become a drag.
     fn begin_press(&mut self, x: f32, y: f32) {
         self.drag_from = Some((x, y));
@@ -1217,7 +1983,7 @@ impl FinderWindow {
         }
     }
 
-    pub fn on_down(&mut self, x: f32, y: f32, ctrl: bool, shift: bool, kinds: &mut KindCache) {
+    pub fn on_down(&mut self, x: f32, y: f32, ctrl: bool, shift: bool, kinds: &mut KindCache) -> FinderEvent {
         let hit = self.hit_at(x, y);
         self.end_press();
         self.pressed = hit;
@@ -1229,8 +1995,12 @@ impl FinderWindow {
         if self.rename.is_some() {
             self.commit_rename(kinds);
         }
-        if !matches!(hit, Some(Hit::Search | Hit::SearchClear)) {
+        if !matches!(hit, Some(Hit::Search | Hit::SearchClear | Hit::Filter(_) | Hit::ScopeAll | Hit::ScopeHere)) {
             self.search_focus = false;
+        }
+        // Clicking away from the address field leaves the path as it was, like Explorer.
+        if !matches!(hit, Some(Hit::Address)) {
+            self.address = None;
         }
         match hit {
             Some(Hit::Item(i)) => {
@@ -1238,7 +2008,7 @@ impl FinderWindow {
                     if let Some(e) = self.entries.get(i).cloned() {
                         self.open_path(&e.path, e.is_dir, kinds);
                     }
-                    return;
+                    return FinderEvent::None;
                 }
                 if ctrl {
                     if !self.selected.remove(&i) {
@@ -1263,9 +2033,9 @@ impl FinderWindow {
                 let entry = self.columns.get(c).and_then(|col| col.entries.get(j)).cloned();
                 if double {
                     if let Some(e) = entry.filter(|e| !e.is_dir) {
-                        crate::win::system::open(&e.path.to_string_lossy());
+                        self.open_path(&e.path, false, kinds);
                     }
-                    return;
+                    return FinderEvent::None;
                 }
                 self.select_column(c, j, kinds);
                 self.begin_press(x, y);
@@ -1275,7 +2045,7 @@ impl FinderWindow {
                 self.columns[c].selected = None;
                 self.active_col = c;
             }
-            Some(Hit::Content) if self.view != View::Columns => {
+            Some(Hit::Content) if !matches!(self.view, View::Columns | View::Gallery) => {
                 // Rubber band: Ctrl toggles items against the current selection, Shift adds to it.
                 let base = if ctrl || shift { self.selected.clone() } else { BTreeSet::new() };
                 self.selected = base.clone();
@@ -1287,9 +2057,35 @@ impl FinderWindow {
             Some(Hit::Content) => self.selected.clear(),
             Some(Hit::Header(k)) => self.set_sort(k, kinds),
             Some(Hit::Place(i)) => {
-                if let Some(p) = self.favorites.iter().chain(&self.drives).nth(i).cloned() {
+                if let Some(p) = self.places.get(i).cloned() {
                     self.navigate(p.path, true, kinds);
                 }
+            }
+            Some(Hit::PathBar) => self.begin_address(),
+            Some(Hit::Address) => {
+                if let Some(a) = &mut self.address {
+                    if double {
+                        a.select_all();
+                    } else {
+                        let i = nearest(&self.address_xs, x).min(a.text.len());
+                        a.set_caret(i, shift);
+                        unsafe {
+                            SetCapture(self.hwnd);
+                        }
+                    }
+                }
+            }
+            Some(Hit::ScopeAll) => self.command(FinderCmd::SearchScope(true), kinds),
+            Some(Hit::ScopeHere) => self.command(FinderCmd::SearchScope(false), kinds),
+            Some(Hit::Filter(n)) => {
+                let r = self.hits.iter().find(|(_, h)| *h == Hit::Filter(n)).map(|(r, _)| *r).unwrap_or_default();
+                let entries = self.filter_menu(n);
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(self.hwnd, &mut rc);
+                }
+                self.dirty = true;
+                return FinderEvent::Menu(entries, rc.left as f32 / self.scale + r.x, rc.top as f32 / self.scale + r.bottom() + 4.0);
             }
             Some(Hit::Search) => {
                 self.search_focus = true;
@@ -1306,12 +2102,15 @@ impl FinderWindow {
             Some(Hit::SearchClear) => {
                 self.search.clear();
                 self.search_focus = true;
-                self.apply_filter();
+                self.search_changed(kinds);
             }
             Some(Hit::Crumb(depth)) => {
-                let target = crumbs(&self.cwd).into_iter().nth(depth);
-                if let Some(dir) = target.filter(|d| *d != self.cwd) {
-                    self.navigate(dir, true, kinds);
+                let target = shell::crumbs(&self.cwd).into_iter().nth(depth);
+                match target {
+                    Some(dir) if dir != self.cwd => self.navigate(dir, true, kinds),
+                    // The current folder's own segment: double-click edits the path.
+                    Some(_) if double => self.begin_address(),
+                    _ => {}
                 }
             }
             Some(Hit::QlBackdrop) => self.close_quicklook(),
@@ -1320,6 +2119,39 @@ impl FinderWindow {
             _ => {}
         }
         self.dirty = true;
+        FinderEvent::None
+    }
+
+    /// The search bar's Kind / Date Modified / Size menus.
+    fn filter_menu(&self, n: u8) -> Vec<Entry> {
+        let id = self.id;
+        let q = search::Query::parse(&self.search.string());
+        let f = |prefix: &'static str, v: Option<&'static str>| Action::Finder { window: id, cmd: FinderCmd::SearchFilter(prefix, v) };
+        let mut v = Vec::new();
+        match n {
+            0 => {
+                v.push(Entry::item("Any Kind", f("kind:", None)).checked(q.kind.is_none()));
+                v.push(Entry::Separator);
+                for (k, key, label) in search::Kind::ALL {
+                    v.push(Entry::item(label, f("kind:", Some(key))).checked(q.kind == Some(k)));
+                }
+            }
+            1 => {
+                v.push(Entry::item("Any Date", f("date:", None)).checked(q.when.is_none()));
+                v.push(Entry::Separator);
+                for (w, key, label) in search::When::ALL {
+                    v.push(Entry::item(label, f("date:", Some(key))).checked(q.when == Some(w)));
+                }
+            }
+            _ => {
+                v.push(Entry::item("Any Size", f("size:", None)).checked(q.size.is_none()));
+                v.push(Entry::Separator);
+                for (s, key, label) in search::Size::ALL {
+                    v.push(Entry::item(label, f("size:", Some(key))).checked(q.size == Some(s)));
+                }
+            }
+        }
+        v
     }
 
     /// Middle click: closes a tab, or opens a folder in a new tab.
@@ -1344,7 +2176,7 @@ impl FinderWindow {
                 }
             }
             Some(Hit::Place(i)) => {
-                if let Some(p) = self.favorites.iter().chain(&self.drives).nth(i).cloned() {
+                if let Some(p) = self.places.get(i).cloned() {
                     self.new_tab(p.path, kinds);
                 }
             }
@@ -1370,7 +2202,7 @@ impl FinderWindow {
             Hit::Light(Light::Zoom) => self.toggle_zoom(),
             Hit::Back => self.go_back(kinds),
             Hit::Forward => self.go_forward(kinds),
-            Hit::ViewBtn(v) => self.set_view(v),
+            Hit::ViewBtn(v) => self.set_view(v, kinds),
             Hit::Item(i) if pending == Some(i) => {
                 self.selected = [i].into();
                 self.anchor = Some(i);
@@ -1402,16 +2234,13 @@ impl FinderWindow {
 
     /// Item `i`'s hit areas in content coordinates (scroll 0): icon and label, or the row.
     fn item_rects(&self, i: usize) -> [Rect; 2] {
-        let vr = self.view_rect();
+        let Some(cell) = self.layout.cells.get(i).copied() else { return [Rect::new(0.0, 0.0, 0.0, 0.0); 2] };
         if self.view == View::Icons {
-            let cols = self.grid_cols.max(1);
-            let cw = (vr.w - 2.0 * GRID_PAD) / cols as f32;
-            let cell = Rect::new(vr.x + GRID_PAD + (i % cols) as f32 * cw, vr.y + GRID_PAD + (i / cols) as f32 * CELL_H, cw, CELL_H);
-            let icon = Rect::new(cell.cx() - ICON / 2.0, cell.y + 6.0, ICON, ICON);
+            let s = self.icon_size;
+            let icon = Rect::new(cell.cx() - s / 2.0, cell.y + 6.0, s, s);
             [icon, Rect::new(cell.x + 4.0, icon.bottom() + 6.0, cell.w - 8.0, 32.0)]
         } else {
-            let row = Rect::new(vr.x + 8.0, vr.y + HEADER + 4.0 + i as f32 * ROW, vr.w - 16.0, ROW);
-            [row, row]
+            [cell, cell]
         }
     }
 
@@ -1426,18 +2255,11 @@ impl FinderWindow {
         }
         let Some(band) = &self.band else { return };
         let r = band_rect(band.x0, band.y0, x, y + self.scroll.offset());
-        // Only rows the band spans can intersect it.
-        let n = self.entries.len();
-        let (first, last) = if self.view == View::Icons {
-            let cols = self.grid_cols.max(1);
-            let row = |y: f32| ((y - vr.y - GRID_PAD) / CELL_H).floor().max(0.0) as usize;
-            (row(r.y) * cols, ((row(r.bottom()) + 1) * cols).min(n))
-        } else {
-            let row = |y: f32| ((y - vr.y - HEADER - 4.0) / ROW).floor().max(0.0) as usize;
-            (row(r.y), (row(r.bottom()) + 1).min(n))
-        };
-        let hits: BTreeSet<usize> =
-            (first..last.max(first)).filter(|&i| self.item_rects(i).iter().any(|ir| overlaps(ir, &r))).collect();
+        // Cells are in order down the view: only those between the band's top and bottom can meet it.
+        let cells = &self.layout.cells;
+        let first = cells.partition_point(|c| c.bottom() < r.y);
+        let last = cells.partition_point(|c| c.y <= r.bottom()).max(first);
+        let hits: BTreeSet<usize> = (first..last).filter(|&i| self.item_rects(i).iter().any(|ir| overlaps(ir, &r))).collect();
         let sel: BTreeSet<usize> =
             if band.toggle { band.base.symmetric_difference(&hits).copied().collect() } else { band.base.union(&hits).copied().collect() };
         self.selected = sel;
@@ -1475,7 +2297,7 @@ impl FinderWindow {
         let target = match hit {
             Some(Hit::Item(i)) => self.entries.get(i).filter(|e| e.is_dir).map(|e| (Hit::Item(i), e.path.clone())),
             Some(Hit::Column(c, j)) => self.columns[c].entries.get(j).filter(|e| e.is_dir).map(|e| (Hit::Column(c, j), e.path.clone())),
-            Some(Hit::Place(i)) => self.favorites.iter().chain(&self.drives).nth(i).map(|p| (Hit::Place(i), p.path.clone())),
+            Some(Hit::Place(i)) => self.places.get(i).map(|p| (Hit::Place(i), p.path.clone())),
             Some(Hit::Tab(i) | Hit::TabClose(i)) => self.tab_dir(i).map(|d| (Hit::Tab(i), d.to_path_buf())),
             _ => None,
         }
@@ -1494,78 +2316,7 @@ impl FinderWindow {
         target.map(|t| t.1)
     }
 
-    pub fn on_right_click(&mut self, x: f32, y: f32, kinds: &mut KindCache) -> FinderEvent {
-        if self.rename.is_some() {
-            self.commit_rename(kinds);
-        }
-        if self.quicklook.is_some() {
-            return FinderEvent::None;
-        }
-        self.search_focus = false;
-        let id = self.id;
-        let cmd = |c: FinderCmd| Action::Finder { window: id, cmd: c };
-        let hit = self.hit_at(x, y);
-        // Right-clicking an unselected item selects it first.
-        match hit {
-            Some(Hit::Item(i)) if !self.selected.contains(&i) => {
-                self.selected = [i].into();
-                self.anchor = Some(i);
-            }
-            Some(Hit::Column(c, j)) if self.columns.get(c).and_then(|c| c.selected) != Some(j) => {
-                self.select_column(c, j, kinds)
-            }
-            _ => {}
-        }
-        self.dirty = true;
-        let on_item = matches!(hit, Some(Hit::Item(_) | Hit::Column(..)));
-        let entries = if on_item {
-            let sel: Vec<FileEntry> = self.selection().into_iter().cloned().collect();
-            let paths: Vec<PathBuf> = sel.iter().map(|e| e.path.clone()).collect();
-            let Some(first) = sel.first() else { return FinderEvent::None };
-            let mut v = vec![
-                Entry::item("Open", cmd(FinderCmd::Open(first.path.clone()))),
-                Entry::Separator,
-                Entry::item("Move to Trash", cmd(FinderCmd::Trash(paths.clone()))),
-                Entry::Separator,
-                Entry::item("Rename", cmd(FinderCmd::Rename)),
-                Entry::item(if paths.len() > 1 { "Copy Paths" } else { "Copy Path" }, cmd(FinderCmd::CopyPath(paths))),
-                Entry::item("Show in File Explorer", cmd(FinderCmd::Reveal(first.path.clone()))),
-            ];
-            if first.is_dir {
-                v.insert(1, Entry::item("Open in New Tab", cmd(FinderCmd::OpenTab(first.path.clone()))));
-                v.push(Entry::Separator);
-                v.push(Entry::item("New Terminal at Folder", cmd(FinderCmd::Terminal(first.path.clone()))));
-            }
-            v
-        } else {
-            let dir = self.target_dir();
-            let view = |label: &str, v: View| Entry::item(label, cmd(FinderCmd::SetView(v))).checked(self.view == v);
-            let sort = |label: &str, k: SortKey| Entry::item(label, cmd(FinderCmd::Sort(k))).checked(self.sort == k);
-            vec![
-                Entry::item("New Folder", cmd(FinderCmd::NewFolder)),
-                Entry::Separator,
-                Entry::item("New Terminal at Folder", cmd(FinderCmd::Terminal(dir.clone()))),
-                Entry::item("Open in File Explorer", cmd(FinderCmd::Explorer(dir.clone()))),
-                Entry::item("Copy Path", cmd(FinderCmd::CopyPath(vec![dir]))),
-                Entry::Separator,
-                view("as Icons", View::Icons),
-                view("as List", View::List),
-                view("as Columns", View::Columns),
-                Entry::Separator,
-                sort("Sort by Name", SortKey::Name),
-                sort("Sort by Date Modified", SortKey::Modified),
-                sort("Sort by Size", SortKey::Size),
-                sort("Sort by Kind", SortKey::Kind),
-            ]
-        };
-        let mut rc = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(self.hwnd, &mut rc);
-        }
-        FinderEvent::Menu(entries, rc.left as f32 / self.scale + x, rc.top as f32 / self.scale + y)
-    }
-
-    /// Keyboard shortcuts mirror macOS with Ctrl in place of ⌘.
+    /// Keyboard shortcuts: macOS's with Ctrl in place of ⌘, plus File Explorer's.
     pub fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool, kinds: &mut KindCache) -> FinderEvent {
         self.dirty = true;
         if let Some(r) = &mut self.rename {
@@ -1579,12 +2330,24 @@ impl FinderWindow {
             return FinderEvent::None;
         }
 
+        if let Some(a) = &mut self.address {
+            match vk {
+                ENTER => self.go_address(kinds),
+                ESC => self.address = None,
+                TAB => self.complete_address(),
+                _ => {
+                    a.on_key(vk, ctrl, shift);
+                }
+            }
+            return FinderEvent::None;
+        }
+
         if self.search_focus {
             match vk {
                 // Esc clears the search, then leaves the field.
                 ESC if !self.search.is_empty() => {
                     self.search.clear();
-                    self.apply_filter();
+                    self.search_changed(kinds);
                 }
                 ESC => self.search_focus = false,
                 // Into the results.
@@ -1597,7 +2360,7 @@ impl FinderWindow {
                     }
                 }
                 _ => match self.search.on_key(vk, ctrl, shift) {
-                    KeyResult::Edited => self.apply_filter(),
+                    KeyResult::Edited => self.search_changed(kinds),
                     // Unhandled Ctrl shortcuts (close window, views, ...) still work.
                     KeyResult::Ignored if ctrl => return self.on_shortcut(vk, ctrl, shift, alt, kinds),
                     _ => {}
@@ -1614,15 +2377,24 @@ impl FinderWindow {
     }
 
     fn on_shortcut(&mut self, vk: u16, ctrl: bool, shift: bool, alt: bool, kinds: &mut KindCache) -> FinderEvent {
+        let paths: Vec<PathBuf> = self.selection().iter().map(|e| e.path.clone()).collect();
+        let is = |c: char| vk == c as u16;
+        let in_trash = self.cwd.as_os_str().eq_ignore_ascii_case(shell::RECYCLE_BIN);
         match (vk, ctrl, alt) {
             (SPACE, false, false) => self.toggle_quicklook(),
-            (k, true, false) if k == b'Y' as u16 => self.toggle_quicklook(),
-            (k, true, false) if k == b'F' as u16 => self.focus_search(),
-            (k, true, false) if k == b'N' as u16 && shift => self.new_folder(kinds),
-            (k, true, false) if k == b'N' as u16 => return FinderEvent::NewWindow,
-            (k, true, false) if k == b'T' as u16 => self.new_tab(fs::home(), kinds),
+            _ if ctrl && !alt && is('Y') && shift => self.toggle_quicklook(),
+            // Search: Ctrl+F (macOS), Ctrl+E and F3 (Explorer).
+            _ if ctrl && !alt && (is('F') || is('E')) => self.focus_search(),
+            (F3, false, false) => self.focus_search(),
+            // The address field: Ctrl+L, Alt+D, F4, and macOS's Go to Folder.
+            _ if (ctrl && !alt && is('L')) || (alt && !ctrl && is('D')) || (ctrl && shift && is('G')) => self.begin_address(),
+            (F4, false, false) => self.begin_address(),
+            _ if ctrl && !alt && is('N') && shift => self.new_folder(kinds),
+            // A new window at this folder, like Explorer.
+            _ if ctrl && !alt && is('N') => return FinderEvent::NewWindow(Some(self.cwd.clone())),
+            _ if ctrl && !alt && is('T') => self.new_tab(fs::home(), kinds),
             // Ctrl+W closes the tab, or the window with its last tab.
-            (k, true, false) if k == b'W' as u16 => {
+            _ if ctrl && !alt && is('W') => {
                 if self.close_tab(self.active_tab, kinds) {
                     return FinderEvent::Close;
                 }
@@ -1630,40 +2402,87 @@ impl FinderWindow {
             (TAB, true, false) => self.cycle_tab(if shift { -1 } else { 1 }, kinds),
             (RBRACKET, true, false) if shift => self.cycle_tab(1, kinds),
             (LBRACKET, true, false) if shift => self.cycle_tab(-1, kinds),
-            (k, true, false) if k == b'1' as u16 => self.set_view(View::Icons),
-            (k, true, false) if k == b'2' as u16 => self.set_view(View::List),
-            (k, true, false) if k == b'3' as u16 => self.set_view(View::Columns),
-            (k, true, false) if k == b'A' as u16 => {
+            // Views: Ctrl+1-4 (macOS); Ctrl+Shift+1-8 (Explorer: icon sizes, list, details, tiles, content).
+            _ if ctrl && shift && !alt && ('1'..='8').any(is) => {
+                let n = vk - b'0' as u16;
+                if n <= 4 {
+                    self.icon_size = [256.0, 128.0, 64.0, 32.0][n as usize - 1];
+                    self.prefs_dirty = true;
+                    self.set_view(View::Icons, kinds);
+                } else {
+                    self.set_view(View::List, kinds);
+                }
+            }
+            _ if ctrl && !alt && is('1') => self.set_view(View::Icons, kinds),
+            _ if ctrl && !alt && is('2') => self.set_view(View::List, kinds),
+            _ if ctrl && !alt && is('3') => self.set_view(View::Columns, kinds),
+            _ if ctrl && !alt && is('4') => self.set_view(View::Gallery, kinds),
+            (PLUS, true, false) => self.zoom_icons(1),
+            (MINUS, true, false) => self.zoom_icons(-1),
+            _ if ctrl && !alt && is('A') => {
                 if self.view != View::Columns {
                     self.selected = (0..self.entries.len()).collect();
                 }
             }
-            (k, true, true) if k == b'C' as u16 => {
-                let paths: Vec<PathBuf> = self.selection().iter().map(|e| e.path.clone()).collect();
-                self.command(FinderCmd::CopyPath(if paths.is_empty() { vec![self.target_dir()] } else { paths }), kinds);
+            // Clipboard and undo.
+            _ if ctrl && !alt && !shift && is('C') && !paths.is_empty() => self.command(FinderCmd::Copy(paths), kinds),
+            _ if ctrl && !alt && is('X') && !paths.is_empty() => self.command(FinderCmd::Cut(paths), kinds),
+            _ if ctrl && !alt && is('V') => return FinderEvent::Run(FinderCmd::Paste(self.target_dir())),
+            _ if ctrl && !alt && is('Z') && shift => return FinderEvent::Run(FinderCmd::Redo),
+            _ if ctrl && !alt && is('Z') => return FinderEvent::Run(FinderCmd::Undo),
+            _ if ctrl && !alt && is('Y') => return FinderEvent::Run(FinderCmd::Redo),
+            _ if ctrl && !alt && is('D') && !paths.is_empty() => return FinderEvent::Run(FinderCmd::Duplicate(paths)),
+            // Copy as path: Ctrl+Shift+C (Windows 11) or Ctrl+Alt+C (macOS's ⌥⌘C).
+            _ if ctrl && (shift || alt) && is('C') => {
+                let paths = if paths.is_empty() { vec![self.target_dir()] } else { paths };
+                self.command(FinderCmd::CopyPath { paths, quoted: shift }, kinds);
             }
+            // Properties: Alt+Enter (Explorer) or Ctrl+I (macOS's Get Info).
+            (ENTER, false, true) => {
+                let paths = if paths.is_empty() { vec![self.target_dir()] } else { paths };
+                return FinderEvent::Run(FinderCmd::Properties(paths));
+            }
+            _ if ctrl && !alt && is('I') => {
+                let paths = if paths.is_empty() { vec![self.target_dir()] } else { paths };
+                return FinderEvent::Run(FinderCmd::Properties(paths));
+            }
+            // Panes: Alt+P preview, Alt+Shift+P details (Explorer); Ctrl+Shift+P (macOS's Show Preview).
+            _ if alt && !ctrl && is('P') => self.command(FinderCmd::SetPane(if shift { Pane::Details } else { Pane::Preview }), kinds),
+            _ if ctrl && shift && !alt && is('P') => self.command(FinderCmd::SetPane(Pane::Preview), kinds),
+            // macOS's Go menu.
+            _ if ctrl && shift && !alt && is('H') => self.go_home(PlaceKind::Home, kinds),
+            _ if ctrl && shift && !alt && is('D') => self.go_home(PlaceKind::Desktop, kinds),
+            _ if ctrl && shift && !alt && is('O') => self.go_home(PlaceKind::Documents, kinds),
+            _ if ctrl && shift && !alt && is('R') => self.go_home(PlaceKind::Recents, kinds),
+            _ if ctrl && shift && !alt && is('K') => self.go_home(PlaceKind::Network, kinds),
+            _ if ctrl && alt && is('L') => self.go_home(PlaceKind::Downloads, kinds),
             (UP, true, _) | (UP, _, true) => self.go_parent(kinds),
             (LEFT, _, true) | (LBRACKET, true, _) | (BACK, false, false) => self.go_back(kinds),
             (RIGHT, _, true) | (RBRACKET, true, _) => self.go_forward(kinds),
-            (ENTER, ..) | (DOWN, true, _) => {
-                if let Some(e) = self.selection().first().map(|e| (*e).clone()) {
+            (HOME, false, true) => self.go_home(PlaceKind::Home, kinds),
+            (ENTER, false, false) | (DOWN, true, _) => {
+                // Enter opens, like Explorer (macOS renames with Return; F2 does that here).
+                for e in self.selection().into_iter().cloned().collect::<Vec<_>>() {
                     self.open_path(&e.path, e.is_dir, kinds);
+                    if e.is_dir {
+                        break;
+                    }
                 }
             }
             (F2, ..) => self.begin_rename(),
-            (DEL, ..) | (BACK, true, _) => {
-                let paths: Vec<PathBuf> = self.selection().iter().map(|e| e.path.clone()).collect();
-                if !paths.is_empty() {
-                    self.command(FinderCmd::Trash(paths), kinds);
-                }
+            // Delete recycles, Shift+Delete deletes for good (as it always does in the Recycle Bin).
+            (DEL, false, false) | (BACK, true, false) if !paths.is_empty() => {
+                return FinderEvent::Run(FinderCmd::Delete { paths, recycle: !shift && !in_trash });
             }
-            (F5, ..) => self.reload(kinds),
-            // ⌘⇧. on macOS: toggle hidden files.
-            (PERIOD, true, false) if shift => {
-                self.show_hidden = !self.show_hidden;
-                self.prefs_dirty = true;
+            (F5, ..) => {
+                self.refresh_places();
                 self.reload(kinds);
             }
+            (F11, false, false) => self.toggle_zoom(),
+            (F10, false, false) if shift => return self.key_menu(),
+            (APPS, ..) => return self.key_menu(),
+            // ⌘⇧. on macOS: toggle hidden files.
+            (PERIOD, true, false) if shift => self.command(FinderCmd::ToggleHidden, kinds),
             (LEFT | RIGHT | UP | DOWN | HOME | END, false, false) => self.move_selection(vk, shift, kinds),
             _ => {}
         }
@@ -1676,24 +2495,24 @@ impl FinderWindow {
             let n = self.columns[c].entries.len();
             let cur = self.columns[c].selected;
             match vk {
-                0x25 if c > 0 => {
+                LEFT if c > 0 => {
                     // Left: focus the parent column; this column stays visible.
                     self.columns.truncate(c + 1);
                     self.columns[c].selected = None;
                     self.active_col = c - 1;
                 }
-                0x27 => {
+                RIGHT => {
                     // Right: into the selected folder's column.
                     if self.columns.len() > c + 1 && !self.columns[c + 1].entries.is_empty() {
                         self.select_column(c + 1, 0, kinds);
                     }
                 }
-                0x26 | 0x28 | 0x24 | 0x23 if n > 0 => {
+                UP | DOWN | HOME | END if n > 0 => {
                     let j = match (vk, cur) {
-                        (0x24, _) => 0,
-                        (0x23, _) => n - 1,
-                        (0x26, Some(j)) => j.saturating_sub(1),
-                        (0x28, Some(j)) => (j + 1).min(n - 1),
+                        (HOME, _) => 0,
+                        (END, _) => n - 1,
+                        (UP, Some(j)) => j.saturating_sub(1),
+                        (DOWN, Some(j)) => (j + 1).min(n - 1),
                         _ => 0,
                     };
                     self.select_column(c, j, kinds);
@@ -1707,16 +2526,17 @@ impl FinderWindow {
         if n == 0 {
             return;
         }
-        let step = if self.view == View::Icons { self.grid_cols.max(1) } else { 1 };
         let cur = self.cursor.filter(|c| self.selected.contains(c)).or_else(|| self.selected.iter().next_back().copied());
         let next = match (vk, cur) {
             (_, None) => 0,
-            (0x24, _) => 0,
-            (0x23, _) => n - 1,
-            (0x25, Some(i)) if self.view == View::Icons => i.saturating_sub(1),
-            (0x27, Some(i)) if self.view == View::Icons => (i + 1).min(n - 1),
-            (0x26, Some(i)) => i.saturating_sub(step),
-            (0x28, Some(i)) => (i + step).min(n - 1),
+            (HOME, _) => 0,
+            (END, _) => n - 1,
+            (LEFT, Some(i)) if self.view != View::List => i.saturating_sub(1),
+            (RIGHT, Some(i)) if self.view != View::List => (i + 1).min(n - 1),
+            (UP, Some(i)) if self.view == View::Icons => self.vertical_neighbour(i, false),
+            (DOWN, Some(i)) if self.view == View::Icons => self.vertical_neighbour(i, true),
+            (UP, Some(i)) => i.saturating_sub(1),
+            (DOWN, Some(i)) => (i + 1).min(n - 1),
             (_, Some(i)) => i,
         };
         if shift {
@@ -1731,7 +2551,21 @@ impl FinderWindow {
         self.ensure_visible();
     }
 
-    pub fn on_char(&mut self, ch: char) {
+    /// The icon in the row above or below item `i` nearest it horizontally (rows differ across groups).
+    fn vertical_neighbour(&self, i: usize, down: bool) -> usize {
+        let cells = &self.layout.cells;
+        let Some(cur) = cells.get(i).copied() else { return i };
+        let row_of = |y: f32| cells.iter().enumerate().filter(move |(_, c)| (c.y - y).abs() < 0.5);
+        let target_y = if down {
+            cells[i..].iter().map(|c| c.y).find(|y| *y > cur.y + 0.5)
+        } else {
+            cells[..i].iter().rev().map(|c| c.y).find(|y| *y < cur.y - 0.5)
+        };
+        let Some(y) = target_y else { return i };
+        row_of(y).min_by(|a, b| (a.1.cx() - cur.cx()).abs().total_cmp(&(b.1.cx() - cur.cx()).abs())).map(|(j, _)| j).unwrap_or(i)
+    }
+
+    pub fn on_char(&mut self, ch: char, kinds: &mut KindCache) {
         if ch.is_control() {
             return;
         }
@@ -1740,9 +2574,14 @@ impl FinderWindow {
             self.dirty = true;
             return;
         }
+        if let Some(a) = &mut self.address {
+            a.insert(&ch.to_string());
+            self.dirty = true;
+            return;
+        }
         if self.search_focus {
             self.search.insert(&ch.to_string());
-            self.apply_filter();
+            self.search_changed(kinds);
             return;
         }
         if ch == ' ' {
@@ -1766,6 +2605,7 @@ impl FinderWindow {
         } else if let Some(i) = self.entries.iter().position(matches) {
             self.selected = [i].into();
             self.anchor = Some(i);
+            self.cursor = Some(i);
         }
         self.ensure_visible();
         self.dirty = true;
@@ -1773,22 +2613,30 @@ impl FinderWindow {
 
     fn ensure_visible(&mut self) {
         let vr = self.view_rect();
+        let cell = self.cursor.or(self.selected.iter().next().copied()).and_then(|i| self.layout.cells.get(i)).copied();
         match self.view {
-            View::Icons => {
-                let Some(&i) = self.cursor.as_ref().or(self.selected.iter().next()) else { return };
-                let top = (i / self.grid_cols.max(1)) as f32 * CELL_H;
+            View::Icons | View::List => {
+                let Some(c) = cell else { return };
+                // Content offsets of the item's top and bottom, and the part of the view rows show in.
+                let top_pad = if self.view == View::List { HEADER + 4.0 } else { 0.0 };
+                let (top, bottom) = (c.y - vr.y - top_pad, c.bottom() - vr.y);
+                let visible = vr.h - top_pad;
                 let s = self.scroll.target();
                 if top < s {
-                    self.scroll.to(top);
-                } else if top + CELL_H + 24.0 > s + vr.h {
-                    self.scroll.to(top + CELL_H + 24.0 - vr.h);
+                    self.scroll.to(top.max(0.0));
+                } else if bottom + 8.0 > s + top_pad + visible {
+                    self.scroll.to((bottom + 8.0 - visible - top_pad).min(self.max_scroll.max(bottom + 8.0 - vr.h)));
                 }
             }
-            View::List => {
-                let Some(&i) = self.cursor.as_ref().or(self.selected.iter().next()) else { return };
-                let top = i as f32 * ROW;
-                let visible = vr.h - HEADER;
-                self.scroll.to(self.scroll.target().min(top).max(top + ROW - visible + 4.0));
+            View::Gallery => {
+                let Some(c) = cell else { return };
+                let (left, right) = (c.x - vr.x - 12.0, c.right() - vr.x + 12.0);
+                let s = self.scroll.target();
+                if left < s {
+                    self.scroll.to(left.max(0.0));
+                } else if right > s + vr.w {
+                    self.scroll.to(right - vr.w);
+                }
             }
             View::Columns => {
                 let c = self.active_col.min(self.columns.len() - 1);
@@ -1798,6 +2646,102 @@ impl FinderWindow {
                     col.scroll.to(col.scroll.target().min(top).max(top + ROW - vr.h + 8.0));
                 }
             }
+        }
+    }
+
+    // --- address field -----------------------------------------------------------
+
+    /// The path bar turns into a field showing the path, selected, like Explorer's address bar.
+    fn begin_address(&mut self) {
+        self.rename = None;
+        self.search_focus = false;
+        let text = if shell::is_fs_path(&self.cwd) { self.cwd.display().to_string() } else { self.title_for(&self.cwd.clone()) };
+        let mut field = TextField::new(&text);
+        field.select_all();
+        self.address = Some(field);
+        self.dirty = true;
+    }
+
+    /// Where typed text leads: a folder, a file, or nothing (Explorer then runs it as a command).
+    fn resolve(&self, text: &str) -> Option<PathBuf> {
+        let t = text.trim().trim_matches('"');
+        if t.is_empty() {
+            return None;
+        }
+        let named = match t.to_lowercase().as_str() {
+            "this pc" | "computer" | "my computer" => Some(PathBuf::from(shell::THIS_PC)),
+            "network" => Some(PathBuf::from(shell::NETWORK)),
+            "recycle bin" | "trash" => Some(PathBuf::from(shell::RECYCLE_BIN)),
+            "libraries" => Some(PathBuf::from(shell::LIBRARIES)),
+            "~" | "home" => Some(fs::home()),
+            lower => self.places.iter().find(|p| p.name.to_lowercase() == lower).map(|p| p.path.clone()),
+        };
+        if named.is_some() {
+            return named;
+        }
+        // %VARIABLES% and ~\ expand, like Explorer and shells.
+        let mut expanded = String::new();
+        let mut rest = t;
+        while let Some(a) = rest.find('%') {
+            let Some(b) = rest[a + 1..].find('%') else { break };
+            let name = &rest[a + 1..a + 1 + b];
+            expanded += &rest[..a];
+            expanded += &std::env::var(name).unwrap_or_else(|_| format!("%{name}%"));
+            rest = &rest[a + b + 2..];
+        }
+        expanded += rest;
+        let expanded = match expanded.strip_prefix("~\\").or_else(|| expanded.strip_prefix("~/")) {
+            Some(r) => fs::home().join(r).display().to_string(),
+            None => expanded,
+        };
+        let p = PathBuf::from(expanded.replace('/', "\\"));
+        let s = p.to_string_lossy().to_string();
+        let candidate = if shell::is_fs_path(&p) || s.starts_with("::") || s.to_lowercase().starts_with("shell:") {
+            p
+        } else if shell::is_fs_path(&self.cwd) {
+            self.cwd.join(&p)
+        } else {
+            p
+        };
+        // The shell understands everything else (shell:Downloads, ::{GUID}, UNC, ...).
+        shell::item(&candidate).and_then(|i| shell::parsing_name(&i)).map(PathBuf::from)
+    }
+
+    fn go_address(&mut self, kinds: &mut KindCache) {
+        let Some(field) = self.address.take() else { return };
+        let text = field.string();
+        match self.resolve(&text) {
+            Some(p) => {
+                let is_dir = p.is_dir() || !shell::is_fs_path(&p) && shell::list(&p, false).is_ok();
+                self.open_path(&p, is_dir, kinds);
+            }
+            // Explorer runs what it can't find ("notepad", "cmd").
+            None if crate::win::elevation::shell_open(text.trim(), None, shell::is_fs_path(&self.cwd).then(|| self.cwd.to_string_lossy().into_owned()).as_deref()) => {}
+            None => {
+                self.show_flash(format!("Windows can't find “{}”. Check the spelling and try again.", text.trim()));
+                self.address = Some(field);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Tab completes the folder name being typed.
+    fn complete_address(&mut self) {
+        let Some(a) = &mut self.address else { return };
+        let text = a.string();
+        let (dir, prefix) = match text.rfind('\\') {
+            Some(i) => (text[..=i].to_string(), text[i + 1..].to_lowercase()),
+            None => return,
+        };
+        let Ok(items) = fs::list(Path::new(&dir), self.show_hidden) else { return };
+        let mut names: Vec<String> = items.into_iter().filter(|e| e.is_dir && e.name.to_lowercase().starts_with(&prefix)).map(|e| e.name).collect();
+        names.sort_by(|a, b| fs::natural_cmp(a, b));
+        // Cycle to the next match if this one is already complete.
+        let current = text[dir.len()..].trim_end_matches('\\').to_string();
+        let next = names.iter().position(|n| *n == current).map(|i| (i + 1) % names.len()).unwrap_or(0);
+        if let Some(name) = names.get(next) {
+            *a = TextField::new(&format!("{dir}{name}\\"));
+            self.dirty = true;
         }
     }
 
@@ -1903,17 +2847,25 @@ impl FinderWindow {
         let ql_title = gfx.format(&theme.font, 13.0, Weight::Bold, Align::Center);
         let mono = gfx.format_wrapped("Consolas", 12.0);
 
-        // Grid / scroll metrics for the current view.
+        // Layout and scroll metrics for the current view (the gallery's strip scrolls sideways).
         let n = self.entries.len();
-        let pad = GRID_PAD;
-        self.grid_cols = (((vr.w - 2.0 * pad) / CELL_W).floor() as usize).max(1);
-        let content_h = match self.view {
-            View::Icons => n.div_ceil(self.grid_cols) as f32 * CELL_H + 2.0 * pad,
-            View::List => n as f32 * ROW + 8.0 + HEADER,
-            View::Columns => 0.0,
-        };
-        self.max_scroll = (content_h - vr.h).max(0.0);
+        self.compute_layout();
+        let span = if self.view == View::Gallery { vr.w } else { vr.h };
+        self.max_scroll = if self.view == View::Columns { 0.0 } else { (self.layout.extent - span).max(0.0) };
         self.scroll.clamp(self.max_scroll);
+        if self.flash.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(6)) {
+            self.flash = None;
+        }
+        // The pane's details follow the selection.
+        let pane_on = self.pane_shown();
+        let focus_entry = if pane_on || self.view == View::Gallery { self.ql_entry().cloned() } else { None };
+        match &focus_entry {
+            Some(e) if pane_on && self.details.as_ref().map(|d| &d.0) != Some(&e.path) => {
+                self.details = Some((e.path.clone(), shell::details(&e.path)));
+            }
+            None => self.details = None,
+            _ => {}
+        }
         // The overlay scrollbar shows at once while scrolling, then fades away.
         let scrollbar_a = {
             let recent = self.scrolled_at.elapsed().as_secs_f32() < SCROLLBAR_LINGER;
@@ -1938,13 +2890,22 @@ impl FinderWindow {
             } else {
                 format!("{total} item{}", if total == 1 { "" } else { "s" })
             };
-            match self.free {
-                Some(f) => format!("{items}, {} available", fs::format_size(f)),
-                None => items,
+            if let Some((msg, _)) = &self.flash {
+                msg.clone()
+            } else if let Some(s) = &self.searching {
+                let state = if s.finished() { "found" } else { "found so far…" };
+                format!("{total} item{} {state}", if total == 1 { "" } else { "s" })
+            } else if self.pending.is_some() && n == 0 {
+                "Loading…".to_string()
+            } else {
+                match self.free {
+                    Some(f) => format!("{items}, {} available", fs::format_size(f)),
+                    None => items,
+                }
             }
         };
         let title = self.title();
-        let path_names: Vec<String> = crumbs(&self.cwd).iter().map(|d| self.title_for(d)).collect();
+        let path_names: Vec<String> = shell::crumbs(&self.cwd).iter().map(|d| self.title_for(d)).collect();
         let preview = self.preview_entry().cloned();
         let column_offset = self.column_offset(vr);
         let ql_live = self.quicklook.is_some();
@@ -1958,6 +2919,8 @@ impl FinderWindow {
         };
         let active_tab = self.active_tab;
 
+        let shown_cols = self.shown_cols();
+        let search_bar = self.search_h();
         let kinds = &mut *ctx.kinds;
         let loader = &mut *ctx.loader;
         let bitmaps = &mut self.bitmaps;
@@ -1965,16 +2928,21 @@ impl FinderWindow {
         let (view, hover, error, rename) = (self.view, self.hover, &self.error, &self.rename);
         let scroll = self.scroll.offset_px(self.scale);
         let px = self.scale;
-        let (max_scroll, grid_cols, active_col) = (self.max_scroll, self.grid_cols, self.active_col);
+        let (max_scroll, active_col) = (self.max_scroll, self.active_col);
         let motion = &self.motion;
         let (sort, ascending) = (self.sort, self.ascending);
         let (can_back, can_fwd) = (self.hist_pos > 0, self.hist_pos + 1 < self.history.len());
-        let places: Vec<&Place> = self.favorites.iter().chain(&self.drives).collect();
-        let fav_count = self.favorites.len();
+        let places: Vec<&Place> = self.places.iter().collect();
+        let fav_count = self.fav_count;
         let cwd = &self.cwd;
-        // Sidebar rows, and the hover highlight gliding between them.
+        // Sidebar rows (scrolled when they don't fit), and the hover highlight gliding between them.
         let side = if floating { chrome::sidebar_pane(body, SIDEBAR) } else { Rect::new(body.x, body.y, SIDEBAR, body.h) };
-        let place_rows = place_rows(side, places.len(), fav_count);
+        let unscrolled = place_rows(side, places.len(), fav_count, 0.0);
+        self.side_max = unscrolled.last().map_or(0.0, |r| (r.bottom() + 12.0 - side.bottom()).max(0.0));
+        self.side_scroll.clamp(self.side_max);
+        let side_off = self.side_scroll.offset();
+        let place_rows = place_rows(side, places.len(), fav_count, side_off);
+        let side_clip = Rect::new(side.x, side.y + 40.0, side.w, side.h - 40.0);
         let side_target = match hover {
             Some(Hit::Place(i)) if places.get(i).is_some_and(|p| p.path != *cwd) => place_rows.get(i).copied(),
             _ => None,
@@ -1991,6 +2959,20 @@ impl FinderWindow {
         let ql_bitmap = &mut self.ql_bitmap;
         let ql_px = ql.as_ref().and_then(|(_, e)| loader.get_large(e));
         let mut search_xs: Vec<f32> = Vec::new();
+        let mut address_xs: Vec<f32> = Vec::new();
+        let show_ext = self.show_ext;
+        let layout = &self.layout;
+        let groups = &self.groups;
+        let icon_size = self.icon_size;
+        let address = self.address.as_ref();
+        let search_all = self.search_all;
+        let scope_here = if shell::is_fs_path(cwd) { format!("“{}”", shell::title(cwd)) } else { String::new() };
+        let query = search::Query::parse(&self.search.string());
+        let pane = if pane_on { self.pane } else { Pane::None };
+        let details = self.details.as_ref().map(|d| d.1.as_slice()).unwrap_or(&[]);
+        let big_px = focus_entry.as_ref().filter(|_| pane == Pane::Preview || view == View::Gallery).and_then(|e| loader.get_large(e));
+        let focus_bitmap = &mut self.focus_bitmap;
+        let multi = if view == View::Columns { 0 } else { selected.len() };
 
         // Just the animating area when that's all that changed (and the window
         // itself isn't zooming or fading).
@@ -2074,19 +3056,23 @@ impl FinderWindow {
             let glyph_c = if dark { Color::gray(255, 0.78) } else { Color::gray(0, 0.72) };
             // Hover and selection glide from place to place; under the selection
             // the glyphs turn accent, clipped to it, so the colour moves with it.
+            let sel_fill = if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.075) };
+            let glyph_at = |i: usize| glyphs::Glyph::for_place(places[i].kind);
+            p.push_clip(side_clip);
             if let Some((g, a)) = side_glide {
                 p.fill_round(g, 8.0, soft_t(a));
             }
-            let sel_fill = if dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.075) };
             if let Some((g, a)) = sel_glide {
                 p.fill_round(g, 8.0, sel_fill.alpha(sel_fill.a * a));
             }
-            let glyph_at = |i: usize| glyphs::Glyph::for_place(i, &places[i].name, i >= fav_count);
             for (i, place) in places.iter().enumerate() {
                 let row = place_rows[i];
                 if i == 0 || i == fav_count {
                     let header = if i == 0 { "Favorites" } else { "Locations" };
                     p.text(header, &small_bold, Rect::new(side.x + 14.0, row.y - 24.0, side.w - 24.0, 24.0), theme.text_secondary);
+                }
+                if row.bottom() < side_clip.y || row.y > side_clip.bottom() {
+                    continue;
                 }
                 if drop_hit == Some(Hit::Place(i)) {
                     p.fill_round(row, 8.0, theme.accent.alpha(0.3));
@@ -2094,7 +3080,7 @@ impl FinderWindow {
                 }
                 glyphs::draw(p, glyph_at(i), row.x + 16.0, row.cy(), glyph_c);
                 p.text(&place.name, &regular, Rect::new(row.x + 32.0, row.y, row.w - 36.0, row.h), theme.text);
-                hits.push((row, Hit::Place(i)));
+                hits.extend(intersect(row, side_clip).map(|r| (r, Hit::Place(i))));
             }
             if let Some((g, a)) = sel_glide {
                 p.faded(a, || {
@@ -2107,6 +3093,7 @@ impl FinderWindow {
                     });
                 });
             }
+            p.pop_clip();
 
             // Toolbar: glass capsules floating over the content, lined up with the traffic lights.
             let cy = body.y + CONTROL_CY;
@@ -2166,9 +3153,9 @@ impl FinderWindow {
 
             // View switcher capsule, the current view on a darker pill.
             let seg_w = 40.0;
-            let outer = Rect::new(sf.x - 10.0 - seg_w * 3.0 - 8.0, ty, seg_w * 3.0 + 8.0, CONTROL_H);
+            let outer = Rect::new(sf.x - 10.0 - seg_w * 4.0 - 8.0, ty, seg_w * 4.0 + 8.0, CONTROL_H);
             glyphs::capsule(p, outer, dark, false);
-            let views = [View::Icons, View::List, View::Columns];
+            let views = [View::Icons, View::List, View::Columns, View::Gallery];
             let seg_at = |k: f32| Rect::new(outer.x + 4.0 + k * seg_w, outer.y + 4.0, seg_w, outer.h - 8.0);
             for (k, v) in views.into_iter().enumerate() {
                 let t = if v == view { 0.0 } else { hv(Hit::ViewBtn(v)) };
@@ -2202,6 +3189,12 @@ impl FinderWindow {
                         p.stroke_round(r, 2.2, c, 1.3);
                         p.line(cx - 2.7, r.y, cx - 2.7, r.bottom(), c, 1.2);
                         p.line(cx + 2.7, r.y, cx + 2.7, r.bottom(), c, 1.2);
+                    }
+                    View::Gallery => {
+                        p.stroke_round(Rect::new(cx - 8.0, cy - 6.5, 16.0, 9.0), 2.0, c, 1.3);
+                        for dx in [-6.0, -1.5, 3.0] {
+                            p.fill_round(Rect::new(cx + dx, cy + 4.0, 3.0, 2.6), 0.8, c);
+                        }
                     }
                 }
                 hits.push((seg, Hit::ViewBtn(v)));
@@ -2261,18 +3254,80 @@ impl FinderWindow {
                 p.pop_clip();
             }
 
+            // Search scope and filters, under the toolbar (and tabs), like macOS's search bar.
+            if search_bar > 0.0 {
+                let bar = Rect::new(content_x, body.y + TOOLBAR + tab_h, content_w, SEARCHBAR);
+                p.fill_rect(bar, pal.content);
+                p.line(bar.x, bar.bottom(), bar.right(), bar.bottom(), pal.divider, 1.0);
+                p.text("Search:", &small, Rect::new(bar.x + 12.0, bar.y, 60.0, bar.h), theme.text_secondary);
+                let kind = query.kind.and_then(|k| search::Kind::ALL.iter().find(|x| x.0 == k)).map(|x| x.2);
+                let when = query.when.and_then(|w| search::When::ALL.iter().find(|x| x.0 == w)).map(|x| x.2);
+                let size = query.size.and_then(|s| search::Size::ALL.iter().find(|x| x.0 == s)).map(|x| x.2);
+                let mut pills: Vec<(String, bool, Hit)> = vec![("This PC".into(), search_all, Hit::ScopeAll)];
+                if !scope_here.is_empty() {
+                    pills.push((scope_here.clone(), !search_all, Hit::ScopeHere));
+                }
+                pills.push((kind.map_or("Kind".into(), |k| format!("Kind: {k}")), kind.is_some(), Hit::Filter(0)));
+                pills.push((when.map_or("Date Modified".into(), |w| format!("Modified: {w}")), when.is_some(), Hit::Filter(1)));
+                pills.push((size.map_or("Size".into(), |s| format!("Size: {s}")), size.is_some(), Hit::Filter(2)));
+                let mut x = bar.x + 12.0 + p.gfx.measure("Search:", &small) + 8.0;
+                for (k, (label, on, hit)) in pills.iter().enumerate() {
+                    // A gap between the scope and the filters.
+                    if k > 0 && matches!(hit, Hit::Filter(0)) {
+                        x += 12.0;
+                    }
+                    let chevron = matches!(hit, Hit::Filter(_));
+                    let w = p.gfx.measure(label, &small) + if chevron { 30.0 } else { 20.0 };
+                    let r = Rect::new(x, bar.y + 5.0, w, bar.h - 10.0);
+                    if x + w > bar.right() - 8.0 {
+                        break;
+                    }
+                    if *on {
+                        p.fill_round(r, r.h / 2.0, theme.accent.alpha(0.16));
+                    } else {
+                        let t = hv(*hit);
+                        p.fill_round(r, r.h / 2.0, soft_t(0.6 + 0.4 * t));
+                    }
+                    let tc = if *on { theme.accent } else { theme.text };
+                    p.text(label, &small, Rect::new(r.x + 10.0, r.y, r.w - 10.0, r.h), tc);
+                    if chevron {
+                        let (cx, cy) = (r.right() - 11.0, r.cy());
+                        p.line(cx - 3.0, cy - 1.5, cx, cy + 1.5, tc, 1.2);
+                        p.line(cx, cy + 1.5, cx + 3.0, cy - 1.5, tc, 1.2);
+                    }
+                    hits.push((r, *hit));
+                    x += w + 6.0;
+                }
+            }
+
+            // Group headings, in content coordinates.
+            let group_heading = |p: &Painter, y: f32, k: usize| {
+                let r = Rect::new(vr.x + 12.0, y - scroll, vr.w - 24.0, GROUP_H);
+                if r.bottom() < vr.y || r.y > vr.bottom() {
+                    return;
+                }
+                let label = groups.get(k).map(|g| g.1.as_str()).unwrap_or("");
+                p.text(label, &small_bold, Rect::new(r.x + 2.0, r.y + 6.0, r.w, r.h - 8.0), theme.text);
+                p.line(r.x, r.bottom() - 3.0, r.right(), r.bottom() - 3.0, pal.divider, 1.0);
+            };
+            // Hidden and cut items show faded, like Explorer.
+            let dim = |sel: bool, e: &FileEntry| if (e.hidden || shell::is_cut(&e.path)) && !sel { 0.5 } else { 1.0 };
+
             // Content.
             hits.push((vr, Hit::Content));
             p.clipped(vr, || match view {
                 View::Icons => {
-                    let cw = (vr.w - 2.0 * pad) / grid_cols as f32;
-                    let first_row = ((scroll - pad) / CELL_H).floor().max(0.0) as usize;
-                    let last_row = ((scroll + vr.h) / CELL_H).ceil() as usize + 1;
-                    for i in (first_row * grid_cols)..(last_row * grid_cols).min(n) {
+                    let cells = &layout.cells;
+                    // Cells run down the view: draw only those in sight.
+                    let first = cells.partition_point(|c| c.bottom() - scroll < vr.y);
+                    let last = cells.partition_point(|c| c.y - scroll <= vr.bottom());
+                    for &(y, k) in &layout.headers {
+                        group_heading(p, y, k);
+                    }
+                    for i in first..last.max(first).min(n) {
                         let e = &entries[i];
-                        let (col, row) = (i % grid_cols, i / grid_cols);
-                        let cell = Rect::new(vr.x + pad + col as f32 * cw, vr.y + pad + row as f32 * CELL_H - scroll, cw, CELL_H);
-                        let icon_r = Rect::new(cell.cx() - ICON / 2.0, cell.y + 6.0, ICON, ICON);
+                        let cell = cells[i].offset(0.0, -scroll);
+                        let icon_r = Rect::new(cell.cx() - icon_size / 2.0, cell.y + 6.0, icon_size, icon_size);
                         let sel = selected.contains(&i);
                         if drop_hit == Some(Hit::Item(i)) {
                             p.fill_round(icon_r.inset(-6.0, -5.0), 6.0, theme.accent.alpha(0.3));
@@ -2280,39 +3335,49 @@ impl FinderWindow {
                             p.fill_round(icon_r.inset(-6.0, -5.0), 6.0, soft);
                         }
                         let bmp = icon_for(p, e, Some(icon_r));
-                        draw_icon(p, bmp, icon_r);
+                        p.faded(dim(sel, e), || draw_icon(p, bmp, icon_r));
                         let label = Rect::new(cell.x + 4.0, icon_r.bottom() + 6.0, cell.w - 8.0, 32.0);
+                        let name = e.label(show_ext);
                         match rename.as_ref().filter(|r| r.target == e.path) {
                             Some(ren) => draw_field(p, Rect::new(cell.x + 2.0, label.y, cell.w - 4.0, 20.0), ren),
                             None => {
                                 if sel {
-                                    let tw = p.gfx.measure(&e.name, &label_font).min(label.w);
-                                    let lines = if p.gfx.measure(&e.name, &label_font) > label.w { 2.0 } else { 1.0 };
+                                    let tw = p.gfx.measure(name, &label_font).min(label.w);
+                                    let lines = if p.gfx.measure(name, &label_font) > label.w { 2.0 } else { 1.0 };
                                     p.fill_round(Rect::new(label.cx() - tw / 2.0 - 4.0, label.y - 1.0, tw + 8.0, lines * 15.5 + 2.0), 4.0, sel_bg);
                                 }
-                                p.text(&e.name, &label_font, label, if sel { sel_text } else { theme.text });
+                                p.text(name, &label_font, label, if sel { sel_text } else { theme.text });
                             }
                         }
-                        hits.extend(intersect(Rect::new(cell.x + 4.0, cell.y, cell.w - 8.0, CELL_H - 4.0), vr).map(|r| (r, Hit::Item(i))));
+                        hits.extend(intersect(Rect::new(cell.x + 4.0, cell.y, cell.w - 8.0, cell.h - 4.0), vr).map(|r| (r, Hit::Item(i))));
                     }
                 }
                 View::List => {
                     let x0 = vr.x + 8.0;
                     let w = vr.w - 16.0;
-                    let cols = [
-                        (SortKey::Name, "Name", x0, w * 0.46),
-                        (SortKey::Modified, "Date Modified", x0 + w * 0.46, w * 0.25),
-                        (SortKey::Size, "Size", x0 + w * 0.71, w * 0.11),
-                        (SortKey::Kind, "Kind", x0 + w * 0.84, w * 0.16),
-                    ];
+                    // Name takes what the other columns leave (but at least a third).
+                    let rest: f32 = shown_cols.iter().map(|c| c.weight()).sum::<f32>().min(0.66);
+                    let scale_w = if rest > 0.0 { rest / shown_cols.iter().map(|c| c.weight()).sum::<f32>().max(0.01) } else { 1.0 };
+                    let name_w = w * (1.0 - rest);
+                    let mut cols: Vec<(Option<Col>, Option<SortKey>, &str, f32, f32)> = vec![(None, Some(SortKey::Name), "Name", x0, name_w)];
+                    let mut x = x0 + name_w;
+                    for c in &shown_cols {
+                        let cw = w * c.weight() * scale_w;
+                        cols.push((Some(*c), c.sort_key(), c.label(), x, cw));
+                        x += cw;
+                    }
                     let rows_top = vr.y + HEADER;
-                    let first = ((scroll) / ROW).floor().max(0.0) as usize;
-                    let last = (((scroll + vr.h) / ROW).ceil() as usize + 1).min(n);
                     let rows_clip = Rect::new(vr.x, rows_top, vr.w, vr.h - HEADER);
+                    let cells = &layout.cells;
+                    let first = cells.partition_point(|c| c.bottom() - scroll < rows_top);
+                    let last = cells.partition_point(|c| c.y - scroll <= vr.bottom());
                     p.clipped(rows_clip, || {
-                        for i in first..last {
+                        for &(y, k) in &layout.headers {
+                            group_heading(p, y, k);
+                        }
+                        for i in first..last.max(first).min(n) {
                             let e = &entries[i];
-                            let r = Rect::new(x0, rows_top + 4.0 + i as f32 * ROW - scroll, w, ROW);
+                            let r = cells[i].offset(0.0, -scroll);
                             let sel = selected.contains(&i);
                             if sel {
                                 p.fill_round(r, 7.0, sel_bg);
@@ -2326,39 +3391,108 @@ impl FinderWindow {
                             let sc = if sel { sel_text } else { theme.text_secondary };
                             let icon_r = Rect::new(r.x + 6.0, r.cy() - 8.0, 16.0, 16.0);
                             let bmp = icon_for(p, e, Some(icon_r));
-                            draw_icon(p, bmp, icon_r);
-                            let name_r = Rect::new(r.x + 28.0, r.y, cols[0].3 - 34.0, r.h);
+                            p.faded(dim(sel, e), || draw_icon(p, bmp, icon_r));
+                            let name_r = Rect::new(r.x + 28.0, r.y, cols[0].4 - 34.0, r.h);
                             match rename.as_ref().filter(|ren| ren.target == e.path) {
                                 Some(ren) => draw_field(p, name_r.inset(0.0, 1.0), ren),
-                                None => p.text(&e.name, &regular, name_r, tc),
+                                None => p.text(e.label(show_ext), &regular, name_r, tc),
                             }
-                            let date = e.modified.map(fs::format_date).unwrap_or_else(|| "--".into());
-                            p.text(&date, &regular, Rect::new(cols[1].2, r.y, cols[1].3 - 8.0, r.h), sc);
-                            let size = if e.is_dir { "--".to_string() } else { fs::format_size(e.size) };
-                            p.text(&size, &right, Rect::new(cols[2].2, r.y, cols[2].3 - 14.0, r.h), sc);
-                            p.text(&kinds.kind(e), &regular, Rect::new(cols[3].2, r.y, cols[3].3 - 8.0, r.h), sc);
+                            for &(col, _, _, cx, cw) in &cols[1..] {
+                                let date = |t: Option<std::time::SystemTime>| t.map(fs::format_date).unwrap_or_else(|| "--".into());
+                                let (text, align_right) = match col {
+                                    Some(Col::Modified) => (date(e.modified), false),
+                                    Some(Col::Created) => (date(e.created), false),
+                                    Some(Col::Deleted) => (date(e.deleted), false),
+                                    Some(Col::Size) if e.is_dir && e.extra.is_none() => ("--".into(), true),
+                                    Some(Col::Size) => (fs::format_size(e.size), true),
+                                    Some(Col::Kind) => (kinds.kind(e), false),
+                                    Some(Col::Location) => (e.folder(), false),
+                                    Some(Col::Space) => (e.extra.clone().unwrap_or_default(), false),
+                                    None => (String::new(), false),
+                                };
+                                if align_right {
+                                    p.text(&text, &right, Rect::new(cx, r.y, cw - 14.0, r.h), sc);
+                                } else {
+                                    p.text(&text, &regular, Rect::new(cx + 8.0, r.y, cw - 12.0, r.h), sc);
+                                }
+                            }
                             hits.extend(intersect(r, rows_clip).map(|r| (r, Hit::Item(i))));
                         }
                     });
                     // Header (drawn last so rows scroll under it).
                     let header = Rect::new(vr.x, vr.y, vr.w, HEADER);
                     p.fill_rect(header, pal.content);
-                    for (k, (key, label, x, cw)) in cols.iter().enumerate() {
-                        let r = Rect::new(*x, vr.y, *cw, HEADER);
+                    for (k, &(_, key, label, x, cw)) in cols.iter().enumerate() {
+                        let r = Rect::new(x, vr.y, cw, HEADER);
                         if k > 0 {
                             p.line(r.x - 1.0, r.y + 6.0, r.x - 1.0, r.bottom() - 6.0, pal.divider, 1.0);
                         }
-                        let font = if *key == sort { &small_bold } else { &small };
+                        let current = key == Some(sort);
+                        let font = if current { &small_bold } else { &small };
                         p.text(label, font, Rect::new(r.x + 8.0, r.y, r.w - 24.0, r.h), theme.text_secondary);
-                        if *key == sort {
+                        if current {
                             let (cx, cy) = (r.right() - 14.0, r.cy());
                             let d = if ascending { -1.0 } else { 1.0 };
                             p.line(cx - 3.5, cy - 1.5 * d, cx, cy + 1.5 * d, theme.text_secondary, 1.3);
                             p.line(cx, cy + 1.5 * d, cx + 3.5, cy - 1.5 * d, theme.text_secondary, 1.3);
                         }
-                        hits.push((r, Hit::Header(*key)));
+                        // Columns without a sort (Free Space) still take the header's menu.
+                        hits.push((r, Hit::Header(key.unwrap_or(sort))));
                     }
                     p.line(vr.x, header.bottom(), vr.right(), header.bottom(), pal.divider, 1.0);
+                }
+                View::Gallery => {
+                    // The selected item big, its name and details, and a strip of thumbnails below.
+                    let strip = Rect::new(vr.x, vr.bottom() - STRIP_H, vr.w, STRIP_H);
+                    let stage = Rect::new(vr.x + 20.0, vr.y + 16.0, vr.w - 40.0, strip.y - vr.y - 60.0);
+                    if let Some(e) = &focus_entry {
+                        let key = IconLoader::large_key(e);
+                        let big = match focus_bitmap.as_ref().filter(|(k, _)| *k == key) {
+                            Some((_, b)) => b.clone(),
+                            None => {
+                                let b = big_px.as_ref().and_then(|px| px.to_bitmap(p.rt));
+                                if b.is_some() {
+                                    *focus_bitmap = Some((key, b.clone()));
+                                }
+                                b
+                            }
+                        };
+                        let image = big.or_else(|| icon_for(p, e, None));
+                        if let Some(b) = image {
+                            let size = unsafe { b.GetSize() };
+                            let (bw, bh) = (size.width.max(1.0), size.height.max(1.0));
+                            let k = (stage.w / bw).min(stage.h / bh).min(1.0);
+                            let (iw, ih) = (bw * k, bh * k);
+                            p.bitmap(&b, Rect::new(stage.cx() - iw / 2.0, stage.cy() - ih / 2.0, iw, ih), 1.0);
+                        }
+                        p.text(e.label(show_ext), &preview_title, Rect::new(stage.x, stage.bottom() + 8.0, stage.w, 22.0), theme.text);
+                        let mut info = kinds.kind(e);
+                        if !e.is_dir {
+                            info += &format!(" — {}", fs::format_size(e.size));
+                        }
+                        if let Some(m) = e.modified {
+                            info += &format!(" — {}", fs::format_date(m));
+                        }
+                        p.text(&info, &center, Rect::new(stage.x, stage.bottom() + 30.0, stage.w, 18.0), theme.text_secondary);
+                    }
+                    p.line(strip.x, strip.y, strip.right(), strip.y, pal.divider, 1.0);
+                    let cells = &layout.cells;
+                    let first = cells.partition_point(|c| c.right() - scroll < vr.x);
+                    let last = cells.partition_point(|c| c.x - scroll <= vr.right());
+                    for i in first..last.max(first).min(n) {
+                        let e = &entries[i];
+                        let cell = cells[i].offset(-scroll, 0.0);
+                        let thumb = Rect::new(cell.cx() - 28.0, cell.y + 6.0, 56.0, 56.0);
+                        if selected.contains(&i) {
+                            p.fill_round(cell.inset(4.0, 0.0), 8.0, theme.accent.alpha(0.25));
+                            p.stroke_round(cell.inset(4.0, 0.0), 8.0, theme.accent, 2.0);
+                        } else if drop_hit == Some(Hit::Item(i)) {
+                            p.stroke_round(cell.inset(4.0, 0.0), 8.0, theme.accent, 2.0);
+                        }
+                        let bmp = icon_for(p, e, Some(thumb));
+                        draw_icon(p, bmp, thumb);
+                        hits.extend(intersect(cell, vr).map(|r| (r, Hit::Item(i))));
+                    }
                 }
                 View::Columns => {
                     for (c, col) in columns.iter().enumerate() {
@@ -2438,36 +3572,116 @@ impl FinderWindow {
 
             // Overlay scrollbar.
             // Shows while scrolling, then fades away like macOS.
-            if max_scroll > 0.0 && view != View::Columns && scrollbar_a > 0.01 {
+            if max_scroll > 0.0 && !matches!(view, View::Columns | View::Gallery) && scrollbar_a > 0.01 {
                 let total = vr.h + max_scroll;
                 let th = (vr.h * vr.h / total).max(24.0);
                 let ty = vr.y + (vr.h - th) * (scroll / max_scroll).clamp(0.0, 1.0);
                 p.fill_round(Rect::new(vr.right() - 8.0, ty + 2.0, 5.0, th - 4.0), 2.5, Color::gray(128, 0.45 * scrollbar_a));
             }
 
-            // Path bar: breadcrumbs from the root, trimmed from the left to fit.
+            // Preview / details pane at the right of the view.
+            if pane != Pane::None {
+                let pr = Rect::new(vr.right(), vr.y, PANE_W, vr.h);
+                p.fill_rect(pr, pal.content);
+                p.line(pr.x, pr.y, pr.x, pr.bottom(), pal.divider, 1.0);
+                let inner = pr.inset(16.0, 14.0);
+                let mut y = inner.y;
+                p.clipped(pr, || {
+                    match &focus_entry {
+                        Some(e) if multi <= 1 => {
+                            let side = if pane == Pane::Preview { inner.w.min(inner.h * 0.45) } else { 64.0 };
+                            let box_r = Rect::new(inner.cx() - side / 2.0, y, side, side);
+                            let mut image = None;
+                            if pane == Pane::Preview {
+                                let key = IconLoader::large_key(e);
+                                image = match focus_bitmap.as_ref().filter(|(k, _)| *k == key) {
+                                    Some((_, b)) => b.clone(),
+                                    None => {
+                                        let b = big_px.as_ref().and_then(|px| px.to_bitmap(p.rt));
+                                        if b.is_some() {
+                                            *focus_bitmap = Some((key, b.clone()));
+                                        }
+                                        b
+                                    }
+                                };
+                            }
+                            let image = image.or_else(|| icon_for(p, e, Some(box_r)));
+                            if let Some(b) = image {
+                                let size = unsafe { b.GetSize() };
+                                let (bw, bh) = (size.width.max(1.0), size.height.max(1.0));
+                                let k = (box_r.w / bw).min(box_r.h / bh);
+                                let (iw, ih) = (bw * k, bh * k);
+                                p.bitmap(&b, Rect::new(box_r.cx() - iw / 2.0, box_r.bottom() - ih, iw, ih), 1.0);
+                            }
+                            y = box_r.bottom() + 12.0;
+                            p.text(e.label(show_ext), &preview_title, Rect::new(inner.x, y, inner.w, 22.0), theme.text);
+                            y += 22.0;
+                            let mut sub = kinds.kind(e);
+                            if !e.is_dir {
+                                sub += &format!(" — {}", fs::format_size(e.size));
+                            }
+                            p.text(&sub, &center, Rect::new(inner.x, y, inner.w, 18.0), theme.text_secondary);
+                            y += 30.0;
+                            p.text("Information", &small_bold, Rect::new(inner.x, y, inner.w, 16.0), theme.text);
+                            y += 20.0;
+                            for (label, value) in details {
+                                if y > inner.bottom() - 16.0 {
+                                    break;
+                                }
+                                p.text(label, &small, Rect::new(inner.x, y, inner.w * 0.42, 16.0), theme.text_secondary);
+                                p.text(value, &small, Rect::new(inner.x + inner.w * 0.45, y, inner.w * 0.55, 16.0), theme.text);
+                                y += 18.0;
+                            }
+                        }
+                        _ => {
+                            let total: u64 = selected.iter().filter_map(|&i| entries.get(i)).map(|e| e.size).sum();
+                            let (head, sub) = if multi > 1 {
+                                (format!("{multi} items"), fs::format_size(total))
+                            } else {
+                                (title.clone(), format!("{n} item{}", if n == 1 { "" } else { "s" }))
+                            };
+                            let mid = inner.cy() - 30.0;
+                            glyphs::folder(p, inner.cx(), mid - 20.0, 2.4, theme.text_secondary);
+                            p.text(&head, &preview_title, Rect::new(inner.x, mid + 8.0, inner.w, 22.0), theme.text);
+                            p.text(&sub, &center, Rect::new(inner.x, mid + 30.0, inner.w, 18.0), theme.text_secondary);
+                        }
+                    }
+                });
+            }
+
+            // Path bar: breadcrumbs from the root, trimmed from the left to fit. A
+            // click beside them (or Ctrl+L) turns it into an address field.
             let pb = Rect::new(content_x, body.bottom() - STATUS - PATHBAR, content_w, PATHBAR);
             p.line(pb.x, pb.y, pb.right(), pb.y, pal.divider, 1.0);
-            let widths: Vec<f32> = path_names.iter().map(|n| p.gfx.measure(n, &small) + 36.0).collect();
-            let mut first = 0;
-            while first + 1 < widths.len() && widths[first..].iter().sum::<f32>() > pb.w - 20.0 {
-                first += 1;
-            }
-            let mut x = pb.x + 10.0;
-            for (depth, name) in path_names.iter().enumerate().skip(first) {
-                let w = widths[depth] - 14.0;
-                let seg = Rect::new(x, pb.y + 2.0, w, pb.h - 4.0);
-                let t = hv(Hit::Crumb(depth));
-                if t > 0.0 {
-                    p.fill_round(seg, 5.0, soft_t(t));
+            if let Some(field) = address {
+                let r = pb.inset(6.0, 2.0);
+                p.fill_round(r, 5.0, field_bg);
+                p.stroke_round(r, 5.0, theme.accent, 1.5);
+                address_xs = edit_text(p, Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h), field, true);
+                hits.push((r, Hit::Address));
+            } else {
+                hits.push((pb, Hit::PathBar));
+                let widths: Vec<f32> = path_names.iter().map(|n| p.gfx.measure(n, &small) + 36.0).collect();
+                let mut first = 0;
+                while first + 1 < widths.len() && widths[first..].iter().sum::<f32>() > pb.w - 20.0 {
+                    first += 1;
                 }
-                glyphs::folder(p, seg.x + 10.0, seg.cy(), 0.72, theme.accent);
-                p.text(name, &small, Rect::new(seg.x + 20.0, seg.y, seg.w - 20.0, seg.h), theme.text_secondary);
-                hits.push((seg, Hit::Crumb(depth)));
-                x += w;
-                if depth + 1 < path_names.len() {
-                    glyphs::chevron(p, x + 7.0, pb.cy(), false, 3.0, theme.text_disabled, 1.1);
-                    x += 14.0;
+                let mut x = pb.x + 10.0;
+                for (depth, name) in path_names.iter().enumerate().skip(first) {
+                    let w = widths[depth] - 14.0;
+                    let seg = Rect::new(x, pb.y + 2.0, w, pb.h - 4.0);
+                    let t = hv(Hit::Crumb(depth));
+                    if t > 0.0 {
+                        p.fill_round(seg, 5.0, soft_t(t));
+                    }
+                    glyphs::folder(p, seg.x + 10.0, seg.cy(), 0.72, theme.accent);
+                    p.text(name, &small, Rect::new(seg.x + 20.0, seg.y, seg.w - 20.0, seg.h), theme.text_secondary);
+                    hits.push((seg, Hit::Crumb(depth)));
+                    x += w;
+                    if depth + 1 < path_names.len() {
+                        glyphs::chevron(p, x + 7.0, pb.cy(), false, 3.0, theme.text_disabled, 1.1);
+                        x += 14.0;
+                    }
                 }
             }
 
@@ -2525,16 +3739,57 @@ impl FinderWindow {
         }));
         self.hits = hits;
         self.search_xs = search_xs;
+        self.address_xs = address_xs;
         if let Err(e) = drawn.and_then(|_| self.canvas.present_part(self.hwnd, rc.left, rc.top, window_alpha, part)) {
             log!("finder render failed: {e}");
         }
     }
 }
 
+/// The group an entry falls in: an order rank and the heading.
+fn group_key(group: Group, e: &FileEntry, kinds: &mut KindCache) -> (u32, String) {
+    match group {
+        Group::None => (0, String::new()),
+        Group::Name => {
+            let c = e.name.chars().next().map(|c| c.to_uppercase().next().unwrap_or(c)).unwrap_or('#');
+            let label = if c.is_alphabetic() {
+                c.to_string()
+            } else if c.is_ascii_digit() {
+                "0–9".to_string()
+            } else {
+                "#".to_string()
+            };
+            (0, label)
+        }
+        Group::Kind => (!e.is_dir as u32, kinds.kind(e)),
+        Group::Size if e.is_dir => (0, "Folders".into()),
+        Group::Size => {
+            let s = search::Size::of(e.size);
+            let i = search::Size::ALL.iter().position(|x| x.0 == s).unwrap_or(0);
+            (1 + i as u32, search::Size::ALL[i].2.to_string())
+        }
+        Group::Modified => {
+            let Some(t) = e.modified else { return (u32::MAX, "Unknown".into()) };
+            let dt: chrono::DateTime<chrono::Local> = t.into();
+            let now = chrono::Local::now();
+            let days = (now.date_naive() - dt.date_naive()).num_days();
+            use chrono::Datelike;
+            match days {
+                i64::MIN..=0 => (0, "Today".into()),
+                1 => (1, "Yesterday".into()),
+                2..=6 => (2, "Previous 7 Days".into()),
+                7..=29 => (3, "Previous 30 Days".into()),
+                _ if dt.year() == now.year() => (100 + 12 - dt.month(), dt.format("%B").to_string()),
+                _ => (1000 + (3000 - dt.year().clamp(0, 3000)) as u32, dt.year().to_string()),
+            }
+        }
+    }
+}
+
 /// The sidebar's place rows inside `side`: Favorites, then Locations, each under a header.
-fn place_rows(side: Rect, n: usize, fav_count: usize) -> Vec<Rect> {
+fn place_rows(side: Rect, n: usize, fav_count: usize, scroll: f32) -> Vec<Rect> {
     let mut rows = Vec::with_capacity(n);
-    let mut y = side.y + 46.0;
+    let mut y = side.y + 46.0 - scroll;
     for i in 0..n {
         if i == 0 || i == fav_count {
             y += 24.0;
@@ -2546,6 +3801,11 @@ fn place_rows(side: Rect, n: usize, fav_count: usize) -> Vec<Rect> {
         }
     }
     rows
+}
+
+/// The index of the caret position in `xs` nearest to `x`.
+fn nearest(xs: &[f32], x: f32) -> usize {
+    xs.iter().enumerate().min_by(|a, b| (a.1 - x).abs().total_cmp(&(b.1 - x).abs())).map(|(i, _)| i).unwrap_or(0)
 }
 
 /// Normalized rectangle between two corners.
@@ -2671,16 +3931,180 @@ impl Drop for FinderWindow {
     }
 }
 
-/// `dir` and its ancestors, root first.
-fn crumbs(dir: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = dir.ancestors().map(Path::to_path_buf).collect();
-    v.reverse();
-    v
-}
-
 #[cfg(test)]
 mod bench {
     use super::*;
+
+    /// Drives a Finder window through places, views, menus, search and file
+    /// operations, saving a PNG of each step to `TOUR_DIR`.
+    /// `cargo test --profile fast finder_tour -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn finder_tour() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc_(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        dnd::ensure_ole();
+        let _ = crate::win::register_class(Some(proc_));
+        let out = PathBuf::from(std::env::var("TOUR_DIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string()));
+        let gfx = Gfx::new().unwrap();
+        let cfg = crate::config::defaults();
+        let theme = Theme::new(&cfg, &gfx);
+        let mut loader = IconLoader::new(0, 0);
+        let mut kinds = KindCache::default();
+        let prefs = FinderCfg { view: View::List, show_hidden: false, ..cfg.finder.clone() };
+        let mut ctx = Ctx { gfx: &gfx, theme: &theme, loader: &mut loader, kinds: &mut kinds };
+        let mut f = FinderWindow::new(&mut ctx, &Monitor::primary(), 1, fs::home(), 0, 0, 0, &prefs).unwrap();
+        // Settles background work and icons, then saves a picture.
+        let snap = |f: &mut FinderWindow, ctx: &mut Ctx, name: &str| {
+            for _ in 0..150 {
+                f.poll_async(ctx.kinds);
+                let busy = f.pending.is_some() || f.searching.as_ref().is_some_and(|s| !s.finished());
+                ctx.loader.drain();
+                f.icons_ready = true;
+                f.tick(0.05);
+                f.dirty = true;
+                f.render(ctx);
+                if !busy {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            for _ in 0..12 {
+                std::thread::sleep(Duration::from_millis(60));
+                ctx.loader.drain();
+                f.tick(0.05);
+                f.dirty = true;
+                f.render(ctx);
+            }
+            let px = f.canvas.pixels();
+            crate::gfx::write_png(ctx.gfx, f.canvas.width as u32, f.canvas.height as u32, &px, &out.join(format!("{name}.png")).to_string_lossy());
+            println!("{name}: {} entries, error {:?}, cwd {}", f.entries.len(), f.error, f.cwd.display());
+        };
+        let print_menu = |name: &str, ev: FinderEvent| {
+            fn walk(v: &[Entry], depth: usize) {
+                for e in v {
+                    match e {
+                        Entry::Separator => println!("{}--", "  ".repeat(depth)),
+                        Entry::Item(i) => {
+                            let tag = if i.action.is_none() && i.submenu.is_empty() { " (disabled)" } else { "" };
+                            println!("{}{}{tag}", "  ".repeat(depth), i.label);
+                            if depth < 2 {
+                                walk(&i.submenu, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            println!("== {name}");
+            if let FinderEvent::Menu(v, ..) = ev {
+                walk(&v, 1);
+            }
+        };
+
+        snap(&mut f, &mut ctx, "01-home-list");
+        f.navigate(PathBuf::from(shell::THIS_PC), true, ctx.kinds);
+        snap(&mut f, &mut ctx, "02-this-pc");
+        f.navigate(PathBuf::from(shell::RECYCLE_BIN), true, ctx.kinds);
+        snap(&mut f, &mut ctx, "03-recycle-bin");
+        f.navigate(PathBuf::from(shell::LIBRARIES), true, ctx.kinds);
+        snap(&mut f, &mut ctx, "04-libraries");
+        f.navigate(fs::home(), true, ctx.kinds);
+        f.command(FinderCmd::SetView(View::Icons), ctx.kinds);
+        f.command(FinderCmd::GroupBy(Group::Kind), ctx.kinds);
+        snap(&mut f, &mut ctx, "05-icons-grouped");
+        f.command(FinderCmd::GroupBy(Group::None), ctx.kinds);
+        if let Some(pics) = fs::known_folder(&windows::Win32::UI::Shell::FOLDERID_Pictures) {
+            f.navigate(pics, true, ctx.kinds);
+        }
+        f.command(FinderCmd::SetView(View::Gallery), ctx.kinds);
+        snap(&mut f, &mut ctx, "06-gallery");
+        f.navigate(fs::home().join("Documents"), true, ctx.kinds);
+        f.command(FinderCmd::SetView(View::List), ctx.kinds);
+        f.command(FinderCmd::SetPane(Pane::Preview), ctx.kinds);
+        if let Some(i) = f.entries.iter().position(|e| !e.is_dir) {
+            f.selected = [i].into();
+            f.cursor = Some(i);
+        }
+        snap(&mut f, &mut ctx, "07-preview-pane");
+        f.command(FinderCmd::SetPane(Pane::Preview), ctx.kinds);
+
+        // Context menus: on the selected file, and on the background.
+        if let Some(i) = f.entries.iter().position(|e| !e.is_dir) {
+            let r = f.layout.cells[i];
+            print_menu("item menu", f.on_right_click(r.x + 40.0, r.cy() - f.scroll.offset(), false, ctx.kinds));
+        }
+        f.dirty = true;
+        f.render(&mut ctx);
+        let vr = f.view_rect();
+        print_menu("background menu", f.on_right_click(vr.right() - 20.0, vr.bottom() - 6.0, false, ctx.kinds));
+        println!("new types: {:?}", shell::new_types().iter().map(|t| t.name.clone()).collect::<Vec<_>>());
+
+        // Address field.
+        f.on_key(b'L' as u16, true, false, false, ctx.kinds);
+        snap(&mut f, &mut ctx, "08-address");
+        f.address = Some(TextField::new("%USERPROFILE%\\Desktop"));
+        f.on_key(ENTER, false, false, false, ctx.kinds);
+        println!("address went to {}", f.cwd.display());
+
+        // Search under the repo with a filter.
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let repo = PathBuf::from(repo.canonicalize().unwrap().display().to_string().trim_start_matches(r"\\?\"));
+        f.navigate(repo, true, ctx.kinds);
+        f.search = TextField::new("finder ext:rs");
+        f.search_changed(ctx.kinds);
+        snap(&mut f, &mut ctx, "09-search");
+        f.search.clear();
+        f.search_changed(ctx.kinds);
+
+        // File operations and undo in a scratch folder.
+        let scratch = std::env::temp_dir().join("dockside-finder-tour");
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("a.txt"), "hello").unwrap();
+        let a = scratch.join("a.txt");
+        let names = |d: &Path| {
+            let mut v: Vec<String> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        };
+        let dup = ops::duplicate(HWND::default(), &[a.clone()]);
+        println!("duplicate -> {dup:?}: {:?}", names(&scratch));
+        let zip = ops::compress(HWND::default(), &[a.clone()]);
+        // The zip folder compresses in the background.
+        std::thread::sleep(Duration::from_millis(1500));
+        println!("compress -> {zip:?}: {:?} ({} bytes)", names(&scratch), zip.as_ref().and_then(|z| std::fs::metadata(z).ok()).map_or(0, |m| m.len()));
+        if let Some(z) = &zip {
+            std::fs::rename(z, scratch.join("packed.zip")).unwrap();
+            let x = ops::extract(HWND::default(), &scratch.join("packed.zip"));
+            println!("extract -> {x:?}: {:?} / {:?}", names(&scratch), x.as_ref().map(|d| names(d)));
+        }
+        let sub = scratch.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let moved = ops::transfer(HWND::default(), &[a.clone()], &sub, DropOp::Move);
+        println!("move -> {moved:?}: {:?} / {:?}", names(&scratch), names(&sub));
+        let back = ops::undo(HWND::default());
+        println!("undo move -> {back:?}: {:?} / {:?}", names(&scratch), names(&sub));
+        let again = ops::redo(HWND::default());
+        println!("redo move -> {again:?}: {:?} / {:?}", names(&scratch), names(&sub));
+        ops::undo(HWND::default());
+        ops::delete(HWND::default(), &[a.clone()], true);
+        println!("trash: {:?} (label {:?})", names(&scratch), ops::undo_label());
+        let restored = ops::undo(HWND::default());
+        println!("undo trash -> {restored:?}: {:?}", names(&scratch));
+        let links = ops::shortcuts(&[a.clone()], &scratch);
+        println!("shortcut -> {links:?}");
+        shell::set_clipboard(&[a.clone()], false);
+        let pasted = ops::paste(HWND::default(), &sub);
+        println!("paste -> {pasted:?}: {:?}", names(&sub));
+        f.navigate(scratch.clone(), true, ctx.kinds);
+        f.command(FinderCmd::NewFile(0), ctx.kinds);
+        println!("new file ({:?}): renaming {:?}", shell::new_types().first().map(|t| t.name.clone()), f.rename.as_ref().map(|r| r.target.clone()));
+        f.rename = None;
+        snap(&mut f, &mut ctx, "10-scratch");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 
     /// On-screen frame rate while scrolling a big folder every frame.
     /// `cargo test --profile fast bench_finder -- --ignored --nocapture`
@@ -2720,7 +4144,7 @@ mod bench {
             let mut input = 0.0;
             for k in 0..n {
                 let t0 = Instant::now();
-                f.on_wheel(500.0, if k % 50 < 25 { -120 } else { 120 });
+                f.on_wheel(500.0, if k % 50 < 25 { -120 } else { 120 }, false);
                 f.tick(1.0 / 165.0);
                 input += t0.elapsed().as_secs_f64() * 1000.0;
                 let t0 = Instant::now();
@@ -2740,7 +4164,7 @@ mod bench {
             while f.scroll.offset() < f.max_scroll && frames < 3000 {
                 let t0 = Instant::now();
                 if frames % 4 == 0 {
-                    f.on_wheel(500.0, -120);
+                    f.on_wheel(500.0, -120, false);
                 }
                 if ctx.loader.drain() {
                     f.on_icons();
@@ -2760,7 +4184,7 @@ mod bench {
             println!("  spin: {frames} frames, {:.0} fps on screen, worst frame {worst:.2} ms, {slow} over budget", frames as f64 / t.elapsed().as_secs_f64());
 
             // Partial frames must leave exactly what a full repaint would.
-            f.on_wheel(500.0, -360);
+            f.on_wheel(500.0, -360, false);
             let mut partial = 0;
             for _ in 0..40 {
                 if f.tick(1.0 / 165.0) {

@@ -4,6 +4,8 @@
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 
+use super::fs::PlaceKind;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Glyph {
     Home,
@@ -14,26 +16,35 @@ pub enum Glyph {
     Music,
     Movies,
     Drive,
+    Removable,
     Folder,
+    Recents,
+    Computer,
+    Network,
+    Cloud,
+    Library,
+    Trash,
 }
 
 impl Glyph {
-    /// The glyph for a sidebar place (`index` 0 is the home folder).
-    pub fn for_place(index: usize, name: &str, is_drive: bool) -> Glyph {
-        if is_drive {
-            return Glyph::Drive;
-        }
-        if index == 0 {
-            return Glyph::Home;
-        }
-        match name {
-            "Desktop" => Glyph::Desktop,
-            "Documents" => Glyph::Documents,
-            "Downloads" => Glyph::Downloads,
-            "Pictures" => Glyph::Pictures,
-            "Music" => Glyph::Music,
-            "Movies" => Glyph::Movies,
-            _ => Glyph::Folder,
+    pub fn for_place(kind: PlaceKind) -> Glyph {
+        match kind {
+            PlaceKind::Recents => Glyph::Recents,
+            PlaceKind::Home => Glyph::Home,
+            PlaceKind::Desktop => Glyph::Desktop,
+            PlaceKind::Documents => Glyph::Documents,
+            PlaceKind::Downloads => Glyph::Downloads,
+            PlaceKind::Pictures => Glyph::Pictures,
+            PlaceKind::Music => Glyph::Music,
+            PlaceKind::Movies => Glyph::Movies,
+            PlaceKind::Cloud => Glyph::Cloud,
+            PlaceKind::Pinned => Glyph::Folder,
+            PlaceKind::ThisPc => Glyph::Computer,
+            PlaceKind::Drive => Glyph::Drive,
+            PlaceKind::Removable => Glyph::Removable,
+            PlaceKind::Network => Glyph::Network,
+            PlaceKind::Libraries => Glyph::Library,
+            PlaceKind::Trash => Glyph::Trash,
         }
     }
 }
@@ -97,7 +108,49 @@ pub fn draw(p: &Painter, g: Glyph, cx: f32, cy: f32, c: Color) {
             p.line(r.x + 1.0, cy + 0.5, r.right() - 1.0, cy + 0.5, c, 1.0);
             p.fill_circle(r.right() - 3.2, cy + 2.4, 0.9, c);
         }
+        Glyph::Removable => {
+            let r = Rect::new(cx - 4.5, cy - 7.0, 9.0, 14.0);
+            p.stroke_round(r, 2.0, c, W);
+            p.line(cx - 1.5, r.y + 3.0, cx + 1.5, r.y + 3.0, c, 1.0);
+            p.line(r.x, cy + 1.5, r.right(), cy + 1.5, c, 1.0);
+        }
         Glyph::Folder => folder(p, cx, cy, 1.0, c),
+        Glyph::Recents => {
+            p.stroke_circle(cx, cy, 7.0, c, W);
+            p.line(cx, cy - 4.2, cx, cy, c, W);
+            p.line(cx, cy, cx + 3.0, cy + 1.8, c, W);
+        }
+        Glyph::Computer => {
+            p.stroke_round(Rect::new(cx - 6.0, cy - 6.0, 12.0, 8.5), 1.5, c, W);
+            p.line(cx - 8.0, cy + 5.0, cx + 8.0, cy + 5.0, c, W + 0.2);
+            p.line(cx - 6.5, cy + 3.0, cx - 8.0, cy + 5.0, c, W);
+            p.line(cx + 6.5, cy + 3.0, cx + 8.0, cy + 5.0, c, W);
+        }
+        Glyph::Network => {
+            p.stroke_circle(cx, cy, 7.0, c, W);
+            p.line(cx - 7.0, cy, cx + 7.0, cy, c, 1.0);
+            p.stroke_round(Rect::new(cx - 3.2, cy - 7.0, 6.4, 14.0), 3.2, c, 1.0);
+        }
+        Glyph::Cloud => {
+            p.stroke_circle(cx - 3.0, cy + 1.0, 3.6, c, W);
+            p.stroke_circle(cx + 1.5, cy - 1.5, 4.6, c, W);
+            p.stroke_circle(cx + 4.8, cy + 1.8, 3.0, c, W);
+            p.line(cx - 3.0, cy + 4.6, cx + 4.8, cy + 4.8, c, W);
+        }
+        Glyph::Library => {
+            for (dx, h) in [(-5.0, 12.0), (-1.5, 13.0), (2.0, 12.0)] {
+                p.stroke_round(Rect::new(cx + dx, cy + 6.5 - h, 3.0, h), 0.8, c, 1.1);
+            }
+            p.line(cx + 5.5, cy - 4.5, cx + 7.5, cy + 6.0, c, 1.2);
+        }
+        Glyph::Trash => {
+            p.line(cx - 6.5, cy - 4.5, cx + 6.5, cy - 4.5, c, W);
+            p.line(cx - 2.0, cy - 6.5, cx + 2.0, cy - 6.5, c, W);
+            p.stroke_round(Rect::new(cx - 5.0, cy - 4.5, 10.0, 11.5), 1.6, c, W);
+            for dx in [-2.0, 0.0, 2.0] {
+                p.line(cx + dx, cy - 1.5, cx + dx, cy + 4.0, c, 1.0);
+            }
+        }
     }
 }
 

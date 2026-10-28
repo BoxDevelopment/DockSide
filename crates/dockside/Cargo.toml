@@ -74,6 +74,7 @@ features = [
     "Win32_Graphics_Imaging",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
@@ -92,6 +93,7 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ]
 

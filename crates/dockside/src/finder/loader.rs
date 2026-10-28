@@ -28,8 +28,11 @@ const LARGE_KEEP: usize = 6;
 /// Extensions whose icon depends on the file itself (not just its type).
 const PER_FILE: &[&str] = &["exe", "lnk", "ico", "url", "appref-ms", "msc", "cpl"];
 /// Extensions that get content thumbnails.
-const THUMBNAIL: &[&str] =
-    &["png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "avif", "tif", "tiff", "mp4", "mov", "mkv", "avi", "wmv", "pdf"];
+const THUMBNAIL: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "heic", "heif", "avif", "jxl", "tif", "tiff", "ico", "svg", "psd", "dng", "cr2", "cr3",
+    "nef", "arw", "raf", "orf", "rw2", "mp4", "mov", "mkv", "avi", "wmv", "webm", "m4v", "mpg", "mpeg", "3gp", "mp3", "m4a", "flac",
+    "wma", "pdf", "docx", "xlsx", "pptx", "3mf", "stl", "glb", "fbx", "obj",
+];
 
 pub struct IconLoader {
     tx: Sender<(String, PathBuf, bool, i32)>,

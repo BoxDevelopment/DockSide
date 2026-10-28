@@ -146,6 +146,14 @@ impl Entry {
         self
     }
 
+    /// Adds an icon before the label (shell menu bitmaps, Open With apps).
+    pub fn with_pixels(mut self, icon: Option<crate::gfx::icons::IconPixels>) -> Entry {
+        if let (Entry::Item(i), Some(px)) = (&mut self, icon) {
+            i.icon = Some(std::rc::Rc::new(px));
+        }
+        self
+    }
+
     pub fn checked(mut self, on: bool) -> Entry {
         if let Entry::Item(i) = &mut self {
             i.checked = on;

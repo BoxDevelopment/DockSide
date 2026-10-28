@@ -1035,11 +1035,12 @@ impl SettingsWindow {
                 }),
             ),
             Key::FinderView => fixed(
-                &[("Icons", "icons"), ("List", "list"), ("Columns", "columns")],
+                &[("Icons", "icons"), ("List", "list"), ("Columns", "columns"), ("Gallery", "gallery")],
                 Some(match cfg.finder.view {
                     crate::finder::View::Icons => 0,
                     crate::finder::View::List => 1,
                     crate::finder::View::Columns => 2,
+                    crate::finder::View::Gallery => 3,
                 }),
             ),
             Key::MbBackdrop => fixed(&MB_BACKDROPS, Some(backdrop(cfg.menubar.backdrop))),

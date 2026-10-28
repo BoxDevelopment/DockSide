@@ -212,8 +212,22 @@ pub fn finder_drag(id: u32, phase: finder::dnd::Phase, paths: &[PathBuf]) -> Opt
 }
 
 /// Queues the copy / move for a drop; it runs once the drop callback has returned.
-pub fn finder_transfer(id: u32, paths: Vec<PathBuf>, dest: PathBuf, copy: bool) {
-    push(Action::Finder { window: id, cmd: finder::FinderCmd::Transfer { paths, dest, copy } });
+pub fn finder_transfer(id: u32, paths: Vec<PathBuf>, dest: PathBuf, op: finder::ops::DropOp) {
+    push(Action::Finder { window: id, cmd: finder::FinderCmd::Transfer { paths, dest, op } });
+    win::post(MSG_HWND.load(Ordering::Relaxed), WM_NULL);
+}
+
+/// A right-button drop: queues the "Move Here / Copy Here / Create Shortcuts Here" menu (screen pixels).
+pub fn finder_drop_menu(id: u32, paths: Vec<PathBuf>, dest: PathBuf, x: i32, y: i32) {
+    let scale = with_app(|app| app.monitor.scale).unwrap_or(1.0);
+    let (x, y) = (x as f32 / scale, y as f32 / scale);
+    push(Action::Finder { window: id, cmd: finder::FinderCmd::DropMenu { paths, dest, x, y } });
+    win::post(MSG_HWND.load(Ordering::Relaxed), WM_NULL);
+}
+
+/// A drop of items without file paths (kept by `finder::ops::keep_dropped`).
+pub fn finder_drop_virtual(id: u32, dest: PathBuf, copy: bool) {
+    push(Action::Finder { window: id, cmd: finder::FinderCmd::TransferDropped { dest, copy } });
     win::post(MSG_HWND.load(Ordering::Relaxed), WM_NULL);
 }
 
@@ -272,6 +286,10 @@ fn drain_actions() {
 fn execute(action: Action) {
     log!("action: {action:?}");
     match action {
+        // The Dock's Trash opens in Finder, like macOS.
+        Action::Launch { path, .. } | Action::Open(path) if path.eq_ignore_ascii_case("shell:RecycleBinFolder") => {
+            with_app(|app| app.open_finder(Some(PathBuf::from(finder::shell::RECYCLE_BIN))));
+        }
         Action::Open(target) => system::open(&target),
         Action::Launch { path, .. } if path == FINDER_PATH => {
             with_app(|app| app.open_finder(None));
@@ -286,8 +304,15 @@ fn execute(action: Action) {
         // Drags and file operations run modal loops: keep them outside the App borrow.
         Action::Finder { window, cmd } if cmd.is_modal() => {
             let hwnd = with_app(|app| app.finders.iter().find(|f| f.id == window).map(|f| f.hwnd)).flatten();
-            finder::run_modal(hwnd.unwrap_or_default(), cmd);
-            with_app(|app| app.finder_cmd(window, finder::FinderCmd::Reload));
+            let select = finder::run_modal(hwnd.unwrap_or_default(), cmd);
+            // Other windows may show the folders the operation touched.
+            with_app(|app| {
+                let ids: Vec<u32> = app.finders.iter().map(|f| f.id).filter(|&id| id != window).collect();
+                for id in ids {
+                    app.finder_cmd(id, finder::FinderCmd::Settle(Vec::new()));
+                }
+                app.finder_cmd(window, finder::FinderCmd::Settle(select));
+            });
         }
         Action::Finder { window, cmd } => {
             with_app(|app| app.finder_cmd(window, cmd));
@@ -327,7 +352,7 @@ fn execute(action: Action) {
         Action::CloseWindows(hwnds) => hwnds.into_iter().for_each(apps::close),
         Action::Reveal(path) => system::reveal(&path),
         Action::TrashFiles(paths) => {
-            finder::fs::trash(&paths, HWND::default());
+            finder::ops::delete(HWND::default(), &paths, true);
         }
         Action::TogglePin { path, name, pin } => {
             with_app(|app| app.toggle_pin(&path, &name, pin));
@@ -1675,7 +1700,9 @@ impl App {
     /// Re-indexes apps and the user's folders in the background.
     fn rebuild_index(&self) {
         let home = finder::fs::home();
-        let roots = finder::fs::favorites().into_iter().map(|p| p.path).filter(|p| *p != home).collect();
+        use finder::fs::PlaceKind;
+        let user = [PlaceKind::Desktop, PlaceKind::Documents, PlaceKind::Downloads, PlaceKind::Pictures, PlaceKind::Music, PlaceKind::Movies];
+        let roots = finder::fs::favorites(&[]).into_iter().filter(|p| user.contains(&p.kind) && p.path != home).map(|p| p.path).collect();
         spotlight::index::rebuild(self.index.clone(), roots, self.msg_hwnd.0 as isize, WM_APP_INDEX_READY);
     }
 
@@ -1909,29 +1936,64 @@ impl App {
     }
 
     fn finder_cmd(&mut self, id: u32, cmd: finder::FinderCmd) {
+        let mut events = Vec::new();
         if let Some(f) = self.finders.iter_mut().find(|f| f.id == id) {
             f.command(cmd, &mut self.kinds);
+            events = f.take_events();
+        }
+        for event in events {
+            self.finder_event(id, event);
         }
         self.save_finder_prefs();
         self.flush();
     }
 
-    /// Saves a Finder window's changed view / sort / hidden-files choice as the default for new windows.
+    /// Saves a Finder window's changed view settings as the default for new windows,
+    /// and its sidebar pins (shared by every window).
     fn save_finder_prefs(&mut self) {
-        use config::ConfigValue::{Bool, Str};
+        use config::ConfigValue::{Bool, Int, List, Str};
+        if let Some(i) = self.finders.iter().position(|f| f.pins_dirty) {
+            self.finders[i].pins_dirty = false;
+            let pins = self.finders[i].pins().to_vec();
+            for f in &mut self.finders {
+                f.set_pins(&pins);
+            }
+            self.cfg.finder.sidebar_pins = pins.clone();
+            let list = List(pins.iter().map(|p| p.display().to_string()).collect());
+            if let Err(e) = config::save_values(&self.cfg_path, "finder", &[("sidebar_pins", list)]) {
+                log!("could not save Finder sidebar: {e:#}");
+            }
+        }
         let Some(f) = self.finders.iter_mut().find(|f| f.prefs_dirty) else { return };
         f.prefs_dirty = false;
-        let (view, sort, ascending, show_hidden) = f.prefs();
+        let p = f.prefs();
         let c = &mut self.cfg.finder;
-        if (c.view, c.sort, c.ascending, c.show_hidden) == (view, sort, ascending, show_hidden) {
+        let old = finder::Prefs {
+            view: c.view,
+            sort: c.sort,
+            ascending: c.ascending,
+            show_hidden: c.show_hidden,
+            show_ext: c.show_extensions,
+            group: c.group,
+            columns: c.columns.clone(),
+            pane: c.pane,
+            icon_size: c.icon_size,
+        };
+        if old == p {
             return;
         }
-        (c.view, c.sort, c.ascending, c.show_hidden) = (view, sort, ascending, show_hidden);
+        (c.view, c.sort, c.ascending, c.show_hidden, c.show_extensions) = (p.view, p.sort, p.ascending, p.show_hidden, p.show_ext);
+        (c.group, c.columns, c.pane, c.icon_size) = (p.group, p.columns.clone(), p.pane, p.icon_size);
         let values = [
-            ("view", Str(view.name().into())),
-            ("sort", Str(sort.name().into())),
-            ("ascending", Bool(ascending)),
-            ("show_hidden", Bool(show_hidden)),
+            ("view", Str(p.view.name().into())),
+            ("sort", Str(p.sort.name().into())),
+            ("ascending", Bool(p.ascending)),
+            ("show_hidden", Bool(p.show_hidden)),
+            ("show_extensions", Bool(p.show_ext)),
+            ("group", Str(p.group.name().into())),
+            ("columns", List(p.columns.iter().map(|c| c.name().to_string()).collect())),
+            ("pane", Str(p.pane.name().into())),
+            ("icon_size", Int(p.icon_size.round() as i64)),
         ];
         if let Err(e) = config::save_values(&self.cfg_path, "finder", &values) {
             log!("could not save Finder settings: {e:#}");
@@ -1990,6 +2052,9 @@ impl App {
             }
             WM_ACTIVATE => {
                 f.focused = (wp.0 & 0xFFFF) != 0;
+                if f.focused {
+                    f.on_focus(&mut self.kinds);
+                }
                 f.dirty = true;
                 return None;
             }
@@ -2004,12 +2069,14 @@ impl App {
                 f.on_leave();
                 FinderEvent::None
             }
-            WM_LBUTTONDOWN => {
-                f.on_down(x, y, down(VK_CONTROL), down(VK_SHIFT), &mut self.kinds);
-                FinderEvent::None
-            }
+            WM_LBUTTONDOWN => f.on_down(x, y, down(VK_CONTROL), down(VK_SHIFT), &mut self.kinds),
             WM_LBUTTONUP => f.on_up(x, y, &mut self.kinds),
-            WM_RBUTTONUP => f.on_right_click(x, y, &mut self.kinds),
+            WM_RBUTTONUP => f.on_right_click(x, y, down(VK_SHIFT), &mut self.kinds),
+            // The mouse's back and forward buttons.
+            WM_XBUTTONUP => {
+                let back = ((wp.0 >> 16) & 0xFFFF) == 1;
+                f.on_key(if back { 0x25 } else { 0x27 }, false, false, true, &mut self.kinds)
+            }
             WM_MBUTTONUP => f.on_middle(x, y, &mut self.kinds),
             WM_MOUSEWHEEL => {
                 let mut rc = RECT::default();
@@ -2017,7 +2084,7 @@ impl App {
                     let _ = GetWindowRect(hwnd, &mut rc);
                 }
                 let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
-                f.on_wheel((sx - rc.left) as f32 / scale, ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                f.on_wheel((sx - rc.left) as f32 / scale, ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32, down(VK_CONTROL));
                 FinderEvent::None
             }
             // Alt+F4 keeps its default meaning (WM_CLOSE).
@@ -2027,7 +2094,7 @@ impl App {
             }
             WM_CHAR => {
                 if let Some(c) = char::from_u32(wp.0 as u32) {
-                    f.on_char(c);
+                    f.on_char(c, &mut self.kinds);
                 }
                 FinderEvent::None
             }
@@ -2036,15 +2103,23 @@ impl App {
             _ => return None,
         };
         let id = f.id;
-        match event {
-            FinderEvent::None => {}
-            FinderEvent::Close => self.close_finder(id),
-            FinderEvent::NewWindow => self.open_finder(None),
-            FinderEvent::Menu(entries, x, y) => self.open_menu(entries, Placement::Below { x, y }, MenuSource::Window),
-            FinderEvent::Run(cmd) => push(Action::Finder { window: id, cmd }),
+        let mut events = f.take_events();
+        events.insert(0, event);
+        for event in events {
+            self.finder_event(id, event);
         }
         self.save_finder_prefs();
         Some(LRESULT(0))
+    }
+
+    fn finder_event(&mut self, id: u32, event: FinderEvent) {
+        match event {
+            FinderEvent::None => {}
+            FinderEvent::Close => self.close_finder(id),
+            FinderEvent::NewWindow(path) => self.open_finder(path),
+            FinderEvent::Menu(entries, x, y) => self.open_menu(entries, Placement::Below { x, y }, MenuSource::Window),
+            FinderEvent::Run(cmd) => push(Action::Finder { window: id, cmd }),
+        }
     }
 
     // --- menus -------------------------------------------------------------
@@ -2403,6 +2478,13 @@ impl App {
                         if let Some(s) = &mut self.spotlight {
                             s.dirty = true;
                         }
+                    }
+                }
+                win::WM_APP_FINDER_ASYNC => {
+                    let id = wp.0 as u32;
+                    if let Some(f) = self.finders.iter_mut().find(|f| f.id == id) {
+                        f.poll_async(&mut self.kinds);
+                        self.animate();
                     }
                 }
                 WM_APP_FINDER_CHANGED => {

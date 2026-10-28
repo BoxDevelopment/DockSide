@@ -29,6 +29,7 @@ use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
 use crate::island::sources::VolumeKey;
+use crate::keybind;
 use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
 use crate::menubar::{Hit, MenuBar};
@@ -46,6 +47,7 @@ use crate::win::{
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
+    WM_APP_RECORD_KEY, WM_APP_SPOTLIGHT_TAP,
 };
 
 thread_local! {
@@ -86,6 +88,8 @@ const TIMER_APPBAR: usize = 10;
 const TIMER_TASKBAR: usize = 11;
 /// The foreground window moved or resized: check whether it now fills the screen.
 const TIMER_FULLSCREEN: usize = 12;
+/// The Spotlight key is Win and was tapped once: open Spotlight unless a second tap (Start) follows.
+const TIMER_SPOTLIGHT_TAP: usize = 13;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
 /// Messages handled slower than this are logged.
@@ -768,6 +772,8 @@ pub struct App {
     /// Finder windows whose folder changed on disk (reloaded on a short timer).
     finder_changed: Vec<u32>,
     spotlight: Option<Spotlight>,
+    /// Watches for the Spotlight key when it's a modifier tapped on its own.
+    spotlight_tap: Option<keybind::TapWatch>,
     /// Change Icon… for a Dock app.
     icon_picker: Option<IconPicker>,
     index: spotlight::index::Shared,
@@ -890,6 +896,7 @@ impl App {
             kinds: finder::fs::KindCache::default(),
             finder_changed: Vec::new(),
             spotlight: None,
+            spotlight_tap: None,
             icon_picker: None,
             index: Default::default(),
             hooks: Vec::new(),
@@ -1743,20 +1750,42 @@ impl App {
         self.mark_settings_dirty();
     }
 
+    /// Sets up the Spotlight shortcut: a registered hotkey for a combination,
+    /// or the tap hook for a lone modifier.
     fn register_hotkey(&mut self) {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
         unsafe {
             let _ = UnregisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT);
         }
-        if !self.cfg.spotlight.enabled {
+        self.spotlight_tap = None;
+        let spec = &self.cfg.spotlight.hotkey;
+        if !self.cfg.spotlight.enabled || spec.trim().is_empty() {
             return;
         }
-        let spec = &self.cfg.spotlight.hotkey;
-        let Some((mods, vk)) = win::parse_hotkey(spec) else {
-            return log!("spotlight hotkey '{spec}' isn't valid");
-        };
-        if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT, mods | MOD_NOREPEAT, vk) }.is_err() {
-            log!("spotlight hotkey '{spec}' is already used by another app");
+        match keybind::Hotkey::parse(spec) {
+            None => log!("spotlight hotkey '{spec}' isn't valid"),
+            Some(keybind::Hotkey::Tap(m)) => self.spotlight_tap = keybind::TapWatch::new(m, self.msg_hwnd.0 as isize, WM_APP_SPOTLIGHT_TAP),
+            Some(keybind::Hotkey::Combo { mods, vk }) => {
+                if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) }.is_err() {
+                    log!("spotlight hotkey '{spec}' is already used by another app");
+                }
+            }
+        }
+    }
+
+    /// The Spotlight modifier was tapped. Win waits a moment: a double tap opens Start instead.
+    fn on_spotlight_tap(&mut self, double: bool) {
+        if keybind::Hotkey::parse(&self.cfg.spotlight.hotkey) != Some(keybind::Hotkey::Tap(keybind::WIN)) {
+            return self.toggle_spotlight();
+        }
+        if double {
+            unsafe {
+                let _ = KillTimer(self.msg_hwnd, TIMER_SPOTLIGHT_TAP);
+            }
+            self.close_spotlight();
+            system::open_start();
+        } else {
+            self.timer(TIMER_SPOTLIGHT_TAP, keybind::DOUBLE_TAP_MS);
         }
     }
 
@@ -2400,6 +2429,7 @@ impl App {
                         TIMER_WALLPAPER => win::glass::wallpaper_changed(),
                         TIMER_APPBAR => self.on_appbar_change(),
                         TIMER_FULLSCREEN => self.update_fullscreen(),
+                        TIMER_SPOTLIGHT_TAP => self.toggle_spotlight(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
                         TIMER_THEME
@@ -2441,6 +2471,7 @@ impl App {
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
                 WM_HOTKEY if wp.0 as i32 == HOTKEY_SPOTLIGHT => self.toggle_spotlight(),
+                WM_APP_SPOTLIGHT_TAP => self.on_spotlight_tap(wp.0 == 2),
                 // The hooks' keys, delivered as hotkeys while an admin window has focus.
                 WM_HOTKEY => {
                     let id = wp.0 as i32;
@@ -2687,6 +2718,17 @@ impl App {
                     s.on_char(c);
                 }
             }
+            WM_APP_RECORD_KEY => {
+                if let SettingsEvent::Action(a) = s.on_record_key(wp.0, &self.cfg) {
+                    push(a);
+                }
+            }
+            WM_ACTIVATE => {
+                if wp.0 & 0xFFFF == 0 {
+                    s.on_deactivate();
+                }
+                return None;
+            }
             WM_CLOSE => self.close_settings(),
             WM_SIZE => {
                 s.on_size();
@@ -2738,6 +2780,13 @@ impl App {
                 o.on_up(x, y, &self.cfg)
             }
             WM_KEYDOWN => o.on_key(wp.0 as u16),
+            WM_APP_RECORD_KEY => o.on_record_key(wp.0, &self.cfg),
+            WM_ACTIVATE => {
+                if wp.0 & 0xFFFF == 0 {
+                    o.on_deactivate();
+                }
+                return None;
+            }
             WM_CLOSE => OnboardingEvent::Finish(None),
             WM_SIZE => {
                 o.on_size();

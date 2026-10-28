@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::geom::{Color, Rect};
 use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::Action;
-use crate::settings::{self, Anim, Hit, Key, Page, Row, RowCtx, SliderDrag, Style, ROW_H};
+use crate::settings::{self, Anim, Hit, Key, Page, Recording, Row, RowCtx, SliderDrag, Style, ROW_H};
 use crate::theme::Theme;
 use crate::win::{self, startup, Monitor};
 
@@ -167,7 +167,7 @@ fn rows(step: usize, cfg: &Config) -> Vec<Row> {
         8 => {
             let mut rows = vec![Row::Toggle("Spotlight search", Key::SpotlightEnabled)];
             if cfg.spotlight.enabled {
-                rows.push(Row::Segmented("Keyboard shortcut", Key::SpotlightHotkey));
+                rows.push(Row::Keybind("Keyboard shortcut", Key::SpotlightHotkey));
             }
             rows
         }
@@ -223,16 +223,18 @@ fn note(step: usize, cfg: &Config) -> String {
         6 => "These are Windows\u{2019} own virtual desktops: press Win+Ctrl+D to make a new one.".into(),
         7 => "Add more widgets in System Settings \u{203A} Widgets.".into(),
         8 if cfg.spotlight.enabled => {
-            let key = cfg.spotlight.hotkey.split('+').map(capitalize).collect::<Vec<_>>().join("+");
-            format!("Try it now: press {key}.")
+            // Spelled out: the keys as printed on the keyboard read better in a sentence.
+            match crate::keybind::Hotkey::parse(&cfg.spotlight.hotkey) {
+                Some(h @ crate::keybind::Hotkey::Tap(m)) if m == crate::keybind::WIN => {
+                    format!("Try it now: tap {}. Double-tap it for the Start menu.", h.label(false))
+                }
+                Some(h @ crate::keybind::Hotkey::Tap(_)) => format!("Try it now: tap {}.", h.label(false)),
+                Some(h) => format!("Try it now: press {}.", h.label(false)),
+                None => "Click the shortcut to choose one.".into(),
+            }
         }
         _ => String::new(),
     }
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.trim().chars();
-    c.next().map_or_else(String::new, |f| f.to_uppercase().chain(c).collect())
 }
 
 /// Clickable parts of the window.
@@ -268,6 +270,8 @@ pub struct Onboarding {
     slider: Option<SliderDrag>,
     /// Slider value just released, shown until the config reload catches up.
     pending: Option<(Key, f32)>,
+    /// The Spotlight shortcut row capturing keys.
+    recording: Option<Recording>,
     login: bool,
     fonts: Vec<String>,
     shown: bool,
@@ -303,6 +307,7 @@ impl Onboarding {
             pressed: None,
             slider: None,
             pending: None,
+            recording: None,
             login: startup::is_enabled(),
             fonts: settings::installed_fonts(gfx),
             shown: false,
@@ -387,6 +392,26 @@ impl Onboarding {
         OnboardingEvent::None
     }
 
+    /// A key captured while the shortcut row is recording.
+    pub fn on_record_key(&mut self, wp: usize, cfg: &Config) -> OnboardingEvent {
+        let Some(r) = &mut self.recording else { return OnboardingEvent::None };
+        self.dirty = true;
+        match r.on_key(wp, cfg) {
+            None => OnboardingEvent::None,
+            Some(action) => {
+                self.recording = None;
+                action.map_or(OnboardingEvent::None, OnboardingEvent::Action)
+            }
+        }
+    }
+
+    /// The window lost focus: stop taking the keyboard.
+    pub fn on_deactivate(&mut self) {
+        if self.recording.take().is_some() {
+            self.dirty = true;
+        }
+    }
+
     pub fn on_key(&mut self, vk: u16) -> OnboardingEvent {
         const ENTER: u16 = 0x0D;
         const ESC: u16 = 0x1B;
@@ -444,8 +469,16 @@ impl Onboarding {
             self.pending = Some(pending);
             return OnboardingEvent::Action(action);
         }
+        // Any click stops recording; clicking the recording row again only stops it.
+        let was_recording = self.recording.take().map(|r| r.key());
         let Some(target) = self.hit_at(x, y).filter(|t| Some(*t) == pressed) else { return OnboardingEvent::None };
         match target {
+            Target::Control(Hit::Keybind(key)) => {
+                if was_recording != Some(key) {
+                    self.recording = Recording::start(self.hwnd, key);
+                }
+                OnboardingEvent::None
+            }
             Target::Close | Target::Skip => OnboardingEvent::Finish(None),
             Target::Minimize => {
                 self.window.minimize();
@@ -487,6 +520,7 @@ impl Onboarding {
             pressed: self.pressed,
             slider: self.slider,
             pending: self.pending,
+            recording: self.recording.as_ref(),
             login: self.login,
             fonts: &self.fonts,
             motion: Some(&self.motion),
@@ -531,6 +565,7 @@ struct Frame<'a> {
     pressed: Option<Target>,
     slider: Option<SliderDrag>,
     pending: Option<(Key, f32)>,
+    recording: Option<&'a Recording>,
     login: bool,
     fonts: &'a [String],
     motion: Option<&'a Motion<Anim>>,
@@ -572,6 +607,7 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             fonts: f.fonts,
             bitmaps: None,
             editing: None,
+            recording: f.recording,
             motion: f.motion,
         };
         let mut hits: Vec<(Rect, Target)> = Vec::new();
@@ -880,6 +916,7 @@ mod tests {
                     pressed: None,
                     slider: None,
                     pending: None,
+                    recording: None,
                     login: false,
                     fonts: &fonts,
                     motion: None,
@@ -938,5 +975,7 @@ mod tests {
         let mut cfg = crate::config::defaults();
         cfg.spotlight.hotkey = "ctrl+alt+space".into();
         assert_eq!(note(8, &cfg), "Try it now: press Ctrl+Alt+Space.");
+        cfg.spotlight.hotkey = "win".into();
+        assert_eq!(note(8, &cfg), "Try it now: tap Win. Double-tap it for the Start menu.");
     }
 }

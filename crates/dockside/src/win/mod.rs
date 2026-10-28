@@ -182,45 +182,9 @@ pub const WM_APP_CLOSE_PICKER: u32 = WM_APP + 23;
 pub const WM_APP_ADMIN_TASK: u32 = WM_APP + 24;
 /// A Finder window's background listing or search has results (`wParam`: window id).
 pub const WM_APP_FINDER_ASYNC: u32 = WM_APP + 25;
+/// A key the Settings shortcut recorder captured (wParam: virtual key, plus 1 << 16 for a press).
+pub const WM_APP_RECORD_KEY: u32 = WM_APP + 26;
+/// The Spotlight modifier was tapped on its own (wParam 2: the second tap of a double tap).
+pub const WM_APP_SPOTLIGHT_TAP: u32 = WM_APP + 27;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;
-
-/// Parses "alt+space", "ctrl+shift+k", "win+f1", ... into RegisterHotKey arguments.
-pub fn parse_hotkey(spec: &str) -> Option<(windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS, u32)> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::*;
-    let mut mods = HOT_KEY_MODIFIERS(0);
-    let mut key = None;
-    for part in spec.to_lowercase().split('+').map(str::trim) {
-        match part {
-            "ctrl" | "control" => mods |= MOD_CONTROL,
-            "alt" => mods |= MOD_ALT,
-            "shift" => mods |= MOD_SHIFT,
-            "win" | "super" | "cmd" => mods |= MOD_WIN,
-            "space" => key = Some(0x20),
-            "enter" | "return" => key = Some(0x0D),
-            "tab" => key = Some(0x09),
-            p if p.len() == 1 && p.chars().all(|c| c.is_ascii_alphanumeric()) => {
-                key = Some(p.to_ascii_uppercase().as_bytes()[0] as u32)
-            }
-            p if p.starts_with('f') && p[1..].parse::<u32>().is_ok_and(|n| (1..=24).contains(&n)) => {
-                key = Some(0x70 + p[1..].parse::<u32>().unwrap() - 1)
-            }
-            _ => return None,
-        }
-    }
-    key.map(|k| (mods, k))
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn hotkeys() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::*;
-        assert_eq!(super::parse_hotkey("alt+space"), Some((MOD_ALT, 0x20)));
-        assert_eq!(super::parse_hotkey("Ctrl+Alt+Space"), Some((MOD_CONTROL | MOD_ALT, 0x20)));
-        assert_eq!(super::parse_hotkey("win+f1"), Some((MOD_WIN, 0x70)));
-        assert_eq!(super::parse_hotkey("ctrl+k"), Some((MOD_CONTROL, b'K' as u32)));
-        assert_eq!(super::parse_hotkey("alt+banana"), None);
-        assert_eq!(super::parse_hotkey("alt"), None);
-    }
-}

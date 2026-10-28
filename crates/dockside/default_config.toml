@@ -141,7 +141,9 @@ match = "SystemSettings.exe"
 
 [spotlight]
 enabled = true
-# Global shortcut: "alt+space", "ctrl+space" or "ctrl+alt+space" (any of ctrl/alt/shift/win + a key).
+# Global shortcut: any of ctrl/alt/shift/win + a key ("alt+space", "ctrl+shift+k", "win+f1"),
+# or one of those modifiers tapped on its own ("win", "ctrl"). With "win", double-tap Win for Start.
+# Set it in System Settings > General by clicking the shortcut and pressing the keys.
 hotkey = "alt+space"
 # Engine for "Search the web" results: "google", "bing", "duckduckgo", "kagi", "brave" or "custom".
 search_engine = "google"

@@ -19,6 +19,7 @@ use crate::config::{AnimSpeed, Appearance, Backdrop, Config, ConfigValue, IconSt
 use crate::dock::START_PATH;
 use crate::finder::text::TextField;
 use crate::finder::FINDER_PATH;
+use crate::keybind;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
 use crate::gfx::{finder_icon, start_icon, Align, Canvas, Gfx, Painter, Weight};
@@ -260,6 +261,7 @@ pub(crate) enum Hit {
     OpenLog,
     OpenUpdate,
     Field(Key),
+    Keybind(Key),
     ConnectClaude(bool),
     AddWidget(crate::config::WidgetKind),
     ResetWidgets,
@@ -295,6 +297,8 @@ pub(crate) enum Row {
     Info(&'static str, String),
     /// Label, key, placeholder.
     Text(&'static str, Key, &'static str),
+    /// A keyboard shortcut: click, then press the keys.
+    Keybind(&'static str, Key),
 }
 
 struct Group {
@@ -314,6 +318,41 @@ pub(crate) struct Editing {
     field: TextField,
     /// Last commit was rejected (shown with a red outline).
     invalid: bool,
+}
+
+/// A shortcut row capturing keys (see [`keybind::Recorder`]).
+pub(crate) struct Recording {
+    key: Key,
+    rec: keybind::Recorder,
+}
+
+impl Recording {
+    /// Starts capturing the keyboard for `key`; keys arrive at `hwnd` as `WM_APP_RECORD_KEY`.
+    pub(crate) fn start(hwnd: HWND, key: Key) -> Option<Recording> {
+        keybind::Recorder::start(hwnd, win::WM_APP_RECORD_KEY).map(|rec| Recording { key, rec })
+    }
+
+    pub(crate) fn key(&self) -> Key {
+        self.key
+    }
+
+    /// A captured key. When recording is over: `Some`, with the action saving
+    /// the new shortcut (`None` when cancelled or unchanged).
+    pub(crate) fn on_key(&mut self, wp: usize, cfg: &Config) -> Option<Option<Action>> {
+        let current = keybind_value(self.key, cfg);
+        Some(match self.rec.on_key(wp, &current)? {
+            keybind::Recorded::Set(spec) if spec != current => Some(self.key.set(ConfigValue::Str(spec))),
+            _ => None,
+        })
+    }
+}
+
+/// A shortcut setting's config value.
+fn keybind_value(key: Key, cfg: &Config) -> String {
+    match key {
+        Key::SpotlightHotkey => cfg.spotlight.hotkey.trim().to_lowercase(),
+        _ => String::new(),
+    }
 }
 
 /// Slider knob radius; the knob travels inside the track so it never
@@ -424,6 +463,7 @@ pub(crate) struct RowCtx<'a> {
     /// Pinned-app icons (Dock page only).
     pub bitmaps: Option<&'a HashMap<String, Option<ID2D1Bitmap>>>,
     pub editing: Option<&'a Editing>,
+    pub recording: Option<&'a Recording>,
     /// The window's springs; without them controls jump straight to their state.
     pub motion: Option<&'a Motion<Anim>>,
 }
@@ -499,6 +539,7 @@ pub struct SettingsWindow {
     /// knob doesn't flick back to the old value.
     pending: Option<(Key, f32)>,
     editing: Option<Editing>,
+    recording: Option<Recording>,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     login: bool,
     /// "Run as administrator" is on (its scheduled task exists).
@@ -548,6 +589,7 @@ impl SettingsWindow {
             slider: None,
             pending: None,
             editing: None,
+            recording: None,
             bitmaps: HashMap::new(),
             login: startup::is_enabled(),
             admin: win::elevation::task_enabled(),
@@ -678,9 +720,12 @@ impl SettingsWindow {
                     rows: {
                         let mut rows = vec![
                             Row::Toggle("Spotlight search", Key::SpotlightEnabled),
-                            Row::Segmented("Keyboard shortcut", Key::SpotlightHotkey),
-                            Row::Segmented("Web search", Key::SearchEngine),
+                            Row::Keybind("Keyboard shortcut", Key::SpotlightHotkey),
                         ];
+                        if keybind::Hotkey::parse(&cfg.spotlight.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN)) {
+                            rows.push(Row::Info("Start menu", "Double-tap Win".to_string()));
+                        }
+                        rows.push(Row::Segmented("Web search", Key::SearchEngine));
                         if cfg.spotlight.search_engine.eq_ignore_ascii_case("custom") {
                             rows.push(Row::Text("Search URL", Key::CustomSearchUrl, "https://example.com/search?q=%s"));
                         }
@@ -1060,12 +1105,6 @@ impl SettingsWindow {
                 fixed(&[("Apple", "apple"), ("Windows", "windows")], sel)
             }
             Key::MbClock => fixed(&CLOCKS, CLOCKS.iter().position(|c| c.1 == cfg.menubar.clock_format)),
-            Key::SpotlightHotkey => {
-                const KEYS: [(&str, &str); 3] =
-                    [("Alt+Space", "alt+space"), ("Ctrl+Space", "ctrl+space"), ("Ctrl+Alt+Space", "ctrl+alt+space")];
-                let current = cfg.spotlight.hotkey.to_lowercase().replace(' ', "");
-                fixed(&KEYS, KEYS.iter().position(|k| k.1 == current))
-            }
             Key::SearchEngine => {
                 let mut labels: Vec<String> = web::ENGINES.iter().map(|e| e.1.to_string()).collect();
                 let mut values: Vec<String> = web::ENGINES.iter().map(|e| e.0.to_string()).collect();
@@ -1157,6 +1196,9 @@ impl SettingsWindow {
     pub fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool, cfg: &Config) -> SettingsEvent {
         const ENTER: u16 = 0x0D;
         const ESC: u16 = 0x1B;
+        if self.recording.is_some() {
+            return SettingsEvent::None;
+        }
         let Some(ed) = &mut self.editing else {
             return if vk == ESC { SettingsEvent::Close } else { SettingsEvent::None };
         };
@@ -1173,6 +1215,26 @@ impl SettingsWindow {
                 }
                 SettingsEvent::None
             }
+        }
+    }
+
+    /// A key captured while a shortcut row is recording.
+    pub fn on_record_key(&mut self, wp: usize, cfg: &Config) -> SettingsEvent {
+        let Some(r) = &mut self.recording else { return SettingsEvent::None };
+        self.dirty = true;
+        match r.on_key(wp, cfg) {
+            None => SettingsEvent::None,
+            Some(action) => {
+                self.recording = None;
+                action.map_or(SettingsEvent::None, SettingsEvent::Action)
+            }
+        }
+    }
+
+    /// The window lost focus: stop taking the keyboard.
+    pub fn on_deactivate(&mut self) {
+        if self.recording.take().is_some() {
+            self.dirty = true;
         }
     }
 
@@ -1255,8 +1317,16 @@ impl SettingsWindow {
                 return self.commit(cfg);
             }
         }
+        // Any click stops recording; clicking the recording row again only stops it.
+        let was_recording = self.recording.take().map(|r| r.key);
         let Some(hit) = hit else { return SettingsEvent::None };
         let action = match hit {
+            Hit::Keybind(key) => {
+                if was_recording != Some(key) {
+                    self.recording = Recording::start(self.hwnd, key);
+                }
+                return SettingsEvent::None;
+            }
             Hit::Field(key) => {
                 if self.editing.is_none() {
                     let mut field = TextField::new(&Self::text_value(key, cfg));
@@ -1382,6 +1452,7 @@ impl SettingsWindow {
             fonts: &self.fonts,
             bitmaps: Some(&self.bitmaps),
             editing: self.editing.as_ref(),
+            recording: self.recording.as_ref(),
             motion: Some(motion),
         };
 
@@ -1637,6 +1708,40 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 }
             }
             hits.push((f, Hit::Field(*key)));
+        }
+        Row::Keybind(label, key) => {
+            p.text(label, &regular, label_r, theme.text);
+            let mac = cfg.general.shortcut_style == ShortcutStyle::Mac;
+            let f = Rect::new(right_edge - 160.0, r.cy() - 12.0, 160.0, 24.0);
+            let rec = ctx.recording.filter(|rc| rc.key == *key);
+            let warn = Color::rgba(255, 69, 58, 1.0);
+            let hot = ctx.hover_t(Hit::Keybind(*key));
+            p.fill_round(f, 6.0, if rec.is_some() { field_bg } else { control_bg.mix(selected_seg, hot * 0.5) });
+            let ring = match rec {
+                Some(rc) if rc.rec.warning.is_some() => warn,
+                Some(_) => theme.accent,
+                None => card_border,
+            };
+            p.stroke_round(f.inset(0.5, 0.5), 6.0, ring, if rec.is_some() { 2.0 } else { 1.0 });
+            let (text, color) = match rec {
+                Some(rc) => match rc.rec.preview(mac) {
+                    Some(t) => (t, theme.text),
+                    None => ("Type a shortcut\u{2026}".to_string(), theme.text_disabled),
+                },
+                None => match keybind::Hotkey::parse(&keybind_value(*key, cfg)) {
+                    Some(h) => (h.label(mac), theme.text),
+                    None => ("None".to_string(), theme.text_disabled),
+                },
+            };
+            p.text(&text, &button_font, f, color);
+            // Left of the field: why a combination wasn't taken, or how to use the recorder.
+            let note = Rect::new(r.x + 130.0, r.y, f.x - 10.0 - (r.x + 130.0), r.h);
+            match rec.map(|rc| rc.rec.warning) {
+                Some(Some(w)) => p.text(w, &right, note, warn),
+                Some(None) => p.text("Esc cancels, Backspace clears", &right, note, theme.text_secondary),
+                None => {}
+            }
+            hits.push((f, Hit::Keybind(*key)));
         }
         Row::Info(label, value) => {
             p.text(label, &regular, label_r, theme.text);

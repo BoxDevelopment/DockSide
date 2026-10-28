@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use windows::core::Result;
 use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
-use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, SetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 use self::index::{Index, Item, Kind};
 use crate::anim::Glide;
@@ -222,11 +222,10 @@ impl Spotlight {
         })
     }
 
-    /// Gives the panel keyboard focus (allowed: we're handling a hotkey or click).
+    /// Gives the panel keyboard focus. A hotkey or click allows that; a tapped
+    /// modifier (seen only by our hook) may not, so fall back to borrowing focus.
     pub fn focus(&self) {
-        unsafe {
-            let _ = SetForegroundWindow(self.surface.content);
-        }
+        crate::win::apps::activate(self.surface.content);
     }
 
     fn query(&self) -> String {

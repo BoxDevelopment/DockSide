@@ -30,6 +30,10 @@ pub enum Signal {
     DownloadGone(PathBuf),
     Bluetooth { name: String, connected: bool, battery: Option<u8> },
     Notification(Note),
+    /// What was already in the notification center when watching began (newest first).
+    NoteHistory(Vec<Note>),
+    /// Notifications cleared from the notification center.
+    NotesGone(Vec<u32>),
     Calendar(Vec<CalEvent>),
 }
 

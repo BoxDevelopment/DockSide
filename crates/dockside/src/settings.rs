@@ -80,6 +80,7 @@ fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
         "downloads" => c.downloads,
         "calendar" => c.calendar,
         "claude_code" => c.claude_code,
+        "live_activities" => c.live_activities,
         "shelf" => c.shelf,
         "shelf_clear_on_start" => c.shelf_clear_on_start,
         "volume" => c.volume,
@@ -267,6 +268,9 @@ pub(crate) enum Hit {
     ResetWidgets,
     Onboarding,
     RunAsAdmin,
+    NotificationSettings,
+    LiveDemo,
+    LiveDocs,
 }
 
 /// Springs behind the controls: hover fades, switch knobs, segment pills.
@@ -299,6 +303,26 @@ pub(crate) enum Row {
     Text(&'static str, Key, &'static str),
     /// A keyboard shortcut: click, then press the keys.
     Keybind(&'static str, Key),
+    /// A few lines of explanation (taller than other rows).
+    Note(&'static str),
+}
+
+/// A note row fits three lines of 12 pt text.
+const NOTE_H: f32 = 64.0;
+
+impl Row {
+    pub(crate) fn height(&self) -> f32 {
+        if matches!(self, Row::Note(_)) {
+            NOTE_H
+        } else {
+            ROW_H
+        }
+    }
+}
+
+/// The height of a card holding `rows`.
+pub(crate) fn rows_height(rows: &[Row]) -> f32 {
+    rows.iter().map(Row::height).sum()
 }
 
 struct Group {
@@ -485,12 +509,14 @@ pub(crate) fn draw_card(p: &Painter, card: Rect, rows: &[Row], ctx: &RowCtx, hit
     let s = ctx.style;
     p.fill_round(card, 10.0, s.card_bg);
     p.stroke_round(card.inset(0.25, 0.25), 10.0, s.card_border, 0.5);
+    let mut y = card.y;
     for (i, row) in rows.iter().enumerate() {
-        let r = Rect::new(card.x, card.y + i as f32 * ROW_H, card.w, ROW_H);
+        let r = Rect::new(card.x, y, card.w, row.height());
         if i > 0 {
             p.line(r.x + 14.0, r.y, r.right() - 14.0, r.y, s.card_border, 1.0);
         }
         draw_row(p, row, r, ctx, hits);
+        y += r.h;
     }
 }
 
@@ -816,6 +842,7 @@ impl SettingsWindow {
                         Row::Toggle("Upcoming meetings", Key::Island("calendar")),
                         Row::Text("Calendar link", Key::IslandIcs, "https://…/basic.ics or webcal://…"),
                         Row::Toggle("Claude Code", Key::Island("claude_code")),
+                        Row::Toggle("Live Activities from apps", Key::Island("live_activities")),
                         Row::Toggle("File shelf", Key::Island("shelf")),
                     ]
                     .into_iter()
@@ -847,6 +874,40 @@ impl SettingsWindow {
                         Row::Toggle("Screenshots", Key::Island("screenshots")),
                         Row::Toggle("Finished downloads", Key::Island("download_alerts")),
                         Row::Toggle("Desktop switches", Key::DesktopsIsland),
+                    ],
+                },
+                Group {
+                    title: Some("Notifications"),
+                    rows: vec![
+                        Row::Info(
+                            "Windows notifications",
+                            if crate::island::notifications::windows_enabled() {
+                                "On".to_string()
+                            } else {
+                                "Off: the island can\u{2019}t see any".to_string()
+                            },
+                        ),
+                        Row::Note(
+                            "The island shows what Windows keeps in its notification list, so Windows\u{2019} \
+                             Notifications switch must be on. To hide Windows\u{2019} own banners, turn on \
+                             Do not disturb: the island still shows everything.",
+                        ),
+                        Row::Note(
+                            "Page right from the home panel, or right-click the island, for recent notifications \
+                             by app. Click one to open it; \u{D7} or swipe sideways to dismiss it here and in Windows.",
+                        ),
+                        Row::Buttons("", vec![("Open Notification Settings\u{2026}", Hit::NotificationSettings)]),
+                    ],
+                },
+                Group {
+                    title: Some("Live Activities"),
+                    rows: vec![
+                        Row::Note(
+                            "Apps and scripts can show progress, timers and status here. From a terminal: \
+                             dockside activity start build --title Build --progress 40%, then update build \u{2026} \
+                             and end build.",
+                        ),
+                        Row::Buttons("", vec![("Learn More\u{2026}", Hit::LiveDocs), ("Try It", Hit::LiveDemo)]),
                     ],
                 },
                 Group {
@@ -1365,6 +1426,9 @@ impl SettingsWindow {
                 crate::update::available().map_or_else(|| crate::update::REPO_URL.to_string() + "/releases", |r| r.url),
             ),
             Hit::OpenLog => Action::Open(crate::config::dir().join("dockside.log").display().to_string()),
+            Hit::NotificationSettings => Action::Open("ms-settings:notifications".into()),
+            Hit::LiveDemo => Action::Island(crate::island::IslandCmd::LiveDemo),
+            Hit::LiveDocs => Action::Open(format!("{}#live-activities", crate::update::REPO_URL)),
             Hit::ConnectClaude(on) => Action::ConnectClaude(on),
             Hit::AddWidget(kind) => Action::Widget(crate::widgets::WidgetCmd::Add(kind)),
             Hit::ResetWidgets => Action::Widget(crate::widgets::WidgetCmd::Reset),
@@ -1412,7 +1476,7 @@ impl SettingsWindow {
         // Measure content height for scrolling.
         let content_h: f32 = groups
             .iter()
-            .map(|g| if g.title.is_some() { 26.0 } else { 0.0 } + g.rows.len() as f32 * ROW_H + 20.0)
+            .map(|g| if g.title.is_some() { 26.0 } else { 0.0 } + rows_height(&g.rows) + 20.0)
             .sum::<f32>()
             + 8.0;
         self.max_scroll = (content_h - viewport.h).max(0.0);
@@ -1503,7 +1567,7 @@ impl SettingsWindow {
                             p.text(t, &header_font, Rect::new(content_x + 4.0, y, content_w, 26.0), theme.text_secondary);
                             y += 26.0;
                         }
-                        let card = Rect::new(content_x, y, content_w, group.rows.len() as f32 * ROW_H);
+                        let card = Rect::new(content_x, y, content_w, rows_height(&group.rows));
                         draw_card(p, card, &group.rows, &ctx, &mut hits);
                         y += card.h + 20.0;
                     }
@@ -1747,6 +1811,10 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
             p.text(label, &regular, label_r, theme.text);
             let vr = Rect::new(r.x + r.w * 0.3, r.y, r.w * 0.7 - 14.0, r.h);
             p.text(value, &right, vr, theme.text_secondary);
+        }
+        Row::Note(text) => {
+            let block = p.gfx.format_block(&theme.font, 12.0, Weight::Regular, Align::Leading);
+            p.text(text, &block, Rect::new(r.x + 14.0, r.y + 8.0, r.w - 28.0, r.h - 16.0), theme.text_secondary);
         }
     }
 }

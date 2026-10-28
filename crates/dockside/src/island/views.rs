@@ -12,9 +12,11 @@ use super::calendar::CalEvent;
 use super::claude::{Session, State};
 use super::glyphs as g;
 use super::holding::{self, Item};
+use super::live::{Activity, Live};
 use super::media::NowPlaying;
+use super::notifications::{self, Note};
 use super::timer::Clock;
-use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, Persist, BLUE, CLAUDE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
+use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, NoteRow, Persist, BLUE, CLAUDE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 
@@ -57,6 +59,15 @@ pub struct View<'a> {
     pub time: f32,
     pub claude: Option<&'a Session>,
     pub claude_more: usize,
+    pub live: &'a Live,
+    pub live_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
+    pub notes: &'a [Note],
+    pub note_icons: &'a HashMap<u64, ID2D1Bitmap>,
+    pub note_rows: &'a [NoteRow],
+    /// One app's stack is opened out.
+    pub note_open: bool,
+    /// A row being swiped away: (row, start, offset).
+    pub note_drag: Option<(usize, f32, f32)>,
 }
 
 /// The spark turns while Claude works and holds still while it waits on you.
@@ -120,6 +131,15 @@ pub fn compact(p: &Painter, r: Rect, which: Persist, v: &View, a: f32, hits: &mu
             p.text(&s.status(), &v.fonts.alert, Rect::new(inner.x, r.y, r.w - (inner.x - r.x) - tw - h * 0.5, h), color.alpha(a));
             p.text_tabular(&time, &v.fonts.small_r, Rect::new(r.x, r.y, r.w - h * 0.5 - 2.0, h), SECONDARY.alpha(a));
         }
+        Persist::Live(k) => {
+            let Some(act) = v.live.get(k) else { return };
+            live_icon(p, act, v, icon_cx, r.cy(), h * 0.7, a);
+            let trail = act.trailing();
+            let tw = if trail.is_empty() { 0.0 } else { p.gfx.measure(&trail, &v.fonts.alert_b) + 8.0 };
+            p.text(&act.title, &v.fonts.alert, Rect::new(inner.x, r.y, r.w - (inner.x - r.x) - tw - h * 0.5, h), WHITE.alpha(a));
+            let color = act.color.unwrap_or(v.accent);
+            p.text_tabular(&trail, &v.fonts.alert_b, Rect::new(r.x, r.y, r.w - h * 0.5 - 2.0, h), color.alpha(a));
+        }
         Persist::Shelf => {
             g::tray(p, icon_cx, r.cy(), h * 0.68, WHITE.alpha(a));
             let n = v.shelf.len();
@@ -160,6 +180,24 @@ pub fn bubble(p: &Painter, c: Rect, which: Persist, v: &View, a: f32) {
         Persist::Calendar => g::calendar(p, cx, cy, d * 0.6, WHITE.alpha(a), RED.alpha(a)),
         Persist::Shelf => g::tray(p, cx, cy, d * 0.6, WHITE.alpha(a)),
         Persist::Claude => g::spark(p, cx, cy, d * 0.62, spark_angle(v), CLAUDE.alpha(a)),
+        Persist::Live(k) => {
+            if let Some(act) = v.live.get(k) {
+                live_icon(p, act, v, cx, cy, d * 0.62, a);
+            }
+        }
+    }
+}
+
+/// A Live Activity's mark: its icon, else a ring filling with its progress, else a dot in its color.
+fn live_icon(p: &Painter, act: &Activity, v: &View, cx: f32, cy: f32, s: f32, a: f32) {
+    let color = act.color.unwrap_or(v.accent);
+    match (act.icon.as_ref().and_then(|i| v.live_icons.get(i)), act.progress) {
+        (Some(img), _) => p.bitmap_round(img, Rect::new(cx - s / 2.0, cy - s / 2.0, s, s), s * 0.24, a),
+        (None, Some(f)) => g::timer(p, cx, cy, s * 0.9, f, color.alpha(a)),
+        (None, None) => {
+            p.fill_circle(cx, cy, s * 0.36, color.alpha(a));
+            p.fill_circle(cx, cy, s * 0.13, WHITE.alpha(a));
+        }
     }
 }
 
@@ -337,6 +375,14 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             if !n.body.is_empty() {
                 p.text(&n.body, &f.alert, Rect::new(tx, cy + 7.0, tw, 18.0), Color::gray(255, 0.75 * a));
             }
+            hits.push((r, Hit::AlertBody));
+        }
+        Alert::LiveDone { title, message, color } => {
+            let c = color.unwrap_or(GREEN);
+            g::check(p, icon_cx, cy, h * 0.6, c.alpha(a));
+            let mw = p.gfx.measure(message, &f.alert_b) + 8.0;
+            p.text(title, &f.alert, Rect::new(text_x, r.y, r.w - (text_x - r.x) - mw - right_inset, r.h), WHITE.alpha(a));
+            p.text(message, &f.alert_b, Rect::new(r.x, r.y, r.w - right_inset, r.h), c.alpha(a));
             hits.push((r, Hit::AlertBody));
         }
         Alert::ClaudeDone { project, secs, tools } => {
@@ -608,6 +654,105 @@ pub fn claude_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         }
     } else {
         p.fill_round(bar, 2.0, ORANGE.alpha(0.6 * a));
+    }
+}
+
+/// An expanded Live Activity: its icon, title and subtitle, the time or value,
+/// and a progress bar. Clicking the top opens what it links to.
+pub fn live_panel(p: &Painter, r: Rect, key: u32, v: &View, a: f32, hits: &mut Hits) {
+    let Some(act) = v.live.get(key) else { return };
+    let f = v.fonts;
+    let color = act.color.unwrap_or(v.accent);
+    live_icon(p, act, v, r.x + 40.0, r.y + 38.0, 40.0, a);
+    let trail = act.trailing();
+    let tw = if trail.is_empty() { 0.0 } else { p.gfx.measure(&trail, &f.title) + 12.0 };
+    let tx = r.x + 72.0;
+    let text_w = r.right() - 22.0 - tw - tx;
+    p.text(&act.title, &f.title, Rect::new(tx, r.y + 18.0, text_w, 22.0), WHITE.alpha(a));
+    if !act.subtitle.is_empty() {
+        p.text(&act.subtitle, &f.body, Rect::new(tx, r.y + 40.0, text_w, 18.0), SECONDARY.alpha(a));
+    }
+    if !trail.is_empty() {
+        p.text_tabular(&trail, &f.alert_b, Rect::new(r.x, r.y + 18.0, r.w - 22.0, 22.0), color.alpha(a));
+    }
+    if let Some(frac) = act.progress {
+        let bar = Rect::new(r.x + 22.0, r.bottom() - 30.0, r.w - 44.0, 6.0);
+        p.fill_round(bar, 3.0, Color::gray(255, 0.14 * a));
+        if frac > 0.0 {
+            p.fill_round(Rect::new(bar.x, bar.y, (bar.w * frac).max(bar.h), bar.h), 3.0, color.alpha(a));
+        }
+    }
+    if act.open.is_some() {
+        hits.push((Rect::new(r.x, r.y, r.w, 64.0), Hit::LiveOpen(key)));
+    }
+}
+
+/// The notification stack: a row per app (its notes stacked behind the newest),
+/// or one app's notes opened out. Click to open, × or swipe sideways to dismiss.
+pub fn notes_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let f = v.fonts;
+    let more = v.note_rows.len().saturating_sub(super::NOTE_ROWS);
+    p.text("Notifications", &f.header, Rect::new(r.x + 22.0, r.y + 14.0, 120.0, 18.0), WHITE.alpha(a));
+    if more > 0 {
+        p.text(&format!("+{more} more"), &f.small_l, Rect::new(r.x + 122.0, r.y + 15.0, 100.0, 16.0), SECONDARY.alpha(a));
+    }
+    let (label, hit) = if v.note_open { ("Show Less", Hit::NotesBack) } else { ("Clear All", Hit::NotesClear) };
+    let b = Rect::new(r.right() - 20.0 - 78.0, r.y + 12.0, 78.0, 22.0);
+    let (hot, pressed) = button_state(v, hit, true);
+    p.fill_round(b, 11.0, Color::gray(255, if pressed { 0.26 } else if hot { 0.2 } else { 0.12 } * a));
+    p.text(label, &f.small_c, b, WHITE.alpha(a));
+    hits.push((b, hit));
+
+    let now = SystemTime::now();
+    for (i, row) in v.note_rows.iter().take(super::NOTE_ROWS).enumerate() {
+        let Some(n) = v.notes.get(row.note()) else { continue };
+        let dx = v.note_drag.filter(|d| d.0 == i).map_or(0.0, |d| d.2);
+        let ra = a * (1.0 - (dx.abs() / (super::NOTE_SWIPE * 1.8)).min(0.85));
+        let y = r.y + 46.0 + i as f32 * super::NOTE_ROW_H;
+        let card = Rect::new(r.x + 12.0 + dx, y, r.w - 24.0, super::NOTE_ROW_H - 6.0);
+        let count = match row {
+            NoteRow::Stack { count, .. } => *count,
+            NoteRow::One(_) => 1,
+        };
+        // More from the same app peek out underneath.
+        if count > 1 {
+            p.fill_round(Rect::new(card.x + 10.0, card.y + 5.0, card.w - 20.0, card.h), 12.0, Color::gray(255, 0.05 * ra));
+        }
+        let hot = v.hot == Some(Hit::NoteRow(i)) || v.hot == Some(Hit::NoteClose(i));
+        p.fill_round(card, 12.0, Color::rgba(38, 38, 40, ra));
+        if hot {
+            p.fill_round(card, 12.0, Color::gray(255, 0.05 * ra));
+        }
+        let icon = Rect::new(card.x + 10.0, card.cy() - 15.0, 30.0, 30.0);
+        match n.icon.as_ref().and_then(|i| v.note_icons.get(&i.id)) {
+            Some(img) => p.bitmap_round(img, icon, 7.0, ra),
+            None => {
+                p.fill_round(icon, 7.0, Color::gray(255, 0.14 * ra));
+                g::bell(p, icon.cx(), icon.cy(), 15.0, WHITE.alpha(ra));
+            }
+        }
+        let tx = icon.right() + 10.0;
+        let close = Rect::new(card.right() - 30.0, card.cy() - 12.0, 24.0, 24.0);
+        let badge_w = if count > 1 { 26.0 } else { 0.0 };
+        let tw = close.x - tx - 6.0 - badge_w;
+        let age = notifications::age(n.at, now);
+        p.text(&format!("{} \u{B7} {age}", n.app), &f.small_l, Rect::new(tx, card.y + 4.0, tw, 14.0), SECONDARY.alpha(ra));
+        p.text(&n.title, &f.alert_title, Rect::new(tx, card.y + 17.0, tw, 17.0), WHITE.alpha(ra));
+        if !n.body.is_empty() {
+            p.text(&n.body, &f.small_l, Rect::new(tx, card.y + 33.0, tw, 15.0), Color::gray(255, 0.7 * ra));
+        }
+        if count > 1 {
+            let badge = Rect::new(close.x - badge_w - 2.0, card.cy() - 9.0, badge_w, 18.0);
+            p.fill_round(badge, 9.0, Color::gray(255, 0.16 * ra));
+            p.text(&count.to_string(), &f.small_c, badge, WHITE.alpha(ra));
+        }
+        let close_hot = v.hot == Some(Hit::NoteClose(i));
+        if close_hot {
+            p.fill_circle(close.cx(), close.cy(), 11.0, Color::gray(255, 0.14 * ra));
+        }
+        g::xmark(p, close.cx(), close.cy(), 8.0, Color::gray(255, if hot { 0.8 } else { 0.4 } * ra), 1.5);
+        hits.push((card, Hit::NoteRow(i)));
+        hits.push((close, Hit::NoteClose(i)));
     }
 }
 

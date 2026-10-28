@@ -47,8 +47,12 @@ fn main() {
         island::claude::relay();
         return;
     }
-    // Run elevated (through UAC) by Settings to add or remove the admin task.
     let args: Vec<String> = std::env::args().collect();
+    // `dockside activity start build --title Build …`: a Live Activity for the island.
+    if args.get(1).is_some_and(|a| a == "activity") {
+        std::process::exit(island::live::cli(&args[2..]));
+    }
+    // Run elevated (through UAC) by Settings to add or remove the admin task.
     if let Some(i) = args.iter().position(|a| a == win::elevation::ADMIN_TASK) {
         let on = args.get(i + 1).is_some_and(|a| a == "on");
         std::process::exit(win::elevation::admin_task_command(on));

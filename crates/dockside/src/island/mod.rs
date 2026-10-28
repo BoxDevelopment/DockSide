@@ -25,8 +25,9 @@ mod encode;
 pub mod glyphs;
 mod holding;
 mod ics;
+pub mod live;
 pub mod media;
-mod notifications;
+pub mod notifications;
 mod shelf;
 pub mod sources;
 pub mod timer;
@@ -126,6 +127,8 @@ pub enum Persist {
     Download,
     Calendar,
     Shelf,
+    /// A Live Activity from another app, by its key.
+    Live(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -136,6 +139,9 @@ enum Panel {
     Timer,
     Shelf,
     Calendar,
+    Live(u32),
+    /// The notification stack, paged to from the home panel.
+    Notes,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -162,6 +168,8 @@ pub enum Alert {
     TimerDone,
     ClaudeDone { project: String, secs: f32, tools: u32 },
     ClaudeNeeds { project: String, message: String },
+    /// A Live Activity ended with a closing message.
+    LiveDone { title: String, message: String, color: Option<Color> },
     /// A virtual desktop switch; `missing` is a desktop number that doesn't exist.
     Desktop { index: usize, count: usize, name: String, missing: Option<usize> },
 }
@@ -220,7 +228,44 @@ pub enum Hit {
     AlertBody,
     /// A page dot under an expanded panel.
     Page(usize),
+    /// A Live Activity's panel: opens what it links to.
+    LiveOpen(u32),
+    /// A row of the notification stack (see [`NoteRow`]), its close button, and the header's buttons.
+    NoteRow(usize),
+    NoteClose(usize),
+    NotesClear,
+    NotesBack,
 }
+
+/// One row of the notification stack: an app's notifications stacked up, or
+/// (once that stack is opened) each of them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NoteRow {
+    Stack { app_id: String, latest: usize, count: usize },
+    One(usize),
+}
+
+impl NoteRow {
+    /// The note it shows.
+    fn note(&self) -> usize {
+        match self {
+            NoteRow::Stack { latest, .. } => *latest,
+            NoteRow::One(i) => *i,
+        }
+    }
+}
+
+/// The sample Live Activity Settings starts, and how long it runs.
+const DEMO_ID: &str = "dockside-sample";
+const DEMO_SECS: u32 = 15;
+
+/// Most notifications kept in the stack.
+const MAX_NOTES: usize = 40;
+/// Rows the stack shows at once.
+pub(crate) const NOTE_ROWS: usize = 4;
+pub(crate) const NOTE_ROW_H: f32 = 56.0;
+/// Swiping a row this far sideways dismisses it.
+pub(crate) const NOTE_SWIPE: f32 = 90.0;
 
 /// Commands from menus and Spotlight.
 #[derive(Clone, Debug)]
@@ -230,6 +275,10 @@ pub enum IslandCmd {
     ToggleClock,
     CancelClock,
     ClearShelf,
+    /// Open the notification stack.
+    ShowNotes,
+    /// Settings' "Try It": a short sample Live Activity.
+    LiveDemo,
     /// Take one file off the shelf (deleting its held copy).
     RemoveShelf(PathBuf),
     /// Convert a held file; the result joins the shelf beside it.
@@ -345,6 +394,8 @@ pub struct Handover {
     feeds: Feeds,
     events: Vec<CalEvent>,
     downloads: Vec<Download>,
+    live: live::Live,
+    notes: Vec<Note>,
 }
 
 pub struct Island {
@@ -372,6 +423,14 @@ pub struct Island {
     clock: Option<Clock>,
     shelf: Vec<Item>,
     shelf_icons: HashMap<PathBuf, ID2D1Bitmap>,
+    live: live::Live,
+    live_icons: HashMap<PathBuf, ID2D1Bitmap>,
+    /// The notification stack, newest first, and the app whose stack is opened out.
+    notes: Vec<Note>,
+    note_icons: HashMap<u64, ID2D1Bitmap>,
+    note_open: Option<String>,
+    /// A stack row being swiped: (row, where the press started, how far it moved).
+    note_drag: Option<(usize, f32, f32)>,
     /// Held files dragged off the shelf, deleted after `ORPHAN_GRACE`.
     orphans: Vec<(PathBuf, Instant)>,
     events: Vec<CalEvent>,
@@ -464,6 +523,15 @@ impl Island {
         let rect = window_rect(&monitor, top, iw, ih + lip);
         let surface = Surface::new(gfx, rect, monitor.scale, Backdrop::None, Color::TRANSPARENT)?;
         let ic = &cfg.island;
+        // Live Activities come from other apps: they carry over whatever changed.
+        let (handover, live, notes) = match handover {
+            Some(mut h) => {
+                let live = std::mem::take(&mut h.live);
+                let notes = std::mem::take(&mut h.notes);
+                (Some(h), live, notes)
+            }
+            None => (None, live::Live::default(), Vec::new()),
+        };
         let (feeds, events, downloads) = match handover {
             Some(h) if h.feeds.key == FeedKey::new(ic) => (h.feeds, h.events, h.downloads),
             // Sources changed: the old ones stop as they're dropped.
@@ -491,6 +559,12 @@ impl Island {
             clock: None,
             shelf: holding::load(ic.shelf_clear_on_start),
             shelf_icons: HashMap::new(),
+            live,
+            live_icons: HashMap::new(),
+            notes,
+            note_icons: HashMap::new(),
+            note_open: None,
+            note_drag: None,
             orphans: Vec::new(),
             events,
             downloads,
@@ -589,9 +663,64 @@ impl Island {
         list
     }
 
-    /// Panels you can page between while expanded, in a stable order.
+    /// Panels you can page between while expanded, in a stable order: the
+    /// activities, or from the home panel, the notification stack.
     fn pages(&self) -> Vec<Panel> {
+        if matches!(self.expanded, Some(Panel::Home | Panel::Notes)) {
+            return if self.notes_valid() { vec![Panel::Home, Panel::Notes] } else { Vec::new() };
+        }
         self.natural().into_iter().filter_map(Self::panel_for).collect()
+    }
+
+    fn notes_valid(&self) -> bool {
+        self.cfg.notifications && !self.notes.is_empty()
+    }
+
+    /// The stack's rows: one per app (newest app first), with the opened app's notes each on their own.
+    fn note_rows(&self) -> Vec<NoteRow> {
+        let mut rows: Vec<NoteRow> = Vec::new();
+        for (i, n) in self.notes.iter().enumerate() {
+            if self.note_open.as_deref() == Some(n.app_id.as_str()) {
+                rows.push(NoteRow::One(i));
+            } else if let Some(NoteRow::Stack { count, .. }) =
+                rows.iter_mut().find(|r| matches!(r, NoteRow::Stack { app_id, .. } if *app_id == n.app_id))
+            {
+                *count += 1;
+            } else {
+                rows.push(NoteRow::Stack { app_id: n.app_id.clone(), latest: i, count: 1 });
+            }
+        }
+        rows
+    }
+
+    /// The notes a row stands for.
+    fn row_notes(&self, row: &NoteRow) -> Vec<u32> {
+        match row {
+            NoteRow::Stack { app_id, .. } => self.notes.iter().filter(|n| n.app_id == *app_id).map(|n| n.id).collect(),
+            NoteRow::One(i) => self.notes.get(*i).map(|n| vec![n.id]).unwrap_or_default(),
+        }
+    }
+
+    /// Takes notes off the stack, and out of the notification center too.
+    fn dismiss_notes(&mut self, ids: Vec<u32>) {
+        self.notes.retain(|n| !ids.contains(&n.id));
+        if self.note_open.as_ref().is_some_and(|app| !self.notes.iter().any(|n| n.app_id == *app)) {
+            self.note_open = None;
+        }
+        let ids: Vec<u32> = ids.into_iter().filter(|&id| id != 0).collect();
+        if !ids.is_empty() {
+            notifications::remove(Some(ids));
+        }
+        self.retarget();
+        self.dirty = true;
+    }
+
+    /// Opens a notification's app (and takes it off the stack, as opening it reads it).
+    fn open_note(&mut self, i: usize) -> Option<IslandEvent> {
+        let n = self.notes.get(i)?.clone();
+        self.dismiss_notes(vec![n.id]);
+        self.expanded = None;
+        note_event(&n)
     }
 
     fn dots_for(&self, p: Panel) -> bool {
@@ -606,7 +735,8 @@ impl Island {
             Panel::Timer => Some(Persist::Timer),
             Panel::Shelf => Some(Persist::Shelf),
             Panel::Calendar => Some(Persist::Calendar),
-            Panel::Home => None,
+            Panel::Live(k) => Some(Persist::Live(k)),
+            Panel::Home | Panel::Notes => None,
         }
     }
 
@@ -715,6 +845,9 @@ impl Island {
         if self.cfg.shelf && !self.shelf.is_empty() {
             list.push(Persist::Shelf);
         }
+        if self.cfg.live_activities {
+            list.extend(self.live.list.iter().map(|a| Persist::Live(a.key)));
+        }
         list
     }
 
@@ -725,6 +858,8 @@ impl Island {
             Panel::Timer => self.cfg.timers && self.clock.is_some(),
             Panel::Shelf => self.cfg.shelf,
             Panel::Calendar => self.cfg.calendar,
+            Panel::Live(k) => self.cfg.live_activities && self.live.get(k).is_some(),
+            Panel::Notes => self.notes_valid(),
             Panel::Home => true,
         }
     }
@@ -736,6 +871,7 @@ impl Island {
             Persist::Media => Some(Panel::Media),
             Persist::Calendar => Some(Panel::Calendar),
             Persist::Shelf => Some(Panel::Shelf),
+            Persist::Live(k) => Some(Panel::Live(k)),
             Persist::Download => None,
         }
     }
@@ -777,6 +913,7 @@ impl Island {
                 Persist::Download => (240.0, ch),
                 Persist::Calendar => (276.0, ch),
                 Persist::Shelf => (152.0, ch),
+                Persist::Live(_) => (250.0, ch),
             },
             Content::Alert(id) => match self.alert_by_id(id).map(|s| &s.alert) {
                 Some(Alert::Charging(_) | Alert::LowBattery(_)) => (264.0, ch),
@@ -795,6 +932,7 @@ impl Island {
                 Some(Alert::TimerDone) => (220.0, ch),
                 Some(Alert::ClaudeDone { .. }) => (330.0, ch),
                 Some(Alert::ClaudeNeeds { .. }) => (400.0, ch),
+                Some(Alert::LiveDone { .. }) => (330.0, ch),
                 None => (ch * 3.6, ch),
             },
             Content::Panel(p) => {
@@ -815,6 +953,14 @@ impl Island {
                     (360.0, 48.0 + 44.0 * n as f32)
                 }
                 Panel::Home => (372.0, if self.cfg.timers { 134.0 } else { 92.0 }),
+                Panel::Live(k) => {
+                    let bar = self.live.get(k).is_some_and(|a| a.progress.is_some());
+                    (372.0, if bar { 118.0 } else { 98.0 })
+                }
+                Panel::Notes => {
+                    let rows = self.note_rows().len().clamp(1, NOTE_ROWS);
+                    (392.0, 46.0 + NOTE_ROW_H * rows as f32 + 8.0)
+                }
         }
     }
 
@@ -944,6 +1090,8 @@ impl Island {
 
     pub fn show_update(&mut self, release: &crate::update::Release) {
         let note = notifications::Note {
+            id: 0,
+            at: SystemTime::now(),
             app: "DockSide".into(),
             app_id: release.url.clone(),
             title: format!("Update available: {}", release.tag),
@@ -999,7 +1147,13 @@ impl Island {
     /// Gives up the running sources (and their data) for the island replacing this one.
     pub fn hand_over(&mut self) -> Option<Handover> {
         let feeds = self.feeds.take()?;
-        Some(Handover { feeds, events: std::mem::take(&mut self.events), downloads: std::mem::take(&mut self.downloads) })
+        Some(Handover {
+            feeds,
+            events: std::mem::take(&mut self.events),
+            downloads: std::mem::take(&mut self.downloads),
+            live: std::mem::take(&mut self.live),
+            notes: std::mem::take(&mut self.notes),
+        })
     }
 
     fn media(&self, cmd: Cmd) {
@@ -1080,7 +1234,27 @@ impl Island {
                         self.show_alert(Alert::Bluetooth { name, connected, battery }, 4.0);
                     }
                 }
-                Signal::Notification(n) => self.show_alert(Alert::Note(n), 5.0),
+                Signal::Notification(n) => {
+                    self.notes.retain(|x| x.id != n.id);
+                    self.notes.insert(0, n.clone());
+                    self.notes.truncate(MAX_NOTES);
+                    self.show_alert(Alert::Note(n), 5.0);
+                }
+                Signal::NoteHistory(history) => {
+                    for n in history {
+                        if !self.notes.iter().any(|x| x.id == n.id) {
+                            self.notes.push(n);
+                        }
+                    }
+                    self.notes.sort_by_key(|n| std::cmp::Reverse(n.at));
+                    self.notes.truncate(MAX_NOTES);
+                }
+                Signal::NotesGone(ids) => {
+                    self.notes.retain(|n| !ids.contains(&n.id));
+                    if self.note_open.as_ref().is_some_and(|app| !self.notes.iter().any(|n| n.app_id == *app)) {
+                        self.note_open = None;
+                    }
+                }
                 Signal::Calendar(events) => self.events = events,
             }
         }
@@ -1136,6 +1310,8 @@ impl Island {
             d.size = std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(d.size);
         }
         self.claude.prune();
+        self.live.prune();
+        self.tick_demo();
         self.expire_shelf();
         // A missed rename event must not leave a download spinning forever.
         self.downloads.retain(|d| d.path.exists());
@@ -1195,6 +1371,33 @@ impl Island {
         }
         if !was && self.claude.current().is_some() {
             self.nudge();
+        }
+        self.retarget();
+        self.dirty = true;
+    }
+
+    /// Fills the sample activity's bar with its countdown, and ends it at zero.
+    fn tick_demo(&mut self) {
+        let Some(left) = self.live.list.iter().find(|a| a.id == DEMO_ID).and_then(|a| a.clock_secs()) else { return };
+        let json = if left <= 0.0 {
+            format!(r#"{{"op":"end","id":"{DEMO_ID}","subtitle":"Done"}}"#)
+        } else {
+            format!(r#"{{"id":"{DEMO_ID}","progress":{}}}"#, 1.0 - left / DEMO_SECS as f32)
+        };
+        self.on_live(&json);
+    }
+
+    /// A Live Activity message from another app (see [`live`]).
+    pub fn on_live(&mut self, json: &str) {
+        if !self.cfg.live_activities {
+            return;
+        }
+        match self.live.apply(json) {
+            live::Change::Started(_) => self.nudge(),
+            live::Change::Ended { title, message, color } if !message.is_empty() => {
+                self.show_alert(Alert::LiveDone { title, message, color }, 3.5);
+            }
+            _ => {}
         }
         self.retarget();
         self.dirty = true;
@@ -1274,6 +1477,18 @@ impl Island {
         match cmd {
             IslandCmd::Timer(secs) => self.clock = Some(Clock::timer(secs)),
             IslandCmd::Stopwatch => self.clock = Some(Clock::stopwatch()),
+            IslandCmd::LiveDemo => {
+                self.on_live(&format!(
+                    r##"{{"op":"start","id":"{DEMO_ID}","title":"Sample activity","subtitle":"Sent the way apps send them",
+                        "progress":0,"timer":{DEMO_SECS},"color":"#34C759"}}"##
+                ));
+                self.expanded = self.live.list.iter().find(|a| a.id == DEMO_ID).map(|a| Panel::Live(a.key));
+            }
+            IslandCmd::ShowNotes => {
+                if self.notes_valid() {
+                    self.expanded = Some(Panel::Notes);
+                }
+            }
             IslandCmd::ToggleClock => {
                 if let Some(c) = self.clock.as_mut() {
                     c.toggle();
@@ -1370,6 +1585,9 @@ impl Island {
         let held = inside || self.page_drag.is_some();
         self.leave_at = if held { None } else { self.leave_at.or_else(|| expanded.then(Instant::now)) };
         self.drag_pages(x);
+        if let Some((r, x0, _)) = self.note_drag {
+            self.note_drag = Some((r, x0, x - x0));
+        }
         if self.scrub.is_some() {
             self.scrub = Some(frac_in(self.rect_of(Hit::Progress).map(|r| r.inset(4.0, 8.0)).unwrap_or_default(), x));
         }
@@ -1433,6 +1651,10 @@ impl Island {
         let hit = self.hit_at(x, y);
         self.down = hit;
         self.down_at = (x, y);
+        self.note_drag = match hit {
+            Some(Hit::NoteRow(r)) => Some((r, x, 0.0)),
+            _ => None,
+        };
         let paged = matches!(self.shown, Content::Panel(p) if self.dots_for(p));
         self.page_drag = match hit {
             Some(Hit::Page(_)) => Some(PageDrag::Dots),
@@ -1455,7 +1677,16 @@ impl Island {
         let hit = self.hit_at(x, y);
         let mut event = None;
         // A drag already showed its page; a press that didn't move is still a click.
-        let dragged = matches!(self.page_drag.take(), Some(PageDrag::Panel { moved: true, .. }));
+        let mut dragged = matches!(self.page_drag.take(), Some(PageDrag::Panel { moved: true, .. }));
+        if let Some((r, _, dx)) = self.note_drag.take() {
+            if dx.abs() >= NOTE_SWIPE {
+                if let Some(row) = self.note_rows().get(r).cloned() {
+                    let ids = self.row_notes(&row);
+                    self.dismiss_notes(ids);
+                }
+            }
+            dragged |= dx.abs() > DRAG_THRESHOLD;
+        }
         if !self.inside && matches!(self.shown, Content::Panel(_)) {
             self.leave_at.get_or_insert_with(Instant::now);
         }
@@ -1498,6 +1729,29 @@ impl Island {
                 }
             }
             Hit::Page(i) => self.show_page(i),
+            Hit::NoteRow(r) => match self.note_rows().get(r)?.clone() {
+                NoteRow::Stack { app_id, count, .. } if count > 1 => self.note_open = Some(app_id),
+                row => return self.open_note(row.note()),
+            },
+            Hit::NoteClose(r) => {
+                let row = self.note_rows().get(r)?.clone();
+                let ids = self.row_notes(&row);
+                self.dismiss_notes(ids);
+            }
+            Hit::NotesBack => self.note_open = None,
+            Hit::NotesClear => {
+                self.notes.clear();
+                self.note_open = None;
+                notifications::remove(None);
+                self.expanded = Some(Panel::Home);
+            }
+            Hit::LiveOpen(k) => {
+                let target = self.live.get(k).and_then(|a| a.open.clone())?;
+                self.expanded = None;
+                // An AppUserModelID ("Company.App!Main") opens as an app; anything else through the shell.
+                let aumid = target.contains('!') && !target.contains(['\\', '/', ':']);
+                return Some(if aumid { IslandEvent::OpenApp(target) } else { IslandEvent::Run(Action::Open(target)) });
+            }
             Hit::Art => return self.now.as_ref().map(|n| IslandEvent::OpenApp(n.app_id.clone())),
             Hit::Play => {
                 if let Some(n) = self.now.as_mut() {
@@ -1538,13 +1792,19 @@ impl Island {
     }
 
     fn alert_click(&mut self) -> Option<IslandEvent> {
+        if let Some(Alert::Note(n)) = self.alert.as_ref().map(|s| &s.alert) {
+            let id = n.id;
+            if id != 0 && self.notes.iter().any(|x| x.id == id) {
+                self.notes.retain(|x| x.id != id);
+                notifications::remove(Some(vec![id]));
+            }
+        }
         let event = match self.alert.as_ref().map(|s| &s.alert) {
             Some(Alert::Volume | Alert::Brightness(_)) => return None,
             Some(Alert::Screenshot(p)) => Some(IslandEvent::Run(Action::Open(p.to_string_lossy().into_owned()))),
             Some(Alert::Downloaded(p)) => Some(IslandEvent::Run(Action::Reveal(p.to_string_lossy().into_owned()))),
             Some(Alert::Bluetooth { .. }) => Some(IslandEvent::Run(Action::Open("ms-settings:bluetooth".into()))),
-            Some(Alert::Note(n)) if n.app_id.starts_with("https://") => Some(IslandEvent::Run(Action::Open(n.app_id.clone()))),
-            Some(Alert::Note(n)) if !n.app_id.is_empty() => Some(IslandEvent::OpenApp(n.app_id.clone())),
+            Some(Alert::Note(n)) => note_event(n),
             _ => None,
         };
         self.dismiss_alert();
@@ -1596,6 +1856,12 @@ impl Island {
                 entries.push(Entry::Separator);
             }
             entries.push(Entry::item("Clear Shelf", Action::Island(IslandCmd::ClearShelf)));
+        }
+        if self.notes_valid() {
+            if !entries.is_empty() {
+                entries.push(Entry::Separator);
+            }
+            entries.push(Entry::item(&format!("Notifications ({})", self.notes.len()), Action::Island(IslandCmd::ShowNotes)));
         }
         if !entries.is_empty() {
             entries.push(Entry::Separator);
@@ -1728,6 +1994,22 @@ impl Island {
                 _ => None,
             };
         }
+        self.live_icons.retain(|p, _| self.live.list.iter().any(|a| a.icon.as_ref() == Some(p)));
+        for path in self.live.list.iter().filter_map(|a| a.icon.as_ref()) {
+            if !self.live_icons.contains_key(path) {
+                if let Some(b) = load_shell_image(&path.to_string_lossy(), 96, true).and_then(|px| px.to_bitmap(&rt)) {
+                    self.live_icons.insert(path.clone(), b);
+                }
+            }
+        }
+        self.note_icons.retain(|id, _| self.notes.iter().any(|n| n.icon.as_ref().is_some_and(|a| a.id == *id)));
+        for a in self.notes.iter().filter_map(|n| n.icon.as_ref()) {
+            if !self.note_icons.contains_key(&a.id) {
+                if let Some(b) = (IconPixels { width: a.size, height: a.size, data: a.data.clone() }).to_bitmap(&rt) {
+                    self.note_icons.insert(a.id, b);
+                }
+            }
+        }
         self.shelf_icons.retain(|p, _| self.shelf.iter().any(|i| i.path == *p && !i.pending));
         for i in self.shelf.iter().filter(|i| !i.pending) {
             if !self.shelf_icons.contains_key(&i.path) {
@@ -1777,6 +2059,7 @@ impl Island {
         let bubble_rect = Rect::new(bcx - bd / 2.0, lip + ch / 2.0 - bd / 2.0, bd, bd);
 
         let fonts = Fonts::new(gfx, &theme.font);
+        let note_rows = self.note_rows();
         let view = View {
             fonts: &fonts,
             now: self.now.as_ref(),
@@ -1797,6 +2080,13 @@ impl Island {
             clock: self.clock.as_ref(),
             shelf: &self.shelf,
             shelf_icons: &self.shelf_icons,
+            live: &self.live,
+            live_icons: &self.live_icons,
+            notes: &self.notes,
+            note_icons: &self.note_icons,
+            note_rows: &note_rows,
+            note_open: self.note_open.is_some(),
+            note_drag: self.note_drag,
             shelf_lifetime: self.shelf_lifetime(),
             wall: SystemTime::now(),
             drag_over: self.drag_over,
@@ -1895,6 +2185,8 @@ impl Island {
                         Panel::Shelf => views::shelf_panel(p, body, &view, a, &mut content_hits),
                         Panel::Calendar => views::calendar_panel(p, body, &view, a, &mut content_hits),
                         Panel::Home => views::home_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Live(k) => views::live_panel(p, body, k, &view, a, &mut content_hits),
+                        Panel::Notes => views::notes_panel(p, body, &view, a, &mut content_hits),
                     });
                 }
             });
@@ -1979,6 +2271,17 @@ fn frac_in(r: Rect, x: f32) -> f32 {
         0.0
     } else {
         ((x - r.x) / r.w).clamp(0.0, 1.0)
+    }
+}
+
+/// What clicking a notification opens: its link, or its app.
+fn note_event(n: &Note) -> Option<IslandEvent> {
+    if n.app_id.starts_with("https://") {
+        Some(IslandEvent::Run(Action::Open(n.app_id.clone())))
+    } else if !n.app_id.is_empty() {
+        Some(IslandEvent::OpenApp(n.app_id.clone()))
+    } else {
+        None
     }
 }
 

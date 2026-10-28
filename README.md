@@ -77,6 +77,14 @@ hidden while DockSide runs and is always restored when it exits.
 - **Alerts**: notifications (as banners from the island), Bluetooth devices connecting with their battery,
   screenshots (click to open, drag to use), finished downloads (with a live download activity while they run),
   charging / low battery, Caps Lock and Do Not Disturb
+- **Notification stack**: page right from the home panel (or right-click › Notifications) for recent
+  notifications stacked by app, in step with Windows' notification center. Click a stack to open it out,
+  click a notification to open its app, and × or swipe one sideways to dismiss it
+- Notifications need Windows' own Notifications switch on (Settings › System › Notifications). To see
+  them only in the island, also turn on Do not disturb: it hides Windows' banners but keeps the notifications
+- **Live Activities from other apps and scripts**: progress, timers and status, sent with
+  `dockside activity` (see [Live Activities](#live-activities))
+- Press and drag along the page dots, or drag a panel sideways, to switch between activities
 - Alerts queue up and wait while you hover them; every source can be switched off in `[island]`
 
 **Spotlight**
@@ -116,6 +124,27 @@ hidden while DockSide runs and is always restored when it exits.
 - Hides itself for fullscreen apps
 - Rendering uses Direct2D/DirectWrite into layered windows; animations are vsync-paced and the
   app idles at ~0% CPU
+
+## Live Activities
+
+Anything that can run a command can put an activity in the island:
+
+```
+dockside activity start build --title "Build" --subtitle "Compiling" --progress 0%
+dockside activity update build --progress 45% --value "45/100"
+dockside activity end build --subtitle "Finished"
+```
+
+Options: `--title`, `--subtitle`, `--progress` (0–1 or a percentage), `--value` (short text at the
+right of the pill), `--timer SECONDS` (counts down), `--stopwatch` (counts up), `--color #RRGGBB`,
+`--icon PATH` (an image or an app whose icon to show) and `--open TARGET` (a URL, file or app opened
+when the expanded activity is clicked). `end` with `--subtitle` shows that message briefly. Up to 8
+run at once, and one nobody updates for 12 hours is dropped.
+
+Apps can skip the command and send the same fields as JSON (`{"op": "start", "id": "build",
+"title": "Build", "progress": 0.45}`) in a `WM_COPYDATA` message with `dwData = 0xAC710001` to the
+message-only window of class `DockSideSurface`; `dockside activity send '<json>'` does the same from
+a script. Turn them off with `[island] live_activities = false`.
 
 ## Build & run
 
@@ -196,7 +225,8 @@ crates/dockside/src
 - [ ] Mission Control / App Exposé, Launchpad
 - [x] Virtual desktop shortcuts (Alt+number) with Dynamic Island switch animations
 - [x] Dynamic Island: Now Playing, HUDs, timers, shelf, calendar, notifications, device and status alerts
-- [ ] Dynamic Island: reply to notifications, Live Activities from other apps
+- [x] Dynamic Island: Live Activities from other apps, notification stack
+- [ ] Dynamic Island: reply to notifications from the island
 - [x] A System Settings-style GUI for the config, plus Start at login
 - [x] Menu bar tray item listing every app's notification-area icon
 - [x] Spotlight: LaTeX symbol lookup (for Notion equations)

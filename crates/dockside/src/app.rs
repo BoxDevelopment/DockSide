@@ -2407,6 +2407,9 @@ impl App {
                     if let (Some(i), Some(json)) = (self.island.as_mut(), crate::island::claude::receive(lp)) {
                         i.on_claude(&json);
                         self.animate();
+                    } else if let (Some(i), Some(json)) = (self.island.as_mut(), crate::island::live::receive(lp)) {
+                        i.on_live(&json);
+                        self.animate();
                     }
                 }
                 WM_APP_FRAME => self.on_frame(),

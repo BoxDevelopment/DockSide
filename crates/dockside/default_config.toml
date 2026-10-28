@@ -213,6 +213,9 @@ calendar_ics = ""
 # Show what Claude Code is doing, and when it finishes or needs you. Click
 # "Connect Claude Code" in System Settings > Dynamic Island to add its hooks.
 claude_code = true
+# Live Activities from other apps and scripts: progress, timers and status they
+# send with `dockside activity start <id> --title ... --progress 40%` (see README).
+live_activities = true
 # Drop files on the island to hold them on a shelf. They're copied to a
 # holding folder (%LOCALAPPDATA%\DockSide\Shelf), so you can drag them back
 # out later; right-click one to convert it to another format.

@@ -257,6 +257,8 @@ pub struct IslandCfg {
     pub calendar_ics: String,
     /// Show what Claude Code is doing (needs "Connect Claude Code" in Settings).
     pub claude_code: bool,
+    /// Live Activities other apps and scripts send (`dockside activity …`).
+    pub live_activities: bool,
     /// Files dropped on the island are copied to a holding folder and shown on a shelf.
     pub shelf: bool,
     /// Empty the holding folder when DockSide starts.

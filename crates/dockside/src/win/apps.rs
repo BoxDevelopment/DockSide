@@ -110,7 +110,7 @@ pub fn is_desktop(hwnd: HWND) -> bool {
     matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW")
 }
 
-/// Whether `hwnd` is an app filling `monitor` (a game, a fullscreen video).
+/// Whether `hwnd` is an app filling `monitor` (a game, a fullscreen video, F11).
 /// Windows' own fullscreen report also fires for live wallpapers and desktop
 /// overlays (Wallpaper Engine, desktop pets), which are the desktop or are
 /// layered/click-through windows drawn over it.
@@ -130,7 +130,19 @@ pub fn is_fullscreen_app(hwnd: HWND, monitor: RECT) -> bool {
         if GetWindowRect(hwnd, &mut r).is_err() {
             return false;
         }
-        r.left <= monitor.left && r.top <= monitor.top && r.right >= monitor.right && r.bottom >= monitor.bottom
+        let covers = |r: &RECT| r.left <= monitor.left && r.top <= monitor.top && r.right >= monitor.right && r.bottom >= monitor.bottom;
+        if !covers(&r) {
+            return false;
+        }
+        // A maximized window's frame overhangs the screen too, but its caption
+        // keeps the client area off the top edge; a fullscreen app's doesn't.
+        let mut c = RECT::default();
+        if GetClientRect(hwnd, &mut c).is_err() {
+            return false;
+        }
+        let mut corners = [POINT { x: c.left, y: c.top }, POINT { x: c.right, y: c.bottom }];
+        let _ = windows::Win32::Graphics::Gdi::MapWindowPoints(hwnd, HWND::default(), &mut corners);
+        covers(&RECT { left: corners[0].x, top: corners[0].y, right: corners[1].x, bottom: corners[1].y })
     }
 }
 

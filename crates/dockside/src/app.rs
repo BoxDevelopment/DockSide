@@ -45,7 +45,7 @@ use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
-    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
+    WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
 };
 
 thread_local! {
@@ -84,6 +84,8 @@ const TIMER_WALLPAPER: usize = 9;
 const TIMER_APPBAR: usize = 10;
 /// TaskbarCreated broadcast: rebuild only if Explorer's taskbar window was replaced.
 const TIMER_TASKBAR: usize = 11;
+/// The foreground window moved or resized: check whether it now fills the screen.
+const TIMER_FULLSCREEN: usize = 12;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
 /// Messages handled slower than this are logged.
@@ -541,7 +543,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 unsafe extern "system" fn win_event(
     _hook: HWINEVENTHOOK,
     event: u32,
-    _hwnd: HWND,
+    hwnd: HWND,
     id_object: i32,
     id_child: i32,
     _thread: u32,
@@ -550,7 +552,13 @@ unsafe extern "system" fn win_event(
     if id_object != OBJID_WINDOW.0 || id_child != 0 {
         return;
     }
-    let msg = if event == EVENT_SYSTEM_FOREGROUND { WM_APP_FOREGROUND } else { WM_APP_WINDOWS_CHANGED };
+    let msg = match event {
+        EVENT_SYSTEM_FOREGROUND => WM_APP_FOREGROUND,
+        // Scoped to the foreground app's process; its other windows don't matter.
+        EVENT_OBJECT_LOCATIONCHANGE if hwnd != GetForegroundWindow() => return,
+        EVENT_OBJECT_LOCATIONCHANGE => WM_APP_FG_MOVED,
+        _ => WM_APP_WINDOWS_CHANGED,
+    };
     win::post(MSG_HWND.load(Ordering::Relaxed), msg);
 }
 
@@ -747,6 +755,9 @@ pub struct App {
     /// Hides Windows' own desktop switch popup.
     desktop_popup: Option<win::desktops::PopupHider>,
     win_hooks: Vec<HWINEVENTHOOK>,
+    /// Location changes of the foreground app's process (pid, hook): catches an
+    /// app going fullscreen in place, which no focus change reports.
+    fg_hook: Option<(u32, HWINEVENTHOOK)>,
     /// The registered "SHELLHOOK" message: app windows shown, hidden or destroyed.
     shell_hook: u32,
     _watcher: Option<notify::RecommendedWatcher>,
@@ -757,8 +768,6 @@ pub struct App {
     explorer_tray: Option<HWND>,
     /// Edge the taskbar was last seen on, to notice it being moved while we run.
     taskbar_edge: Option<u32>,
-    /// Windows' last ABN_FULLSCREENAPP report (checked against the foreground window).
-    fullscreen_reported: bool,
     /// Shell surfaces are currently hidden for a fullscreen app.
     fullscreen_hidden: bool,
     /// Sources of a retired island / widgets, for their replacements to take over.
@@ -864,12 +873,12 @@ impl App {
             desktop_watch: None,
             desktop_popup: None,
             win_hooks,
+            fg_hook: None,
             shell_hook,
             _watcher: watcher,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             explorer_tray: None,
             taskbar_edge: None,
-            fullscreen_reported: false,
             fullscreen_hidden: false,
             island_handover: None,
             widgets_handover: None,
@@ -1438,12 +1447,13 @@ impl App {
         }
     }
 
-    /// Hides the shell surfaces while a real app fills the screen. Windows'
-    /// report alone isn't trusted: live wallpapers and desktop overlays trigger
-    /// it too, and it can go stale when focus moves on.
+    /// Hides the shell surfaces while a real app fills the screen. Decided from
+    /// the foreground window itself: Windows' ABN_FULLSCREENAPP report fires for
+    /// live wallpapers and desktop overlays too, goes stale when focus moves on,
+    /// and isn't always sent for in-place fullscreen (F11).
     fn update_fullscreen(&mut self) {
         let fg = unsafe { GetForegroundWindow() };
-        let hide = self.fullscreen_reported && apps::is_fullscreen_app(fg, self.monitor.rect);
+        let hide = apps::is_fullscreen_app(fg, self.monitor.rect);
         if hide == self.fullscreen_hidden {
             return;
         }
@@ -1459,10 +1469,34 @@ impl App {
         }
     }
 
+    /// Follows the foreground app's window moves, re-hooking when its process changes.
+    fn watch_foreground(&mut self, fg: HWND) {
+        let pid = if fg.is_invalid() { 0 } else { apps::window_pid(fg) };
+        if pid == self.pid || self.fg_hook.is_some_and(|(p, _)| p == pid) {
+            return;
+        }
+        if let Some((_, h)) = self.fg_hook.take() {
+            unsafe {
+                let _ = UnhookWinEvent(h);
+            }
+        }
+        if pid == 0 {
+            return;
+        }
+        let h = unsafe {
+            SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, None, Some(win_event), pid, 0, WINEVENT_OUTOFCONTEXT)
+        };
+        if !h.is_invalid() {
+            self.fg_hook = Some((pid, h));
+        }
+    }
+
     fn update_foreground(&mut self) {
-        self.raise_surfaces();
-        self.update_fullscreen();
         let fg = unsafe { GetForegroundWindow() };
+        self.watch_foreground(fg);
+        // Hide first, so a fullscreen app never gets the surfaces raised over it.
+        self.update_fullscreen();
+        self.raise_surfaces();
         // Our own shell surfaces (Dock, menu bar, menus) leave the state as it was.
         let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg) || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg);
         let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || ours {
@@ -2290,6 +2324,7 @@ impl App {
                         TIMER_RETIRE => self.retired.clear(),
                         TIMER_WALLPAPER => win::glass::wallpaper_changed(),
                         TIMER_APPBAR => self.on_appbar_change(),
+                        TIMER_FULLSCREEN => self.update_fullscreen(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
                         TIMER_THEME
@@ -2325,6 +2360,8 @@ impl App {
                     self.timer(TIMER_REFRESH, 100);
                 }
                 WM_APP_WINDOWS_CHANGED => self.timer(TIMER_REFRESH, 150),
+                // Drags fire this per frame; settle first.
+                WM_APP_FG_MOVED => self.timer(TIMER_FULLSCREEN, 60),
                 WM_APP_CLOSE_MENU => self.close_menu(),
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
@@ -2459,7 +2496,6 @@ impl App {
         }
         if msg == WM_APP_APPBAR {
             if wp.0 as u32 == ABN_FULLSCREENAPP {
-                self.fullscreen_reported = lp.0 != 0;
                 self.update_fullscreen();
                 self.flush();
             }
@@ -2928,7 +2964,7 @@ impl Drop for App {
             }
         }
         self.desktop_watch = None;
-        for h in self.win_hooks.drain(..) {
+        for h in self.win_hooks.drain(..).chain(self.fg_hook.take().map(|(_, h)| h)) {
             unsafe {
                 let _ = UnhookWinEvent(h);
             }

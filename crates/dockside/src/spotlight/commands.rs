@@ -26,6 +26,7 @@ pub enum Command {
     ControlPanel,
     DockSideSettings,
     SetupAssistant,
+    QuitDockSide,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +69,7 @@ const COMMANDS: &[(&str, &str, char, Command)] = &[
     ("Control Panel", "control panel", '\u{E80F}', Command::ControlPanel),
     ("DockSide Settings", "dockside settings preferences menu bar dock", '\u{E713}', Command::DockSideSettings),
     ("DockSide Setup Assistant", "setup assistant onboarding welcome tour getting started guide", '\u{E8FC}', Command::SetupAssistant),
+    ("Quit DockSide", "quit dockside exit close stop", '\u{E8BB}', Command::QuitDockSide),
 ];
 
 /// Commands matching `raw` (any case). `low_power` / `dark` are the current
@@ -254,6 +256,13 @@ mod tests {
     fn setup_assistant() {
         assert_eq!(search("setup assistant", false, false)[0].command, Command::SetupAssistant);
         assert_eq!(search("onboarding", false, false)[0].command, Command::SetupAssistant);
+    }
+
+    #[test]
+    fn quit() {
+        assert_eq!(search("quit", false, false)[0].command, Command::QuitDockSide);
+        assert_eq!(search("quit dockside", false, false)[0].command, Command::QuitDockSide);
+        assert_eq!(search("exit", false, false)[0].command, Command::QuitDockSide);
     }
 
     #[test]

@@ -933,11 +933,7 @@ impl App {
         self.backdrop_state = backdrop_state();
         self.monitor = Monitor::primary();
 
-        if self.cfg.general.hide_taskbar {
-            taskbar::hide();
-        } else {
-            taskbar::restore();
-        }
+        self.apply_taskbar();
         if self.cfg.menubar.enabled && self.cfg.menubar.show_tray {
             if let Err(e) = crate::win::tray::start() {
                 log!("tray host failed: {e}");
@@ -1053,6 +1049,9 @@ impl App {
             if let Some(w) = &mut self.widgets {
                 w.sync(&self.gfx, &self.theme, &self.cfg);
             }
+        }
+        if old.dock.enabled != self.cfg.dock.enabled {
+            self.apply_taskbar();
         }
         if old.dock != self.cfg.dock || old.app_icons != self.cfg.app_icons {
             let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock) && old.app_icons == self.cfg.app_icons;
@@ -1314,6 +1313,20 @@ impl App {
         self.flush();
     }
 
+    /// The taskbar is hidden only while the Dock stands in for it: with the
+    /// Dock off there'd be nothing left to launch or switch apps from.
+    fn hides_taskbar(&self) -> bool {
+        self.cfg.general.hide_taskbar && self.cfg.dock.enabled
+    }
+
+    fn apply_taskbar(&self) {
+        if self.hides_taskbar() {
+            taskbar::hide();
+        } else {
+            taskbar::restore();
+        }
+    }
+
     fn rebuild_dock(&mut self) {
         if self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::Dock(_))) {
             self.close_menu();
@@ -1424,7 +1437,7 @@ impl App {
             log!("taskbar edge: {:?} -> {:?}", self.taskbar_edge, edge);
             self.taskbar_edge = edge;
         }
-        if self.cfg.general.hide_taskbar {
+        if self.hides_taskbar() {
             // Moving the taskbar can turn auto-hide back off and re-show it.
             taskbar::enforce();
             taskbar::reapply();
@@ -1443,7 +1456,7 @@ impl App {
         if let Some(w) = &mut self.widgets {
             w.on_tick();
         }
-        if self.cfg.general.hide_taskbar {
+        if self.hides_taskbar() {
             taskbar::reapply();
         }
         if self.cfg.dock.show_trash && self.dock.as_mut().is_some_and(|d| d.set_trash_full(system::trash_full())) {

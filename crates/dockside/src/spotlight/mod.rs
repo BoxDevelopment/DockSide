@@ -709,6 +709,7 @@ fn command_action(c: commands::Command) -> Option<Action> {
         Command::ControlPanel => Action::Launch { path: "control.exe".into(), args: None },
         Command::DockSideSettings => Action::OpenSettings(None),
         Command::SetupAssistant => Action::OpenOnboarding,
+        Command::QuitDockSide => Action::Quit,
         Command::LowPowerMode(on) => {
             controls::set_low_power_mode(on);
             return None;

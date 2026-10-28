@@ -92,6 +92,18 @@ const COLLAPSE_DELAY: f32 = 0.9;
 const HOVER_EXPAND_DELAY: f32 = 0.35;
 /// How far the pointer moves before a press on a file becomes a drag.
 const DRAG_THRESHOLD: f32 = 5.0;
+/// Sideways travel that turns one page when dragging an expanded panel.
+const PAGE_DRAG_STEP: f32 = 48.0;
+
+/// Pressing and dragging to page between activities.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PageDrag {
+    /// Started on the page dots: the page whose dot is under the cursor shows.
+    Dots,
+    /// Started on the panel's background: each `PAGE_DRAG_STEP` sideways turns
+    /// one page. `moved` once it travelled, so letting go doesn't fold the panel.
+    Panel { anchor: f32, moved: bool },
+}
 /// Held files dragged off the shelf stay in the folder this long (the drop
 /// target may still be copying them), then they're deleted.
 const ORPHAN_GRACE: Duration = Duration::from_secs(300);
@@ -423,6 +435,7 @@ pub struct Island {
     down: Option<Hit>,
     down_at: (f32, f32),
     scrub: Option<f32>,
+    page_drag: Option<PageDrag>,
     hits: Vec<(Rect, Hit)>,
     pill_rect: Rect,
 
@@ -529,6 +542,7 @@ impl Island {
             down: None,
             down_at: (0.0, 0.0),
             scrub: None,
+            page_drag: None,
             hits: Vec::new(),
             pill_rect: Rect::default(),
             fullscreen: false,
@@ -617,6 +631,57 @@ impl Island {
         self.retarget();
         self.dirty = true;
         true
+    }
+
+    /// Expands the `i`th page, sliding in from its side.
+    fn show_page(&mut self, i: usize) {
+        let pages = self.pages();
+        if let (Some(&next), Content::Panel(cur)) = (pages.get(i), self.shown) {
+            let from = pages.iter().position(|p| *p == cur).unwrap_or(0);
+            if i != from {
+                self.go_to(next, if i > from { 1 } else { -1 });
+                self.retarget();
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Follows a press-and-drag between pages (see [`PageDrag`]).
+    fn drag_pages(&mut self, x: f32) {
+        match self.page_drag {
+            Some(PageDrag::Dots) => {
+                // The dot nearest the cursor, even once it's past either end or off the row.
+                let dots = self.hits.iter().filter_map(|(r, h)| match h {
+                    Hit::Page(i) => Some((*i, (r.cx() - x).abs())),
+                    _ => None,
+                });
+                if let Some((i, _)) = dots.min_by(|a, b| a.1.total_cmp(&b.1)) {
+                    self.show_page(i);
+                }
+            }
+            Some(PageDrag::Panel { anchor, moved }) => {
+                let dx = x - anchor;
+                let moved = moved || dx.abs() > DRAG_THRESHOLD * 2.0;
+                let mut anchor = anchor;
+                if dx.abs() >= PAGE_DRAG_STEP {
+                    // Like swiping a page: dragging left brings in the next one. No wrapping.
+                    let pages = self.pages();
+                    let cur = match self.wanted().0 {
+                        Content::Panel(p) => pages.iter().position(|x| *x == p),
+                        _ => None,
+                    };
+                    if let Some(cur) = cur {
+                        let next = if dx < 0.0 { cur + 1 } else { cur.wrapping_sub(1) };
+                        if next < pages.len() {
+                            self.show_page(next);
+                        }
+                    }
+                    anchor = x;
+                }
+                self.page_drag = Some(PageDrag::Panel { anchor, moved });
+            }
+            None => {}
+        }
     }
 
     fn go_to(&mut self, panel: Panel, dir: i32) {
@@ -816,7 +881,8 @@ impl Island {
 
         let playing = self.now.as_ref().is_some_and(|n| n.playing);
         self.energy.set(if playing { 1.0 } else { 0.0 });
-        self.press.set(if self.down == Some(Hit::Pill) { 1.0 } else { 0.0 });
+        let paging = matches!(self.page_drag, Some(PageDrag::Panel { moved: true, .. }));
+        self.press.set(if self.down == Some(Hit::Pill) && !paging { 1.0 } else { 0.0 });
         let compact = matches!(want, Content::Idle | Content::Compact(_));
         self.hover.set(if self.inside && compact { 1.0 } else { 0.0 });
         if let Content::Panel(p) = self.shown {
@@ -1300,7 +1366,10 @@ impl Island {
             self.hover_since = inside.then(Instant::now);
         }
         let expanded = matches!(self.shown, Content::Panel(_));
-        self.leave_at = if inside { None } else { self.leave_at.or_else(|| expanded.then(Instant::now)) };
+        // A drag that wanders off the island keeps it open until it's let go.
+        let held = inside || self.page_drag.is_some();
+        self.leave_at = if held { None } else { self.leave_at.or_else(|| expanded.then(Instant::now)) };
+        self.drag_pages(x);
         if self.scrub.is_some() {
             self.scrub = Some(frac_in(self.rect_of(Hit::Progress).map(|r| r.inset(4.0, 8.0)).unwrap_or_default(), x));
         }
@@ -1353,7 +1422,7 @@ impl Island {
         self.inside = false;
         self.hover_since = None;
         self.hot = None;
-        if matches!(self.shown, Content::Panel(_)) && self.scrub.is_none() {
+        if matches!(self.shown, Content::Panel(_)) && self.scrub.is_none() && self.page_drag.is_none() {
             self.leave_at.get_or_insert_with(Instant::now);
         }
         self.retarget();
@@ -1364,6 +1433,12 @@ impl Island {
         let hit = self.hit_at(x, y);
         self.down = hit;
         self.down_at = (x, y);
+        let paged = matches!(self.shown, Content::Panel(p) if self.dots_for(p));
+        self.page_drag = match hit {
+            Some(Hit::Page(_)) => Some(PageDrag::Dots),
+            Some(Hit::Pill) if paged => Some(PageDrag::Panel { anchor: x, moved: false }),
+            _ => None,
+        };
         match hit {
             Some(Hit::Progress) if self.now.as_ref().is_some_and(|n| n.can_seek) => {
                 self.scrub = Some(frac_in(self.rect_of(Hit::Progress).map(|r| r.inset(4.0, 8.0)).unwrap_or_default(), x));
@@ -1379,6 +1454,11 @@ impl Island {
         let down = self.down.take();
         let hit = self.hit_at(x, y);
         let mut event = None;
+        // A drag already showed its page; a press that didn't move is still a click.
+        let dragged = matches!(self.page_drag.take(), Some(PageDrag::Panel { moved: true, .. }));
+        if !self.inside && matches!(self.shown, Content::Panel(_)) {
+            self.leave_at.get_or_insert_with(Instant::now);
+        }
         if let Some(f) = self.scrub.take() {
             if let Some(n) = self.now.as_mut() {
                 let secs = f * n.duration;
@@ -1386,7 +1466,7 @@ impl Island {
                 n.at = Instant::now();
                 self.media(Cmd::Seek(secs));
             }
-        } else if down.is_some() && down == hit {
+        } else if down.is_some() && down == hit && !dragged {
             event = self.click(hit.unwrap_or(Hit::Pill));
         }
         self.retarget();
@@ -1417,13 +1497,7 @@ impl Island {
                     self.expanded = Self::panel_for(p);
                 }
             }
-            Hit::Page(i) => {
-                let pages = self.pages();
-                if let (Some(&next), Content::Panel(cur)) = (pages.get(i), self.shown) {
-                    let from = pages.iter().position(|p| *p == cur).unwrap_or(0);
-                    self.go_to(next, if i > from { 1 } else { -1 });
-                }
-            }
+            Hit::Page(i) => self.show_page(i),
             Hit::Art => return self.now.as_ref().map(|n| IslandEvent::OpenApp(n.app_id.clone())),
             Hit::Play => {
                 if let Some(n) = self.now.as_mut() {

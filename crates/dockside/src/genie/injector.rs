@@ -5,7 +5,7 @@
 //! Only 64-bit apps at our integrity level or below get the DLL; the rest keep
 //! Windows' own animations.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{FreeLibrary, BOOL, HMODULE, HWND, LPARAM, WPARAM};
@@ -34,12 +34,7 @@ pub struct Injector {
 
 impl Injector {
     pub fn start() -> Option<Injector> {
-        let built = std::env::current_exe().ok()?.with_file_name("dockside_hook.dll");
-        if !built.exists() {
-            log!("genie: {} is missing", built.display());
-            return None;
-        }
-        let path = loaded_copy(&built).unwrap_or(built);
+        let path = write_dll().map_err(|e| log!("genie: writing the hook DLL failed: {e}")).ok()?;
         unsafe {
             let dll = LoadLibraryExW(&HSTRING::from(path.as_os_str()), None, LOAD_WITH_ALTERED_SEARCH_PATH)
                 .map_err(|e| log!("genie: loading {} failed: {e}", path.display()))
@@ -107,15 +102,18 @@ impl Drop for Injector {
     }
 }
 
-/// The DLL, copied under a name of its own for this build: every app it's loaded
-/// into keeps the file open until it next handles a message after we unhook, which
-/// would stop the build next to the exe from being replaced.
-fn loaded_copy(built: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(built).ok()?;
-    let stamp = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+/// `dockside_hook.dll`, built by build.rs, so DockSide ships as a single exe.
+static HOOK_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dockside_hook.dll"));
+
+/// Writes the embedded DLL out under a name of its own for this build: every app
+/// it's loaded into keeps the file open until it next handles a message after we
+/// unhook, so a newer DockSide can't overwrite it in place.
+fn write_dll() -> std::io::Result<PathBuf> {
+    // FNV-1a, so each distinct DLL gets its own file name.
+    let hash = HOOK_DLL.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
     let dir = crate::config::dir().join("hook");
-    std::fs::create_dir_all(&dir).ok()?;
-    let name = format!("dockside_hook-{stamp:x}-{:x}.dll", meta.len());
+    std::fs::create_dir_all(&dir)?;
+    let name = format!("dockside_hook-{hash:016x}.dll");
     // Older copies go once no app has them open any more.
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -124,9 +122,12 @@ fn loaded_copy(built: &Path) -> Option<PathBuf> {
             }
         }
     }
-    let copy = dir.join(name);
-    if !copy.exists() {
-        std::fs::copy(built, &copy).ok()?;
+    let path = dir.join(name);
+    if std::fs::metadata(&path).ok().map(|m| m.len()) != Some(HOOK_DLL.len() as u64) {
+        // Written beside and renamed into place, so a half-written DLL is never loaded.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, HOOK_DLL)?;
+        std::fs::rename(&tmp, &path)?;
     }
-    Some(copy)
+    Ok(path)
 }

@@ -148,6 +148,23 @@ impl Item {
         }
     }
 
+    /// What to launch with dropped files as arguments. A `shell:AppsFolder`
+    /// entry drops its arguments, so use the exe behind it where we can find it:
+    /// the running app's, or the path a desktop app is listed under. Store apps'
+    /// own exes (under WindowsApps) can't be started directly, so they keep the entry.
+    fn open_with(&self) -> String {
+        let Some(id) = self.launch.get(..17).filter(|p| p.eq_ignore_ascii_case("shell:AppsFolder\\")).map(|_| &self.launch[17..])
+        else {
+            return self.launch.clone();
+        };
+        self.windows
+            .iter()
+            .find_map(|w| apps::process_path(apps::effective_pid(w.hwnd)))
+            .filter(|p| !p.to_lowercase().contains("\\windowsapps\\"))
+            .or_else(|| (id.contains(":\\") && id.to_lowercase().ends_with(".exe")).then(|| id.to_string()))
+            .unwrap_or_else(|| self.launch.clone())
+    }
+
     /// What its bitmap is cached under: a custom icon replaces the app's own.
     fn bitmap_key(&self) -> &str {
         self.custom_icon.as_deref().unwrap_or(&self.icon_key)
@@ -901,6 +918,10 @@ impl Dock {
         (item.map_or(FileDrop::None, |i| self.file_drop_on(i, paths)), spring)
     }
 
+    pub fn file_hovering(&self) -> bool {
+        self.file_hover.is_some()
+    }
+
     pub fn on_file_leave(&mut self) -> bool {
         self.file_hover = None;
         self.on_leave()
@@ -922,7 +943,7 @@ impl Dock {
                     Some(a) if !a.is_empty() => format!("{a} {files}"),
                     _ => files,
                 };
-                Some(Action::Launch { path: item.launch.clone(), args: Some(args) })
+                Some(Action::Launch { path: item.open_with(), args: Some(args) })
             }
         };
         (drop, action)

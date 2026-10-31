@@ -103,7 +103,15 @@ pub fn hdrop_paths(data: &IDataObject) -> Vec<PathBuf> {
     };
     unsafe {
         let Ok(mut medium) = data.GetData(&fmt) else { return Vec::new() };
-        let hdrop = HDROP(medium.u.hGlobal.0);
+        let out = query_hdrop(HDROP(medium.u.hGlobal.0));
+        ReleaseStgMedium(&mut medium);
+        out
+    }
+}
+
+/// File paths in an HDROP (from a data object or a WM_DROPFILES).
+pub fn query_hdrop(hdrop: HDROP) -> Vec<PathBuf> {
+    unsafe {
         let n = DragQueryFileW(hdrop, u32::MAX, None);
         let mut out = Vec::with_capacity(n as usize);
         for i in 0..n {
@@ -112,7 +120,6 @@ pub fn hdrop_paths(data: &IDataObject) -> Vec<PathBuf> {
             DragQueryFileW(hdrop, i, Some(&mut buf));
             out.push(PathBuf::from(String::from_utf16_lossy(&buf[..len])));
         }
-        ReleaseStgMedium(&mut medium);
         out
     }
 }

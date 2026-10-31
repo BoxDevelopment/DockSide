@@ -211,6 +211,11 @@ pub fn activate(hwnd: HWND) {
         let _ = SetForegroundWindow(hwnd);
         let _ = BringWindowToTop(hwnd);
         let _ = AttachThreadInput(me, fg_thread, false);
+        if GetForegroundWindow() != hwnd {
+            // Still refused (often mid-drag, when the drag's source owns the input):
+            // at least raise it, which needs no foreground rights, so a drop can land in it.
+            let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 }
 

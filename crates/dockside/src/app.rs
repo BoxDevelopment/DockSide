@@ -90,6 +90,9 @@ const TIMER_TASKBAR: usize = 11;
 const TIMER_FULLSCREEN: usize = 12;
 /// The Spotlight key is Win and was tapped once: open Spotlight unless a second tap (Start) follows.
 const TIMER_SPOTLIGHT_TAP: usize = 13;
+/// Elevated only: polls for another app's drag over the Dock, which OLE can't tell us about.
+const TIMER_DRAG_WATCH: usize = 14;
+const DRAG_WATCH_MS: u32 = 80;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
 /// Messages handled slower than this are logged.
@@ -952,7 +955,12 @@ impl App {
         }
         if self.cfg.dock.enabled {
             match Dock::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(d) => self.dock = Some(d),
+                Ok(d) => {
+                    self.dock = Some(d);
+                    if win::elevation::is_elevated() {
+                        self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
+                    }
+                }
                 Err(e) => log!("dock failed: {e}"),
             }
         }
@@ -1334,7 +1342,12 @@ impl App {
         self.retire_dock();
         if self.cfg.dock.enabled {
             match Dock::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(d) => self.dock = Some(d),
+                Ok(d) => {
+                    self.dock = Some(d);
+                    if win::elevation::is_elevated() {
+                        self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
+                    }
+                }
                 Err(e) => log!("dock failed: {e}"),
             }
         }
@@ -2446,6 +2459,7 @@ impl App {
                         TIMER_APPBAR => self.on_appbar_change(),
                         TIMER_FULLSCREEN => self.update_fullscreen(),
                         TIMER_SPOTLIGHT_TAP => self.toggle_spotlight(),
+                        TIMER_DRAG_WATCH => self.watch_drag(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
                         TIMER_THEME
@@ -2668,7 +2682,7 @@ impl App {
         } else if self.menubar.as_ref().is_some_and(|m| m.surface.content == hwnd) {
             self.on_menubar_mouse(hwnd, msg, lp)
         } else if self.dock.as_ref().is_some_and(|d| d.surface.content == hwnd) {
-            self.on_dock_mouse(hwnd, msg, lp)
+            self.on_dock_mouse(hwnd, msg, wp, lp)
         } else if self.island.as_ref().is_some_and(|i| i.surface.content == hwnd) {
             self.on_island_mouse(hwnd, msg, wp, lp)
         } else if self.widgets.as_ref().is_some_and(|w| w.owns(hwnd)) {
@@ -3037,11 +3051,50 @@ impl App {
         Some(LRESULT(0))
     }
 
-    fn on_dock_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
+    /// Elevated: shows the Dock (and spring-loads its icons) while another app's
+    /// drag is over it, standing in for OLE's DragOver/DragLeave.
+    fn watch_drag(&mut self) {
+        if self.dock.is_none() {
+            return;
+        }
+        self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
+        let Some(d) = self.dock.as_mut() else { return };
+        let mut pt = POINT::default();
+        let r = d.surface.rect;
+        let over = crate::dock_drop::foreign_drag(d.surface.content)
+            && unsafe { GetCursorPos(&mut pt) }.is_ok()
+            && (r.left..r.right).contains(&pt.x)
+            && (r.top..r.bottom).contains(&pt.y);
+        if over {
+            let s = d.surface.scale;
+            let (_, spring) = d.on_file_drag((pt.x - r.left) as f32 / s, (pt.y - r.top) as f32 / s, &[]);
+            if let Some(a) = spring {
+                push(a);
+            }
+        } else if d.file_hovering() {
+            d.on_file_leave();
+        } else {
+            return;
+        }
+        self.animate();
+    }
+
+    fn on_dock_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let d = self.dock.as_mut()?;
         let (x, y) = mouse_pt(lp, d.surface.scale);
         let mut animate = false;
         match msg {
+            // Elevated only (see dock_drop).
+            WM_DROPFILES => {
+                let (paths, pt) = crate::dock_drop::take_dropfiles(windows::Win32::UI::Shell::HDROP(wp.0 as _));
+                let s = d.surface.scale;
+                let (drop, action) = d.on_file_drop(pt.x as f32 / s, pt.y as f32 / s, &paths);
+                log!("dock: {} file(s) dropped ({drop:?})", paths.len());
+                if let Some(a) = action {
+                    push(a);
+                }
+                animate = true;
+            }
             WM_MOUSEMOVE => {
                 if !d.tracking {
                     d.tracking = true;

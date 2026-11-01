@@ -28,7 +28,9 @@ pub mod glyphs;
 mod holding;
 mod ics;
 pub mod live;
+mod lyrics;
 pub mod media;
+mod mixer;
 pub mod notifications;
 mod ocr;
 mod shelf;
@@ -100,6 +102,14 @@ const DISARM_DELAY: Duration = Duration::from_millis(300);
 const CATCH_BELOW: f32 = 14.0;
 /// Room around the opened shelf the zone covers while a drag is over it.
 const CATCH_AROUND: f32 = 48.0;
+/// Swiping the Now Playing card: how far skips a track, how far the card flies
+/// off, and the rubber band's reach (toward a skip, and where there's none).
+const ART_SKIP: f32 = 56.0;
+const ART_FLY: f32 = 130.0;
+const ART_STRETCH: f32 = 90.0;
+const ART_STRETCH_BLOCKED: f32 = 22.0;
+/// A skipped track's card waits this long for the new song before coming back.
+const ART_SWAP_WAIT: Duration = Duration::from_millis(900);
 /// How far the pointer moves before a press on a file becomes a drag.
 const DRAG_THRESHOLD: f32 = 5.0;
 /// Sideways travel that turns one page when dragging an expanded panel.
@@ -190,6 +200,8 @@ enum Panel {
     Live(u32),
     /// The notification stack, paged to from the home panel.
     Notes,
+    /// Per-app volume, opened from the volume HUD.
+    Mixer,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -265,6 +277,8 @@ pub enum Hit {
     Next,
     Progress,
     Slider,
+    /// A sound mixer slider: 0 the master volume, then each app.
+    MixSlider(usize),
     TimerToggle,
     TimerCancel,
     /// Quick timer in seconds (0 = stopwatch).
@@ -337,6 +351,8 @@ pub enum IslandCmd {
     ClearShelf,
     /// Open the notification stack.
     ShowNotes,
+    /// Open the sound mixer.
+    ShowMixer,
     /// Settings' "Try It": a short sample Live Activity.
     LiveDemo,
     /// Take files off the shelf (deleting them only if the shelf made them).
@@ -484,6 +500,22 @@ pub struct Island {
     art: Option<(u64, ID2D1Bitmap)>,
     old_art: Option<ID2D1Bitmap>,
     art_fade: Spring,
+    /// The current song's lyrics (looked up by `lyrics::Key`), the one asked
+    /// for, the line being sung and the one before it, crossfading.
+    lyrics: Option<(lyrics::Key, lyrics::Lines)>,
+    lyrics_want: Option<lyrics::Key>,
+    lyric_line: Option<usize>,
+    lyric_prev: Option<usize>,
+    lyric_fade: Spring,
+    /// The sound mixer's apps, their icons, and the slider being dragged.
+    mixer: Vec<mixer::App>,
+    mixer_icons: HashMap<PathBuf, ID2D1Bitmap>,
+    mix_drag: Option<usize>,
+    /// The Now Playing card being swiped (where the press started), its
+    /// offset, and a skip waiting for the next song's art: (direction, when).
+    art_drag: Option<f32>,
+    art_shift: Spring,
+    art_swap: Option<(f32, Instant)>,
     clock: Option<Clock>,
     shelf: Vec<Item>,
     shelf_icons: HashMap<PathBuf, ID2D1Bitmap>,
@@ -649,6 +681,17 @@ impl Island {
             art: None,
             old_art: None,
             art_fade: Spring::new(1.0, 0.45, 1.0),
+            lyrics: None,
+            lyrics_want: None,
+            lyric_line: None,
+            lyric_prev: None,
+            lyric_fade: Spring::new(1.0, 0.3, 1.0),
+            mixer: Vec::new(),
+            mixer_icons: HashMap::new(),
+            mix_drag: None,
+            art_drag: None,
+            art_shift: Spring::new(0.0, 0.34, 0.78),
+            art_swap: None,
             clock: None,
             shelf: holding::load(ic.shelf_clear_on_start),
             shelf_icons: HashMap::new(),
@@ -732,6 +775,7 @@ impl Island {
             dirty: true,
         };
         island.surface.set_hidden(true);
+        island.want_lyrics();
         island.retarget();
         Ok(island)
     }
@@ -845,7 +889,7 @@ impl Island {
             Panel::Shelf => Some(Persist::Shelf),
             Panel::Calendar => Some(Persist::Calendar),
             Panel::Live(k) => Some(Persist::Live(k)),
-            Panel::Home | Panel::Notes => None,
+            Panel::Home | Panel::Notes | Panel::Mixer => None,
         }
     }
 
@@ -970,6 +1014,7 @@ impl Island {
             Panel::Live(k) => self.cfg.live_activities && self.live.get(k).is_some(),
             Panel::Notes => self.notes_valid(),
             Panel::Home => true,
+            Panel::Mixer => self.cfg.volume,
         }
     }
 
@@ -1054,7 +1099,8 @@ impl Island {
 
     fn panel_size(&self, p: Panel) -> (f32, f32) {
         match p {
-                Panel::Media => (372.0, 166.0),
+                Panel::Media => (372.0, 166.0 + if self.lyrics_row() { views::LYRICS_H } else { 0.0 }),
+                Panel::Mixer => (372.0, 56.0 + views::MIX_ROW * (1 + self.mixer.len().min(views::MIX_ROWS)) as f32 + 8.0),
                 Panel::Claude => (372.0, 126.0),
                 Panel::Timer => (340.0, 96.0),
                 Panel::Shelf if self.preview.is_some() && !self.drag_over => (420.0, 360.0),
@@ -1289,8 +1335,69 @@ impl Island {
             _ => self.paused_since = None,
         }
         self.now = next;
+        self.want_lyrics();
         self.retarget();
         self.dirty = true;
+    }
+
+    /// Looks up the current song's lyrics (once per song).
+    fn want_lyrics(&mut self) {
+        let key = self.now.as_ref().filter(|n| self.cfg.lyrics && !n.title.is_empty()).map(|n| (n.title.clone(), n.artist.clone()));
+        if key == self.lyrics_want {
+            return;
+        }
+        self.lyrics_want = key.clone();
+        self.lyric_line = None;
+        self.lyric_prev = None;
+        self.lyrics = None;
+        if let (Some(key), Some(n)) = (key, self.now.as_ref()) {
+            self.lyrics = lyrics::lookup(&key, n.duration).map(|lines| (key, lines));
+        }
+    }
+
+    /// The Now Playing panel shows a lyrics row: the song has words.
+    fn lyrics_row(&self) -> bool {
+        self.lyrics.as_ref().is_some_and(|(_, l)| l.iter().any(|(_, t)| !t.is_empty()))
+    }
+
+    /// Follows the song through its lyrics while the Now Playing panel is open.
+    fn tick_lyrics(&mut self) {
+        let (Some((_, lines)), Some(n)) = (&self.lyrics, &self.now) else { return };
+        if self.shown != Content::Panel(Panel::Media) {
+            return;
+        }
+        let line = lyrics::current(lines, n.position_now());
+        if line != self.lyric_line {
+            self.lyric_prev = self.lyric_line;
+            self.lyric_line = line;
+            self.lyric_fade.snap(0.0);
+            self.lyric_fade.set(1.0);
+        }
+    }
+
+    /// Reads the apps making sound again (not under a dragged slider).
+    fn refresh_mixer(&mut self) {
+        if self.mix_drag.is_none() {
+            self.mixer = mixer::apps();
+            if let Some(v) = sources::volume() {
+                self.volume = v;
+            }
+        }
+    }
+
+    /// Sets the level of mixer row `k` from the pointer at `x`.
+    fn set_mix_at(&mut self, k: usize, x: f32) {
+        let Some(r) = self.rect_of(Hit::MixSlider(k)).map(|r| r.inset(4.0, 12.0)) else { return };
+        let level = frac_in(r, x);
+        if k == 0 {
+            if let Some(v) = sources::set_volume(level) {
+                self.volume = v;
+            }
+        } else if let Some(app) = self.mixer.get_mut(k - 1) {
+            mixer::set_level(app, level);
+            app.level = level;
+            app.muted &= level <= 0.0;
+        }
     }
 
     /// Signals from the background sources.
@@ -1369,6 +1476,12 @@ impl Island {
                 Signal::Calendar(events) => self.events = events,
             }
         }
+        for found in lyrics::drain() {
+            if self.lyrics_want.as_ref() == Some(&found.key) {
+                self.lyrics = Some((found.key, found.lines));
+                changed = true;
+            }
+        }
         for done in holding::drain() {
             changed = true;
             match done {
@@ -1425,6 +1538,9 @@ impl Island {
         self.claude.prune();
         self.live.prune();
         self.tick_demo();
+        if self.shown == Content::Panel(Panel::Mixer) {
+            self.refresh_mixer();
+        }
         self.expire_shelf();
         // A missed rename event must not leave a download spinning forever.
         self.downloads.retain(|d| d.path.exists());
@@ -1630,6 +1746,11 @@ impl Island {
                         "progress":0,"timer":{DEMO_SECS},"color":"#34C759"}}"##
                 ));
                 self.expanded = self.live.list.iter().find(|a| a.id == DEMO_ID).map(|a| Panel::Live(a.key));
+            }
+            IslandCmd::ShowMixer => {
+                self.dismiss_alert();
+                self.refresh_mixer();
+                self.expanded = Some(Panel::Mixer);
             }
             IslandCmd::ShowNotes => {
                 if self.notes_valid() {
@@ -1902,7 +2023,7 @@ impl Island {
         }
         let expanded = matches!(self.shown, Content::Panel(_));
         // A drag that wanders off the island keeps it open until it's let go.
-        let held = inside || self.page_drag.is_some();
+        let held = inside || self.page_drag.is_some() || self.mix_drag.is_some();
         self.leave_at = if held { None } else { self.leave_at.or_else(|| expanded.then(Instant::now)) };
         self.drag_pages(x);
         if let Some((r, x0, _)) = self.note_drag {
@@ -1913,6 +2034,12 @@ impl Island {
         }
         if self.down == Some(Hit::Slider) {
             self.set_volume_at(x);
+        }
+        if let Some(x0) = self.art_drag {
+            self.art_shift.snap(self.stretch(x - x0));
+        }
+        if let Some(k) = self.mix_drag {
+            self.set_mix_at(k, x);
         }
         self.hot = hit;
         self.retarget();
@@ -1947,6 +2074,31 @@ impl Island {
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    /// Whether a swipe that way (left: next) would skip.
+    fn can_skip(&self, dx: f32) -> bool {
+        self.now.as_ref().is_some_and(|n| if dx < 0.0 { n.can_next } else { n.can_prev })
+    }
+
+    /// The card's offset for a swipe of `dx`: it follows, then resists more
+    /// the farther it goes, and barely moves where there's nothing to skip to.
+    fn stretch(&self, dx: f32) -> f32 {
+        let reach = if self.can_skip(dx) { ART_STRETCH } else { ART_STRETCH_BLOCKED };
+        dx.signum() * reach * (1.0 - 1.0 / (dx.abs() / reach + 1.0))
+    }
+
+    /// Let go of the card: far enough skips (it flies off and the next song's
+    /// art slides in from the other side), otherwise it springs back.
+    fn release_art(&mut self, dx: f32) {
+        if dx.abs() >= ART_SKIP && self.can_skip(dx) {
+            let dir = dx.signum();
+            self.media(if dir < 0.0 { Cmd::Next } else { Cmd::Prev });
+            self.art_shift.set(dir * ART_FLY);
+            self.art_swap = Some((dir, Instant::now()));
+        } else {
+            self.art_shift.set(0.0);
         }
     }
 
@@ -1994,6 +2146,11 @@ impl Island {
                 self.scrub = Some(frac_in(self.rect_of(Hit::Progress).map(|r| r.inset(4.0, 8.0)).unwrap_or_default(), x));
             }
             Some(Hit::Slider) => self.set_volume_at(x),
+            Some(Hit::Art) => self.art_drag = Some(x),
+            Some(Hit::MixSlider(k)) => {
+                self.mix_drag = Some(k);
+                self.set_mix_at(k, x);
+            }
             _ => {}
         }
         self.retarget();
@@ -2017,6 +2174,14 @@ impl Island {
         }
         if !self.inside && matches!(self.shown, Content::Panel(_)) {
             self.leave_at.get_or_insert_with(Instant::now);
+        }
+        self.mix_drag = None;
+        if let Some(x0) = self.art_drag.take() {
+            let dx = x - x0;
+            dragged |= dx.abs() > DRAG_THRESHOLD;
+            if dragged {
+                self.release_art(dx);
+            }
         }
         if let Some(f) = self.scrub.take() {
             if let Some(n) = self.now.as_mut() {
@@ -2119,7 +2284,7 @@ impl Island {
             Hit::Drop(_) => {}
             Hit::Event(_) => return Some(IslandEvent::Run(Action::Open("outlookcal:".into()))),
             Hit::AlertBody => return self.alert_click(),
-            Hit::Progress | Hit::Slider => {}
+            Hit::Progress | Hit::Slider | Hit::MixSlider(_) => {}
         }
         None
     }
@@ -2133,6 +2298,10 @@ impl Island {
             }
         }
         let event = match self.alert.as_ref().map(|s| &s.alert) {
+            Some(Alert::Volume) if self.cfg.volume => {
+                self.command(IslandCmd::ShowMixer);
+                return None;
+            }
             Some(Alert::Volume | Alert::Brightness(_)) => return None,
             Some(Alert::Screenshot(p)) => Some(IslandEvent::Run(Action::Open(p.to_string_lossy().into_owned()))),
             Some(Alert::Downloaded(p)) => Some(IslandEvent::Run(Action::Reveal(p.to_string_lossy().into_owned()))),
@@ -2314,6 +2483,9 @@ impl Island {
         if !entries.is_empty() {
             entries.push(Entry::Separator);
         }
+        if self.cfg.volume {
+            entries.push(Entry::item("Sound Mixer", Action::Island(IslandCmd::ShowMixer)));
+        }
         entries.push(Entry::item("Dynamic Island Settings…", Action::OpenSettings(Some(crate::settings::Page::Island))));
         entries.push(Entry::item(
             "Hide Dynamic Island",
@@ -2401,6 +2573,13 @@ impl Island {
             moving = true;
         }
         moving |= self.tick_shelf(dt);
+        self.tick_lyrics();
+        // A skip whose new art never came (same cover, or none): bring the card back.
+        if self.art_swap.is_some_and(|(_, t)| t.elapsed() >= ART_SWAP_WAIT) {
+            self.art_swap = None;
+            self.art_shift.snap(-self.art_shift.value * 0.6);
+            self.art_shift.set(0.0);
+        }
         for s in [
             &mut self.w,
             &mut self.h,
@@ -2411,6 +2590,8 @@ impl Island {
             &mut self.press,
             &mut self.bar_hover,
             &mut self.art_fade,
+            &mut self.art_shift,
+            &mut self.lyric_fade,
             &mut self.slide,
             &mut self.dot_pos,
             &mut self.desk,
@@ -2440,6 +2621,7 @@ impl Island {
             || self.leave_at.is_some()
             || self.armed
             || self.drag_left.is_some()
+            || self.art_swap.is_some()
             || (self.cfg.expand_on_hover && self.hover_since.is_some() && self.expanded.is_none());
         moving || (visible && period.is_some()) || waiting
     }
@@ -2480,6 +2662,11 @@ impl Island {
             });
             self.old_art = self.art.take().map(|(_, b)| b);
             self.art = bmp;
+            if let Some((dir, _)) = self.art_swap.take() {
+                self.art_shift.snap(-dir * ART_FLY * 0.6);
+                self.art_shift.set(0.0);
+                self.old_art = None;
+            }
             self.art_fade.snap(0.0);
             self.art_fade.set(1.0);
         }
@@ -2492,6 +2679,14 @@ impl Island {
                 }),
                 _ => None,
             };
+        }
+        self.mixer_icons.retain(|p, _| self.mixer.iter().any(|a| a.exe.as_ref() == Some(p)));
+        for exe in self.mixer.iter().filter_map(|a| a.exe.as_ref()) {
+            if !self.mixer_icons.contains_key(exe) {
+                if let Some(b) = load_shell_image(&exe.to_string_lossy(), 48, false).and_then(|px| px.to_bitmap(&rt)) {
+                    self.mixer_icons.insert(exe.clone(), b);
+                }
+            }
         }
         self.live_icons.retain(|p, _| self.live.list.iter().any(|a| a.icon.as_ref() == Some(p)));
         for path in self.live.list.iter().filter_map(|a| a.icon.as_ref()) {
@@ -2560,6 +2755,7 @@ impl Island {
 
         // The bubble splits off the pill's right end.
         let b = self.bubble.value.max(0.0);
+        let bubble_vel = self.bubble.velocity;
         let bd = ch * (0.55 + 0.45 * b.min(1.0));
         let bcx = pill.right() - ch / 2.0 + (ch + 6.0) * b;
         let bubble_rect = Rect::new(bcx - bd / 2.0, lip + ch / 2.0 - bd / 2.0, bd, bd);
@@ -2573,6 +2769,7 @@ impl Island {
             art: self.art.as_ref().map(|(_, b)| b),
             old_art: self.old_art.as_ref(),
             art_fade: self.art_fade.value.clamp(0.0, 1.0),
+            art_shift: self.art_shift.value,
             wave_t: self.wave_t,
             energy: self.energy.value.clamp(0.0, 1.0),
             hot: self.hot,
@@ -2607,6 +2804,12 @@ impl Island {
             events: &self.events,
             downloads: &self.downloads,
             volume: self.volume,
+            lyrics_row: self.lyrics_row(),
+            lyric: self.lyrics.as_ref().zip(self.lyric_line).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
+            lyric_prev: self.lyrics.as_ref().zip(self.lyric_prev).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
+            lyric_fade: self.lyric_fade.value,
+            mixer: &self.mixer,
+            mixer_icons: &self.mixer_icons,
             alert_img: match self.shown {
                 Content::Alert(id) => {
                     [&self.alert, &self.prev_alert].into_iter().flatten().find(|s| s.id == id).and_then(|s| s.img.as_ref())
@@ -2663,6 +2866,13 @@ impl Island {
                 p.stroke_round(shape.inset(0.25, 0.25), radius, Color::gray(255, 0.07 * grown * presence), 0.5);
             }
             if b > 0.001 {
+                // While it's moving, a neck joins it to the pill; it snaps as the bubble settles.
+                if b < 0.98 && bubble_vel.abs() > 0.2 {
+                    let r1 = pill.h / 2.0;
+                    let end = (pill.right() - r1, pill.cy(), r1);
+                    let ball = (bubble_rect.cx(), bubble_rect.cy(), bd / 2.0);
+                    glyphs::neck(p, end, ball, r1 + bd / 2.0 + ch * 0.4, Color::BLACK.alpha(presence));
+                }
                 p.fill_circle(bubble_rect.cx(), bubble_rect.cy(), bd / 2.0, Color::BLACK.alpha(presence));
                 if let Some(k) = bubble_kind {
                     views::bubble(p, bubble_rect, k, &view, presence * ((b - 0.4) / 0.6).clamp(0.0, 1.0));
@@ -2701,6 +2911,7 @@ impl Island {
                         Panel::Home => views::home_panel(p, body, &view, a, &mut content_hits),
                         Panel::Live(k) => views::live_panel(p, body, k, &view, a, &mut content_hits),
                         Panel::Notes => views::notes_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Mixer => views::mixer_panel(p, body, &view, a, &mut content_hits),
                     });
                 }
             });
@@ -2828,3 +3039,4 @@ mod tests {
         assert_eq!(fmt_time(-3.0), "0:00");
     }
 }
+

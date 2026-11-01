@@ -203,6 +203,10 @@ hide_paused_after = 60
 # Activities: these stay in the island while they're happening.
 # Media playing in any app.
 now_playing = true
+# The line being sung, under the song in the Now Playing panel. Lyrics come
+# from lrclib.net (free, no account): each song's title, artist and length are
+# sent there once to look them up.
+lyrics = true
 # Timers and the stopwatch (the home panel's buttons and the right-click menu).
 timers = true
 # Browser downloads in progress.

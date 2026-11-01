@@ -67,9 +67,10 @@ hidden while DockSide runs and is always restored when it exits.
 - Click the idle pill for the time, your next meeting and one-click timers; right-click for timers,
   the shelf and settings
 - **Now Playing** from anything that reports to Windows' media controls (Spotify, browsers, Media Player):
-  artwork, a waveform tinted from it, and an expanded player with scrubbing and transport controls
+  artwork, a waveform tinted from it, and an expanded player with scrubbing and transport controls;
+  swipe the artwork to skip, and synced lyrics (from lrclib.net)
 - **Volume and brightness HUD** in place of the Windows popups (volume keys, or scroll over the island);
-  drag the bar to set the volume
+  drag the bar to set the volume, or click it for a per-app sound mixer
 - **Timer and stopwatch**: from the home panel, the right-click menu, or Spotlight ("timer 10m", "stopwatch")
 - **File shelf**: drag files to the top of the screen to hold them, then drag them out where you need them.
   Quick Action tiles beside the shelf convert them, copy the text out of pictures (OCR) or zip them.

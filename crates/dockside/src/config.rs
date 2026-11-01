@@ -250,6 +250,8 @@ pub struct IslandCfg {
     // Activities: things that stay in the island while they're happening.
     /// Media playing in any app.
     pub now_playing: bool,
+    /// Synced lyrics in the Now Playing panel (looked up on lrclib.net).
+    pub lyrics: bool,
     /// Timers and the stopwatch (the home panel's buttons and the right-click menu).
     pub timers: bool,
     /// Browser downloads in progress.

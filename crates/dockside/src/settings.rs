@@ -76,6 +76,7 @@ fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
         "always_show" => c.always_show,
         "expand_on_hover" => c.expand_on_hover,
         "now_playing" => c.now_playing,
+        "lyrics" => c.lyrics,
         "timers" => c.timers,
         "downloads" => c.downloads,
         "calendar" => c.calendar,
@@ -850,6 +851,7 @@ impl SettingsWindow {
                     title: Some("Activities"),
                     rows: vec![
                         Row::Toggle("Now Playing", Key::Island("now_playing")),
+                        Row::Toggle("Synced lyrics (from lrclib.net)", Key::Island("lyrics")),
                         Row::Toggle("Timers and stopwatch", Key::Island("timers")),
                         Row::Toggle("Downloads in progress", Key::Island("downloads")),
                         Row::Toggle("Upcoming meetings", Key::Island("calendar")),

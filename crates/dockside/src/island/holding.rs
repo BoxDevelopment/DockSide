@@ -73,6 +73,11 @@ pub(super) fn finish(done: Done) {
     if let Ok(mut d) = DONE.lock() {
         d.push(done);
     }
+    signal();
+}
+
+/// Wakes the island to collect results (its workers share this signal).
+pub(super) fn signal() {
     crate::win::post(NOTIFY_HWND.load(Ordering::Relaxed), NOTIFY_MSG.load(Ordering::Relaxed));
 }
 

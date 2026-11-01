@@ -30,6 +30,8 @@ pub struct View<'a> {
     pub art: Option<&'a ID2D1Bitmap>,
     pub old_art: Option<&'a ID2D1Bitmap>,
     pub art_fade: f32,
+    /// How far the artwork and title have been swiped (or are flying), in points.
+    pub art_shift: f32,
     pub wave_t: f32,
     pub energy: f32,
     pub hot: Option<Hit>,
@@ -64,6 +66,15 @@ pub struct View<'a> {
     pub events: &'a [CalEvent],
     pub downloads: &'a [Download],
     pub volume: (f32, bool),
+    /// Now Playing's lyrics: whether the panel has the row, the line being
+    /// sung and the one before it (crossfading by `lyric_fade`).
+    pub lyrics_row: bool,
+    pub lyric: Option<&'a str>,
+    pub lyric_prev: Option<&'a str>,
+    pub lyric_fade: f32,
+    /// The sound mixer's apps and their icons.
+    pub mixer: &'a [super::mixer::App],
+    pub mixer_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
     pub alert_img: Option<&'a ID2D1Bitmap>,
     pub accent: Color,
     pub time: f32,
@@ -436,18 +447,38 @@ pub fn media_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) -> R
     let Some(now) = v.now else { return Rect::default() };
     let f = v.fonts;
     let art = Rect::new(r.x + PAD, r.y + PAD, 56.0, 56.0);
-    artwork(p, art, 12.0, v, a);
     let wave = Rect::new(r.right() - PAD - 22.0, art.cy() - 9.0, 22.0, 18.0);
     waveform(p, wave, v, a);
     let tx = art.right() + 14.0;
     let tw = wave.x - 12.0 - tx;
-    let title = if now.title.is_empty() { "Not Playing" } else { &now.title };
-    p.text(title, &f.title, Rect::new(tx, art.y + 7.0, tw, 20.0), WHITE.alpha(a));
-    p.text(&now.artist, &f.body, Rect::new(tx, art.y + 28.0, tw, 19.0), SECONDARY.alpha(a));
+    // The artwork and title move together as a card when swiped, fading as they go.
+    let fade = a * (1.0 - v.art_shift.abs() / 150.0).clamp(0.0, 1.0);
+    let card = Rect::new(r.x, art.y - 4.0, wave.x - 6.0 - r.x, art.h + 8.0);
+    p.clipped(card, || {
+        p.transformed(v.art_shift, 0.0, 1.0, || {
+            artwork(p, art, 12.0, v, fade);
+            let title = if now.title.is_empty() { "Not Playing" } else { &now.title };
+            p.text(title, &f.title, Rect::new(tx, art.y + 7.0, tw, 20.0), WHITE.alpha(fade));
+            p.text(&now.artist, &f.body, Rect::new(tx, art.y + 28.0, tw, 19.0), SECONDARY.alpha(fade));
+        });
+    });
     hits.push((Rect::new(art.x, art.y, wave.x - art.x, art.h), Hit::Art));
 
+    // The line being sung: the new one rises in as the old one rises away.
+    let ly = if v.lyrics_row { LYRICS_H } else { 0.0 };
+    if v.lyrics_row {
+        let line = Rect::new(r.x + PAD, art.bottom() + 8.0, r.w - 2.0 * PAD, 22.0);
+        let k = v.lyric_fade.clamp(0.0, 1.0);
+        p.clipped(line.inset(0.0, -2.0), || {
+            if let Some(prev) = v.lyric_prev.filter(|_| k < 1.0) {
+                lyric_line(p, line.offset(0.0, -line.h * k), prev, f, a * (1.0 - k) * (1.0 - k));
+            }
+            lyric_line(p, line.offset(0.0, line.h * 0.6 * (1.0 - k)), v.lyric.unwrap_or(""), f, a * k * k);
+        });
+    }
+
     // Progress: elapsed · bar · remaining.
-    let row = r.y + 100.0;
+    let row = r.y + 100.0 + ly;
     let pos = match v.scrub {
         Some(fr) => fr * now.duration,
         None => now.position_now(),
@@ -469,7 +500,7 @@ pub fn media_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) -> R
         hits.push((bar.inset(-4.0, -8.0), Hit::Progress));
     }
 
-    let cy = r.y + 138.0;
+    let cy = r.y + 138.0 + ly;
     let cx = r.cx();
     for (x, hit, enabled) in [(cx - 72.0, Hit::Prev, now.can_prev), (cx, Hit::Play, true), (cx + 72.0, Hit::Next, now.can_next)] {
         let (hot, pressed) = button_state(v, hit, enabled);
@@ -989,6 +1020,53 @@ fn next_event_card(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
 fn button_state(v: &View, hit: Hit, enabled: bool) -> (bool, bool) {
     let hot = enabled && v.hot == Some(hit);
     (hot, hot && v.down == Some(hit))
+}
+
+/// The Now Playing panel's extra height for its lyrics row.
+pub const LYRICS_H: f32 = 28.0;
+
+/// One lyric line; an empty one (a break in the singing) shows a note.
+fn lyric_line(p: &Painter, r: Rect, text: &str, f: &Fonts, a: f32) {
+    if text.is_empty() {
+        p.text("♪", &f.body, r, Color::gray(255, 0.4 * a));
+    } else {
+        p.text(text, &f.body, r, Color::gray(255, 0.92 * a));
+    }
+}
+
+/// The sound mixer: the master volume, then each app making sound.
+pub const MIX_ROW: f32 = 40.0;
+pub const MIX_ROWS: usize = 5;
+
+pub fn mixer_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let f = v.fonts;
+    p.text("Sound", &f.header, Rect::new(r.x + 22.0, r.y + 14.0, 160.0, 18.0), WHITE.alpha(a));
+    let rows = std::iter::once(None).chain(v.mixer.iter().take(MIX_ROWS).map(Some));
+    for (k, app) in rows.enumerate() {
+        let cy = r.y + 46.0 + MIX_ROW * (k as f32 + 0.5);
+        let ic = r.x + PAD + 12.0;
+        let (name, level, muted) = match app {
+            None => ("Volume", v.volume.0, v.volume.1),
+            Some(app) => (app.name.as_str(), app.level, app.muted),
+        };
+        match app.and_then(|a| a.exe.as_ref()).and_then(|e| v.mixer_icons.get(e)) {
+            Some(bmp) => p.bitmap(bmp, Rect::new(ic - 12.0, cy - 12.0, 24.0, 24.0), a),
+            None => g::speaker(p, ic, cy, 16.0, if muted { 0.0 } else { level }, muted, WHITE.alpha(a)),
+        }
+        let dim = if app.is_some_and(|x| !x.active) { 0.55 } else { 0.92 };
+        p.text(name, &f.body, Rect::new(ic + 20.0, cy - 9.5, 104.0, 19.0), Color::gray(255, dim * a));
+        let hit = Hit::MixSlider(k);
+        let track = Rect::new(r.x + 150.0, cy - 3.0, r.w - 150.0 - PAD - 40.0, 6.0);
+        let hot = v.hot == Some(hit) || v.down == Some(hit);
+        let thick = if hot { 8.0 } else { 6.0 };
+        let bar = Rect::new(track.x, cy - thick / 2.0, track.w, thick);
+        p.fill_round(bar, thick / 2.0, Color::gray(255, 0.2 * a));
+        let shown = if muted { 0.0 } else { level.clamp(0.0, 1.0) };
+        p.fill_round(Rect::new(bar.x, bar.y, (bar.w * shown).max(thick), thick), thick / 2.0, Color::gray(255, if muted { 0.35 } else { 0.92 } * a));
+        let pct = if muted { "Muted".to_string() } else { format!("{}%", (level * 100.0).round() as i32) };
+        p.text_tabular(&pct, &f.small_r, Rect::new(bar.right(), cy - 8.0, PAD + 40.0 - PAD, 16.0), SECONDARY.alpha(a));
+        hits.push((bar.inset(-4.0, -12.0), hit));
+    }
 }
 
 fn artwork(p: &Painter, r: Rect, radius: f32, v: &View, a: f32) {

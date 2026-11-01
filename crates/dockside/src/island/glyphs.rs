@@ -395,3 +395,51 @@ pub fn chevron(p: &Painter, cx: f32, cy: f32, s: f32, back: bool, c: Color) {
     p.line(cx + 2.5 * k * d, cy - 6.0 * k, cx - 3.5 * k * d, cy, c, 1.8 * k);
     p.line(cx - 3.5 * k * d, cy, cx + 2.5 * k * d, cy + 6.0 * k, c, 1.8 * k);
 }
+
+/// The "goo" joining two circles as they pull apart or merge (a metaball
+/// bridge): curves leave each circle and pinch in between. Nothing when
+/// they're farther apart than `max_d`, or one sits inside the other.
+pub fn neck(p: &Painter, (x1, y1, r1): (f32, f32, f32), (x2, y2, r2): (f32, f32, f32), max_d: f32, c: Color) {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let (dx, dy) = (x2 - x1, y2 - y1);
+    let d = dx.hypot(dy);
+    if d > max_d || d <= (r1 - r2).abs() || d < 0.001 {
+        return;
+    }
+    // How far round each circle the bridge starts, and how strongly it bends.
+    const SPREAD: f32 = 0.5;
+    const HANDLE: f32 = 2.4;
+    let (u1, u2) = if d < r1 + r2 {
+        (
+            ((r1 * r1 + d * d - r2 * r2) / (2.0 * r1 * d)).clamp(-1.0, 1.0).acos(),
+            ((r2 * r2 + d * d - r1 * r1) / (2.0 * r2 * d)).clamp(-1.0, 1.0).acos(),
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    let base = dy.atan2(dx);
+    let max_spread = ((r1 - r2) / d).clamp(-1.0, 1.0).acos();
+    let a1a = base + u1 + (max_spread - u1) * SPREAD;
+    let a1b = base - u1 - (max_spread - u1) * SPREAD;
+    let a2a = base + PI - u2 - (PI - u2 - max_spread) * SPREAD;
+    let a2b = base - PI + u2 + (PI - u2 - max_spread) * SPREAD;
+    let at = |x: f32, y: f32, a: f32, r: f32| (x + a.cos() * r, y + a.sin() * r);
+    let (p1a, p1b) = (at(x1, y1, a1a, r1), at(x1, y1, a1b, r1));
+    let (p2a, p2b) = (at(x2, y2, a2a, r2), at(x2, y2, a2b, r2));
+    let total = r1 + r2;
+    let k = (SPREAD * HANDLE).min((p1a.0 - p2a.0).hypot(p1a.1 - p2a.1) / total) * (d * 2.0 / total).min(1.0);
+    let h1 = at(p1a.0, p1a.1, a1a - FRAC_PI_2, r1 * k);
+    let h2 = at(p2a.0, p2a.1, a2a + FRAC_PI_2, r2 * k);
+    let h3 = at(p2b.0, p2b.1, a2b - FRAC_PI_2, r2 * k);
+    let h4 = at(p1b.0, p1b.1, a1b + FRAC_PI_2, r1 * k);
+    let geom = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(p1a.0, p1a.1), D2D1_FIGURE_BEGIN_FILLED);
+        g.AddBezier(&D2D1_BEZIER_SEGMENT { point1: pt(h1.0, h1.1), point2: pt(h2.0, h2.1), point3: pt(p2a.0, p2a.1) });
+        g.AddLine(pt(p2b.0, p2b.1));
+        g.AddBezier(&D2D1_BEZIER_SEGMENT { point1: pt(h3.0, h3.1), point2: pt(h4.0, h4.1), point3: pt(p1b.0, p1b.1) });
+        g.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = geom {
+        p.fill_geometry(&g, c);
+    }
+}

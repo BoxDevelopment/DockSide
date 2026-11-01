@@ -2,8 +2,9 @@
 //! screen that morphs between live activities.
 //!
 //! * **Idle**: a small pill in the menu bar. Click it for a home panel (time,
-//!   next event, quick timers); drop files on it to hold them on the shelf
-//!   (copied to a holding folder, where they expire; right-click to convert).
+//!   next event, quick timers). Drag files to the top of the screen to hold
+//!   them on the shelf (by reference; they expire) or drop them on a Quick
+//!   Action tile (convert, copy text, zip); right-click a held file to convert.
 //! * **Compact activities** (persistent): timer / stopwatch, Now Playing,
 //!   downloads, an upcoming meeting and the file shelf. When two are running,
 //!   the second splits off into a bubble beside the pill.
@@ -19,6 +20,7 @@
 
 pub mod bluetooth;
 pub mod calendar;
+mod catch;
 pub mod claude;
 mod convert;
 mod encode;
@@ -28,6 +30,7 @@ mod ics;
 pub mod live;
 pub mod media;
 pub mod notifications;
+mod ocr;
 mod shelf;
 pub mod sources;
 pub mod timer;
@@ -55,6 +58,7 @@ use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
 use crate::theme::Theme;
 use crate::win::system::Battery;
+use catch::Catch;
 use crate::win::Monitor;
 use calendar::CalEvent;
 pub use convert::Format;
@@ -87,10 +91,15 @@ const SWIPE_COOLDOWN: Duration = Duration::from_millis(250);
 /// How far content slides when switching pages, in points.
 const SLIDE: f32 = 42.0;
 
-/// Pointer away from an expanded island this long collapses it.
-const COLLAPSE_DELAY: f32 = 0.9;
-/// Pointer resting on the island this long expands it (`expand_on_hover`).
-const HOVER_EXPAND_DELAY: f32 = 0.35;
+/// A file drag that leaves the island (or its drop zone) keeps it open this
+/// long, so moving from the zone onto the island doesn't flicker it shut.
+const DRAG_LINGER: Duration = Duration::from_millis(150);
+/// The drop zone stays a moment after the button is let go, for the drop to arrive.
+const DISARM_DELAY: Duration = Duration::from_millis(300);
+/// How far below the pill the drop zone reaches before a drag is over it.
+const CATCH_BELOW: f32 = 14.0;
+/// Room around the opened shelf the zone covers while a drag is over it.
+const CATCH_AROUND: f32 = 48.0;
 /// How far the pointer moves before a press on a file becomes a drag.
 const DRAG_THRESHOLD: f32 = 5.0;
 /// Sideways travel that turns one page when dragging an expanded panel.
@@ -117,6 +126,26 @@ const PURPLE: Color = Color::rgba(125, 122, 255, 1.0);
 const CLAUDE: Color = Color::rgba(217, 119, 87, 1.0);
 const WHITE: Color = Color::gray(255, 0.96);
 const SECONDARY: Color = Color::gray(255, 0.55);
+
+/// Where a file drag over the island lands: the shelf, or a Quick Action.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tile {
+    Hold,
+    Convert,
+    Text,
+    Zip,
+}
+
+impl Tile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tile::Hold => "Hold",
+            Tile::Convert => "Convert",
+            Tile::Text => "Copy Text",
+            Tile::Zip => "Zip",
+        }
+    }
+}
 
 /// Long-running activities, in priority order: the first is the pill, the second the bubble.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -166,6 +195,8 @@ pub enum Alert {
     Privacy { camera: bool, app: String },
     Note(Note),
     TimerDone,
+    /// "Copy Text" finished: the text copied (empty: none found).
+    TextCopied(String),
     ClaudeDone { project: String, secs: f32, tools: u32 },
     ClaudeNeeds { project: String, message: String },
     /// A Live Activity ended with a closing message.
@@ -224,6 +255,8 @@ pub enum Hit {
     /// A held file's expiry badge (hover for the time left).
     ShelfTimer(usize),
     ShelfClear,
+    /// A drop target while a file drag is over the island.
+    Drop(Tile),
     Event(usize),
     AlertBody,
     /// A page dot under an expanded panel.
@@ -279,10 +312,10 @@ pub enum IslandCmd {
     ShowNotes,
     /// Settings' "Try It": a short sample Live Activity.
     LiveDemo,
-    /// Take one file off the shelf (deleting its held copy).
+    /// Take one file off the shelf (deleting it only if the shelf made it).
     RemoveShelf(PathBuf),
-    /// Convert a held file; the result joins the shelf beside it.
-    Convert(PathBuf, Format),
+    /// Convert files; each result joins the shelf beside its original (or at the end).
+    Convert(Vec<PathBuf>, Format),
 }
 
 pub enum IslandEvent {
@@ -454,7 +487,24 @@ pub struct Island {
     /// A menu is open (the island's context menu): don't fold away under it.
     pub hold_open: bool,
     drag_over: bool,
+    /// When a file drag last left; it closes after `DRAG_LINGER` unless it comes back.
+    drag_left: Option<Instant>,
+    /// The files being dragged over, and the target under the pointer.
+    drop_paths: Vec<PathBuf>,
+    drop_hot: Option<Tile>,
     dragging_out: bool,
+    /// The drop zone along the top edge, shown while the mouse button is held.
+    catch: Option<Catch>,
+    /// The button is held and moving (anywhere): the drop zone is out.
+    armed: bool,
+    /// Elevated: drags from other apps can't reach our OLE targets, so the
+    /// pointer is watched for one over the zone instead (and drops arrive as
+    /// WM_DROPFILES). Whether the last look found it there.
+    elevated: bool,
+    polled_over: bool,
+    disarm_at: Option<Instant>,
+    /// Something for the app to do after a drop (the Convert tile's menu).
+    event: Option<IslandEvent>,
     shown: Content,
     bubble_kind: Option<Persist>,
     w: Spring,
@@ -582,7 +632,16 @@ impl Island {
             expanded: None,
             hold_open: false,
             drag_over: false,
+            drag_left: None,
+            drop_paths: Vec::new(),
+            drop_hot: None,
             dragging_out: false,
+            catch: if ic.shelf { Catch::new() } else { None },
+            armed: false,
+            elevated: crate::win::elevation::is_elevated(),
+            polled_over: false,
+            disarm_at: None,
+            event: None,
             shown: Content::Idle,
             bubble_kind: None,
             w: Spring::new(iw, 0.42, 0.72),
@@ -930,6 +989,7 @@ impl Island {
                 Some(Alert::Privacy { .. }) => (272.0, ch),
                 Some(Alert::Note(_)) => (380.0, 74.0),
                 Some(Alert::TimerDone) => (220.0, ch),
+                Some(Alert::TextCopied(_)) => (330.0, ch),
                 Some(Alert::ClaudeDone { .. }) => (330.0, ch),
                 Some(Alert::ClaudeNeeds { .. }) => (400.0, ch),
                 Some(Alert::LiveDone { .. }) => (330.0, ch),
@@ -947,7 +1007,7 @@ impl Island {
                 Panel::Media => (372.0, 166.0),
                 Panel::Claude => (372.0, 126.0),
                 Panel::Timer => (340.0, 96.0),
-                Panel::Shelf => (420.0, 140.0),
+                Panel::Shelf => (if self.drag_over && !self.tiles().is_empty() { 460.0 } else { 420.0 }, 140.0),
                 Panel::Calendar => {
                     let n = self.events.iter().filter(|e| e.end > calendar::unix_now()).take(3).count().max(1);
                     (360.0, 48.0 + 44.0 * n as f32)
@@ -1264,10 +1324,12 @@ impl Island {
                 holding::Done::Ready(p) => match self.shelf.iter_mut().find(|i| i.path == p) {
                     Some(i) => i.pending = false,
                     // Finished for an island that was rebuilt since.
-                    None => self.shelf.push(Item { path: p, source: None, added: SystemTime::now(), pending: false }),
+                    None => self.shelf.push(Item { path: p, added: SystemTime::now(), pending: false }),
                 },
                 holding::Done::Failed(p) => self.shelf.retain(|i| i.path != p),
+                holding::Done::Copied(text) => self.show_alert(Alert::TextCopied(text), 3.0),
             }
+            holding::save(&self.shelf);
         }
         if changed {
             self.retarget();
@@ -1330,6 +1392,7 @@ impl Island {
     fn expire_shelf(&mut self) {
         let now = SystemTime::now();
         let life = self.shelf_lifetime();
+        let before = self.shelf.len();
         let mut gone = Vec::new();
         self.shelf.retain(|i| {
             let expired = !i.pending && life.is_some_and(|l| i.added + l <= now);
@@ -1338,10 +1401,14 @@ impl Island {
             }
             !expired && (i.pending || i.path.exists())
         });
+        let vanished = self.shelf.len() + gone.len() != before;
         let (old, keep): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.orphans).into_iter().partition(|(_, t)| t.elapsed() >= ORPHAN_GRACE);
         self.orphans = keep;
         gone.extend(old.into_iter().map(|(p, _)| p).filter(|p| !self.shelf.iter().any(|i| i.path == *p)));
+        if vanished || !gone.is_empty() {
+            holding::save(&self.shelf);
+        }
         if !gone.is_empty() {
             holding::discard(gone);
         }
@@ -1351,6 +1418,7 @@ impl Island {
     fn remove_shelf(&mut self, keep: impl Fn(&Item) -> bool) {
         let (kept, gone): (Vec<Item>, Vec<Item>) = std::mem::take(&mut self.shelf).into_iter().partition(|i| keep(i));
         self.shelf = kept;
+        holding::save(&self.shelf);
         holding::discard(gone.into_iter().map(|i| i.path).collect());
     }
 
@@ -1497,14 +1565,14 @@ impl Island {
             IslandCmd::CancelClock => self.clock = None,
             IslandCmd::ClearShelf => self.remove_shelf(|_| false),
             IslandCmd::RemoveShelf(ref p) => self.remove_shelf(|i| i.path != *p),
-            IslandCmd::Convert(ref p, to) => {
-                if let Some(item) = holding::convert(p, to) {
-                    let at = self.shelf.iter().position(|i| i.path == *p).map_or(self.shelf.len(), |i| i + 1);
-                    self.shelf.insert(at, item);
-                    // Show it arriving, then fold away unless the pointer stays.
-                    self.expanded = Some(Panel::Shelf);
-                    self.leave_at = Some(Instant::now() + Duration::from_millis(1200));
+            IslandCmd::Convert(ref paths, to) => {
+                for p in paths {
+                    if let Some(item) = holding::convert(p, to) {
+                        let at = self.shelf.iter().position(|i| i.path == *p).map_or(self.shelf.len(), |i| i + 1);
+                        self.shelf.insert(at, item);
+                    }
                 }
+                self.show_shelf();
             }
         }
         if matches!(cmd, IslandCmd::Timer(_) | IslandCmd::Stopwatch) {
@@ -1515,37 +1583,196 @@ impl Island {
         self.dirty = true;
     }
 
-    /// A file drag over the island (OLE drop target). Returns whether it's accepted.
+    /// A file drag over the island or its drop zone (OLE drop targets; `x`, `y`
+    /// in screen pixels). Returns whether it's accepted where it is.
     pub fn on_drag(&mut self, phase: Phase, paths: &[PathBuf]) -> bool {
         if self.dragging_out || !self.cfg.shelf {
             return false;
         }
-        match phase {
-            Phase::Over(..) => {
-                if !self.drag_over {
-                    self.drag_over = true;
-                    self.leave_at = None;
+        let ok = match phase {
+            Phase::Over(x, y) => {
+                self.drag_over = true;
+                self.drag_left = None;
+                self.leave_at = None;
+                if self.drop_paths != paths {
+                    self.drop_paths = paths.to_vec();
                 }
+                let tile = self.tile_at(x, y);
+                self.drop_hot = Some(tile);
+                self.tile_ok(tile, paths)
             }
-            Phase::Leave => self.drag_over = false,
-            Phase::Drop(..) => {
-                self.drag_over = false;
-                for p in paths {
-                    let held = self.shelf.iter().any(|i| i.path == *p || i.source.as_ref() == Some(p));
-                    if !held {
-                        if let Some(item) = holding::hold(p) {
-                            self.shelf.push(item);
-                        }
-                    }
+            // Moving between the zone and the island leaves one and enters the other.
+            // (A drag it never took, text say, leaves too.)
+            Phase::Leave => {
+                if self.drag_over {
+                    self.drag_left = Some(Instant::now());
                 }
-                // Show what landed, then fold away unless the pointer stays.
-                self.expanded = Some(Panel::Shelf);
-                self.leave_at = Some(Instant::now() + Duration::from_millis(1200));
+                false
             }
-        }
+            Phase::Drop(x, y) => {
+                // A WM_DROPFILES (elevated) arrives wherever it was let go, even
+                // on a tile that can't take these files: those go on the shelf.
+                let tile = Some(self.tile_at(x, y)).filter(|t| self.tile_ok(*t, paths)).unwrap_or(Tile::Hold);
+                self.end_drag();
+                let ok = !paths.is_empty();
+                if ok {
+                    self.drop_on(tile, paths, x, y);
+                }
+                ok
+            }
+        };
         self.retarget();
         self.dirty = true;
-        true
+        ok
+    }
+
+    fn end_drag(&mut self) {
+        self.drag_over = false;
+        self.drag_left = None;
+        self.drop_hot = None;
+        self.drop_paths.clear();
+    }
+
+    /// The Quick Action tiles that are switched on, in order.
+    fn tiles(&self) -> Vec<Tile> {
+        [(Tile::Convert, self.cfg.quick_convert), (Tile::Text, self.cfg.quick_text), (Tile::Zip, self.cfg.quick_zip)]
+            .into_iter()
+            .filter_map(|(t, on)| on.then_some(t))
+            .collect()
+    }
+
+    /// What a drop at screen pixel `(x, y)` would land on: a tile under the
+    /// pointer, otherwise the shelf (anywhere in the drop zone holds).
+    fn tile_at(&self, x: i32, y: i32) -> Tile {
+        let s = self.surface.scale;
+        let lx = (x - self.surface.rect.left) as f32 / s;
+        let ly = (y - self.surface.rect.top) as f32 / s;
+        match self.hit_at(lx, ly) {
+            Some(Hit::Drop(t)) => t,
+            _ => Tile::Hold,
+        }
+    }
+
+    /// Whether `tile` can take `paths`. Unknown files (an elevated DockSide
+    /// only learns them on the drop) could go anywhere.
+    pub fn tile_ok(&self, tile: Tile, paths: &[PathBuf]) -> bool {
+        if paths.is_empty() {
+            return self.polled_over;
+        }
+        match tile {
+            Tile::Hold | Tile::Zip => !paths.is_empty(),
+            Tile::Convert => !common_targets(paths).is_empty(),
+            Tile::Text => paths.iter().any(|p| convert::is_image(p)),
+        }
+    }
+
+    fn drop_on(&mut self, tile: Tile, paths: &[PathBuf], x: i32, y: i32) {
+        match tile {
+            Tile::Hold => {
+                for p in paths {
+                    if !self.shelf.iter().any(|i| i.path == *p) {
+                        self.shelf.push(holding::hold(p));
+                    }
+                }
+                holding::save(&self.shelf);
+                self.show_shelf();
+            }
+            Tile::Convert => {
+                let entries = common_targets(paths)
+                    .into_iter()
+                    .map(|f| Entry::item(f.label(), Action::Island(IslandCmd::Convert(paths.to_vec(), f))))
+                    .collect();
+                let s = self.surface.scale;
+                self.event = Some(IslandEvent::Menu(entries, Placement::Below { x: x as f32 / s, y: y as f32 / s }));
+            }
+            Tile::Text => ocr::copy_text(paths.to_vec()),
+            Tile::Zip => {
+                if let Some(item) = holding::zip(paths) {
+                    self.shelf.push(item);
+                    self.show_shelf();
+                }
+            }
+        }
+    }
+
+    /// Opens the shelf to show what just landed, then folds it away unless the pointer stays.
+    fn show_shelf(&mut self) {
+        self.expanded = Some(Panel::Shelf);
+        self.leave_at = Some(Instant::now() + Duration::from_millis(1200));
+    }
+
+    /// Whether `hwnd` is the island's window or its drop zone.
+    pub fn owns(&self, hwnd: windows::Win32::Foundation::HWND) -> bool {
+        hwnd == self.surface.content || self.catch.as_ref().is_some_and(|c| c.hwnd() == hwnd)
+    }
+
+    /// Elevated: files dropped on the island or its drop zone.
+    pub fn on_dropfiles(&mut self, hwnd: windows::Win32::Foundation::HWND, hdrop: windows::Win32::UI::Shell::HDROP) {
+        let (paths, pt) = shelf::take_dropfiles(hwnd, hdrop);
+        log!("island: {} file(s) dropped", paths.len());
+        self.polled_over = false;
+        self.on_drag(Phase::Drop(pt.x, pt.y), &paths);
+    }
+
+    /// Elevated: stands in for OLE's DragOver / DragLeave while the drop zone
+    /// is out, by checking whether a drag-and-drop is over it.
+    fn poll_drag(&mut self) {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut pt = POINT::default();
+        let pointer = shelf::ole_drag() && unsafe { GetCursorPos(&mut pt) }.is_ok();
+        let inside = |r: RECT| (r.left..r.right).contains(&pt.x) && (r.top..r.bottom).contains(&pt.y);
+        let over = pointer && (self.catch.as_ref().and_then(|c| c.rect()).is_some_and(inside) || inside(self.surface.rect));
+        if over {
+            self.polled_over = true;
+            self.on_drag(Phase::Over(pt.x, pt.y), &[]);
+        } else if self.polled_over {
+            self.polled_over = false;
+            self.on_drag(Phase::Leave, &[]);
+        }
+    }
+
+    /// Something for the app to do after a drop.
+    pub fn take_event(&mut self) -> Option<IslandEvent> {
+        self.event.take()
+    }
+
+    /// The mouse button went down and started moving (`true`), or was let go:
+    /// the drop zone comes out for the length of the drag.
+    pub fn on_drag_watch(&mut self, held: bool) {
+        if held {
+            if self.catch.is_some() && !self.dragging_out && !self.fullscreen {
+                self.armed = true;
+                self.disarm_at = None;
+                self.place_catch();
+            }
+        } else if self.armed {
+            self.disarm_at = Some(Instant::now() + DISARM_DELAY);
+        }
+    }
+
+    /// Fits the drop zone: the top edge of the screen, plus the opened shelf
+    /// while a drag is over it.
+    fn place_catch(&mut self) {
+        let m = self.monitor;
+        let s = m.scale;
+        let mut r = RECT {
+            left: m.rect.left,
+            top: m.rect.top,
+            right: m.rect.right,
+            bottom: m.rect.top + ((self.top + self.lip + self.compact_h + CATCH_BELOW) * s).ceil() as i32,
+        };
+        if self.drag_over {
+            let (pw, ph) = self.panel_size(Panel::Shelf);
+            let w = ((pw + 2.0 * CATCH_AROUND) * s).ceil() as i32;
+            let cx = (m.rect.left + m.rect.right) / 2;
+            r.left = r.left.max(cx - w / 2);
+            r.right = r.right.min(cx + w / 2);
+            r.bottom = r.bottom.max(m.rect.top + ((self.top + self.lip + ph + CATCH_AROUND) * s).ceil() as i32);
+        }
+        if let Some(c) = self.catch.as_mut() {
+            c.show(r);
+        }
     }
 
     /// A drag out of the island finished; shelf items that were dropped somewhere leave the shelf.
@@ -1556,9 +1783,10 @@ impl Island {
             // in the folder a while, in case the drop target is still reading it.
             self.shelf.retain(|i| !paths.contains(&i.path));
             let now = Instant::now();
-            self.orphans.extend(paths.iter().filter(|p| p.exists()).map(|p| (p.clone(), now)));
+            self.orphans.extend(paths.iter().filter(|p| holding::is_ours(p) && p.exists()).map(|p| (p.clone(), now)));
         }
         self.shelf.retain(|i| i.pending || i.path.exists());
+        holding::save(&self.shelf);
         self.retarget();
         self.dirty = true;
     }
@@ -1784,6 +2012,7 @@ impl Island {
             }
             Hit::ShelfTimer(_) => {}
             Hit::ShelfClear => self.remove_shelf(|_| false),
+            Hit::Drop(_) => {}
             Hit::Event(_) => return Some(IslandEvent::Run(Action::Open("outlookcal:".into()))),
             Hit::AlertBody => return self.alert_click(),
             Hit::Progress | Hit::Slider => {}
@@ -1816,11 +2045,11 @@ impl Island {
         let path = item.path.clone();
         let convert: Vec<Entry> = convert::targets(&path)
             .into_iter()
-            .map(|f| Entry::item(f.label(), Action::Island(IslandCmd::Convert(path.clone(), f))))
+            .map(|f| Entry::item(f.label(), Action::Island(IslandCmd::Convert(vec![path.clone()], f))))
             .collect();
         vec![
             Entry::item("Open", Action::Open(path.to_string_lossy().into_owned())),
-            Entry::item("Show in Finder", Action::OpenFinder(Some(holding::dir()))),
+            Entry::item("Show in Finder", Action::Reveal(path.to_string_lossy().into_owned())),
             Entry::Separator,
             Entry::submenu("Convert to", convert),
             Entry::Separator,
@@ -1905,12 +2134,37 @@ impl Island {
         if self.hold_open && self.leave_at.is_some() {
             self.leave_at = Some(now);
         }
-        if !self.drag_over && self.leave_at.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() > COLLAPSE_DELAY) {
+        if self.drag_left.is_some_and(|t| now - t >= DRAG_LINGER) {
+            self.end_drag();
+            self.leave_at = matches!(self.shown, Content::Panel(_)).then_some(now);
+        }
+        if self.armed {
+            // A missed button-up (the hook can lose one) mustn't leave the zone over the menu bar.
+            let held = crate::win::system::mouse_button_down();
+            if !held && self.disarm_at.is_none() {
+                self.disarm_at = Some(now + DISARM_DELAY);
+            }
+            if self.disarm_at.is_some_and(|t| now >= t) && !self.drag_over {
+                self.armed = false;
+                self.disarm_at = None;
+                if let Some(c) = self.catch.as_mut() {
+                    c.hide();
+                }
+            } else {
+                if self.elevated {
+                    self.poll_drag();
+                }
+                self.place_catch();
+            }
+        }
+        let collapse = self.cfg.collapse_delay_ms as f32 / 1000.0;
+        if !self.drag_over && self.leave_at.is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() >= collapse) {
             self.expanded = None;
             self.leave_at = None;
         }
         if self.cfg.expand_on_hover && self.expanded.is_none() && self.down.is_none() {
-            let resting = self.hover_since.is_some_and(|t| (now - t).as_secs_f32() > HOVER_EXPAND_DELAY);
+            let delay = self.cfg.hover_delay_ms as f32 / 1000.0;
+            let resting = self.hover_since.is_some_and(|t| (now - t).as_secs_f32() > delay);
             if resting {
                 if let Content::Compact(p) = self.shown {
                     self.expanded = Self::panel_for(p);
@@ -1964,6 +2218,8 @@ impl Island {
         }
         let waiting = self.alert.is_some()
             || self.leave_at.is_some()
+            || self.armed
+            || self.drag_left.is_some()
             || (self.cfg.expand_on_hover && self.hover_since.is_some() && self.expanded.is_none());
         moving || (visible && period.is_some()) || waiting
     }
@@ -2060,6 +2316,7 @@ impl Island {
 
         let fonts = Fonts::new(gfx, &theme.font);
         let note_rows = self.note_rows();
+        let tiles: Vec<(Tile, bool)> = self.tiles().into_iter().map(|t| (t, self.tile_ok(t, &self.drop_paths))).collect();
         let view = View {
             fonts: &fonts,
             now: self.now.as_ref(),
@@ -2090,6 +2347,9 @@ impl Island {
             shelf_lifetime: self.shelf_lifetime(),
             wall: SystemTime::now(),
             drag_over: self.drag_over,
+            tiles: &tiles,
+            drop_hot: self.drop_hot,
+            drop_paths: &self.drop_paths,
             events: &self.events,
             downloads: &self.downloads,
             volume: self.volume,
@@ -2247,6 +2507,17 @@ fn play_sound() {
             let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
         }
     }
+}
+
+/// The formats every one of `paths` converts to.
+fn common_targets(paths: &[PathBuf]) -> Vec<Format> {
+    let Some((first, rest)) = paths.split_first() else { return Vec::new() };
+    let mut out = convert::targets(first);
+    for p in rest {
+        let t = convert::targets(p);
+        out.retain(|f| t.contains(f));
+    }
+    out
 }
 
 fn blob_size(compact_h: f32) -> (f32, f32) {

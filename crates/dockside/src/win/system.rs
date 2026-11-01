@@ -163,6 +163,12 @@ fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
     }
 }
 
+/// Whether the left or right mouse button is held (as the hardware reports
+/// it, so swapped buttons don't matter).
+pub fn mouse_button_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 }
+}
+
 /// Presses `keys` in order, then releases them in reverse.
 pub fn send_keys(keys: &[VIRTUAL_KEY]) {
     let mut inputs: Vec<INPUT> = keys.iter().map(|&k| key_input(k, false)).collect();

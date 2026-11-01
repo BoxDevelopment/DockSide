@@ -186,7 +186,12 @@ enabled = true
 # Keep the small pill visible when nothing is happening.
 always_show = true
 # Expand an activity when the pointer rests on it (otherwise click).
-expand_on_hover = false
+expand_on_hover = true
+# Milliseconds the pointer rests on the island before it expands.
+hover_delay_ms = 350
+# Milliseconds after the pointer leaves before an expanded island folds away
+# (0 = at once).
+collapse_delay_ms = 900
 # "pill" floats a capsule; "notch" hangs from the top edge with a flat top and
 # rounded bottom corners, and opens into squarer panels.
 style = "pill"
@@ -216,15 +221,22 @@ claude_code = true
 # Live Activities from other apps and scripts: progress, timers and status they
 # send with `dockside activity start <id> --title ... --progress 40%` (see README).
 live_activities = true
-# Drop files on the island to hold them on a shelf. They're copied to a
-# holding folder (%LOCALAPPDATA%\DockSide\Shelf), so you can drag them back
-# out later; right-click one to convert it to another format.
+# Drag files to the top of the screen to hold them on a shelf, then drag them
+# out where they're going. Nothing is copied: the shelf points at the files
+# where they are, and dragging one out to the same drive moves it. Right-click
+# one to convert it to another format.
 shelf = true
-# Empty the holding folder each time DockSide starts.
+# Empty the shelf each time DockSide starts.
 shelf_clear_on_start = true
-# Minutes a held file stays on the shelf before it's removed (0 = keep until
-# you remove it). 60 = an hour, 1440 = a day, 10080 = a week.
+# Minutes a file stays on the shelf before it's taken off (0 = keep until you
+# remove it). 60 = an hour, 1440 = a day, 10080 = a week. The file itself stays.
 shelf_expire_minutes = 1440
+# Quick Actions: tiles beside the shelf while you drag files over it. Drop on
+# one instead of the shelf to convert the files (the results land on the
+# shelf), copy the text in pictures, or zip them.
+quick_convert = true
+quick_text = true
+quick_zip = true
 
 # Alerts: brief pop-ups when something changes.
 # Volume (media keys, or scroll over the island) and brightness, shown in the

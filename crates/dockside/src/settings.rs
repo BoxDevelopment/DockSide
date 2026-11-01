@@ -83,6 +83,9 @@ fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
         "live_activities" => c.live_activities,
         "shelf" => c.shelf,
         "shelf_clear_on_start" => c.shelf_clear_on_start,
+        "quick_convert" => c.quick_convert,
+        "quick_text" => c.quick_text,
+        "quick_zip" => c.quick_zip,
         "volume" => c.volume,
         "brightness" => c.brightness,
         "charging" => c.charging,
@@ -143,6 +146,8 @@ pub(crate) enum Key {
     IslandIcs,
     IslandStyle,
     IslandShelfExpiry,
+    IslandHoverDelay,
+    IslandCollapseDelay,
     IslandOffset,
     DockEnabled,
     DockSize,
@@ -206,6 +211,8 @@ impl Key {
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::IslandStyle => ("island", "style"),
             Key::IslandShelfExpiry => ("island", "shelf_expire_minutes"),
+            Key::IslandHoverDelay => ("island", "hover_delay_ms"),
+            Key::IslandCollapseDelay => ("island", "collapse_delay_ms"),
             Key::IslandOffset => ("island", "vertical_offset"),
             Key::DockEnabled => ("dock", "enabled"),
             Key::DockSize => ("dock", "tile_size"),
@@ -536,7 +543,7 @@ pub(crate) fn control_action(hit: Hit, login: &mut bool, fonts: &[String], cfg: 
             }
             match (key, values[i].parse()) {
                 // Numeric settings offered as a few choices.
-                (Key::IslandShelfExpiry, Ok(n)) => key.set(ConfigValue::Int(n)),
+                (Key::IslandShelfExpiry | Key::IslandHoverDelay | Key::IslandCollapseDelay, Ok(n)) => key.set(ConfigValue::Int(n)),
                 _ => key.set(ConfigValue::Str(values[i].clone())),
             }
         }
@@ -829,9 +836,15 @@ impl SettingsWindow {
                         Row::Toggle("Show Dynamic Island", Key::Island("enabled")),
                         Row::Toggle("Always show the island", Key::Island("always_show")),
                         Row::Toggle("Expand when hovered", Key::Island("expand_on_hover")),
+                    ]
+                    .into_iter()
+                    .chain(cfg.island.expand_on_hover.then_some(Row::Segmented("Expand after", Key::IslandHoverDelay)))
+                    .chain([
+                        Row::Segmented("Fold away after", Key::IslandCollapseDelay),
                         Row::Segmented("Style", Key::IslandStyle),
                         Row::Slider("Vertical offset", Key::IslandOffset),
-                    ],
+                    ])
+                    .collect(),
                 },
                 Group {
                     title: Some("Activities"),
@@ -852,7 +865,10 @@ impl SettingsWindow {
                             .shelf
                             .then_some([
                                 Row::Toggle("Empty the shelf when DockSide starts", Key::Island("shelf_clear_on_start")),
-                                Row::Segmented("Remove held files after", Key::IslandShelfExpiry),
+                                Row::Segmented("Take files off after", Key::IslandShelfExpiry),
+                                Row::Toggle("Quick Action: Convert", Key::Island("quick_convert")),
+                                Row::Toggle("Quick Action: Copy Text", Key::Island("quick_text")),
+                                Row::Toggle("Quick Action: Zip", Key::Island("quick_zip")),
                             ])
                             .into_iter()
                             .flatten(),
@@ -1178,6 +1194,16 @@ impl SettingsWindow {
                 &[("Pill", "pill"), ("Notch", "notch")],
                 Some((cfg.island.style == IslandStyle::Notch) as usize),
             ),
+            Key::IslandHoverDelay => {
+                const AFTER: [(&str, &str); 3] = [("Short", "200"), ("Medium", "350"), ("Long", "600")];
+                let current = cfg.island.hover_delay_ms.to_string();
+                fixed(&AFTER, AFTER.iter().position(|a| a.1 == current))
+            }
+            Key::IslandCollapseDelay => {
+                const AFTER: [(&str, &str); 4] = [("Instantly", "0"), ("Short", "400"), ("Medium", "900"), ("Long", "2000")];
+                let current = cfg.island.collapse_delay_ms.to_string();
+                fixed(&AFTER, AFTER.iter().position(|a| a.1 == current))
+            }
             Key::IslandShelfExpiry => {
                 const AFTER: [(&str, &str); 5] = [("1 Hour", "60"), ("1 Day", "1440"), ("1 Week", "10080"), ("30 Days", "43200"), ("Never", "0")];
                 let current = cfg.island.shelf_expire_minutes.to_string();

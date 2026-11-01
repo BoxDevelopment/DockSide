@@ -134,6 +134,11 @@ fn kind(path: &Path) -> Option<(Kind, String)> {
     Some((k, ext))
 }
 
+/// Whether `path` is a picture (by its extension).
+pub fn is_image(path: &Path) -> bool {
+    kind(path).is_some_and(|(k, _)| k == Kind::Image) && !path.is_dir()
+}
+
 /// Every format `path` can be converted to (never its own).
 pub fn targets(path: &Path) -> Vec<Format> {
     let Some((k, ext)) = kind(path) else { return Vec::new() };

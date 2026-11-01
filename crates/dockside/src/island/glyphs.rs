@@ -341,3 +341,40 @@ pub fn battery(p: &Painter, right: f32, cy: f32, pct: u8, c: Color, a: f32) {
     let inner = body.inset(2.0, 2.0);
     p.fill_round(Rect::new(inner.x, inner.y, (inner.w * pct.min(100) as f32 / 100.0).max(2.0), inner.h), 1.6, c.alpha(a));
 }
+
+/// Convert: two arrows passing each other.
+pub fn convert(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    let w = 1.6 * k;
+    p.line(cx - 6.5 * k, cy - 3.0 * k, cx + 6.5 * k, cy - 3.0 * k, c, w);
+    p.line(cx + 3.5 * k, cy - 6.0 * k, cx + 6.5 * k, cy - 3.0 * k, c, w);
+    p.line(cx + 3.5 * k, cy, cx + 6.5 * k, cy - 3.0 * k, c, w);
+    p.line(cx + 6.5 * k, cy + 3.0 * k, cx - 6.5 * k, cy + 3.0 * k, c, w);
+    p.line(cx - 3.5 * k, cy, cx - 6.5 * k, cy + 3.0 * k, c, w);
+    p.line(cx - 3.5 * k, cy + 6.0 * k, cx - 6.5 * k, cy + 3.0 * k, c, w);
+}
+
+/// Copy Text: lines of text inside viewfinder corners.
+pub fn text_scan(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    let w = 1.5 * k;
+    let (e, l) = (7.0 * k, 3.5 * k);
+    for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let (x, y) = (cx + dx * e, cy + dy * e);
+        p.line(x, y, x - dx * l, y, c, w);
+        p.line(x, y, x, y - dy * l, c, w);
+    }
+    for (dy, len) in [(-2.6, 7.0), (0.0, 7.0), (2.6, 4.4)] {
+        let x0 = cx - 3.5 * k;
+        p.line(x0, cy + dy * k, x0 + len * k, cy + dy * k, c, 1.3 * k);
+    }
+}
+
+/// Zip: an archive box with its lid.
+pub fn archive(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    let w = 1.4 * k;
+    p.stroke_round(Rect::new(cx - 7.5 * k, cy - 6.5 * k, 15.0 * k, 4.0 * k), 1.2 * k, c, w);
+    p.stroke_round(Rect::new(cx - 6.5 * k, cy - 2.5 * k, 13.0 * k, 9.0 * k), 1.4 * k, c, w);
+    p.line(cx - 2.2 * k, cy + 0.8 * k, cx + 2.2 * k, cy + 0.8 * k, c, 1.6 * k);
+}

@@ -237,6 +237,10 @@ pub struct IslandCfg {
     /// Keep the idle pill visible when nothing is happening.
     pub always_show: bool,
     pub expand_on_hover: bool,
+    /// Milliseconds the pointer rests on the island before it expands (`expand_on_hover`).
+    pub hover_delay_ms: u32,
+    /// Milliseconds after the pointer leaves an expanded island before it folds away (0 = at once).
+    pub collapse_delay_ms: u32,
     pub style: IslandStyle,
     /// Points to move the island down (negative moves it up).
     pub vertical_offset: f32,
@@ -259,12 +263,16 @@ pub struct IslandCfg {
     pub claude_code: bool,
     /// Live Activities other apps and scripts send (`dockside activity …`).
     pub live_activities: bool,
-    /// Files dropped on the island are copied to a holding folder and shown on a shelf.
+    /// Files dragged to the top of the screen are held (by reference) on a shelf.
     pub shelf: bool,
-    /// Empty the holding folder when DockSide starts.
+    /// Empty the shelf when DockSide starts.
     pub shelf_clear_on_start: bool,
-    /// Minutes a held file stays before it's removed (0 = until you remove it).
+    /// Minutes a file stays on the shelf before it's taken off (0 = until you remove it).
     pub shelf_expire_minutes: u32,
+    /// Quick Action tiles beside the shelf while files are dragged over it.
+    pub quick_convert: bool,
+    pub quick_text: bool,
+    pub quick_zip: bool,
 
     // Alerts: brief pop-ups when something changes.
     /// Volume keys and scrolling over the island, instead of the Windows popup.

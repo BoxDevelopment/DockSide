@@ -47,7 +47,7 @@ use crate::win::{
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
-    WM_APP_RECORD_KEY, WM_APP_SPOTLIGHT_TAP,
+    WM_APP_DRAG_WATCH, WM_APP_RECORD_KEY, WM_APP_SPOTLIGHT_TAP,
 };
 
 thread_local! {
@@ -641,6 +641,44 @@ unsafe extern "system" fn island_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> 
     CallNextHookEx(None, code, wp, lp)
 }
 
+/// While the island's shelf is on: reports a mouse button held and moving (the
+/// start of any drag, file or not) and its release, so the island can lay its
+/// drop zone along the top of the screen for the length of the drag.
+unsafe extern "system" fn drag_watch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    use std::sync::atomic::{AtomicBool, AtomicI32};
+    /// Pixels the pointer travels with a button held before it counts as a drag.
+    const TRAVEL: i32 = 8;
+    static DOWN: AtomicBool = AtomicBool::new(false);
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static X: AtomicI32 = AtomicI32::new(0);
+    static Y: AtomicI32 = AtomicI32::new(0);
+    if code >= 0 {
+        let pt = (*(lp.0 as *const MSLLHOOKSTRUCT)).pt;
+        match wp.0 as u32 {
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                X.store(pt.x, Ordering::Relaxed);
+                Y.store(pt.y, Ordering::Relaxed);
+                DOWN.store(true, Ordering::Relaxed);
+            }
+            WM_MOUSEMOVE if DOWN.load(Ordering::Relaxed) && !ARMED.load(Ordering::Relaxed) => {
+                let (dx, dy) = (pt.x - X.load(Ordering::Relaxed), pt.y - Y.load(Ordering::Relaxed));
+                if dx * dx + dy * dy > TRAVEL * TRAVEL {
+                    ARMED.store(true, Ordering::Relaxed);
+                    win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_DRAG_WATCH, 1);
+                }
+            }
+            WM_LBUTTONUP | WM_RBUTTONUP => {
+                DOWN.store(false, Ordering::Relaxed);
+                if ARMED.swap(false, Ordering::Relaxed) {
+                    win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_DRAG_WATCH, 0);
+                }
+            }
+            _ => {}
+        }
+    }
+    CallNextHookEx(None, code, wp, lp)
+}
+
 /// Desktop shortcuts: Alt+1…9, and Win+Ctrl+←/→ in place of Windows' own (which
 /// shows a popup). Swallowed, with a masking key so releasing Alt / Win doesn't
 /// open an app's menu or Start.
@@ -716,6 +754,9 @@ fn track_leave(hwnd: HWND) {
 pub fn island_drag(phase: finder::dnd::Phase, paths: &[PathBuf]) -> bool {
     with_app(|app| {
         let ok = app.island.as_mut().is_some_and(|i| i.on_drag(phase, paths));
+        if let Some(e) = app.island.as_mut().and_then(|i| i.take_event()) {
+            app.island_event(e);
+        }
         app.animate();
         app.flush();
         ok
@@ -782,6 +823,8 @@ pub struct App {
     index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
     island_hook: Option<HHOOK>,
+    /// Watches for drags while the island's shelf is on (its drop zone).
+    drag_watch_hook: Option<HHOOK>,
     /// Alt+number / Win+Ctrl+arrow desktop shortcuts.
     desktop_hook: Option<HHOOK>,
     /// Reports desktop switches made anywhere, for the island.
@@ -904,6 +947,7 @@ impl App {
             index: Default::default(),
             hooks: Vec::new(),
             island_hook: None,
+            drag_watch_hook: None,
             desktop_hook: None,
             desktop_watch: None,
             desktop_popup: None,
@@ -1154,6 +1198,20 @@ impl App {
             (false, Some(h)) => unsafe {
                 let _ = UnhookWindowsHookEx(h);
                 self.island_hook = None;
+            },
+            _ => {}
+        }
+        let watch = self.island.is_some() && self.cfg.island.shelf;
+        match (watch, self.drag_watch_hook) {
+            (true, None) => unsafe {
+                match SetWindowsHookExW(WH_MOUSE_LL, Some(drag_watch_hook), win::hinstance(), 0) {
+                    Ok(h) => self.drag_watch_hook = Some(h),
+                    Err(e) => log!("island drag hook failed: {e}"),
+                }
+            },
+            (false, Some(h)) => unsafe {
+                let _ = UnhookWindowsHookEx(h);
+                self.drag_watch_hook = None;
             },
             _ => {}
         }
@@ -2572,6 +2630,12 @@ impl App {
                         self.animate();
                     }
                 }
+                WM_APP_DRAG_WATCH => {
+                    if let Some(i) = &mut self.island {
+                        i.on_drag_watch(wp.0 != 0);
+                        self.animate();
+                    }
+                }
                 WM_APP_WIDGETS => {
                     if let Some(w) = &mut self.widgets {
                         w.on_data();
@@ -2683,7 +2747,7 @@ impl App {
             self.on_menubar_mouse(hwnd, msg, lp)
         } else if self.dock.as_ref().is_some_and(|d| d.surface.content == hwnd) {
             self.on_dock_mouse(hwnd, msg, wp, lp)
-        } else if self.island.as_ref().is_some_and(|i| i.surface.content == hwnd) {
+        } else if self.island.as_ref().is_some_and(|i| i.owns(hwnd)) {
             self.on_island_mouse(hwnd, msg, wp, lp)
         } else if self.widgets.as_ref().is_some_and(|w| w.owns(hwnd)) {
             self.on_widget_message(hwnd, msg, wp, lp)
@@ -2933,6 +2997,19 @@ impl App {
 
     fn on_island_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let i = self.island.as_mut()?;
+        // Elevated only (see island::shelf), on the island or its drop zone.
+        if msg == WM_DROPFILES {
+            i.on_dropfiles(hwnd, windows::Win32::UI::Shell::HDROP(wp.0 as _));
+            if let Some(e) = i.take_event() {
+                self.island_event(e);
+            }
+            self.animate();
+            return Some(LRESULT(0));
+        }
+        // The drop zone takes nothing else.
+        if hwnd != i.surface.content {
+            return None;
+        }
         let (x, y) = mouse_pt(lp, i.surface.scale);
         match msg {
             WM_MOUSEMOVE => {
@@ -3153,7 +3230,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.remove_hooks();
-        if let Some(h) = self.island_hook.take() {
+        for h in self.island_hook.take().into_iter().chain(self.drag_watch_hook.take()) {
             unsafe {
                 let _ = UnhookWindowsHookEx(h);
             }

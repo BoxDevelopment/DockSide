@@ -186,5 +186,7 @@ pub const WM_APP_FINDER_ASYNC: u32 = WM_APP + 25;
 pub const WM_APP_RECORD_KEY: u32 = WM_APP + 26;
 /// The Spotlight modifier was tapped on its own (wParam 2: the second tap of a double tap).
 pub const WM_APP_SPOTLIGHT_TAP: u32 = WM_APP + 27;
+/// A mouse button was held and moved, starting a drag anywhere (wParam 1), or let go (0).
+pub const WM_APP_DRAG_WATCH: u32 = WM_APP + 28;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

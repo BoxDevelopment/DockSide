@@ -1,14 +1,15 @@
-//! The shelf's holding folder (`%LOCALAPPDATA%\DockSide\Shelf`). Files dropped
-//! on the island are copied in, so they outlive the original (a download you
-//! then delete, a file on a drive you unplug), and drag back out from here.
-//! Conversions land here too. Copies and conversions run on worker threads,
-//! writing to a `.dockside-part` file that's renamed into place when done.
+//! What the shelf holds. Files dropped on the island are held by reference
+//! (nothing is copied), and the list is kept in `%LOCALAPPDATA%\DockSide\shelf.txt`
+//! so it outlives a restart. Files the shelf makes itself (conversions, zips)
+//! live in the holding folder (`%LOCALAPPDATA%\DockSide\Shelf`); those jobs run
+//! on worker threads, writing to a `.dockside-part` file that's renamed into
+//! place when done.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::convert::{self, Format};
 
@@ -17,17 +18,17 @@ const PART: &str = ".dockside-part";
 #[derive(Clone, Debug)]
 pub struct Item {
     pub path: PathBuf,
-    /// Where it was dropped from (to skip dropping the same file twice).
-    pub source: Option<PathBuf>,
     /// When it arrived; the expiry counts from here.
     pub added: SystemTime,
-    /// Still copying or converting.
+    /// Still being made (a conversion or zip).
     pub pending: bool,
 }
 
 pub enum Done {
     Ready(PathBuf),
     Failed(PathBuf),
+    /// "Copy Text" finished: what was copied (empty when nothing was found).
+    Copied(String),
 }
 
 /// Finished jobs, for whichever island is current (it may be rebuilt meanwhile).
@@ -44,6 +45,17 @@ pub fn dir() -> PathBuf {
     local.join("DockSide").join("Shelf")
 }
 
+/// The held references, one `seconds-since-1970<TAB>path` per line.
+fn list_path() -> PathBuf {
+    dir().with_file_name("shelf.txt")
+}
+
+/// Whether `p` is one of the shelf's own files (in the holding folder), which
+/// it may delete; anything else is the user's and is only ever referenced.
+pub fn is_ours(p: &Path) -> bool {
+    p.parent() == Some(dir().as_path())
+}
+
 /// Where finished jobs are announced (the island's signal message).
 pub fn set_notify(hwnd: isize, msg: u32) {
     NOTIFY_HWND.store(hwnd, Ordering::Relaxed);
@@ -54,7 +66,7 @@ pub fn drain() -> Vec<Done> {
     DONE.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default()
 }
 
-fn finish(done: Done) {
+pub(super) fn finish(done: Done) {
     if let Ok(mut d) = DONE.lock() {
         d.push(done);
     }
@@ -71,9 +83,9 @@ fn is_part(p: &Path) -> bool {
     p.file_name().is_some_and(|n| n.to_string_lossy().ends_with(PART))
 }
 
-/// What's held, oldest first. The first call in a process empties the
-/// folder when `clear` is set (and always drops a crashed run's partial files);
-/// later calls (an island rebuilt after a settings change) keep everything.
+/// What's held, oldest first. The first call in a process empties the shelf
+/// when `clear` is set (and always drops a crashed run's partial files); later
+/// calls (an island rebuilt after a settings change) keep everything.
 pub fn load(clear: bool) -> Vec<Item> {
     let dir = dir();
     let first = !LOADED.swap(true, Ordering::Relaxed);
@@ -83,21 +95,48 @@ pub fn load(clear: bool) -> Vec<Item> {
         let stale: Vec<PathBuf> = entries.iter().filter(|p| clear || is_part(p)).cloned().collect();
         delete_all(&stale);
         if clear {
+            let _ = std::fs::remove_file(list_path());
             return Vec::new();
         }
     }
-    let jobs = JOBS.lock().map(|j| j.clone()).unwrap_or_default();
-    let mut items: Vec<Item> = entries
-        .into_iter()
-        .filter(|p| !is_part(p) && p.exists())
-        .map(|path| {
-            let added = std::fs::metadata(&path).and_then(|m| m.created().or_else(|_| m.modified())).unwrap_or_else(|_| SystemTime::now());
-            Item { path, source: None, added, pending: false }
-        })
-        .chain(jobs.into_iter().map(|path| Item { path, source: None, added: SystemTime::now(), pending: true }))
+    let mut items: Vec<Item> = std::fs::read_to_string(list_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(parse_line)
+        .filter(|i| i.path.exists())
         .collect();
+    // Our own files the list missed (a crash before it was saved).
+    for path in entries.into_iter().filter(|p| !is_part(p) && p.exists()) {
+        if !items.iter().any(|i| i.path == path) {
+            let added = std::fs::metadata(&path).and_then(|m| m.created().or_else(|_| m.modified())).unwrap_or_else(|_| SystemTime::now());
+            items.push(Item { path, added, pending: false });
+        }
+    }
+    let jobs = JOBS.lock().map(|j| j.clone()).unwrap_or_default();
+    items.extend(jobs.into_iter().map(|path| Item { path, added: SystemTime::now(), pending: true }));
     items.sort_by_key(|i| i.added);
     items
+}
+
+fn parse_line(line: &str) -> Option<Item> {
+    let (secs, path) = line.split_once('\t')?;
+    let added = UNIX_EPOCH + Duration::from_secs(secs.parse().ok()?);
+    Some(Item { path: PathBuf::from(path), added, pending: false })
+}
+
+fn format_line(i: &Item) -> String {
+    let secs = i.added.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("{secs}\t{}\n", i.path.display())
+}
+
+/// Writes the list of held files (pending jobs are found again by `load`).
+pub fn save(items: &[Item]) {
+    let text: String = items.iter().filter(|i| !i.pending).map(format_line).collect();
+    let path = list_path();
+    let _ = std::fs::create_dir_all(dir());
+    if let Err(e) = std::fs::write(&path, text) {
+        log!("shelf: couldn't save {}: {e}", path.display());
+    }
 }
 
 /// Picks a free name in the folder ("a.png", "a 2.png", ...) and claims it
@@ -162,27 +201,12 @@ fn spawn(dest: PathBuf, what: String, work: impl FnOnce(&Path) -> anyhow::Result
             }
         }
     });
-    Item { path: dest, source: None, added: SystemTime::now(), pending: true }
+    Item { path: dest, added: SystemTime::now(), pending: true }
 }
 
-/// Starts holding `src`: a copy for files from elsewhere, the file itself if it's already here.
-pub fn hold(src: &Path) -> Option<Item> {
-    if src.parent() == Some(dir().as_path()) {
-        return Some(Item { path: src.to_path_buf(), source: None, added: SystemTime::now(), pending: false });
-    }
-    let folder = src.is_dir();
-    let dest = reserve(Path::new(src.file_name()?), folder)?;
-    let from = src.to_path_buf();
-    let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let mut item = spawn(dest, format!("hold “{name}”"), move |tmp| {
-        if folder {
-            copy_tree(&from, tmp)
-        } else {
-            std::fs::copy(&from, tmp).map(|_| ()).map_err(Into::into)
-        }
-    });
-    item.source = Some(src.to_path_buf());
-    Some(item)
+/// Holds `src` where it is.
+pub fn hold(src: &Path) -> Item {
+    Item { path: src.to_path_buf(), added: SystemTime::now(), pending: false }
 }
 
 /// Starts converting `src` to `to`, next to it in the folder.
@@ -194,25 +218,23 @@ pub fn convert(src: &Path, to: Format) -> Option<Item> {
     Some(spawn(dest, format!("convert “{name}” to {}", to.label()), move |tmp| convert::convert(&from, to, tmp)))
 }
 
-fn copy_tree(from: &Path, to: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(to)?;
-    for e in std::fs::read_dir(from)? {
-        let e = e?;
-        let target = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
-            copy_tree(&e.path(), &target)?;
-        } else {
-            std::fs::copy(e.path(), target)?;
-        }
-    }
-    Ok(())
+/// Starts zipping `paths` into one archive in the folder: "name.zip" for one
+/// item, "Archive.zip" for several (as Finder names them).
+pub fn zip(paths: &[PathBuf]) -> Option<Item> {
+    let name = match paths {
+        [one] => format!("{}.zip", one.file_stem()?.to_string_lossy()),
+        _ => "Archive.zip".into(),
+    };
+    let dest = reserve(Path::new(&name), false)?;
+    let paths = paths.to_vec();
+    Some(spawn(dest, format!("zip “{name}”"), move |tmp| super::encode::zip(&paths, tmp)))
 }
 
-/// Deletes held files (in the background; folders can be large). Only ever
-/// touches the holding folder. One still being written is deleted when it finishes.
+/// Deletes the shelf's own files among `paths` (in the background; folders can
+/// be large). Only ever touches the holding folder: held references are the
+/// user's files. One still being written is deleted when it finishes.
 pub fn discard(paths: Vec<PathBuf>) {
-    let dir = dir();
-    let mut ours: Vec<PathBuf> = paths.into_iter().filter(|p| p.parent() == Some(dir.as_path())).collect();
+    let mut ours: Vec<PathBuf> = paths.into_iter().filter(|p| is_ours(p)).collect();
     if let (Ok(jobs), Ok(mut cancelled)) = (JOBS.lock(), CANCELLED.lock()) {
         for p in ours.iter().filter(|p| jobs.contains(p)) {
             cancelled.push(p.clone());
@@ -263,6 +285,16 @@ mod tests {
         assert_eq!(remaining_label(3600 + 20 * 60 + 5), "1 h 20 min");
         assert_eq!(remaining_label(86400 + 3600), "1 day");
         assert_eq!(remaining_label(6 * 86400), "6 days");
+    }
+
+    #[test]
+    fn list_lines() {
+        let item = Item { path: PathBuf::from(r"C:\Users\a b\x.png"), added: UNIX_EPOCH + Duration::from_secs(42), pending: false };
+        let line = format_line(&item);
+        assert_eq!(line, "42\tC:\\Users\\a b\\x.png\n");
+        let back = parse_line(line.trim_end()).unwrap();
+        assert_eq!((back.path, back.added), (item.path, item.added));
+        assert!(parse_line("garbage").is_none());
     }
 
     #[test]

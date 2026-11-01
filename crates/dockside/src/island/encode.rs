@@ -1,6 +1,6 @@
-//! Small file writers the shelf's "Convert to" needs and Windows lacks an
-//! encoder for: lossless WebP (VP8L), ICO (PNG entries) and PDF (one image
-//! per page, or plain text in Courier).
+//! Small file writers the shelf needs and Windows lacks an encoder for:
+//! lossless WebP (VP8L), ICO (PNG entries) and PDF (one image per page, or
+//! plain text in Courier) for "Convert to", and zip for the Zip Quick Action.
 
 // ---------------------------------------------------------------------------
 // WebP (lossless VP8L): subtract-green and an Average(L, T) predictor, then
@@ -436,6 +436,187 @@ fn pdf_string(s: &str) -> Vec<u8> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Zip: deflated entries with UTF-8 names (general purpose bit 11) and sizes in
+// a data descriptor after each entry, so files stream through without being
+// read twice. No Zip64, so entries and the archive stay under 4 GB.
+// ---------------------------------------------------------------------------
+
+struct ZipEntry {
+    name: String,
+    dir: bool,
+    time: (u16, u16),
+    crc: u32,
+    packed: u32,
+    size: u32,
+    offset: u32,
+}
+
+/// Zips `paths` (files and folders, each under its own name) into `out`.
+pub fn zip(paths: &[std::path::PathBuf], out: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut w = std::io::BufWriter::new(std::fs::File::create(out)?);
+    let mut entries = Vec::new();
+    let mut pos = 0u64;
+    for p in paths {
+        let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        zip_add(&mut w, &mut pos, &mut entries, p, name)?;
+    }
+    let dir_at = zip_u32(pos)?;
+    let mut central = Vec::new();
+    for e in &entries {
+        central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+        central.extend_from_slice(&[20, 0, 20, 0]);
+        central.extend_from_slice(&zip_flags(e.dir).to_le_bytes());
+        central.extend_from_slice(&(if e.dir { 0u16 } else { 8 }).to_le_bytes());
+        central.extend_from_slice(&e.time.0.to_le_bytes());
+        central.extend_from_slice(&e.time.1.to_le_bytes());
+        for v in [e.crc, e.packed, e.size] {
+            central.extend_from_slice(&v.to_le_bytes());
+        }
+        central.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
+        // Extra and comment lengths, disk number, internal attributes.
+        central.extend_from_slice(&[0; 8]);
+        // External attributes: the DOS directory bit.
+        central.extend_from_slice(&(if e.dir { 0x10u32 } else { 0 }).to_le_bytes());
+        central.extend_from_slice(&e.offset.to_le_bytes());
+        central.extend_from_slice(e.name.as_bytes());
+    }
+    let count = u16::try_from(entries.len()).map_err(|_| anyhow::anyhow!("too many files to zip (65,535 at most)"))?;
+    let mut end = Vec::with_capacity(22);
+    end.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    end.extend_from_slice(&[0; 4]);
+    end.extend_from_slice(&count.to_le_bytes());
+    end.extend_from_slice(&count.to_le_bytes());
+    end.extend_from_slice(&(central.len() as u32).to_le_bytes());
+    end.extend_from_slice(&dir_at.to_le_bytes());
+    end.extend_from_slice(&[0; 2]);
+    w.write_all(&central)?;
+    w.write_all(&end)?;
+    w.flush()?;
+    Ok(())
+}
+
+fn zip_flags(dir: bool) -> u16 {
+    // Bit 11: the name is UTF-8. Bit 3: sizes follow the data.
+    if dir { 0x0800 } else { 0x0808 }
+}
+
+fn zip_u32(n: u64) -> anyhow::Result<u32> {
+    u32::try_from(n).map_err(|_| anyhow::anyhow!("zips over 4 GB aren't supported yet"))
+}
+
+fn zip_add(
+    w: &mut impl std::io::Write,
+    pos: &mut u64,
+    entries: &mut Vec<ZipEntry>,
+    path: &std::path::Path,
+    name: String,
+) -> anyhow::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let dir = meta.is_dir();
+    let name = if dir { format!("{name}/") } else { name };
+    let time = dos_time(meta.modified().unwrap_or_else(|_| std::time::SystemTime::now()));
+    let offset = zip_u32(*pos)?;
+    let mut local = Vec::with_capacity(30 + name.len());
+    local.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+    local.extend_from_slice(&20u16.to_le_bytes());
+    local.extend_from_slice(&zip_flags(dir).to_le_bytes());
+    local.extend_from_slice(&(if dir { 0u16 } else { 8 }).to_le_bytes());
+    local.extend_from_slice(&time.0.to_le_bytes());
+    local.extend_from_slice(&time.1.to_le_bytes());
+    // CRC and sizes: zero here, in the data descriptor instead.
+    local.extend_from_slice(&[0; 12]);
+    local.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    local.extend_from_slice(&[0; 2]);
+    local.extend_from_slice(name.as_bytes());
+    w.write_all(&local)?;
+    *pos += local.len() as u64;
+    let (mut crc, mut packed, mut size) = (0, 0, 0);
+    if !dir {
+        let (c, read, written) = deflate_stream(&mut std::fs::File::open(path)?, w)?;
+        (crc, packed, size) = (c, zip_u32(written)?, zip_u32(read)?);
+        let mut desc = Vec::with_capacity(16);
+        desc.extend_from_slice(&0x0807_4b50u32.to_le_bytes());
+        for v in [crc, packed, size] {
+            desc.extend_from_slice(&v.to_le_bytes());
+        }
+        w.write_all(&desc)?;
+        *pos += written + desc.len() as u64;
+    }
+    entries.push(ZipEntry { name: name.clone(), dir, time, crc, packed, size, offset });
+    if dir {
+        let mut children: Vec<std::path::PathBuf> =
+            std::fs::read_dir(path)?.map(|e| e.map(|e| e.path())).collect::<Result<_, _>>()?;
+        children.sort();
+        for c in children {
+            let child = format!("{name}{}", c.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+            zip_add(w, pos, entries, &c, child)?;
+        }
+    }
+    Ok(())
+}
+
+/// Raw-deflates `src` into `out`: (CRC-32 of the input, bytes read, bytes written).
+fn deflate_stream(src: &mut impl std::io::Read, out: &mut impl std::io::Write) -> anyhow::Result<(u32, u64, u64)> {
+    use miniz_oxide::deflate::core::{compress, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus};
+    // Negative window bits: a raw stream, without the zlib header.
+    let mut comp = CompressorOxide::new(create_comp_flags_from_zip_params(6, -15, 0));
+    let (mut inbuf, mut outbuf) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    let (mut crc, mut read, mut written) = (!0u32, 0u64, 0u64);
+    loop {
+        let n = src.read(&mut inbuf)?;
+        let flush = if n == 0 { TDEFLFlush::Finish } else { TDEFLFlush::None };
+        crc = crc32_update(crc, &inbuf[..n]);
+        read += n as u64;
+        let mut input = &inbuf[..n];
+        loop {
+            let (status, used, made) = compress(&mut comp, input, &mut outbuf, flush);
+            out.write_all(&outbuf[..made])?;
+            written += made as u64;
+            input = &input[used..];
+            match status {
+                TDEFLStatus::Done => return Ok((!crc, read, written)),
+                TDEFLStatus::Okay => {}
+                _ => anyhow::bail!("deflate failed"),
+            }
+            // Everything taken and room to spare: on to the next chunk.
+            if n > 0 && input.is_empty() && made < outbuf.len() {
+                break;
+            }
+        }
+    }
+}
+
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, v) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *v = c;
+        }
+        t
+    });
+    for &b in data {
+        crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// A modification time as MS-DOS (time, date), in local time.
+fn dos_time(t: std::time::SystemTime) -> (u16, u16) {
+    use chrono::{Datelike, Timelike};
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    let year = dt.year().clamp(1980, 2107) as u16;
+    let date = ((year - 1980) << 9) | ((dt.month() as u16) << 5) | dt.day() as u16;
+    let time = ((dt.hour() as u16) << 11) | ((dt.minute() as u16) << 5) | (dt.second() as u16 / 2);
+    (time, date)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +656,49 @@ mod tests {
         assert_eq!(f[22], 0);
         assert_eq!(u32::from_le_bytes(f[18..22].try_into().unwrap()), 38);
         assert_eq!(&f[38..], &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn crc32_known() {
+        assert_eq!(!crc32_update(!0, b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn zip_round_trip() {
+        let dir = std::env::temp_dir().join(format!("dockside-zip-test-{}", std::process::id()));
+        let sub = dir.join("fold er");
+        std::fs::create_dir_all(&sub).unwrap();
+        let big: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.join("日本 ✓.txt"), "héllo").unwrap();
+        std::fs::write(sub.join("big.bin"), &big).unwrap();
+        let out = dir.join("out.zip");
+        zip(&[dir.join("日本 ✓.txt"), sub.clone()], &out).unwrap();
+        let z = std::fs::read(&out).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let u16_at = |i: usize| u16::from_le_bytes(z[i..i + 2].try_into().unwrap()) as usize;
+        let u32_at = |i: usize| u32::from_le_bytes(z[i..i + 4].try_into().unwrap()) as usize;
+        let end = z.len() - 22;
+        assert_eq!(u32_at(end), 0x0605_4b50);
+        assert_eq!(u16_at(end + 10), 3);
+        let mut at = u32_at(end + 16);
+        let mut found = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(u32_at(at), 0x0201_4b50);
+            let (method, crc, packed, size) = (u16_at(at + 10), u32_at(at + 16), u32_at(at + 20), u32_at(at + 24));
+            let name_len = u16_at(at + 28);
+            let name = String::from_utf8(z[at + 46..at + 46 + name_len].to_vec()).unwrap();
+            let local = u32_at(at + 42);
+            assert_eq!(u32_at(local), 0x0403_4b50);
+            let data = local + 30 + u16_at(local + 26);
+            let raw = if method == 8 { miniz_oxide::inflate::decompress_to_vec(&z[data..data + packed]).unwrap() } else { Vec::new() };
+            assert_eq!(raw.len(), size);
+            assert_eq!(if method == 8 { !crc32_update(!0, &raw) as usize } else { 0 }, crc);
+            found.push((name, raw));
+            at += 46 + name_len;
+        }
+        assert_eq!(found[0], ("日本 ✓.txt".to_string(), "héllo".as_bytes().to_vec()));
+        assert_eq!(found[1].0, "fold er/");
+        assert_eq!(found[2], ("fold er/big.bin".to_string(), big));
     }
 
     #[test]

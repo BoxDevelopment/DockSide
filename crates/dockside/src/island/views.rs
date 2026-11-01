@@ -16,7 +16,7 @@ use super::live::{Activity, Live};
 use super::media::NowPlaying;
 use super::notifications::{self, Note};
 use super::timer::Clock;
-use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, NoteRow, Persist, BLUE, CLAUDE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
+use super::{fmt_time, lerp, Alert, Download, Fonts, Hit, NoteRow, Persist, Tile, BLUE, CLAUDE, GREEN, ORANGE, PURPLE, RED, SECONDARY, WHITE};
 use crate::geom::{Color, Rect};
 use crate::gfx::Painter;
 
@@ -51,6 +51,11 @@ pub struct View<'a> {
     pub shelf_lifetime: Option<Duration>,
     pub wall: SystemTime,
     pub drag_over: bool,
+    /// While a file drag is over: the Quick Action tiles (and whether each
+    /// takes the files), the target under the pointer and the files.
+    pub tiles: &'a [(Tile, bool)],
+    pub drop_hot: Option<Tile>,
+    pub drop_paths: &'a [PathBuf],
     pub events: &'a [CalEvent],
     pub downloads: &'a [Download],
     pub volume: (f32, bool),
@@ -405,6 +410,16 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             g::bell(p, icon_cx, cy, h * 0.68, ORANGE.alpha(a));
             pair("Timer", "Done", ORANGE);
         }
+        Alert::TextCopied(text) if text.is_empty() => {
+            g::text_scan(p, icon_cx, cy, h * 0.66, SECONDARY.alpha(a));
+            pair("Copy Text", "No text found", SECONDARY);
+        }
+        Alert::TextCopied(text) => {
+            g::text_scan(p, icon_cx, cy, h * 0.66, GREEN.alpha(a));
+            let first = text.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
+            p.text("Copied", &f.alert_b, Rect::new(r.x, r.y, r.w - right_inset, r.h), GREEN.alpha(a));
+            p.text(first, &f.alert, Rect::new(text_x, r.y, r.w - (text_x - r.x) - 80.0, r.h), WHITE.alpha(a));
+        }
     }
 }
 
@@ -513,19 +528,12 @@ pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         hits.push((clear, Hit::ShelfClear));
     }
     let body = Rect::new(r.x + 16.0, r.y + 44.0, r.w - 32.0, r.h - 58.0);
-    if v.shelf.is_empty() || v.drag_over {
-        let glow = if v.drag_over { 0.55 } else { 0.22 };
-        dashed_round(p, body, 14.0, Color::gray(255, glow * a));
-        if v.drag_over {
-            p.fill_round(body, 14.0, v.accent.alpha(0.14 * a));
-        }
-        let msg = if v.drag_over { "Drop to hold here" } else { "Drag files here to hold them" };
-        p.text(msg, &f.chip, body, Color::gray(255, if v.drag_over { 0.9 } else { 0.5 } * a));
-        if !v.drag_over {
-            return;
-        }
-    }
     if v.drag_over {
+        return drop_targets(p, body, v, a, hits);
+    }
+    if v.shelf.is_empty() {
+        dashed_round(p, body, 14.0, Color::gray(255, 0.22 * a));
+        p.text("Drag files to the top of the screen to hold them", &f.chip, body, Color::gray(255, 0.5 * a));
         return;
     }
     let tile_w = 68.0;
@@ -592,6 +600,46 @@ pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         p.fill_round(bubble, 10.0, Color::gray(62, a));
         p.stroke_round(bubble.inset(0.25, 0.25), 10.0, Color::gray(255, 0.12 * a), 0.5);
         p.text(&label, &f.small_c, bubble, WHITE.alpha(a));
+    }
+}
+
+/// While files are dragged over the shelf: a zone that holds them, and a tile
+/// per Quick Action. The one under the pointer lights up; tiles that can't take
+/// these files are dimmed.
+fn drop_targets(p: &Painter, body: Rect, v: &View, a: f32, hits: &mut Hits) {
+    const TILE_W: f32 = 76.0;
+    const GAP: f32 = 8.0;
+    let f = v.fonts;
+    let hold = Rect::new(body.x, body.y, body.w - v.tiles.len() as f32 * (TILE_W + GAP), body.h);
+    let hot = v.drop_hot == Some(Tile::Hold);
+    if hot {
+        p.fill_round(hold, 14.0, v.accent.alpha(0.16 * a));
+    }
+    dashed_round(p, hold, 14.0, Color::gray(255, if hot { 0.6 } else { 0.3 } * a));
+    let ink = Color::gray(255, if hot { 0.95 } else { 0.6 } * a);
+    g::tray(p, hold.cx(), hold.cy() - 9.0, 22.0, ink);
+    let n = v.drop_paths.len();
+    let label = if n > 1 { format!("Hold {n} files") } else { "Hold".to_string() };
+    p.text(&label, &f.chip, Rect::new(hold.x, hold.cy() + 8.0, hold.w, 18.0), ink);
+    hits.push((hold, Hit::Drop(Tile::Hold)));
+    for (i, &(tile, ok)) in v.tiles.iter().enumerate() {
+        let t = Rect::new(hold.right() + GAP + i as f32 * (TILE_W + GAP), body.y, TILE_W, body.h);
+        let hot = ok && v.drop_hot == Some(tile);
+        let fade = if ok { 1.0 } else { 0.35 };
+        // The tile under the pointer swells a little, like a Dock icon taking a drop.
+        p.scaled_about(t.cx(), t.cy(), if hot { 1.05 } else { 1.0 }, || {
+            p.fill_round(t, 14.0, if hot { v.accent.alpha(0.9 * a) } else { Color::gray(255, 0.1 * fade * a) });
+            let c = Color::gray(255, if hot { 1.0 } else { 0.85 } * fade * a);
+            let (cx, cy) = (t.cx(), t.cy() - 9.0);
+            match tile {
+                Tile::Convert => g::convert(p, cx, cy, 22.0, c),
+                Tile::Text => g::text_scan(p, cx, cy, 22.0, c),
+                Tile::Zip => g::archive(p, cx, cy, 22.0, c),
+                Tile::Hold => g::tray(p, cx, cy, 22.0, c),
+            }
+            p.text(tile.label(), &f.small_c, Rect::new(t.x + 2.0, t.cy() + 8.0, t.w - 4.0, 16.0), c);
+        });
+        hits.push((t, Hit::Drop(tile)));
     }
 }
 

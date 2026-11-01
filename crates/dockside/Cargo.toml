@@ -19,6 +19,8 @@ toml_edit = "0.22"
 # Needed by windows-rs `#[implement]` (Finder drop target).
 windows-core = "0.58"
 winvd = "0.0.49"
+# Deflate for the shelf's Zip Quick Action (raw streams; the zip container is our own).
+miniz_oxide = "0.8"
 
 [dependencies.windows]
 version = "0.58"
@@ -31,9 +33,11 @@ features = [
     "Graphics",
     "Graphics_Capture",
     "Graphics_DirectX",
+    "Graphics_Imaging",
     "Graphics_DirectX_Direct3D11",
     "Media_Control",
     "Media_MediaProperties",
+    "Media_Ocr",
     "Media_Transcoding",
     "Storage",
     "Storage_Streams",

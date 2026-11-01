@@ -68,6 +68,8 @@ pub fn revoke(hwnd: HWND) {
 /// Drags `paths` with the shell's drag image until they are dropped or the drag
 /// is cancelled. Modal: call outside the App borrow. Returns true if they were dropped somewhere.
 pub fn drag_out(hwnd: HWND, paths: &[PathBuf]) -> bool {
+    // Usually done by registering a drop target, which an elevated DockSide skips.
+    ensure_ole();
     let Some(data) = data_object(paths) else { return false };
     OUTGOING.with(|o| *o.borrow_mut() = paths.to_vec());
     let r = unsafe { SHDoDragDrop(hwnd, &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK) };

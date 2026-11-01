@@ -22,6 +22,8 @@ pub struct Item {
     pub added: SystemTime,
     /// Still being made (a conversion or zip).
     pub pending: bool,
+    /// Kept through expiry, Clear and emptying on start; only removed by hand.
+    pub pinned: bool,
 }
 
 pub enum Done {
@@ -45,7 +47,8 @@ pub fn dir() -> PathBuf {
     local.join("DockSide").join("Shelf")
 }
 
-/// The held references, one `seconds-since-1970<TAB>path` per line.
+/// The held references, one `seconds-since-1970<TAB>path` per line, with
+/// `pin<TAB>` before the path of a pinned one (a path can't hold a tab).
 fn list_path() -> PathBuf {
     dir().with_file_name("shelf.txt")
 }
@@ -91,42 +94,52 @@ pub fn load(clear: bool) -> Vec<Item> {
     let first = !LOADED.swap(true, Ordering::Relaxed);
     let entries: Vec<PathBuf> =
         std::fs::read_dir(&dir).map(|rd| rd.flatten().map(|e| e.path()).collect()).unwrap_or_default();
-    if first {
-        let stale: Vec<PathBuf> = entries.iter().filter(|p| clear || is_part(p)).cloned().collect();
-        delete_all(&stale);
-        if clear {
-            let _ = std::fs::remove_file(list_path());
-            return Vec::new();
-        }
-    }
     let mut items: Vec<Item> = std::fs::read_to_string(list_path())
         .unwrap_or_default()
         .lines()
         .filter_map(parse_line)
         .filter(|i| i.path.exists())
         .collect();
+    if first {
+        // Emptying on start keeps what's pinned.
+        if clear {
+            items.retain(|i| i.pinned);
+        }
+        let stale: Vec<PathBuf> =
+            entries.iter().filter(|p| is_part(p) || (clear && !items.iter().any(|i| i.path == **p))).cloned().collect();
+        delete_all(&stale);
+        if clear {
+            save(&items);
+            return items;
+        }
+    }
     // Our own files the list missed (a crash before it was saved).
     for path in entries.into_iter().filter(|p| !is_part(p) && p.exists()) {
         if !items.iter().any(|i| i.path == path) {
             let added = std::fs::metadata(&path).and_then(|m| m.created().or_else(|_| m.modified())).unwrap_or_else(|_| SystemTime::now());
-            items.push(Item { path, added, pending: false });
+            items.push(Item { path, added, pending: false, pinned: false });
         }
     }
     let jobs = JOBS.lock().map(|j| j.clone()).unwrap_or_default();
-    items.extend(jobs.into_iter().map(|path| Item { path, added: SystemTime::now(), pending: true }));
+    items.extend(jobs.into_iter().map(|path| Item { path, added: SystemTime::now(), pending: true, pinned: false }));
     items.sort_by_key(|i| i.added);
     items
 }
 
 fn parse_line(line: &str) -> Option<Item> {
-    let (secs, path) = line.split_once('\t')?;
+    let (secs, rest) = line.split_once('\t')?;
     let added = UNIX_EPOCH + Duration::from_secs(secs.parse().ok()?);
-    Some(Item { path: PathBuf::from(path), added, pending: false })
+    let (pinned, path) = match rest.strip_prefix("pin\t") {
+        Some(path) => (true, path),
+        None => (false, rest),
+    };
+    Some(Item { path: PathBuf::from(path), added, pending: false, pinned })
 }
 
 fn format_line(i: &Item) -> String {
     let secs = i.added.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    format!("{secs}\t{}\n", i.path.display())
+    let pin = if i.pinned { "pin\t" } else { "" };
+    format!("{secs}\t{pin}{}\n", i.path.display())
 }
 
 /// Writes the list of held files (pending jobs are found again by `load`).
@@ -201,12 +214,12 @@ fn spawn(dest: PathBuf, what: String, work: impl FnOnce(&Path) -> anyhow::Result
             }
         }
     });
-    Item { path: dest, added: SystemTime::now(), pending: true }
+    Item { path: dest, added: SystemTime::now(), pending: true, pinned: false }
 }
 
 /// Holds `src` where it is.
 pub fn hold(src: &Path) -> Item {
-    Item { path: src.to_path_buf(), added: SystemTime::now(), pending: false }
+    Item { path: src.to_path_buf(), added: SystemTime::now(), pending: false, pinned: false }
 }
 
 /// Starts converting `src` to `to`, next to it in the folder.
@@ -289,11 +302,15 @@ mod tests {
 
     #[test]
     fn list_lines() {
-        let item = Item { path: PathBuf::from(r"C:\Users\a b\x.png"), added: UNIX_EPOCH + Duration::from_secs(42), pending: false };
+        let item = Item { path: PathBuf::from(r"C:\Users\a b\x.png"), added: UNIX_EPOCH + Duration::from_secs(42), pending: false, pinned: false };
         let line = format_line(&item);
         assert_eq!(line, "42\tC:\\Users\\a b\\x.png\n");
         let back = parse_line(line.trim_end()).unwrap();
-        assert_eq!((back.path, back.added), (item.path, item.added));
+        assert_eq!((back.path, back.added, back.pinned), (item.path.clone(), item.added, false));
+        let pinned = Item { pinned: true, ..item.clone() };
+        assert_eq!(format_line(&pinned), "42\tpin\tC:\\Users\\a b\\x.png\n");
+        let back = parse_line(format_line(&pinned).trim_end()).unwrap();
+        assert_eq!((back.path, back.pinned), (item.path, true));
         assert!(parse_line("garbage").is_none());
     }
 

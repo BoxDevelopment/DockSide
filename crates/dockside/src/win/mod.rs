@@ -188,5 +188,7 @@ pub const WM_APP_RECORD_KEY: u32 = WM_APP + 26;
 pub const WM_APP_SPOTLIGHT_TAP: u32 = WM_APP + 27;
 /// A mouse button was held and moved, starting a drag anywhere (wParam 1), or let go (0).
 pub const WM_APP_DRAG_WATCH: u32 = WM_APP + 28;
+/// A key the island's open shelf took (wParam: index into `island::ShelfKey::ALL`).
+pub const WM_APP_SHELF_KEY: u32 = WM_APP + 29;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

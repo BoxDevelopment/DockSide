@@ -3,7 +3,7 @@
 //! is given (which springs around), at opacity `a`, and records hit rects.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
@@ -47,6 +47,11 @@ pub struct View<'a> {
     pub clock: Option<&'a Clock>,
     pub shelf: &'a [Item],
     pub shelf_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
+    /// Selected shelf files, how far the row has scrolled, and Quick Look's file and picture.
+    pub selected: &'a [PathBuf],
+    pub shelf_scroll: f32,
+    pub preview: Option<&'a Path>,
+    pub preview_bmp: Option<&'a ID2D1Bitmap>,
     /// How long held files last (`None`: no expiry badges).
     pub shelf_lifetime: Option<Duration>,
     pub wall: SystemTime,
@@ -512,22 +517,43 @@ pub fn timer_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     }
 }
 
+/// Width of one file on the shelf's row, in points.
+pub const TILE_W: f32 = 76.0;
+/// The row's inset from the panel's sides.
+pub const SHELF_INSET: f32 = 16.0;
+
 pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    if let (Some(path), false) = (v.preview, v.drag_over) {
+        return quick_look(p, r, path, v, a, hits);
+    }
     let f = v.fonts;
     let hy = r.y + 14.0;
     g::tray(p, r.x + 30.0, hy + 9.0, 15.0, WHITE.alpha(a));
     p.text("Shelf", &f.header, Rect::new(r.x + 44.0, hy, 80.0, 18.0), WHITE.alpha(a));
     if !v.shelf.is_empty() {
+        // The count: click selects everything, drag takes everything.
         let n = v.shelf.len();
-        let count = if n == 1 { "1 file".to_string() } else { format!("{n} files") };
-        p.text(&count, &f.small_l, Rect::new(r.x + 92.0, hy, 80.0, 18.0), SECONDARY.alpha(a));
+        let picked = v.selected.len();
+        let count = match (picked, n) {
+            (0, 1) => "1 file".to_string(),
+            (0, _) => format!("{n} files"),
+            _ => format!("{picked} of {n} selected"),
+        };
+        let cw = p.gfx.measure(&count, &f.small_l) + 12.0;
+        let cr = Rect::new(r.x + 86.0, hy - 1.0, cw, 20.0);
+        let hot = v.hot == Some(Hit::ShelfAll);
+        if hot {
+            p.fill_round(cr, 10.0, Color::gray(255, 0.1 * a));
+        }
+        p.text(&count, &f.small_l, Rect::new(cr.x + 6.0, hy, cw, 18.0), Color::gray(255, if hot { 0.85 } else { 0.55 } * a));
+        hits.push((cr, Hit::ShelfAll));
         let clear = Rect::new(r.right() - 74.0, hy - 2.0, 54.0, 22.0);
         let hot = v.hot == Some(Hit::ShelfClear);
         p.fill_round(clear, 11.0, Color::gray(255, if hot { 0.22 } else { 0.12 } * a));
         p.text("Clear", &f.chip, clear, WHITE.alpha(a));
         hits.push((clear, Hit::ShelfClear));
     }
-    let body = Rect::new(r.x + 16.0, r.y + 44.0, r.w - 32.0, r.h - 58.0);
+    let body = Rect::new(r.x + SHELF_INSET, r.y + 44.0, r.w - 2.0 * SHELF_INSET, r.h - 58.0);
     if v.drag_over {
         return drop_targets(p, body, v, a, hits);
     }
@@ -536,61 +562,35 @@ pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         p.text("Drag files to the top of the screen to hold them", &f.chip, body, Color::gray(255, 0.5 * a));
         return;
     }
-    let tile_w = 68.0;
-    let max = ((body.w / tile_w) as usize).max(1);
-    let overflow = v.shelf.len() > max;
-    let shown = if overflow { max - 1 } else { v.shelf.len() };
-    // The hovered expiry badge's tooltip, drawn over everything after the tiles.
+    hits.push((body, Hit::ShelfBody));
+    // The hovered badge's tooltip, drawn over everything after the tiles.
     let mut tip: Option<(f32, f32, String)> = None;
-    for (i, item) in v.shelf.iter().take(shown).enumerate() {
-        let tile = Rect::new(body.x + i as f32 * tile_w, body.y, tile_w, body.h);
-        let hot = matches!(v.hot, Some(Hit::ShelfItem(j) | Hit::ShelfRemove(j) | Hit::ShelfTimer(j)) if j == i);
-        if hot && !item.pending {
-            p.fill_round(tile.inset(2.0, 0.0), 10.0, Color::gray(255, 0.1 * a));
-        }
-        let icon = Rect::new(tile.cx() - 20.0, tile.y + 6.0, 40.0, 40.0);
-        match v.shelf_icons.get(&item.path) {
-            Some(bmp) if !item.pending => p.bitmap(bmp, icon, a),
-            _ => p.fill_round(icon, 8.0, Color::gray(255, 0.15 * a)),
-        }
-        if item.pending {
-            spinner(p, icon.cx(), icon.cy(), 9.0, v.time, WHITE.alpha(a));
-        }
-        let name = item.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let fade = if item.pending { 0.5 } else { 0.85 };
-        p.text(&name, &f.small_c, Rect::new(tile.x + 3.0, icon.bottom() + 4.0, tile.w - 6.0, 15.0), Color::gray(255, fade * a));
-        hits.push((tile, Hit::ShelfItem(i)));
-        if item.pending {
-            continue;
-        }
-        // Expiry badge: a ring that empties as the item's time runs out.
-        if let Some(life) = v.shelf_lifetime {
-            let left = (item.added + life).duration_since(v.wall).unwrap_or_default();
-            let frac = left.as_secs_f32() / life.as_secs_f32().max(1.0);
-            let urgent = frac < 0.1 || left.as_secs() < 300;
-            let (cx, cy) = (icon.x + 1.0, icon.bottom() - 1.0);
-            let badge_hot = v.hot == Some(Hit::ShelfTimer(i));
-            p.fill_circle(cx, cy, 8.0, Color::gray(if badge_hot { 78 } else { 52 }, a));
-            g::timer(p, cx, cy, 15.0, frac, if urgent { ORANGE } else { WHITE }.alpha(a));
-            let badge = Rect::new(cx - 9.0, cy - 9.0, 18.0, 18.0);
-            hits.push((badge, Hit::ShelfTimer(i)));
-            if badge_hot {
-                tip = Some((cx, badge.bottom() + 4.0, format!("Expires in {}", holding::remaining_label(left.as_secs()))));
+    p.clipped(body, || {
+        for (i, item) in v.shelf.iter().enumerate() {
+            let x = body.x + i as f32 * TILE_W - v.shelf_scroll;
+            if x + TILE_W <= body.x || x >= body.right() {
+                continue;
+            }
+            let tile = Rect::new(x, body.y, TILE_W, body.h);
+            // Only the part in view takes the pointer.
+            let (x0, x1) = (tile.x.max(body.x), tile.right().min(body.right()));
+            if x1 - x0 > 8.0 {
+                hits.push((Rect::new(x0, tile.y, x1 - x0, tile.h), Hit::ShelfItem(i)));
+            }
+            let whole = tile.x >= body.x - 0.5 && tile.right() <= body.right() + 0.5;
+            if let Some(t) = shelf_tile(p, tile, i, item, v, a, whole, hits) {
+                tip = Some(t);
             }
         }
-        if hot {
-            let x = Rect::new(icon.right() - 6.0, icon.y - 6.0, 16.0, 16.0);
-            p.fill_circle(x.cx(), x.cy(), 8.0, Color::gray(90, a));
-            g::xmark(p, x.cx(), x.cy(), 6.0, WHITE.alpha(a), 1.6);
-            hits.push((x.inset(-2.0, -2.0), Hit::ShelfRemove(i)));
-        }
-    }
-    if overflow {
-        let tile = Rect::new(body.x + shown as f32 * tile_w, body.y, tile_w, body.h);
-        let more = format!("+{}", v.shelf.len() - shown);
-        p.fill_round(Rect::new(tile.cx() - 20.0, tile.y + 6.0, 40.0, 40.0), 10.0, Color::gray(255, 0.12 * a));
-        p.text(&more, &f.chip, Rect::new(tile.cx() - 20.0, tile.y + 6.0, 40.0, 40.0), WHITE.alpha(a));
-        hits.push((tile, Hit::ShelfItem(usize::MAX)));
+    });
+    // A slim scroller under the row while it holds more than fits.
+    let content = v.shelf.len() as f32 * TILE_W;
+    if content > body.w + 0.5 {
+        let track = Rect::new(body.x + 40.0, body.bottom() + 5.0, body.w - 80.0, 3.0);
+        let thumb_w = (track.w * body.w / content).max(18.0);
+        let k = (v.shelf_scroll / (content - body.w)).clamp(0.0, 1.0);
+        p.fill_round(track, 1.5, Color::gray(255, 0.08 * a));
+        p.fill_round(Rect::new(track.x + (track.w - thumb_w) * k, track.y, thumb_w, track.h), 1.5, Color::gray(255, 0.35 * a));
     }
     if let Some((cx, y, label)) = tip {
         let w = p.gfx.measure(&label, &f.small_c) + 18.0;
@@ -603,14 +603,144 @@ pub fn shelf_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     }
 }
 
+/// One file on the shelf: its thumbnail and name (Finder's selection look),
+/// a pin or expiry badge, and a remove button on hover. `whole`: entirely in
+/// view, so its small buttons can take clicks. Returns the badge's tooltip
+/// while it's hovered.
+#[allow(clippy::too_many_arguments)]
+fn shelf_tile(p: &Painter, tile: Rect, i: usize, item: &Item, v: &View, a: f32, whole: bool, hits: &mut Hits) -> Option<(f32, f32, String)> {
+    let f = v.fonts;
+    let selected = v.selected.contains(&item.path);
+    let hot = matches!(v.hot, Some(Hit::ShelfItem(j) | Hit::ShelfRemove(j) | Hit::ShelfTimer(j)) if j == i);
+    let icon = Rect::new(tile.cx() - 26.0, tile.y + 3.0, 52.0, 52.0);
+    if selected || (hot && !item.pending) {
+        p.fill_round(icon.inset(-5.0, -3.0), 10.0, Color::gray(255, if selected { 0.17 } else { 0.08 } * a));
+    }
+    match v.shelf_icons.get(&item.path) {
+        Some(bmp) if !item.pending => p.bitmap(bmp, fit(bmp, icon, 1.0), a),
+        _ => p.fill_round(icon.inset(6.0, 6.0), 8.0, Color::gray(255, 0.15 * a)),
+    }
+    if item.pending {
+        spinner(p, icon.cx(), icon.cy(), 9.0, v.time, WHITE.alpha(a));
+    }
+    let name = item.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let line = Rect::new(tile.x + 3.0, icon.bottom() + 4.0, tile.w - 6.0, 15.0);
+    if selected {
+        let w = (p.gfx.measure(&name, &f.small_c) + 10.0).min(tile.w - 4.0);
+        p.fill_round(Rect::new(tile.cx() - w / 2.0, line.y, w, line.h), line.h / 2.0, v.accent.alpha(a));
+        p.text(&name, &f.small_c, line, WHITE.alpha(a));
+    } else {
+        let fade = if item.pending { 0.5 } else { 0.85 };
+        p.text(&name, &f.small_c, line, Color::gray(255, fade * a));
+    }
+    if item.pending {
+        return None;
+    }
+    let mut tip = None;
+    // Badge: a pin, or a ring that empties as the file's time runs out.
+    let (cx, cy) = (icon.x + 3.0, icon.bottom() - 3.0);
+    let badge = Rect::new(cx - 9.0, cy - 9.0, 18.0, 18.0);
+    let badge_hot = v.hot == Some(Hit::ShelfTimer(i));
+    if item.pinned {
+        p.fill_circle(cx, cy, 8.0, Color::gray(if badge_hot { 78 } else { 52 }, a));
+        g::pin(p, cx, cy, 11.0, WHITE.alpha(a));
+        if badge_hot {
+            tip = Some((cx, badge.bottom() + 4.0, "Pinned".to_string()));
+        }
+    } else if let Some(life) = v.shelf_lifetime {
+        let left = (item.added + life).duration_since(v.wall).unwrap_or_default();
+        let frac = left.as_secs_f32() / life.as_secs_f32().max(1.0);
+        let urgent = frac < 0.1 || left.as_secs() < 300;
+        p.fill_circle(cx, cy, 8.0, Color::gray(if badge_hot { 78 } else { 52 }, a));
+        g::timer(p, cx, cy, 15.0, frac, if urgent { ORANGE } else { WHITE }.alpha(a));
+        if badge_hot {
+            tip = Some((cx, badge.bottom() + 4.0, format!("Expires in {}", holding::remaining_label(left.as_secs()))));
+        }
+    }
+    if whole && (item.pinned || v.shelf_lifetime.is_some()) {
+        hits.push((badge, Hit::ShelfTimer(i)));
+    }
+    if hot && whole {
+        let x = Rect::new(icon.right() - 8.0, icon.y - 4.0, 16.0, 16.0);
+        p.fill_circle(x.cx(), x.cy(), 8.0, Color::gray(90, a));
+        g::xmark(p, x.cx(), x.cy(), 6.0, WHITE.alpha(a), 1.6);
+        hits.push((x.inset(-2.0, -2.0), Hit::ShelfRemove(i)));
+    }
+    tip
+}
+
+/// Quick Look (Space on the shelf): the file big, with its name, Open, and
+/// arrows to step through the shelf.
+fn quick_look(p: &Painter, r: Rect, path: &Path, v: &View, a: f32, hits: &mut Hits) {
+    let f = v.fonts;
+    let hy = r.y + 14.0;
+    let close = Rect::new(r.x + 18.0, hy - 2.0, 22.0, 22.0);
+    let hot = v.hot == Some(Hit::PreviewClose);
+    p.fill_circle(close.cx(), close.cy(), 11.0, Color::gray(255, if hot { 0.22 } else { 0.12 } * a));
+    g::xmark(p, close.cx(), close.cy(), 7.0, WHITE.alpha(a), 1.6);
+    hits.push((close, Hit::PreviewClose));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    p.text(&name, &f.header, Rect::new(close.right() + 10.0, hy, r.w - 150.0, 18.0), WHITE.alpha(a));
+    let open = Rect::new(r.right() - 74.0, hy - 2.0, 54.0, 22.0);
+    let hot = v.hot == Some(Hit::PreviewOpen) && v.down.is_none();
+    p.fill_round(open, 11.0, Color::gray(255, if hot { 0.22 } else { 0.12 } * a));
+    p.text("Open", &f.chip, open, WHITE.alpha(a));
+    hits.push((open, Hit::PreviewOpen));
+
+    let area = Rect::new(r.x + 16.0, r.y + 46.0, r.w - 32.0, r.h - 46.0 - 40.0);
+    match v.preview_bmp {
+        Some(bmp) => {
+            let img = fit(bmp, area, 1.0);
+            p.bitmap_round(bmp, img, 10.0, a);
+            // Click opens it; drag takes the file.
+            hits.push((img, Hit::PreviewOpen));
+        }
+        None => {
+            p.fill_round(area.inset(area.w / 2.0 - 40.0, area.h / 2.0 - 40.0), 14.0, Color::gray(255, 0.12 * a));
+            hits.push((area, Hit::PreviewOpen));
+        }
+    }
+
+    // Footer: where this file is in the shelf, its size, and the arrows.
+    let files: Vec<&Item> = v.shelf.iter().filter(|i| !i.pending).collect();
+    let at = files.iter().position(|i| i.path == path).unwrap_or(0);
+    let cy = r.bottom() - 22.0;
+    let size = std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| human_size(m.len()));
+    let label = match size {
+        Some(sz) => format!("{} of {}  ·  {sz}", at + 1, files.len()),
+        None => format!("{} of {}", at + 1, files.len()),
+    };
+    p.text(&label, &f.small_c, Rect::new(r.x + 60.0, cy - 8.0, r.w - 120.0, 16.0), SECONDARY.alpha(a));
+    for (dir, x) in [(-1, r.x + 34.0), (1, r.right() - 34.0)] {
+        let can = if dir < 0 { at > 0 } else { at + 1 < files.len() };
+        let hot = can && v.hot == Some(Hit::PreviewStep(dir));
+        let c = Color::gray(255, if !can { 0.2 } else if hot { 1.0 } else { 0.7 } * a);
+        if hot {
+            p.fill_circle(x, cy, 13.0, Color::gray(255, 0.12 * a));
+        }
+        g::chevron(p, x, cy, 12.0, dir < 0, c);
+        if can {
+            hits.push((Rect::new(x - 15.0, cy - 15.0, 30.0, 30.0), Hit::PreviewStep(dir)));
+        }
+    }
+}
+
+/// `bmp` fitted inside `r`, keeping its shape and never scaled past `max`.
+fn fit(bmp: &ID2D1Bitmap, r: Rect, max: f32) -> Rect {
+    let s = unsafe { bmp.GetSize() };
+    let k = (r.w / s.width.max(1.0)).min(r.h / s.height.max(1.0)).min(max);
+    let (w, h) = (s.width * k, s.height * k);
+    Rect::new(r.cx() - w / 2.0, r.cy() - h / 2.0, w, h)
+}
+
 /// While files are dragged over the shelf: a zone that holds them, and a tile
 /// per Quick Action. The one under the pointer lights up; tiles that can't take
 /// these files are dimmed.
 fn drop_targets(p: &Painter, body: Rect, v: &View, a: f32, hits: &mut Hits) {
-    const TILE_W: f32 = 76.0;
+    const ACTION_W: f32 = 76.0;
     const GAP: f32 = 8.0;
     let f = v.fonts;
-    let hold = Rect::new(body.x, body.y, body.w - v.tiles.len() as f32 * (TILE_W + GAP), body.h);
+    let hold = Rect::new(body.x, body.y, body.w - v.tiles.len() as f32 * (ACTION_W + GAP), body.h);
     let hot = v.drop_hot == Some(Tile::Hold);
     if hot {
         p.fill_round(hold, 14.0, v.accent.alpha(0.16 * a));
@@ -623,7 +753,7 @@ fn drop_targets(p: &Painter, body: Rect, v: &View, a: f32, hits: &mut Hits) {
     p.text(&label, &f.chip, Rect::new(hold.x, hold.cy() + 8.0, hold.w, 18.0), ink);
     hits.push((hold, Hit::Drop(Tile::Hold)));
     for (i, &(tile, ok)) in v.tiles.iter().enumerate() {
-        let t = Rect::new(hold.right() + GAP + i as f32 * (TILE_W + GAP), body.y, TILE_W, body.h);
+        let t = Rect::new(hold.right() + GAP + i as f32 * (ACTION_W + GAP), body.y, ACTION_W, body.h);
         let hot = ok && v.drop_hot == Some(tile);
         let fade = if ok { 1.0 } else { 0.35 };
         // The tile under the pointer swells a little, like a Dock icon taking a drop.

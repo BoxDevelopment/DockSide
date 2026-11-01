@@ -378,3 +378,20 @@ pub fn archive(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
     p.stroke_round(Rect::new(cx - 6.5 * k, cy - 2.5 * k, 13.0 * k, 9.0 * k), 1.4 * k, c, w);
     p.line(cx - 2.2 * k, cy + 0.8 * k, cx + 2.2 * k, cy + 0.8 * k, c, 1.6 * k);
 }
+
+/// An upright pushpin: cap, body, flared base and needle.
+pub fn pin(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    p.fill_round(Rect::new(cx - 3.2 * k, cy - 7.0 * k, 6.4 * k, 2.2 * k), 1.1 * k, c);
+    p.fill_rect(Rect::new(cx - 2.0 * k, cy - 5.5 * k, 4.0 * k, 4.5 * k), c);
+    p.fill_round(Rect::new(cx - 4.6 * k, cy - 1.4 * k, 9.2 * k, 2.4 * k), 1.2 * k, c);
+    p.line(cx, cy + 0.5 * k, cx, cy + 7.0 * k, c, 1.3 * k);
+}
+
+/// A chevron pointing left (`back`) or right.
+pub fn chevron(p: &Painter, cx: f32, cy: f32, s: f32, back: bool, c: Color) {
+    let k = s / 16.0;
+    let d = if back { 1.0 } else { -1.0 };
+    p.line(cx + 2.5 * k * d, cy - 6.0 * k, cx - 3.5 * k * d, cy, c, 1.8 * k);
+    p.line(cx - 3.5 * k * d, cy, cx + 2.5 * k * d, cy + 6.0 * k, c, 1.8 * k);
+}

@@ -72,7 +72,9 @@ hidden while DockSide runs and is always restored when it exits.
   drag the bar to set the volume
 - **Timer and stopwatch**: from the home panel, the right-click menu, or Spotlight ("timer 10m", "stopwatch")
 - **File shelf**: drag files to the top of the screen to hold them, then drag them out where you need them.
-  Quick Action tiles beside the shelf convert them, copy the text out of pictures (OCR) or zip them
+  Quick Action tiles beside the shelf convert them, copy the text out of pictures (OCR) or zip them.
+  Select files like in Finder (Ctrl/Shift-click, Ctrl+A) and drag them out together, pin the ones to keep,
+  and press Space for a Quick Look preview
 - **Upcoming meetings** from the Windows calendar, a few minutes before they start
 - **Mic and camera indicators**: an orange / green dot while an app is using them, with the app's name
 - **Alerts**: notifications (as banners from the island), Bluetooth devices connecting with their battery,

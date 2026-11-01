@@ -127,6 +127,25 @@ const CLAUDE: Color = Color::rgba(217, 119, 87, 1.0);
 const WHITE: Color = Color::gray(255, 0.96);
 const SECONDARY: Color = Color::gray(255, 0.55);
 
+/// The open shelf takes these keys (through the island's keyboard hook: the
+/// island never has focus) once it has been clicked, until it closes.
+pub static SHELF_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShelfKey {
+    /// Ctrl+A
+    SelectAll,
+    /// Space: Quick Look.
+    Preview,
+    Escape,
+    Prev,
+    Next,
+}
+
+impl ShelfKey {
+    pub const ALL: [ShelfKey; 5] = [ShelfKey::SelectAll, ShelfKey::Preview, ShelfKey::Escape, ShelfKey::Prev, ShelfKey::Next];
+}
+
 /// Where a file drag over the island lands: the shelf, or a Quick Action.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tile {
@@ -255,6 +274,14 @@ pub enum Hit {
     /// A held file's expiry badge (hover for the time left).
     ShelfTimer(usize),
     ShelfClear,
+    /// The shelf's empty space (a click clears the selection).
+    ShelfBody,
+    /// The file count: click selects all, drag takes all.
+    ShelfAll,
+    /// Quick Look: the picture (click opens, drag takes the file), close, step.
+    PreviewOpen,
+    PreviewClose,
+    PreviewStep(i32),
     /// A drop target while a file drag is over the island.
     Drop(Tile),
     Event(usize),
@@ -312,8 +339,12 @@ pub enum IslandCmd {
     ShowNotes,
     /// Settings' "Try It": a short sample Live Activity.
     LiveDemo,
-    /// Take one file off the shelf (deleting it only if the shelf made it).
-    RemoveShelf(PathBuf),
+    /// Take files off the shelf (deleting them only if the shelf made them).
+    RemoveShelf(Vec<PathBuf>),
+    /// Pin (true) or unpin files.
+    Pin(Vec<PathBuf>, bool),
+    /// Quick Look a held file.
+    Preview(PathBuf),
     /// Convert files; each result joins the shelf beside its original (or at the end).
     Convert(Vec<PathBuf>, Format),
 }
@@ -456,6 +487,18 @@ pub struct Island {
     clock: Option<Clock>,
     shelf: Vec<Item>,
     shelf_icons: HashMap<PathBuf, ID2D1Bitmap>,
+    /// Shelf files picked out (Finder-style), the one a Shift-click extends
+    /// from, and the last click (for double-clicks).
+    selected: Vec<PathBuf>,
+    anchor: Option<PathBuf>,
+    last_click: Option<(PathBuf, Instant)>,
+    /// The shelf has been clicked since it opened, so it takes keys.
+    shelf_focus: bool,
+    /// How far the shelf's row has scrolled, in points.
+    shelf_scroll: Spring,
+    /// The file Quick Look shows, and its picture (`None` if it has none).
+    preview: Option<PathBuf>,
+    preview_bmp: Option<(PathBuf, Option<ID2D1Bitmap>)>,
     live: live::Live,
     live_icons: HashMap<PathBuf, ID2D1Bitmap>,
     /// The notification stack, newest first, and the app whose stack is opened out.
@@ -609,6 +652,13 @@ impl Island {
             clock: None,
             shelf: holding::load(ic.shelf_clear_on_start),
             shelf_icons: HashMap::new(),
+            selected: Vec::new(),
+            anchor: None,
+            last_click: None,
+            shelf_focus: false,
+            shelf_scroll: Spring::new(0.0, 0.3, 1.0),
+            preview: None,
+            preview_bmp: None,
             live,
             live_icons: HashMap::new(),
             notes,
@@ -1007,6 +1057,7 @@ impl Island {
                 Panel::Media => (372.0, 166.0),
                 Panel::Claude => (372.0, 126.0),
                 Panel::Timer => (340.0, 96.0),
+                Panel::Shelf if self.preview.is_some() && !self.drag_over => (420.0, 360.0),
                 Panel::Shelf => (if self.drag_over && !self.tiles().is_empty() { 460.0 } else { 420.0 }, 140.0),
                 Panel::Calendar => {
                     let n = self.events.iter().filter(|e| e.end > calendar::unix_now()).take(3).count().max(1);
@@ -1324,7 +1375,7 @@ impl Island {
                 holding::Done::Ready(p) => match self.shelf.iter_mut().find(|i| i.path == p) {
                     Some(i) => i.pending = false,
                     // Finished for an island that was rebuilt since.
-                    None => self.shelf.push(Item { path: p, added: SystemTime::now(), pending: false }),
+                    None => self.shelf.push(Item { path: p, added: SystemTime::now(), pending: false, pinned: false }),
                 },
                 holding::Done::Failed(p) => self.shelf.retain(|i| i.path != p),
                 holding::Done::Copied(text) => self.show_alert(Alert::TextCopied(text), 3.0),
@@ -1395,7 +1446,7 @@ impl Island {
         let before = self.shelf.len();
         let mut gone = Vec::new();
         self.shelf.retain(|i| {
-            let expired = !i.pending && life.is_some_and(|l| i.added + l <= now);
+            let expired = !i.pending && !i.pinned && life.is_some_and(|l| i.added + l <= now);
             if expired {
                 gone.push(i.path.clone());
             }
@@ -1514,7 +1565,32 @@ impl Island {
     }
 
     /// Horizontal scroll (two-finger swipe, tilt wheel, Shift+wheel) pages between activities.
+    /// Scrolls the open shelf's row by `dx` wheel units (positive: on to later
+    /// files). Returns false when there's no shelf to scroll under the pointer.
+    fn scroll_shelf(&mut self, dx: i32) -> bool {
+        if self.shown != Content::Panel(Panel::Shelf) || !self.inside || self.preview.is_some() || self.drag_over {
+            return false;
+        }
+        let max = self.shelf_scroll_max();
+        if max <= 0.0 {
+            return false;
+        }
+        let t = (self.shelf_scroll.target + dx as f32 / 120.0 * views::TILE_W).clamp(0.0, max);
+        self.shelf_scroll.set(t);
+        self.dirty = true;
+        true
+    }
+
+    /// How far the shelf's row can scroll: its files past the panel's width.
+    fn shelf_scroll_max(&self) -> f32 {
+        let (w, _) = self.panel_size(Panel::Shelf);
+        (self.shelf.len() as f32 * views::TILE_W - (w - 2.0 * views::SHELF_INSET)).max(0.0)
+    }
+
     pub fn on_hwheel(&mut self, delta: i32) {
+        if self.scroll_shelf(delta) {
+            return;
+        }
         // One page per gesture: after a switch, wait for the fingers (and any
         // momentum) to pause before accepting another.
         let now = Instant::now();
@@ -1535,6 +1611,9 @@ impl Island {
     }
 
     pub fn on_wheel(&mut self, delta: i32) {
+        if self.scroll_shelf(-delta) {
+            return;
+        }
         if !self.cfg.volume {
             return;
         }
@@ -1563,8 +1642,20 @@ impl Island {
                 }
             }
             IslandCmd::CancelClock => self.clock = None,
-            IslandCmd::ClearShelf => self.remove_shelf(|_| false),
-            IslandCmd::RemoveShelf(ref p) => self.remove_shelf(|i| i.path != *p),
+            IslandCmd::ClearShelf => self.remove_shelf(|i| i.pinned),
+            IslandCmd::RemoveShelf(ref paths) => self.remove_shelf(|i| !paths.contains(&i.path)),
+            IslandCmd::Pin(ref paths, on) => {
+                for i in self.shelf.iter_mut().filter(|i| paths.contains(&i.path)) {
+                    i.pinned = on;
+                }
+                holding::save(&self.shelf);
+            }
+            IslandCmd::Preview(ref p) => {
+                self.expanded = Some(Panel::Shelf);
+                self.preview = Some(p.clone());
+                self.selected = vec![p.clone()];
+                self.shelf_focus = true;
+            }
             IslandCmd::Convert(ref paths, to) => {
                 for p in paths {
                     if let Some(item) = holding::convert(p, to) {
@@ -1698,6 +1789,7 @@ impl Island {
     /// Opens the shelf to show what just landed, then folds it away unless the pointer stays.
     fn show_shelf(&mut self) {
         self.expanded = Some(Panel::Shelf);
+        self.shelf_scroll.set(self.shelf_scroll_max());
         self.leave_at = Some(Instant::now() + Duration::from_millis(1200));
     }
 
@@ -1840,11 +1932,16 @@ impl Island {
 
     fn drag_paths(&self, hit: Hit) -> Option<Vec<PathBuf>> {
         match hit {
-            Hit::ShelfItem(usize::MAX) => {
+            Hit::ShelfAll => {
                 let all: Vec<PathBuf> = self.shelf.iter().filter(|i| !i.pending).map(|i| i.path.clone()).collect();
                 (!all.is_empty()).then_some(all)
             }
-            Hit::ShelfItem(i) | Hit::ShelfTimer(i) => self.shelf.get(i).filter(|i| !i.pending).map(|i| vec![i.path.clone()]),
+            // A selected file takes the whole selection with it.
+            Hit::ShelfItem(i) | Hit::ShelfTimer(i) => {
+                let item = self.shelf.get(i).filter(|i| !i.pending)?;
+                Some(if self.selected.contains(&item.path) { self.selection() } else { vec![item.path.clone()] })
+            }
+            Hit::PreviewOpen => self.preview.clone().map(|p| vec![p]),
             Hit::AlertBody => match self.alert.as_ref().map(|s| &s.alert) {
                 Some(Alert::Screenshot(p) | Alert::Downloaded(p)) => Some(vec![p.clone()]),
                 _ => None,
@@ -1877,6 +1974,9 @@ impl Island {
 
     pub fn on_down(&mut self, x: f32, y: f32) {
         let hit = self.hit_at(x, y);
+        if self.shown == Content::Panel(Panel::Shelf) && hit.is_some() {
+            self.shelf_focus = true;
+        }
         self.down = hit;
         self.down_at = (x, y);
         self.note_drag = match hit {
@@ -2000,18 +2100,22 @@ impl Island {
             }
             Hit::Chip(0) => self.command(IslandCmd::Stopwatch),
             Hit::Chip(secs) => self.command(IslandCmd::Timer(secs)),
-            Hit::ShelfItem(usize::MAX) => {}
-            Hit::ShelfItem(i) => {
-                let item = self.shelf.get(i).filter(|i| !i.pending)?;
-                return Some(IslandEvent::Run(Action::Open(item.path.to_string_lossy().into_owned())));
-            }
+            Hit::ShelfItem(i) => return self.click_item(i),
             Hit::ShelfRemove(i) => {
                 if let Some(p) = self.shelf.get(i).map(|i| i.path.clone()) {
                     self.remove_shelf(|i| i.path != p);
                 }
             }
             Hit::ShelfTimer(_) => {}
-            Hit::ShelfClear => self.remove_shelf(|_| false),
+            Hit::ShelfClear => self.remove_shelf(|i| i.pinned),
+            Hit::ShelfBody => {
+                self.selected.clear();
+                self.anchor = None;
+            }
+            Hit::ShelfAll => self.on_shelf_key(ShelfKey::SelectAll),
+            Hit::PreviewOpen => return self.preview.as_ref().map(|p| IslandEvent::Run(Action::Open(p.to_string_lossy().into_owned()))),
+            Hit::PreviewClose => self.preview = None,
+            Hit::PreviewStep(d) => self.step(d),
             Hit::Drop(_) => {}
             Hit::Event(_) => return Some(IslandEvent::Run(Action::Open("outlookcal:".into()))),
             Hit::AlertBody => return self.alert_click(),
@@ -2040,22 +2144,137 @@ impl Island {
         event
     }
 
-    /// Right-click on a held file: open, convert, remove.
+    /// Right-click on a held file: open, Quick Look, convert, pin, remove. On a
+    /// file that's part of a selection, it's for the whole selection.
     fn item_menu(&self, item: &Item) -> Vec<Entry> {
+        let paths = if self.selected.contains(&item.path) { self.selection() } else { vec![item.path.clone()] };
         let path = item.path.clone();
-        let convert: Vec<Entry> = convert::targets(&path)
+        let one = paths.len() == 1;
+        let convert: Vec<Entry> = common_targets(&paths)
             .into_iter()
-            .map(|f| Entry::item(f.label(), Action::Island(IslandCmd::Convert(vec![path.clone()], f))))
+            .map(|f| Entry::item(f.label(), Action::Island(IslandCmd::Convert(paths.clone(), f))))
             .collect();
-        vec![
-            Entry::item("Open", Action::Open(path.to_string_lossy().into_owned())),
-            Entry::item("Show in Finder", Action::Reveal(path.to_string_lossy().into_owned())),
-            Entry::Separator,
-            Entry::submenu("Convert to", convert),
-            Entry::Separator,
-            Entry::item("Remove from Shelf", Action::Island(IslandCmd::RemoveShelf(path))),
-            Entry::item("Clear Shelf", Action::Island(IslandCmd::ClearShelf)),
-        ]
+        let pinned = paths.iter().all(|p| self.shelf.iter().any(|i| i.path == *p && i.pinned));
+        let mut entries = Vec::new();
+        if one {
+            entries.push(Entry::item("Open", Action::Open(path.to_string_lossy().into_owned())));
+            entries.push(Entry::item("Quick Look", Action::Island(IslandCmd::Preview(path.clone()))));
+            entries.push(Entry::item("Show in Finder", Action::Reveal(path.to_string_lossy().into_owned())));
+            entries.push(Entry::Separator);
+        }
+        if !convert.is_empty() {
+            entries.push(Entry::submenu("Convert to", convert));
+            entries.push(Entry::Separator);
+        }
+        entries.push(Entry::item(if pinned { "Unpin" } else { "Pin" }, Action::Island(IslandCmd::Pin(paths.clone(), !pinned))));
+        let remove = if one { "Remove from Shelf".to_string() } else { format!("Remove {} Files from Shelf", paths.len()) };
+        entries.push(Entry::item(remove, Action::Island(IslandCmd::RemoveShelf(paths))));
+        entries.push(Entry::item("Clear Shelf", Action::Island(IslandCmd::ClearShelf)));
+        entries
+    }
+
+    /// The selected files, in shelf order.
+    fn selection(&self) -> Vec<PathBuf> {
+        self.shelf.iter().filter(|i| !i.pending && self.selected.contains(&i.path)).map(|i| i.path.clone()).collect()
+    }
+
+    /// A click on a shelf file, as in Finder: select it, Ctrl toggles, Shift
+    /// selects the run from the last one; a double-click opens it.
+    fn click_item(&mut self, i: usize) -> Option<IslandEvent> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetKeyState, VK_CONTROL, VK_SHIFT};
+        let path = self.shelf.get(i).filter(|i| !i.pending)?.path.clone();
+        let now = Instant::now();
+        let gap = Duration::from_millis(unsafe { GetDoubleClickTime() } as u64);
+        if self.last_click.take().is_some_and(|(p, t)| p == path && now - t <= gap) {
+            return Some(IslandEvent::Run(Action::Open(path.to_string_lossy().into_owned())));
+        }
+        self.last_click = Some((path.clone(), now));
+        let (ctrl, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };
+        let from = self.anchor.as_ref().and_then(|a| self.shelf.iter().position(|x| x.path == *a));
+        match from {
+            Some(a) if shift => {
+                let (lo, hi) = (a.min(i), a.max(i));
+                self.selected = self.shelf[lo..=hi].iter().filter(|x| !x.pending).map(|x| x.path.clone()).collect();
+            }
+            _ if ctrl => {
+                if let Some(k) = self.selected.iter().position(|p| *p == path) {
+                    self.selected.remove(k);
+                } else {
+                    self.selected.push(path.clone());
+                }
+                self.anchor = Some(path.clone());
+            }
+            _ => {
+                self.selected = vec![path.clone()];
+                self.anchor = Some(path.clone());
+            }
+        }
+        // Quick Look follows the click.
+        if self.preview.is_some() {
+            self.preview = Some(path);
+        }
+        None
+    }
+
+    /// Moves Quick Look (or the selection) to the previous / next file.
+    fn step(&mut self, dir: i32) {
+        let files: Vec<PathBuf> = self.shelf.iter().filter(|i| !i.pending).map(|i| i.path.clone()).collect();
+        let Some(last) = files.len().checked_sub(1) else { return };
+        let current = self.preview.as_ref().or(self.anchor.as_ref()).and_then(|c| files.iter().position(|p| p == c));
+        let next = match current {
+            Some(k) => (k as i32 + dir).clamp(0, last as i32) as usize,
+            None => if dir < 0 { last } else { 0 },
+        };
+        let path = files[next].clone();
+        if self.preview.is_some() {
+            self.preview = Some(path.clone());
+        }
+        self.selected = vec![path.clone()];
+        self.anchor = Some(path);
+        // Keep the picked file in view (tiles count files still being made too).
+        let at = self.shelf.iter().position(|i| self.anchor.as_ref() == Some(&i.path)).unwrap_or(next);
+        let x = at as f32 * views::TILE_W;
+        let (w, _) = self.panel_size(Panel::Shelf);
+        let view_w = w - 2.0 * views::SHELF_INSET;
+        let t = self.shelf_scroll.target;
+        let t = if x < t { x } else if x + views::TILE_W > t + view_w { x + views::TILE_W - view_w } else { t };
+        self.shelf_scroll.set(t.clamp(0.0, self.shelf_scroll_max()));
+    }
+
+    /// A key the open (clicked) shelf took.
+    pub fn on_shelf_key(&mut self, key: ShelfKey) {
+        match key {
+            ShelfKey::SelectAll => {
+                self.selected = self.shelf.iter().filter(|i| !i.pending).map(|i| i.path.clone()).collect();
+                self.anchor = self.selected.first().cloned();
+            }
+            ShelfKey::Escape if self.preview.is_some() => self.preview = None,
+            ShelfKey::Escape if !self.selected.is_empty() => {
+                self.selected.clear();
+                self.anchor = None;
+            }
+            ShelfKey::Escape => self.expanded = None,
+            ShelfKey::Preview if self.preview.is_some() => self.preview = None,
+            ShelfKey::Preview => {
+                // The file under the pointer, else the selection's first, else the newest.
+                let hovered = match self.hot {
+                    Some(Hit::ShelfItem(i) | Hit::ShelfTimer(i)) => self.shelf.get(i).filter(|i| !i.pending).map(|i| i.path.clone()),
+                    _ => None,
+                };
+                let target = hovered
+                    .or_else(|| self.selection().into_iter().next())
+                    .or_else(|| self.shelf.iter().rev().find(|i| !i.pending).map(|i| i.path.clone()));
+                if let Some(p) = target {
+                    self.selected = vec![p.clone()];
+                    self.anchor = Some(p.clone());
+                    self.preview = Some(p);
+                }
+            }
+            ShelfKey::Prev => self.step(-1),
+            ShelfKey::Next => self.step(1),
+        }
+        self.retarget();
+        self.dirty = true;
     }
 
     /// Right-click at `(x, y)`: a held file's menu, or timers, the shelf and settings.
@@ -2181,6 +2400,7 @@ impl Island {
             }
             moving = true;
         }
+        moving |= self.tick_shelf(dt);
         for s in [
             &mut self.w,
             &mut self.h,
@@ -2222,6 +2442,29 @@ impl Island {
             || self.drag_left.is_some()
             || (self.cfg.expand_on_hover && self.hover_since.is_some() && self.expanded.is_none());
         moving || (visible && period.is_some()) || waiting
+    }
+
+    /// Keeps the shelf's selection, Quick Look, scroll and keys in step with
+    /// what's held and whether the shelf is open. Returns whether it's scrolling.
+    fn tick_shelf(&mut self, dt: f32) -> bool {
+        if self.expanded != Some(Panel::Shelf) {
+            self.selected.clear();
+            self.anchor = None;
+            self.preview = None;
+            self.shelf_focus = false;
+        }
+        let shelf = &self.shelf;
+        self.selected.retain(|p| shelf.iter().any(|i| i.path == *p));
+        if self.preview.as_ref().is_some_and(|p| !shelf.iter().any(|i| i.path == *p)) {
+            self.preview = None;
+        }
+        let max = self.shelf_scroll_max();
+        if self.shelf_scroll.target > max {
+            self.shelf_scroll.set(max);
+        }
+        let open = self.shown == Content::Panel(Panel::Shelf) && self.expanded == Some(Panel::Shelf);
+        SHELF_KEYS.store(open && self.shelf_focus && (self.inside || self.preview.is_some()), std::sync::atomic::Ordering::Relaxed);
+        self.shelf_scroll.step(dt)
     }
 
     // --- rendering -----------------------------------------------------------
@@ -2266,10 +2509,17 @@ impl Island {
                 }
             }
         }
+        let want = self.preview.clone();
+        if want.as_ref() != self.preview_bmp.as_ref().map(|(p, _)| p) {
+            self.preview_bmp = want.map(|p| {
+                let bmp = load_shell_image(&p.to_string_lossy(), 512, true).and_then(|px| px.to_bitmap(&rt));
+                (p, bmp)
+            });
+        }
         self.shelf_icons.retain(|p, _| self.shelf.iter().any(|i| i.path == *p && !i.pending));
         for i in self.shelf.iter().filter(|i| !i.pending) {
             if !self.shelf_icons.contains_key(&i.path) {
-                if let Some(b) = load_shell_image(&i.path.to_string_lossy(), 96, true).and_then(|px| px.to_bitmap(&rt)) {
+                if let Some(b) = load_shell_image(&i.path.to_string_lossy(), 128, true).and_then(|px| px.to_bitmap(&rt)) {
                     self.shelf_icons.insert(i.path.clone(), b);
                 }
             }
@@ -2337,6 +2587,10 @@ impl Island {
             clock: self.clock.as_ref(),
             shelf: &self.shelf,
             shelf_icons: &self.shelf_icons,
+            selected: &self.selected,
+            shelf_scroll: self.shelf_scroll.value,
+            preview: self.preview.as_deref(),
+            preview_bmp: self.preview_bmp.as_ref().and_then(|(_, b)| b.as_ref()),
             live: &self.live,
             live_icons: &self.live_icons,
             notes: &self.notes,
@@ -2482,6 +2736,8 @@ impl Island {
 impl Drop for Island {
     fn drop(&mut self) {
         shelf::revoke(self.surface.content);
+        // Never leave the keyboard hook taking keys for a shelf that's gone.
+        SHELF_KEYS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

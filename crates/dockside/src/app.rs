@@ -47,7 +47,7 @@ use crate::win::{
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
-    WM_APP_DRAG_WATCH, WM_APP_RECORD_KEY, WM_APP_SPOTLIGHT_TAP,
+    WM_APP_DRAG_WATCH, WM_APP_RECORD_KEY, WM_APP_SHELF_KEY, WM_APP_SPOTLIGHT_TAP,
 };
 
 thread_local! {
@@ -627,6 +627,27 @@ unsafe extern "system" fn island_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> 
                 win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_ISLAND_KEY, vk as usize);
             }
             return LRESULT(1);
+        }
+        // The open shelf, once clicked, takes a few keys (see island::SHELF_KEYS).
+        if crate::island::SHELF_KEYS.load(Ordering::Relaxed) && !injected {
+            use crate::island::ShelfKey;
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+            let ctrl = GetAsyncKeyState(VK_CONTROL.0 as i32) < 0;
+            let key = match vk {
+                0x41 if ctrl => Some(ShelfKey::SelectAll),
+                0x20 => Some(ShelfKey::Preview),
+                0x1B => Some(ShelfKey::Escape),
+                0x25 => Some(ShelfKey::Prev),
+                0x27 => Some(ShelfKey::Next),
+                _ => None,
+            };
+            if let Some(k) = key {
+                if down {
+                    let n = ShelfKey::ALL.iter().position(|x| *x == k).unwrap_or(0);
+                    win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_SHELF_KEY, n);
+                }
+                return LRESULT(1);
+            }
         }
         // Key repeat sends more key-downs; only the first press of a hold toggles Caps Lock.
         static CAPS_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2627,6 +2648,12 @@ impl App {
                 WM_APP_ISLAND => {
                     if let Some(i) = &mut self.island {
                         i.on_signals();
+                        self.animate();
+                    }
+                }
+                WM_APP_SHELF_KEY => {
+                    if let (Some(i), Some(&k)) = (&mut self.island, crate::island::ShelfKey::ALL.get(wp.0)) {
+                        i.on_shelf_key(k);
                         self.animate();
                     }
                 }

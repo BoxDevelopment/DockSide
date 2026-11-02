@@ -52,7 +52,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::anim::Spring;
-use crate::config::{Backdrop, Config, ConfigValue, IslandCfg, IslandStyle};
+use crate::config::{Backdrop, Config, ConfigValue, IslandCfg, IslandFinish, IslandStyle};
 use crate::finder::dnd::Phase;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{load_shell_image, IconPixels};
@@ -111,6 +111,11 @@ const ART_STRETCH: f32 = 90.0;
 const ART_STRETCH_BLOCKED: f32 = 22.0;
 /// A skipped track's card waits this long for the new song before coming back.
 const ART_SWAP_WAIT: Duration = Duration::from_millis(900);
+/// How much black stays over an open island's glass or frost (so white text
+/// reads on any backdrop); Dynamic is this at its bottom edge, black at the top.
+const FINISH_WASH_GLASS: f32 = 0.55;
+const FINISH_WASH_FROSTED: f32 = 0.42;
+const FINISH_WASH_DYNAMIC: f32 = 0.5;
 /// How far the pointer moves before a press on a file becomes a drag.
 const DRAG_THRESHOLD: f32 = 5.0;
 /// Sideways travel that turns one page when dragging an expanded panel.
@@ -690,7 +695,13 @@ impl Island {
         let top = top - lip;
         let (iw, ih) = blob_size(compact_h);
         let rect = window_rect(&monitor, top, iw, ih + lip);
-        let surface = Surface::new(gfx, rect, monitor.scale, Backdrop::None, Color::TRANSPARENT)?;
+        // Glass or frost behind the open panels: a backdrop fitted to the shape each frame.
+        let (backdrop, tint) = match cfg.island.finish {
+            IslandFinish::Black => (Backdrop::None, Color::TRANSPARENT),
+            IslandFinish::Dynamic | IslandFinish::Glass => (Backdrop::Glass, Color::rgba(0, 0, 0, 0.6)),
+            IslandFinish::Frosted => (Backdrop::Acrylic, Color::rgba(12, 12, 14, 0.55)),
+        };
+        let surface = Surface::new(gfx, rect, monitor.scale, backdrop, tint)?;
         let ic = &cfg.island;
         // Live Activities come from other apps: they carry over whatever changed.
         let (handover, live, notes) = match handover {
@@ -2919,6 +2930,16 @@ impl Island {
         };
         let presence = self.presence.value.clamp(0.0, 1.0);
         let fit = self.fit();
+        let finish = self.cfg.finish;
+        if finish != IslandFinish::Black {
+            // The backdrop only shows once the island opens (folded, it's black
+            // anyway): a bare dot keeps it out of the way, and off the GPU.
+            if grown > 0.02 && presence > 0.02 {
+                self.surface.set_backdrop_shape(shape, radius);
+            } else {
+                self.surface.set_backdrop_shape(Rect::new(pill.cx(), pill.cy(), 0.0, 0.0), 0.0);
+            }
+        }
         let a = presence * self.content.value.clamp(0.0, 1.0) * fit;
 
         // The bubble splits off the pill's right end.
@@ -3043,7 +3064,17 @@ impl Island {
                 }
                 p.clear_round(shape, radius);
             }
-            p.fill_round(shape, radius, Color::BLACK.alpha(presence));
+            // Folded, the island is black; opening, the finish grows in behind a
+            // dark wash that keeps white text readable.
+            match finish {
+                IslandFinish::Black => p.fill_round(shape, radius, Color::BLACK.alpha(presence)),
+                IslandFinish::Dynamic => {
+                    let bottom = lerp(1.0, FINISH_WASH_DYNAMIC, grown);
+                    p.fill_round_gradient(shape, radius, Color::BLACK.alpha(presence), Color::BLACK.alpha(bottom * presence));
+                }
+                IslandFinish::Glass => p.fill_round(shape, radius, Color::BLACK.alpha(lerp(1.0, FINISH_WASH_GLASS, grown) * presence)),
+                IslandFinish::Frosted => p.fill_round(shape, radius, Color::BLACK.alpha(lerp(1.0, FINISH_WASH_FROSTED, grown) * presence)),
+            }
             if grown > 0.01 {
                 p.stroke_round(shape.inset(0.25, 0.25), radius, Color::gray(255, 0.07 * grown * presence), 0.5);
             }

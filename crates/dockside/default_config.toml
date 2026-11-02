@@ -195,6 +195,11 @@ collapse_delay_ms = 900
 # "pill" floats a capsule; "notch" hangs from the top edge with a flat top and
 # rounded bottom corners, and opens into squarer panels.
 style = "pill"
+# What the island is made of once it opens into a panel (folded, it's black):
+# "black", "dynamic" (black at the top melting into Liquid Glass), "glass" or
+# "frosted" (Windows' acrylic blur). With glass, like the Dock's, the island is
+# left out of screenshots and recordings (the glass mustn't see itself).
+finish = "black"
 # Points to move the island down from its spot; negative moves it up.
 vertical_offset = 0
 # Seconds paused media stays in the island; 0 keeps it until the app closes.

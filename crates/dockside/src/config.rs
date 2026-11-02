@@ -74,6 +74,20 @@ pub enum IconStyle {
     Squircle,
 }
 
+/// What an open Dynamic Island is made of (folded, it's always black).
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum IslandFinish {
+    /// Solid black.
+    Black,
+    /// Black at the top, melting into Liquid Glass toward the bottom.
+    Dynamic,
+    /// Liquid Glass throughout, tinted dark.
+    Glass,
+    /// Windows' acrylic blur, tinted dark.
+    Frosted,
+}
+
 /// Shape of the Dynamic Island.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -242,6 +256,7 @@ pub struct IslandCfg {
     /// Milliseconds after the pointer leaves an expanded island before it folds away (0 = at once).
     pub collapse_delay_ms: u32,
     pub style: IslandStyle,
+    pub finish: IslandFinish,
     /// Points to move the island down (negative moves it up).
     pub vertical_offset: f32,
     /// Seconds paused media stays in the island (0 = until the app ends its session).

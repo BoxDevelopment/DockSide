@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{feel, lerp, Glide, Motion, Scroll};
 use crate::chrome::{self, WindowAnim, SHADOW};
-use crate::config::{AnimSpeed, Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandStyle, MinimizeEffect, ShortcutStyle, WindowEffect};
+use crate::config::{AnimSpeed, Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandFinish, IslandStyle, MinimizeEffect, ShortcutStyle, WindowEffect};
 use crate::dock::START_PATH;
 use crate::finder::text::TextField;
 use crate::finder::FINDER_PATH;
@@ -185,6 +185,7 @@ pub(crate) enum Key {
     Island(&'static str),
     IslandIcs,
     IslandStyle,
+    IslandFinish,
     IslandShelfExpiry,
     DiscordId,
     DiscordSecret,
@@ -252,6 +253,7 @@ impl Key {
             Key::Island(name) => ("island", name),
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::IslandStyle => ("island", "style"),
+            Key::IslandFinish => ("island", "finish"),
             Key::IslandShelfExpiry => ("island", "shelf_expire_minutes"),
             Key::DiscordId => ("island", "discord_client_id"),
             Key::DiscordSecret => ("island", "discord_client_secret"),
@@ -888,6 +890,7 @@ impl SettingsWindow {
                     .chain([
                         Row::Segmented("Fold away after", Key::IslandCollapseDelay),
                         Row::Segmented("Style", Key::IslandStyle),
+                        Row::Segmented("Finish", Key::IslandFinish),
                         Row::Slider("Vertical offset", Key::IslandOffset),
                     ])
                     .collect(),
@@ -1241,6 +1244,15 @@ impl SettingsWindow {
                 let sel = values.iter().position(|v| v.eq_ignore_ascii_case(&cfg.spotlight.search_engine));
                 (labels, values, sel)
             }
+            Key::IslandFinish => fixed(
+                &[("Black", "black"), ("Dynamic", "dynamic"), ("Glass", "glass"), ("Frosted", "frosted")],
+                Some(match cfg.island.finish {
+                    IslandFinish::Black => 0,
+                    IslandFinish::Dynamic => 1,
+                    IslandFinish::Glass => 2,
+                    IslandFinish::Frosted => 3,
+                }),
+            ),
             Key::IslandStyle => fixed(
                 &[("Pill", "pill"), ("Notch", "notch")],
                 Some((cfg.island.style == IslandStyle::Notch) as usize),

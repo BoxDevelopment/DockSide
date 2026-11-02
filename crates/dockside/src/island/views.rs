@@ -72,6 +72,15 @@ pub struct View<'a> {
     pub lyric: Option<&'a str>,
     pub lyric_prev: Option<&'a str>,
     pub lyric_fade: f32,
+    /// What's running, for the home page's row (at most a few).
+    pub home_acts: &'a [Persist],
+    /// The Widgets page's readings (`None` until it's first opened).
+    pub weather: Option<&'a crate::widgets::sources::WeatherState>,
+    pub devices: &'a [(String, u8)],
+    pub sys: &'a crate::widgets::sources::SysStats,
+    pub zones: &'a [crate::widgets::sources::Zone],
+    pub h24: bool,
+    pub battery: Option<crate::win::system::Battery>,
     /// Discord voice, and members' pictures by user id.
     pub discord: &'a super::discord::Snapshot,
     pub discord_avatars: &'a HashMap<String, ID2D1Bitmap>,
@@ -996,6 +1005,9 @@ pub fn home_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     if v.home_events {
         next_event_card(p, r, v, a, hits);
     }
+    if !v.home_acts.is_empty() {
+        running_row(p, Rect::new(r.x + 18.0, r.y + 84.0, r.w - 36.0, 32.0), v, a, hits);
+    }
     if !v.home_timers {
         return;
     }
@@ -1011,6 +1023,206 @@ pub fn home_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
         p.fill_round(chip, 14.0, Color::gray(255, bg * a));
         p.text(label, &f.chip, chip, if *secs == 0 { WHITE } else { ORANGE }.alpha(a));
         hits.push((chip, Hit::Chip(*secs)));
+    }
+}
+
+/// The home page's row of what's running: a chip each (icon and a few words);
+/// click one for its panel.
+fn running_row(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let f = v.fonts;
+    let n = v.home_acts.len();
+    let gap = 8.0;
+    let w = (r.w - gap * (n as f32 - 1.0)) / n as f32;
+    for (i, &which) in v.home_acts.iter().enumerate() {
+        let chip = Rect::new(r.x + i as f32 * (w + gap), r.y, w, r.h);
+        let hit = Hit::HomeAct(i as u8);
+        let (hot, pressed) = button_state(v, hit, true);
+        p.fill_round(chip, r.h / 2.0, Color::gray(255, if pressed { 0.24 } else if hot { 0.18 } else { 0.1 } * a));
+        let d = r.h - 8.0;
+        let icon = Rect::new(chip.x + 4.0, chip.y + 4.0, d, d);
+        p.fill_circle(icon.cx(), icon.cy(), d / 2.0, Color::BLACK.alpha(a));
+        bubble(p, icon, which, v, a);
+        let label = running_label(v, which);
+        p.text(&label, &f.chip, Rect::new(icon.right() + 7.0, chip.y, chip.right() - icon.right() - 14.0, chip.h), WHITE.alpha(a));
+        hits.push((chip, hit));
+    }
+}
+
+/// A few words for a running activity.
+fn running_label(v: &View, which: Persist) -> String {
+    match which {
+        Persist::Media => v.now.map(|n| if n.title.is_empty() { "Now Playing".to_string() } else { n.title.clone() }).unwrap_or_default(),
+        Persist::Timer => v.clock.map(|c| c.label()).unwrap_or_default(),
+        Persist::Claude => v.claude.map(|s| if s.project.is_empty() { "Claude Code".to_string() } else { s.project.clone() }).unwrap_or_default(),
+        Persist::Discord => v.discord.voice.as_ref().map(|vc| vc.channel.clone()).unwrap_or_default(),
+        Persist::Download => v.downloads.first().map(|d| d.name()).unwrap_or_default(),
+        Persist::Calendar => {
+            let unix = super::calendar::unix_now();
+            v.events.iter().find(|e| e.end > unix).map(|e| e.title.clone()).unwrap_or_default()
+        }
+        Persist::Shelf => "Shelf".to_string(),
+        Persist::Live(k) => v.live.get(k).map(|act| act.title.clone()).unwrap_or_default(),
+    }
+}
+
+/// The open island's page buttons, floating under it: Home, Shelf, Widgets
+/// (and Notifications while there are some). The current page's is filled.
+pub fn tab_buttons(p: &Painter, pill: Rect, tabs: &[super::Panel], current: super::Panel, v: &View, a: f32, hits: &mut Hits) {
+    use super::Panel;
+    const D: f32 = 30.0;
+    const GAP: f32 = 10.0;
+    let y = pill.bottom() + 8.0 + D / 2.0;
+    let x0 = pill.cx() - (tabs.len() as f32 * (D + GAP) - GAP) / 2.0 + D / 2.0;
+    for (i, &tab) in tabs.iter().enumerate() {
+        let x = x0 + i as f32 * (D + GAP);
+        let on = tab == current;
+        let hit = Hit::Tab(i as u8);
+        let (hot, pressed) = button_state(v, hit, !on);
+        let k = if pressed { 0.92 } else { 1.0 };
+        // A soft shadow keeps the buttons readable over any window.
+        for j in 0..5 {
+            let g = j as f32 * 1.4;
+            p.fill_circle(x, y + 2.0, D / 2.0 + g, Color::BLACK.alpha(0.07 * a * (5 - j) as f32 / 5.0));
+        }
+        p.fill_circle(x, y, D / 2.0 * k, if on { WHITE } else { Color::BLACK }.alpha(a));
+        if !on {
+            p.stroke_circle(x, y, D / 2.0 * k - 0.5, Color::gray(255, if hot { 0.35 } else { 0.18 } * a), 1.0);
+        }
+        let ink = if on { Color::BLACK.alpha(a) } else { Color::gray(255, if hot { 1.0 } else { 0.78 } * a) };
+        let s = 15.0 * k;
+        match tab {
+            Panel::Home => g::house(p, x, y, s, ink),
+            Panel::Shelf => g::tray(p, x, y, s, ink),
+            Panel::Notes => g::bell(p, x, y, s, ink),
+            _ => g::grid(p, x, y, s, ink),
+        }
+        hits.push((Rect::new(x - D / 2.0 - GAP / 2.0, y - D / 2.0 - 4.0, D + GAP, D + 8.0), hit));
+    }
+}
+
+/// The Widgets page: weather, the system, world clocks and batteries, in a 2x2 grid.
+pub fn widgets_panel(p: &Painter, r: Rect, v: &View, a: f32) {
+    let pad = 16.0;
+    let gap = 12.0;
+    let cw = (r.w - 2.0 * pad - gap) / 2.0;
+    let ch = (r.h - 2.0 * pad - gap) / 2.0;
+    let cell = |i: usize, j: usize| Rect::new(r.x + pad + i as f32 * (cw + gap), r.y + pad + j as f32 * (ch + gap), cw, ch);
+    for (i, j) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+        p.fill_round(cell(i, j), 16.0, Color::gray(255, 0.07 * a));
+    }
+    weather_cell(p, cell(0, 0).inset(12.0, 10.0), v, a);
+    system_cell(p, cell(1, 0).inset(12.0, 10.0), v, a);
+    clocks_cell(p, cell(0, 1).inset(12.0, 10.0), v, a);
+    batteries_cell(p, cell(1, 1).inset(12.0, 10.0), v, a);
+}
+
+fn cell_title(p: &Painter, r: Rect, title: &str, v: &View, a: f32) {
+    p.text(title, &v.fonts.small_l, Rect::new(r.x, r.y, r.w, 15.0), SECONDARY.alpha(a));
+}
+
+fn weather_cell(p: &Painter, r: Rect, v: &View, a: f32) {
+    use crate::widgets::sources::WeatherState;
+    let f = v.fonts;
+    match v.weather {
+        Some(WeatherState::Ready(w)) => {
+            p.text(&w.place, &f.small_l, Rect::new(r.x, r.y, r.w - 4.0, 15.0), SECONDARY.alpha(a));
+            p.faded(a, || crate::widgets::glyphs::weather(p, r.right() - 18.0, r.y + 28.0, 30.0, w.code, w.is_day));
+            p.text(&format!("{}°", w.temp.round() as i32), &f.big, Rect::new(r.x, r.y + 13.0, r.w - 40.0, 40.0), WHITE.alpha(a));
+            // Bottom line: the sky on the left, today's range on the right.
+            let line = Rect::new(r.x, r.bottom() - 15.0, r.w, 15.0);
+            let range = format!("H:{}°  L:{}°", w.high.round() as i32, w.low.round() as i32);
+            let rw = p.gfx.measure(&range, &f.small_r) + 8.0;
+            let cond = crate::widgets::sources::condition(w.code, w.is_day);
+            p.text(cond, &f.small_l, Rect::new(line.x, line.y, line.w - rw, line.h), WHITE.alpha(0.9 * a));
+            p.text(&range, &f.small_r, line, SECONDARY.alpha(a));
+        }
+        Some(WeatherState::Failed(_)) => {
+            cell_title(p, r, "Weather", v, a);
+            p.text("Couldn't load the weather", &f.small_l, Rect::new(r.x, r.cy() - 8.0, r.w, 16.0), SECONDARY.alpha(a));
+        }
+        _ => {
+            cell_title(p, r, "Weather", v, a);
+            p.text("Loading\u{2026}", &f.small_l, Rect::new(r.x, r.cy() - 8.0, r.w, 16.0), SECONDARY.alpha(a));
+        }
+    }
+}
+
+/// A labelled bar: name, fill and a value on the right.
+fn meter(p: &Painter, r: Rect, label: &str, frac: f32, value: &str, v: &View, a: f32) {
+    let f = v.fonts;
+    p.text(label, &f.small_l, Rect::new(r.x, r.y, 44.0, r.h), Color::gray(255, 0.85 * a));
+    let bar = Rect::new(r.x + 44.0, r.cy() - 2.5, r.w - 44.0 - 40.0, 5.0);
+    p.fill_round(bar, 2.5, Color::gray(255, 0.16 * a));
+    let c = if frac > 0.9 { RED } else if frac > 0.75 { ORANGE } else { GREEN };
+    p.fill_round(Rect::new(bar.x, bar.y, (bar.w * frac.clamp(0.0, 1.0)).max(5.0), bar.h), 2.5, c.alpha(a));
+    p.text_tabular(value, &f.small_r, Rect::new(bar.right(), r.y, 40.0, r.h), SECONDARY.alpha(a));
+}
+
+fn system_cell(p: &Painter, r: Rect, v: &View, a: f32) {
+    use crate::widgets::sources::rate;
+    let s = v.sys;
+    cell_title(p, r, "System", v, a);
+    let row = |i: usize| Rect::new(r.x, r.y + 19.0 + i as f32 * 17.0, r.w, 16.0);
+    let pct = |x: f32| format!("{}%", (x * 100.0).round() as i32);
+    meter(p, row(0), "CPU", s.cpu, &pct(s.cpu), v, a);
+    meter(p, row(1), "Memory", s.mem, &pct(s.mem), v, a);
+    meter(p, row(2), "Disk", s.disk, &pct(s.disk), v, a);
+    let net = format!("\u{2193} {}   \u{2191} {}", rate(s.down), rate(s.up));
+    p.text(&net, &v.fonts.small_l, row(3), SECONDARY.alpha(a));
+}
+
+fn clocks_cell(p: &Painter, r: Rect, v: &View, a: f32) {
+    use crate::widgets::sources::zone_time;
+    let f = v.fonts;
+    cell_title(p, r, "World Clock", v, a);
+    if v.zones.is_empty() {
+        p.text("Add zones under Widgets", &f.small_l, Rect::new(r.x, r.cy() - 8.0, r.w, 16.0), SECONDARY.alpha(a));
+        return;
+    }
+    for (i, z) in v.zones.iter().take(3).enumerate() {
+        let y = r.y + 19.0 + i as f32 * 22.0;
+        let (h, m, _, _) = zone_time(z);
+        let time = if v.h24 {
+            format!("{h:02}:{m:02}")
+        } else {
+            let (h12, ampm) = match h {
+                0 => (12, "AM"),
+                1..=11 => (h, "AM"),
+                12 => (12, "PM"),
+                _ => (h - 12, "PM"),
+            };
+            format!("{h12}:{m:02} {ampm}")
+        };
+        p.text(&z.label, &f.body, Rect::new(r.x, y, r.w - 70.0, 19.0), WHITE.alpha(a));
+        p.text_tabular(&time, &f.small_r, Rect::new(r.x, y + 1.0, r.w, 17.0), Color::gray(255, 0.85 * a));
+    }
+}
+
+fn batteries_cell(p: &Painter, r: Rect, v: &View, a: f32) {
+    use crate::widgets::glyphs as wg;
+    let f = v.fonts;
+    cell_title(p, r, "Batteries", v, a);
+    let mut rows: Vec<(bool, String, u8, bool)> = Vec::new();
+    if let Some(b) = v.battery {
+        rows.push((true, "This PC".into(), b.percent, b.charging));
+    }
+    rows.extend(v.devices.iter().map(|(name, pct)| (false, name.clone(), *pct, false)));
+    if rows.is_empty() {
+        p.text("No batteries", &f.small_l, Rect::new(r.x, r.cy() - 8.0, r.w, 16.0), SECONDARY.alpha(a));
+        return;
+    }
+    for (i, (pc, name, pct, charging)) in rows.iter().take(3).enumerate() {
+        let y = r.y + 19.0 + i as f32 * 22.0;
+        let ic = (r.x + 8.0, y + 9.5);
+        if *pc {
+            wg::laptop(p, ic.0, ic.1, 14.0, WHITE.alpha(a));
+        } else {
+            wg::bluetooth(p, ic.0, ic.1, 13.0, WHITE.alpha(a));
+        }
+        p.text(name, &f.small_l, Rect::new(r.x + 22.0, y + 1.0, r.w - 96.0, 17.0), WHITE.alpha(a));
+        p.text_tabular(&format!("{pct}%"), &f.small_r, Rect::new(r.x, y + 1.0, r.w - 34.0, 17.0), SECONDARY.alpha(a));
+        let c = if *charging { GREEN } else if *pct <= 20 { RED } else { WHITE };
+        g::battery(p, r.right(), y + 9.5, *pct, c, a);
     }
 }
 

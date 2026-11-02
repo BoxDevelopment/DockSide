@@ -64,8 +64,9 @@ hidden while DockSide runs and is always restored when it exits.
 - An always-present black pill at the top center of the menu bar that morphs between activities on
   spring physics (bouncy growth, a press squish, hover lift, cross-fades). With two activities running,
   the second splits off into a bubble beside it, like the iPhone
-- Click the idle pill for the time, your next meeting and one-click timers; right-click for timers,
-  the shelf and settings
+- Click the idle pill for the time, your next meeting, what's running and one-click timers; buttons
+  under the open island switch to the Shelf and a Widgets page (weather, system stats, world clocks,
+  batteries). Right-click for timers, the shelf and settings
 - **Now Playing** from anything that reports to Windows' media controls (Spotify, browsers, Media Player):
   artwork, a waveform tinted from it, and an expanded player with scrubbing and transport controls;
   swipe the artwork to skip, and synced lyrics (from lrclib.net)

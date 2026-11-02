@@ -1114,8 +1114,13 @@ impl App {
         if old.menubar != self.cfg.menubar {
             self.rebuild_menubar();
         }
+        // (The island's Widgets page reads the weather place and units, world clocks and clock format.)
+        let island_widgets = |c: &Config| {
+            (c.widgets.location.clone(), c.widgets.temperature_unit.clone(), c.widgets.world_clocks.clone(), c.menubar.clock_format.clone())
+        };
         if old.island != self.cfg.island || old.menubar.enabled != self.cfg.menubar.enabled
             || old.menubar.height != self.cfg.menubar.height
+            || island_widgets(&old) != island_widgets(&self.cfg)
         {
             self.rebuild_island();
         }

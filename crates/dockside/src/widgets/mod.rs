@@ -12,7 +12,7 @@
 //!   sources), started only for the widgets on screen. Clocks and stats tick
 //!   with the app's one-second timer.
 
-mod glyphs;
+pub(crate) mod glyphs;
 pub mod sources;
 mod store;
 mod views;

@@ -470,3 +470,32 @@ pub fn hangup(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
         p.fill_round(Rect::new(x - 2.2 * k, cy + 0.6 * k, 4.4 * k, 3.6 * k), 1.4 * k, c);
     }
 }
+
+/// Home: a house.
+pub fn house(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    let geom = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(cx - 6.5 * k, cy - 0.5 * k), D2D1_FIGURE_BEGIN_HOLLOW);
+        g.AddLine(pt(cx, cy - 6.8 * k));
+        g.AddLine(pt(cx + 6.5 * k, cy - 0.5 * k));
+        g.EndFigure(D2D1_FIGURE_END_OPEN);
+        g.BeginFigure(pt(cx - 4.6 * k, cy - 2.0 * k), D2D1_FIGURE_BEGIN_HOLLOW);
+        g.AddLine(pt(cx - 4.6 * k, cy + 6.0 * k));
+        g.AddLine(pt(cx + 4.6 * k, cy + 6.0 * k));
+        g.AddLine(pt(cx + 4.6 * k, cy - 2.0 * k));
+        g.EndFigure(D2D1_FIGURE_END_OPEN);
+    });
+    if let Some(g) = geom {
+        p.stroke_geometry(&g, c, 1.6 * k);
+    }
+    p.fill_round(Rect::new(cx - 1.4 * k, cy + 1.8 * k, 2.8 * k, 4.2 * k), 0.8 * k, c);
+}
+
+/// Widgets: four rounded tiles.
+pub fn grid(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let (x, y) = (cx + dx * 3.6 * k, cy + dy * 3.6 * k);
+        p.stroke_round(Rect::new(x - 2.8 * k, y - 2.8 * k, 5.6 * k, 5.6 * k), 1.6 * k, c, 1.5 * k);
+    }
+}

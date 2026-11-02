@@ -207,6 +207,8 @@ enum Panel {
     Mixer,
     /// The Discord voice channel you're in.
     Discord,
+    /// Weather, the system, world clocks and batteries.
+    Widgets,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -287,6 +289,10 @@ pub enum Hit {
     DiscordMute,
     DiscordDeaf,
     DiscordLeave,
+    /// A page button under the open island (index into its tabs).
+    Tab(u8),
+    /// A running activity on the home page.
+    HomeAct(u8),
     TimerToggle,
     TimerCancel,
     /// Quick timer in seconds (0 = stopwatch).
@@ -486,6 +492,27 @@ pub struct Handover {
     notes: Vec<Note>,
 }
 
+/// What the Widgets page needs from the widget settings.
+struct WidgetCfg {
+    location: String,
+    fahrenheit: bool,
+    h24: bool,
+    zones: Vec<crate::widgets::sources::Zone>,
+}
+
+/// The Widgets page's background watchers, stopped with the island.
+struct WidgetFeeds {
+    stop: Stop,
+    weather: crate::widgets::sources::SharedWeather,
+    devices: crate::widgets::sources::SharedDevices,
+}
+
+impl Drop for WidgetFeeds {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
+
 pub struct Island {
     pub surface: Surface,
     cfg: IslandCfg,
@@ -515,6 +542,12 @@ pub struct Island {
     lyric_line: Option<usize>,
     lyric_prev: Option<usize>,
     lyric_fade: Spring,
+    /// The Widgets page: its settings, its watchers once opened, and the system sampler.
+    wcfg: WidgetCfg,
+    wfeeds: Option<WidgetFeeds>,
+    sys: crate::widgets::sources::Sampler,
+    /// Where background sources post (the window and message).
+    notify: (isize, u32),
     /// Discord voice (from its worker), and members' pictures by user id.
     discord: discord::Snapshot,
     discord_avatars: HashMap<String, ID2D1Bitmap>,
@@ -697,6 +730,15 @@ impl Island {
             lyric_line: None,
             lyric_prev: None,
             lyric_fade: Spring::new(1.0, 0.3, 1.0),
+            wcfg: WidgetCfg {
+                location: cfg.widgets.location.clone(),
+                fahrenheit: crate::widgets::sources::fahrenheit(&cfg.widgets.temperature_unit),
+                h24: cfg.menubar.clock_format.contains("%H"),
+                zones: cfg.widgets.world_clocks.iter().filter_map(|z| crate::widgets::sources::parse_zone(z)).collect(),
+            },
+            wfeeds: None,
+            sys: Default::default(),
+            notify: (hwnd, msg_signal),
             discord: discord::snapshot(),
             discord_avatars: HashMap::new(),
             mixer: Vec::new(),
@@ -833,10 +875,48 @@ impl Island {
     /// Panels you can page between while expanded, in a stable order: the
     /// activities, or from the home panel, the notification stack.
     fn pages(&self) -> Vec<Panel> {
-        if matches!(self.expanded, Some(Panel::Home | Panel::Notes)) {
-            return if self.notes_valid() { vec![Panel::Home, Panel::Notes] } else { Vec::new() };
+        if self.expanded.is_some_and(|p| self.is_tab(p)) {
+            return self.tabs();
         }
-        self.natural().into_iter().filter_map(Self::panel_for).collect()
+        // (The shelf is a tab, not one of the activities.)
+        self.natural().into_iter().filter(|p| *p != Persist::Shelf).filter_map(Self::panel_for).collect()
+    }
+
+    /// The open island's fixed pages, each with a button under it.
+    fn tabs(&self) -> Vec<Panel> {
+        let mut tabs = vec![Panel::Home];
+        if self.cfg.shelf {
+            tabs.push(Panel::Shelf);
+        }
+        tabs.push(Panel::Widgets);
+        if self.notes_valid() {
+            tabs.push(Panel::Notes);
+        }
+        tabs
+    }
+
+    fn is_tab(&self, p: Panel) -> bool {
+        matches!(p, Panel::Home | Panel::Shelf | Panel::Widgets | Panel::Notes)
+    }
+
+    /// What's running, for the home page's row.
+    fn home_acts(&self) -> Vec<Persist> {
+        self.natural().into_iter().filter(|p| *p != Persist::Shelf).take(3).collect()
+    }
+
+    /// Starts the Widgets page's weather and battery watchers (once).
+    fn ensure_widget_feeds(&mut self) {
+        if self.wfeeds.is_some() {
+            return;
+        }
+        let stop = Stop::default();
+        let weather = crate::widgets::sources::SharedWeather::default();
+        let devices = crate::widgets::sources::SharedDevices::default();
+        let w = &self.wcfg;
+        crate::widgets::sources::watch_weather(weather.clone(), stop.clone(), w.location.clone(), w.fahrenheit, w.h24, self.notify.0, self.notify.1);
+        crate::widgets::sources::watch_devices(devices.clone(), stop.clone(), self.notify.0, self.notify.1);
+        self.sys.sample();
+        self.wfeeds = Some(WidgetFeeds { stop, weather, devices });
     }
 
     fn notes_valid(&self) -> bool {
@@ -891,6 +971,10 @@ impl Island {
     }
 
     fn dots_for(&self, p: Panel) -> bool {
+        // Tab pages have their buttons instead.
+        if self.is_tab(p) {
+            return false;
+        }
         let pages = self.pages();
         pages.len() > 1 && pages.contains(&p)
     }
@@ -904,7 +988,7 @@ impl Island {
             Panel::Calendar => Some(Persist::Calendar),
             Panel::Live(k) => Some(Persist::Live(k)),
             Panel::Discord => Some(Persist::Discord),
-            Panel::Home | Panel::Notes | Panel::Mixer => None,
+            Panel::Home | Panel::Notes | Panel::Mixer | Panel::Widgets => None,
         }
     }
 
@@ -1033,6 +1117,7 @@ impl Island {
             Panel::Notes => self.notes_valid(),
             Panel::Home => true,
             Panel::Mixer => self.cfg.volume,
+            Panel::Widgets => true,
             Panel::Discord => self.cfg.discord && self.discord.voice.is_some(),
         }
     }
@@ -1131,7 +1216,11 @@ impl Island {
                     let n = self.events.iter().filter(|e| e.end > calendar::unix_now()).take(3).count().max(1);
                     (360.0, 48.0 + 44.0 * n as f32)
                 }
-                Panel::Home => (372.0, if self.cfg.timers { 134.0 } else { 92.0 }),
+                Panel::Home => {
+                    let acts = if self.home_acts().is_empty() { 0.0 } else { 40.0 };
+                    (372.0, 92.0 + acts + if self.cfg.timers { 42.0 } else { 0.0 })
+                }
+                Panel::Widgets => (420.0, 236.0),
                 Panel::Live(k) => {
                     let bar = self.live.get(k).is_some_and(|a| a.progress.is_some());
                     (372.0, if bar { 118.0 } else { 98.0 })
@@ -1498,6 +1587,9 @@ impl Island {
                 Signal::Calendar(events) => self.events = events,
             }
         }
+        if self.shown == Content::Panel(Panel::Widgets) {
+            changed = true;
+        }
         let voice = discord::snapshot();
         if voice != self.discord {
             let joined = self.discord.voice.is_none() && voice.voice.is_some();
@@ -1571,6 +1663,9 @@ impl Island {
         self.tick_demo();
         if self.shown == Content::Panel(Panel::Mixer) {
             self.refresh_mixer();
+        }
+        if self.shown == Content::Panel(Panel::Widgets) {
+            self.sys.sample();
         }
         self.expire_shelf();
         // A missed rename event must not leave a download spinning forever.
@@ -2314,6 +2409,21 @@ impl Island {
             Hit::PreviewStep(d) => self.step(d),
             Hit::Drop(_) => {}
             Hit::Event(_) => return Some(IslandEvent::Run(Action::Open("outlookcal:".into()))),
+            // From any panel; slides in from the side the page's button is on.
+            Hit::Tab(i) => {
+                let tabs = self.tabs();
+                let target = *tabs.get(i as usize)?;
+                let from = self.expanded.and_then(|e| tabs.iter().position(|t| *t == e));
+                let dir = if from.is_some_and(|f| f > i as usize) { -1 } else { 1 };
+                self.go_to(target, dir);
+            }
+            Hit::HomeAct(i) => match self.home_acts().get(i as usize).copied()? {
+                Persist::Download => return sources::downloads_dir().map(|d| IslandEvent::Run(Action::OpenFinder(Some(d)))),
+                p => {
+                    self.preferred = Some(p);
+                    self.go_to(Self::panel_for(p)?, 1);
+                }
+            },
             Hit::AlertBody => return self.alert_click(),
             Hit::Progress | Hit::Slider | Hit::MixSlider(_) => {}
             // Flipped at once; Discord confirms a moment later.
@@ -2617,6 +2727,9 @@ impl Island {
             moving = true;
         }
         moving |= self.tick_shelf(dt);
+        if self.expanded == Some(Panel::Widgets) {
+            self.ensure_widget_feeds();
+        }
         self.tick_lyrics();
         // A skip whose new art never came (same cover, or none): bring the card back.
         if self.art_swap.is_some_and(|(_, t)| t.elapsed() >= ART_SWAP_WAIT) {
@@ -2817,6 +2930,10 @@ impl Island {
 
         let fonts = Fonts::new(gfx, &theme.font);
         let note_rows = self.note_rows();
+        let tab_row = self.tabs();
+        let home_acts = self.home_acts();
+        let weather = self.wfeeds.as_ref().and_then(|f| f.weather.lock().ok().map(|w| w.clone()));
+        let devices = self.wfeeds.as_ref().and_then(|f| f.devices.lock().ok().map(|d| d.clone())).unwrap_or_default();
         let tiles: Vec<(Tile, bool)> = self.tiles().into_iter().map(|t| (t, self.tile_ok(t, &self.drop_paths))).collect();
         let view = View {
             fonts: &fonts,
@@ -2863,6 +2980,13 @@ impl Island {
             lyric: self.lyrics.as_ref().zip(self.lyric_line).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
             lyric_prev: self.lyrics.as_ref().zip(self.lyric_prev).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
             lyric_fade: self.lyric_fade.value,
+            home_acts: &home_acts,
+            weather: weather.as_ref(),
+            devices: &devices,
+            sys: &self.sys.stats,
+            zones: &self.wcfg.zones,
+            h24: self.wcfg.h24,
+            battery: self.battery,
             discord: &self.discord,
             discord_avatars: &self.discord_avatars,
             mixer: &self.mixer,
@@ -2890,7 +3014,8 @@ impl Island {
         let sliding = shift.abs() > 4.0;
         let pages = self.pages();
         let dots = match shown {
-            Content::Panel(p) if pages.len() > 1 && pages.contains(&p) => pages.len(),
+            // The same test the panel's size uses (tab pages have buttons, not dots).
+            Content::Panel(p) if self.dots_for(p) => pages.len(),
             _ => 0,
         };
         let dot_pos = self.dot_pos.value;
@@ -2970,12 +3095,19 @@ impl Island {
                         Panel::Notes => views::notes_panel(p, body, &view, a, &mut content_hits),
                         Panel::Mixer => views::mixer_panel(p, body, &view, a, &mut content_hits),
                         Panel::Discord => views::discord_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Widgets => views::widgets_panel(p, body, &view, a),
                     });
                 }
             });
             // Controls only become clickable once they're (nearly) fully in and still.
             if a > 0.85 && !sliding {
                 hits.extend(content_hits);
+            }
+            // Page buttons under the open island (whatever it shows), settling
+            // in with it; the current page's is filled. Not over a file drag's targets.
+            if let (Content::Panel(cur), false) = (shown, self.drag_over) {
+                let ta = presence * fit;
+                views::tab_buttons(p, pill.offset(0.0, -8.0 * (1.0 - fit)), &tab_row, cur, &view, ta, &mut hits);
             }
             // Page dots: dim dots with a white capsule gliding to the current page.
             if dots > 0 {
@@ -3097,5 +3229,6 @@ mod tests {
         assert_eq!(fmt_time(-3.0), "0:00");
     }
 }
+
 
 

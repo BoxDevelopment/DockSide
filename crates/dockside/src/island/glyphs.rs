@@ -443,3 +443,30 @@ pub fn neck(p: &Painter, (x1, y1, r1): (f32, f32, f32), (x2, y2, r2): (f32, f32,
         p.fill_geometry(&g, c);
     }
 }
+
+/// A slash through a glyph, cut out of `bg` so it reads against the glyph.
+pub fn slash(p: &Painter, cx: f32, cy: f32, s: f32, c: Color, bg: Color) {
+    let d = s * 0.48;
+    p.line(cx - d, cy - d, cx + d, cy + d, bg, s * 0.2);
+    p.line(cx - d, cy - d, cx + d, cy + d, c, s * 0.1);
+}
+
+/// A phone handset laid down: leave the call.
+pub fn hangup(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    let geom = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(cx - 7.5 * k, cy + 2.6 * k), D2D1_FIGURE_BEGIN_HOLLOW);
+        g.AddBezier(&D2D1_BEZIER_SEGMENT {
+            point1: pt(cx - 5.0 * k, cy - 4.2 * k),
+            point2: pt(cx + 5.0 * k, cy - 4.2 * k),
+            point3: pt(cx + 7.5 * k, cy + 2.6 * k),
+        });
+        g.EndFigure(D2D1_FIGURE_END_OPEN);
+    });
+    if let Some(g) = geom {
+        p.stroke_geometry(&g, c, 3.0 * k);
+    }
+    for x in [cx - 6.6 * k, cx + 6.6 * k] {
+        p.fill_round(Rect::new(x - 2.2 * k, cy + 0.6 * k, 4.4 * k, 3.6 * k), 1.4 * k, c);
+    }
+}

@@ -77,6 +77,8 @@ hidden while DockSide runs and is always restored when it exits.
   Select files like in Finder (Ctrl/Shift-click, Ctrl+A) and drag them out together, pin the ones to keep,
   and press Space for a Quick Look preview
 - **Upcoming meetings** from the Windows calendar, a few minutes before they start
+- **Discord voice**: the channel you're in and who's talking, with mute, deafen and leave buttons
+  (through Discord's local RPC, with your own Discord app: see `[island]` in the config)
 - **Mic and camera indicators**: an orange / green dot while an app is using them, with the app's name
 - **Alerts**: notifications (as banners from the island), Bluetooth devices connecting with their battery,
   screenshots (click to open, drag to use), finished downloads (with a live download activity while they run),

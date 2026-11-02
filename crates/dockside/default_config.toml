@@ -222,6 +222,15 @@ calendar_ics = ""
 # Show what Claude Code is doing, and when it finishes or needs you. Click
 # "Connect Claude Code" in System Settings > Dynamic Island to add its hooks.
 claude_code = true
+# The Discord voice channel you're in, with buttons to mute, deafen and leave.
+# Discord only lets apps it approves (or your own) control voice, so: create an
+# application at https://discord.com/developers/applications, add
+# http://localhost under OAuth2 > Redirects, paste its Client ID and Client
+# Secret below, then click "Connect Discord" in System Settings > Dynamic
+# Island and approve DockSide in Discord.
+discord = true
+discord_client_id = ""
+discord_client_secret = ""
 # Live Activities from other apps and scripts: progress, timers and status they
 # send with `dockside activity start <id> --title ... --progress 40%` (see README).
 live_activities = true

@@ -72,6 +72,9 @@ pub struct View<'a> {
     pub lyric: Option<&'a str>,
     pub lyric_prev: Option<&'a str>,
     pub lyric_fade: f32,
+    /// Discord voice, and members' pictures by user id.
+    pub discord: &'a super::discord::Snapshot,
+    pub discord_avatars: &'a HashMap<String, ID2D1Bitmap>,
     /// The sound mixer's apps and their icons.
     pub mixer: &'a [super::mixer::App],
     pub mixer_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
@@ -121,6 +124,21 @@ pub fn compact(p: &Painter, r: Rect, which: Persist, v: &View, a: f32, hits: &mu
             }
             let tr = Rect::new(r.x, r.y, r.w - h * 0.5 - 2.0, h);
             p.text_tabular(&c.label(), &v.fonts.alert_b, tr, ORANGE.alpha(if c.running { a } else { a * 0.6 }));
+        }
+        Persist::Discord => {
+            let Some(vc) = v.discord.voice.as_ref() else { return };
+            voice_icon(p, icon_cx, r.cy(), h * 0.62, v.discord, a);
+            p.text(&vc.channel, &v.fonts.alert, Rect::new(inner.x, r.y, inner.w - 24.0, h), WHITE.alpha(a));
+            // Someone talking: a pulsing green dot; otherwise how many are in.
+            let (cx, cy) = (r.right() - h * 0.5 - 4.0, r.cy());
+            if vc.members.iter().any(|m| m.speaking) {
+                let pulse = 0.5 + 0.5 * (v.time * 6.0).sin();
+                p.fill_circle(cx, cy, h * 0.3, GREEN.alpha(0.25 * pulse * a));
+                p.fill_circle(cx, cy, h * 0.15, GREEN.alpha(a));
+            } else {
+                let n = vc.members.len().to_string();
+                p.text_tabular(&n, &v.fonts.small_r, Rect::new(r.x, r.y, r.w - h * 0.5 + 2.0, h), SECONDARY.alpha(a));
+            }
         }
         Persist::Download => {
             g::download(p, icon_cx, r.cy(), h * 0.66, BLUE.alpha(a));
@@ -200,6 +218,7 @@ pub fn bubble(p: &Painter, c: Rect, which: Persist, v: &View, a: f32) {
         Persist::Download => spinner(p, cx, cy, d * 0.22, v.time, BLUE.alpha(a)),
         Persist::Calendar => g::calendar(p, cx, cy, d * 0.6, WHITE.alpha(a), RED.alpha(a)),
         Persist::Shelf => g::tray(p, cx, cy, d * 0.6, WHITE.alpha(a)),
+        Persist::Discord => voice_icon(p, cx, cy, d * 0.58, v.discord, a),
         Persist::Claude => g::spark(p, cx, cy, d * 0.62, spark_angle(v), CLAUDE.alpha(a)),
         Persist::Live(k) => {
             if let Some(act) = v.live.get(k) {
@@ -1020,6 +1039,107 @@ fn next_event_card(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
 fn button_state(v: &View, hit: Hit, enabled: bool) -> (bool, bool) {
     let hot = enabled && v.hot == Some(hit);
     (hot, hot && v.down == Some(hit))
+}
+
+/// Discord's blurple, for voice.
+const BLURPLE: Color = Color::rgba(88, 101, 242, 1.0);
+
+/// Your voice state: a mic, red and struck through when muted, or headphones
+/// when deafened.
+fn voice_icon(p: &Painter, cx: f32, cy: f32, s: f32, d: &super::discord::Snapshot, a: f32) {
+    if d.deaf {
+        g::headphones(p, cx, cy, s, RED.alpha(a));
+        g::slash(p, cx, cy, s, RED.alpha(a), Color::BLACK.alpha(a));
+    } else if d.mute {
+        g::mic(p, cx, cy, s, RED.alpha(a));
+        g::slash(p, cx, cy, s, RED.alpha(a), Color::BLACK.alpha(a));
+    } else {
+        g::mic(p, cx, cy, s, BLURPLE.alpha(a));
+    }
+}
+
+/// Discord voice: the channel, who's in it (a green ring while they talk),
+/// and Mute, Deafen and Leave.
+pub fn discord_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let Some(vc) = v.discord.voice.as_ref() else { return };
+    let f = v.fonts;
+    let hy = r.y + 14.0;
+    voice_icon(p, r.x + 30.0, hy + 9.0, 16.0, v.discord, a);
+    p.text(&vc.channel, &f.header, Rect::new(r.x + 46.0, hy, r.w - 150.0, 18.0), WHITE.alpha(a));
+    let count = match vc.members.len() {
+        1 => "1 in voice".to_string(),
+        n => format!("{n} in voice"),
+    };
+    p.text(&count, &f.small_r, Rect::new(r.x, hy, r.w - 22.0, 18.0), SECONDARY.alpha(a));
+
+    // Members: up to six, then "+N".
+    const MAX: usize = 6;
+    let gap = (r.w - 2.0 * PAD) / MAX as f32;
+    let shown = if vc.members.len() > MAX { MAX - 1 } else { vc.members.len() };
+    let ay = r.y + 48.0;
+    // Centered when there are fewer than fill the row.
+    let x0 = r.cx() - gap * vc.members.len().min(MAX) as f32 / 2.0;
+    for (i, m) in vc.members.iter().take(shown).enumerate() {
+        let cx = x0 + gap * (i as f32 + 0.5);
+        let rad = 17.0;
+        match v.discord_avatars.get(&m.id) {
+            Some(bmp) => p.bitmap_round(bmp, Rect::new(cx - rad, ay, rad * 2.0, rad * 2.0), rad, a),
+            None => {
+                p.fill_circle(cx, ay + rad, rad, BLURPLE.alpha(0.85 * a));
+                let initial: String = m.name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+                p.text(&initial, &f.chip, Rect::new(cx - rad, ay, rad * 2.0, rad * 2.0), WHITE.alpha(a));
+            }
+        }
+        if m.speaking {
+            p.stroke_circle(cx, ay + rad, rad + 2.5, GREEN.alpha(a), 2.5);
+        }
+        if m.muted || m.deafened {
+            let (bx, by) = (cx + rad * 0.72, ay + rad * 1.72);
+            p.fill_circle(bx, by, 7.5, Color::BLACK.alpha(a));
+            p.fill_circle(bx, by, 6.0, RED.alpha(a));
+            if m.deafened {
+                g::headphones(p, bx, by, 7.0, WHITE.alpha(a));
+            } else {
+                g::mic(p, bx, by, 7.5, WHITE.alpha(a));
+            }
+        }
+        p.text(&m.name, &f.small_c, Rect::new(cx - gap / 2.0 + 2.0, ay + rad * 2.0 + 4.0, gap - 4.0, 15.0), Color::gray(255, 0.8 * a));
+    }
+    if vc.members.len() > MAX {
+        let cx = x0 + gap * (MAX as f32 - 0.5);
+        p.fill_circle(cx, ay + 17.0, 17.0, Color::gray(255, 0.12 * a));
+        p.text(&format!("+{}", vc.members.len() - shown), &f.chip, Rect::new(cx - 17.0, ay, 34.0, 34.0), WHITE.alpha(a));
+    }
+
+    // Mute, Deafen, Leave.
+    let cy = r.bottom() - 32.0;
+    let cx = r.cx();
+    for (x, hit, on) in [(cx - 72.0, Hit::DiscordMute, v.discord.mute), (cx, Hit::DiscordDeaf, v.discord.deaf), (cx + 72.0, Hit::DiscordLeave, true)] {
+        let (hot, pressed) = button_state(v, hit, true);
+        let leave = hit == Hit::DiscordLeave;
+        let fill = if leave || on { RED } else { Color::gray(255, 1.0) };
+        let base = if leave || on { 0.9 } else if hot { 0.2 } else { 0.12 };
+        let lift = if (leave || on) && hot { 1.0 } else { base };
+        let k = if pressed { 0.92 } else { 1.0 };
+        p.fill_circle(x, cy, 21.0 * k, fill.alpha(lift * a));
+        let bg = if leave || on { RED.alpha(lift * a) } else { Color::BLACK.alpha(a) };
+        match hit {
+            Hit::DiscordMute => {
+                g::mic(p, x, cy, 17.0 * k, WHITE.alpha(a));
+                if on {
+                    g::slash(p, x, cy, 17.0 * k, WHITE.alpha(a), bg);
+                }
+            }
+            Hit::DiscordDeaf => {
+                g::headphones(p, x, cy, 17.0 * k, WHITE.alpha(a));
+                if on {
+                    g::slash(p, x, cy, 17.0 * k, WHITE.alpha(a), bg);
+                }
+            }
+            _ => g::hangup(p, x, cy, 18.0 * k, WHITE.alpha(a)),
+        }
+        hits.push((Rect::new(x - 24.0, cy - 24.0, 48.0, 48.0), hit));
+    }
 }
 
 /// The Now Playing panel's extra height for its lyrics row.

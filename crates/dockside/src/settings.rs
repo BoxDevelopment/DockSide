@@ -69,6 +69,44 @@ const PAGES: [(Page, &str); 9] = [
 /// macOS accent colors: blue, purple, pink, red, orange, yellow, green, graphite.
 const ACCENTS: [&str; 8] = ["#007AFF", "#A550A7", "#F74F9E", "#FF5257", "#F7821B", "#FFC600", "#62BA46", "#8C8C8C"];
 
+/// The Discord group: the switch, then (while on) setup, status and connect.
+fn discord_rows(cfg: &Config) -> Vec<Row> {
+    use crate::island::discord::{self, Status};
+    let mut rows = vec![Row::Toggle("Voice controls in the island", Key::Island("discord"))];
+    if !cfg.island.discord {
+        return rows;
+    }
+    rows.push(Row::Note(
+        "Create an app at discord.com/developers, add http://localhost under OAuth2 > Redirects, \
+         then paste its Client ID and Secret here and click Connect Discord.",
+    ));
+    rows.push(Row::Text("Client ID", Key::DiscordId, "From your app's OAuth2 page"));
+    rows.push(Row::Text("Client Secret", Key::DiscordSecret, "From the same page"));
+    let snap = discord::snapshot();
+    let ready = snap.status == Status::Ready;
+    let status = match &snap.status {
+        Status::Off => "Add your app's Client ID and Secret".to_string(),
+        Status::NotRunning => "Discord isn't running".to_string(),
+        Status::NeedsAuth => "Not connected".to_string(),
+        Status::Authorizing => "Approve DockSide in Discord\u{2026}".to_string(),
+        Status::Ready => match &snap.voice {
+            Some(v) => format!("Connected: in {}", v.channel),
+            None => "Connected".to_string(),
+        },
+        Status::Failed(e) => e.clone(),
+    };
+    rows.push(Row::Info("Status", status));
+    let mut buttons = vec![];
+    if ready {
+        buttons.push(("Disconnect", Hit::ConnectDiscord(false)));
+    } else if !matches!(snap.status, Status::Off | Status::NotRunning) {
+        buttons.push(("Connect Discord", Hit::ConnectDiscord(true)));
+    }
+    buttons.push(("Developer Portal\u{2026}", Hit::DiscordPortal));
+    rows.push(Row::Buttons("", buttons));
+    rows
+}
+
 /// The `[island]` on/off setting called `name`.
 fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
     match name {
@@ -81,6 +119,7 @@ fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
         "downloads" => c.downloads,
         "calendar" => c.calendar,
         "claude_code" => c.claude_code,
+        "discord" => c.discord,
         "live_activities" => c.live_activities,
         "shelf" => c.shelf,
         "shelf_clear_on_start" => c.shelf_clear_on_start,
@@ -147,6 +186,8 @@ pub(crate) enum Key {
     IslandIcs,
     IslandStyle,
     IslandShelfExpiry,
+    DiscordId,
+    DiscordSecret,
     IslandHoverDelay,
     IslandCollapseDelay,
     IslandOffset,
@@ -212,6 +253,8 @@ impl Key {
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::IslandStyle => ("island", "style"),
             Key::IslandShelfExpiry => ("island", "shelf_expire_minutes"),
+            Key::DiscordId => ("island", "discord_client_id"),
+            Key::DiscordSecret => ("island", "discord_client_secret"),
             Key::IslandHoverDelay => ("island", "hover_delay_ms"),
             Key::IslandCollapseDelay => ("island", "collapse_delay_ms"),
             Key::IslandOffset => ("island", "vertical_offset"),
@@ -272,6 +315,8 @@ pub(crate) enum Hit {
     Field(Key),
     Keybind(Key),
     ConnectClaude(bool),
+    ConnectDiscord(bool),
+    DiscordPortal,
     AddWidget(crate::config::WidgetKind),
     ResetWidgets,
     Onboarding,
@@ -929,6 +974,10 @@ impl SettingsWindow {
                     ],
                 },
                 Group {
+                    title: Some("Discord"),
+                    rows: discord_rows(cfg),
+                },
+                Group {
                     title: Some("Claude Code"),
                     rows: if crate::island::claude::connected() {
                         vec![
@@ -1250,6 +1299,8 @@ impl SettingsWindow {
             Key::CustomSearchUrl => cfg.spotlight.custom_search_url.clone(),
             Key::DockMacIconsKey => cfg.dock.macosicons_key.clone(),
             Key::IslandIcs => cfg.island.calendar_ics.clone(),
+            Key::DiscordId => cfg.island.discord_client_id.clone(),
+            Key::DiscordSecret => cfg.island.discord_client_secret.clone(),
             Key::WidgetsLocation => cfg.widgets.location.clone(),
             Key::WidgetsClocks => cfg.widgets.world_clocks.join(", "),
             _ => String::new(),
@@ -1458,6 +1509,8 @@ impl SettingsWindow {
             Hit::LiveDemo => Action::Island(crate::island::IslandCmd::LiveDemo),
             Hit::LiveDocs => Action::Open(format!("{}#live-activities", crate::update::REPO_URL)),
             Hit::ConnectClaude(on) => Action::ConnectClaude(on),
+            Hit::ConnectDiscord(on) => Action::ConnectDiscord(on),
+            Hit::DiscordPortal => Action::Open("https://discord.com/developers/applications".into()),
             Hit::AddWidget(kind) => Action::Widget(crate::widgets::WidgetCmd::Add(kind)),
             Hit::ResetWidgets => Action::Widget(crate::widgets::WidgetCmd::Reset),
             Hit::Slider(_) => return SettingsEvent::None,
@@ -1788,7 +1841,7 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                         value = crate::island::calendar_links_summary(&value);
                     }
                     // So is an API key: show only its last few characters.
-                    if *key == Key::DockMacIconsKey && !value.is_empty() {
+                    if matches!(*key, Key::DockMacIconsKey | Key::DiscordSecret) && !value.is_empty() {
                         let tail: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
                         value = format!("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} {tail}");
                     }

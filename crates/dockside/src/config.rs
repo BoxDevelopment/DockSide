@@ -263,6 +263,10 @@ pub struct IslandCfg {
     pub calendar_ics: String,
     /// Show what Claude Code is doing (needs "Connect Claude Code" in Settings).
     pub claude_code: bool,
+    /// Discord voice: the channel you're in, with mute / deafen / leave (needs your own Discord app).
+    pub discord: bool,
+    pub discord_client_id: String,
+    pub discord_client_secret: String,
     /// Live Activities other apps and scripts send (`dockside activity …`).
     pub live_activities: bool,
     /// Files dragged to the top of the screen are held (by reference) on a shelf.

@@ -23,6 +23,7 @@ pub mod calendar;
 mod catch;
 pub mod claude;
 mod convert;
+pub mod discord;
 mod encode;
 pub mod glyphs;
 mod holding;
@@ -185,6 +186,8 @@ pub enum Persist {
     Download,
     Calendar,
     Shelf,
+    /// The Discord voice channel you're in.
+    Discord,
     /// A Live Activity from another app, by its key.
     Live(u32),
 }
@@ -202,6 +205,8 @@ enum Panel {
     Notes,
     /// Per-app volume, opened from the volume HUD.
     Mixer,
+    /// The Discord voice channel you're in.
+    Discord,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -279,6 +284,9 @@ pub enum Hit {
     Slider,
     /// A sound mixer slider: 0 the master volume, then each app.
     MixSlider(usize),
+    DiscordMute,
+    DiscordDeaf,
+    DiscordLeave,
     TimerToggle,
     TimerCancel,
     /// Quick timer in seconds (0 = stopwatch).
@@ -507,6 +515,9 @@ pub struct Island {
     lyric_line: Option<usize>,
     lyric_prev: Option<usize>,
     lyric_fade: Spring,
+    /// Discord voice (from its worker), and members' pictures by user id.
+    discord: discord::Snapshot,
+    discord_avatars: HashMap<String, ID2D1Bitmap>,
     /// The sound mixer's apps, their icons, and the slider being dragged.
     mixer: Vec<mixer::App>,
     mixer_icons: HashMap<PathBuf, ID2D1Bitmap>,
@@ -686,6 +697,8 @@ impl Island {
             lyric_line: None,
             lyric_prev: None,
             lyric_fade: Spring::new(1.0, 0.3, 1.0),
+            discord: discord::snapshot(),
+            discord_avatars: HashMap::new(),
             mixer: Vec::new(),
             mixer_icons: HashMap::new(),
             mix_drag: None,
@@ -775,6 +788,7 @@ impl Island {
             dirty: true,
         };
         island.surface.set_hidden(true);
+        discord::configure(ic.discord, &ic.discord_client_id, &ic.discord_client_secret);
         island.want_lyrics();
         island.retarget();
         Ok(island)
@@ -889,6 +903,7 @@ impl Island {
             Panel::Shelf => Some(Persist::Shelf),
             Panel::Calendar => Some(Persist::Calendar),
             Panel::Live(k) => Some(Persist::Live(k)),
+            Panel::Discord => Some(Persist::Discord),
             Panel::Home | Panel::Notes | Panel::Mixer => None,
         }
     }
@@ -986,6 +1001,9 @@ impl Island {
         if self.cfg.claude_code && self.claude.current().is_some() {
             list.push(Persist::Claude);
         }
+        if self.cfg.discord && self.discord.voice.is_some() {
+            list.push(Persist::Discord);
+        }
         if self.media_visible() {
             list.push(Persist::Media);
         }
@@ -1015,6 +1033,7 @@ impl Island {
             Panel::Notes => self.notes_valid(),
             Panel::Home => true,
             Panel::Mixer => self.cfg.volume,
+            Panel::Discord => self.cfg.discord && self.discord.voice.is_some(),
         }
     }
 
@@ -1022,6 +1041,7 @@ impl Island {
         match p {
             Persist::Timer => Some(Panel::Timer),
             Persist::Claude => Some(Panel::Claude),
+            Persist::Discord => Some(Panel::Discord),
             Persist::Media => Some(Panel::Media),
             Persist::Calendar => Some(Panel::Calendar),
             Persist::Shelf => Some(Panel::Shelf),
@@ -1064,6 +1084,7 @@ impl Island {
                 Persist::Media => (196.0, ch),
                 Persist::Timer => (176.0, ch),
                 Persist::Claude => (264.0, ch),
+                Persist::Discord => (240.0, ch),
                 Persist::Download => (240.0, ch),
                 Persist::Calendar => (276.0, ch),
                 Persist::Shelf => (152.0, ch),
@@ -1100,6 +1121,7 @@ impl Island {
     fn panel_size(&self, p: Panel) -> (f32, f32) {
         match p {
                 Panel::Media => (372.0, 166.0 + if self.lyrics_row() { views::LYRICS_H } else { 0.0 }),
+                Panel::Discord => (372.0, 176.0),
                 Panel::Mixer => (372.0, 56.0 + views::MIX_ROW * (1 + self.mixer.len().min(views::MIX_ROWS)) as f32 + 8.0),
                 Panel::Claude => (372.0, 126.0),
                 Panel::Timer => (340.0, 96.0),
@@ -1475,6 +1497,15 @@ impl Island {
                 }
                 Signal::Calendar(events) => self.events = events,
             }
+        }
+        let voice = discord::snapshot();
+        if voice != self.discord {
+            let joined = self.discord.voice.is_none() && voice.voice.is_some();
+            self.discord = voice;
+            if joined && self.cfg.discord {
+                self.nudge();
+            }
+            changed = true;
         }
         for found in lyrics::drain() {
             if self.lyrics_want.as_ref() == Some(&found.key) {
@@ -2285,6 +2316,19 @@ impl Island {
             Hit::Event(_) => return Some(IslandEvent::Run(Action::Open("outlookcal:".into()))),
             Hit::AlertBody => return self.alert_click(),
             Hit::Progress | Hit::Slider | Hit::MixSlider(_) => {}
+            // Flipped at once; Discord confirms a moment later.
+            Hit::DiscordMute => {
+                self.discord.mute = !self.discord.mute;
+                discord::send(discord::Cmd::ToggleMute);
+            }
+            Hit::DiscordDeaf => {
+                self.discord.deaf = !self.discord.deaf;
+                discord::send(discord::Cmd::ToggleDeaf);
+            }
+            Hit::DiscordLeave => {
+                self.expanded = None;
+                discord::send(discord::Cmd::Leave);
+            }
         }
         None
     }
@@ -2680,6 +2724,17 @@ impl Island {
                 _ => None,
             };
         }
+        let members: Vec<&discord::Member> = self.discord.voice.iter().flat_map(|v| v.members.iter()).collect();
+        self.discord_avatars.retain(|id, _| members.iter().any(|m| m.id == *id));
+        for m in members {
+            if !self.discord_avatars.contains_key(&m.id) {
+                if let Some((side, data)) = discord::avatar(m) {
+                    if let Some(b) = (IconPixels { width: side, height: side, data }).to_bitmap(&rt) {
+                        self.discord_avatars.insert(m.id.clone(), b);
+                    }
+                }
+            }
+        }
         self.mixer_icons.retain(|p, _| self.mixer.iter().any(|a| a.exe.as_ref() == Some(p)));
         for exe in self.mixer.iter().filter_map(|a| a.exe.as_ref()) {
             if !self.mixer_icons.contains_key(exe) {
@@ -2808,6 +2863,8 @@ impl Island {
             lyric: self.lyrics.as_ref().zip(self.lyric_line).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
             lyric_prev: self.lyrics.as_ref().zip(self.lyric_prev).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
             lyric_fade: self.lyric_fade.value,
+            discord: &self.discord,
+            discord_avatars: &self.discord_avatars,
             mixer: &self.mixer,
             mixer_icons: &self.mixer_icons,
             alert_img: match self.shown {
@@ -2912,6 +2969,7 @@ impl Island {
                         Panel::Live(k) => views::live_panel(p, body, k, &view, a, &mut content_hits),
                         Panel::Notes => views::notes_panel(p, body, &view, a, &mut content_hits),
                         Panel::Mixer => views::mixer_panel(p, body, &view, a, &mut content_hits),
+                        Panel::Discord => views::discord_panel(p, body, &view, a, &mut content_hits),
                     });
                 }
             });
@@ -3039,4 +3097,5 @@ mod tests {
         assert_eq!(fmt_time(-3.0), "0:00");
     }
 }
+
 

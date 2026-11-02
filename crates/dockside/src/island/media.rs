@@ -380,6 +380,13 @@ fn now_universal() -> i64 {
     EPOCH_DIFF + (since_unix.as_nanos() / 100) as i64
 }
 
+/// Decodes image file bytes (PNG, JPEG...) into a square BGRA image of at most
+/// `max` px (for pictures fetched off the web).
+pub(super) fn decode_bytes(data: &[u8], max: u32) -> Option<(u32, Vec<u8>)> {
+    let stream = unsafe { windows::Win32::UI::Shell::SHCreateMemStream(Some(data)) }?;
+    decode_square(&wic()?, &stream, max)
+}
+
 /// Decodes an image, center-crops it square (video thumbnails are 16:9) and
 /// scales it to at most `max` px.
 fn decode_square(wic: &IWICImagingFactory, stream: &IStream, max: u32) -> Option<(u32, Vec<u8>)> {

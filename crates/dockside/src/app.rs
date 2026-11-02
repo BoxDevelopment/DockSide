@@ -460,6 +460,14 @@ fn execute(action: Action) {
             with_app(|app| app.timer(TIMER_REBUILD, 50));
         }
         Action::OpenConfig => system::open(&config::path().to_string_lossy()),
+        Action::ConnectDiscord(on) => {
+            if on {
+                crate::island::discord::send(crate::island::discord::Cmd::Authorize);
+            } else {
+                crate::island::discord::forget();
+            }
+            with_app(|app| app.mark_settings_dirty());
+        }
         Action::ConnectClaude(on) => {
             use crate::island::claude;
             let path = claude::settings_path();
@@ -2650,6 +2658,8 @@ impl App {
                         i.on_signals();
                         self.animate();
                     }
+                    // (Discord's connection status shows in Settings.)
+                    self.mark_settings_dirty();
                 }
                 WM_APP_SHELF_KEY => {
                     if let (Some(i), Some(&k)) = (&mut self.island, crate::island::ShelfKey::ALL.get(wp.0)) {

@@ -14,6 +14,7 @@
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONULL};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::Backdrop;
@@ -296,9 +297,13 @@ impl Surface {
             None if first => accent::round_corners(bd),
             None => {}
         }
-        // The window is clipped to the surface, so a shape sliding past the
-        // bottom edge (Dock auto-hide) is cut off rather than re-rounded.
-        let visible_h = (self.rect.bottom.min(key[3]) - key[1]).max(0);
+        // A shape sliding past the bottom edge (Dock auto-hide) is cut off by
+        // the screen edge, not re-rounded. Only when a monitor sits below is the
+        // window shortened to the surface: resizing it every frame of the slide
+        // makes DWM show the backdrop with square corners until it settles.
+        let below = RECT { left: key[0], top: self.rect.bottom, right: key[2], bottom: key[3] };
+        let spills = key[3] > self.rect.bottom && unsafe { !MonitorFromRect(&below, MONITOR_DEFAULTTONULL).is_invalid() };
+        let visible_h = if spills { (self.rect.bottom - key[1]).max(0) } else { h };
         unsafe {
             let _ = SetWindowPos(bd, None, key[0], key[1], w, visible_h, SWP_NOACTIVATE | SWP_NOZORDER);
         }

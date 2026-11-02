@@ -5,6 +5,11 @@
 //! the same source WinUI's Acrylic uses) under a tint layer, both clipped to
 //! an antialiased rounded rectangle of any radius.
 //!
+//! Composition property changes can reach the screen frames after the window
+//! resizes, so the shape needs none when only its width changes (the Dock
+//! magnifying): fixed rounded ends either side of a middle that stretches with
+//! the window, the right end pinned to the window's right edge.
+//!
 //! Liquid Glass adds two layers on top: a soft vertical sheen and a specular
 //! rim whose brightness sweeps around the edge, as if lit from the top-left.
 //! When refraction is available (see `glass`), a swap chain rendered by its
@@ -25,8 +30,8 @@ use windows::Win32::System::WinRT::{
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    CompositionColorBrush, CompositionLinearGradientBrush, CompositionRoundedRectangleGeometry, Compositor,
-    ContainerVisual, ShapeVisual, SpriteVisual,
+    CompositionBrush, CompositionColorBrush, CompositionLinearGradientBrush, CompositionNineGridBrush,
+    CompositionRoundedRectangleGeometry, Compositor, ContainerVisual, ShapeVisual, SpriteVisual,
 };
 
 use crate::geom::Color;
@@ -100,10 +105,11 @@ fn gradient(compositor: &Compositor, from: Vector2, to: Vector2, stops: &[(f32, 
 /// Rim width in physical pixels.
 const RIM: f32 = 1.25;
 
-/// The Liquid Glass sheen and rim.
+/// The Liquid Glass sheen (a brush, painted over each part of the shape) and rim.
 struct Glass {
+    sheen: CompositionLinearGradientBrush,
     rim: CompositionRoundedRectangleGeometry,
-    _layers: (SpriteVisual, ShapeVisual),
+    rim_layer: ShapeVisual,
 }
 
 impl Glass {
@@ -112,14 +118,13 @@ impl Glass {
         // Dark glass catches less light; subtle glass less still.
         let k = if dark { 0.6 } else { 1.0 } * if style == Style::Subtle { 0.45 } else { 1.0 };
 
-        let sheen = compositor.CreateSpriteVisual()?;
-        sheen.SetBrush(&gradient(
+        // Vertical, so it's seamless across the parts of the shape.
+        let sheen = gradient(
             compositor,
             Vector2 { X: 0.5, Y: 0.0 },
             Vector2 { X: 0.5, Y: 1.0 },
             &[(0.0, white(0.20 * k)), (0.45, white(0.03 * k)), (0.8, white(0.0)), (1.0, white(0.07 * k))],
-        )?)?;
-        sheen.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+        )?;
 
         let rim = compositor.CreateRoundedRectangleGeometry()?;
         let stroke = compositor.CreateSpriteShapeWithGeometry(&rim)?;
@@ -134,7 +139,7 @@ impl Glass {
         rim_layer.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
         rim_layer.Shapes()?.Append(&stroke)?;
 
-        Ok(Self { rim, _layers: (sheen, rim_layer) })
+        Ok(Self { sheen, rim, rim_layer })
     }
 }
 
@@ -142,11 +147,16 @@ pub struct CompositionBackdrop {
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     shape: ContainerVisual,
-    geometry: CompositionRoundedRectangleGeometry,
+    /// Rounded ends of a fixed size either side of a middle that stretches
+    /// with the window (see the module docs).
+    parts: [ContainerVisual; 3],
+    clips: [CompositionRoundedRectangleGeometry; 2],
     tint: CompositionColorBrush,
     glass: Option<Glass>,
-    refraction: Option<(Pane, SpriteVisual)>,
-    _layers: (SpriteVisual, SpriteVisual),
+    /// The pane's swap chain, through a nine-grid so a frame rendered at an
+    /// older width stretches only its straight middle, not its rounded ends.
+    refraction: Option<(Pane, CompositionNineGridBrush)>,
+    _layers: Vec<SpriteVisual>,
 }
 
 impl CompositionBackdrop {
@@ -173,60 +183,91 @@ impl CompositionBackdrop {
         root.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
         target.SetRoot(&root)?;
 
-        let geometry = compositor.CreateRoundedRectangleGeometry()?;
-        let shape = compositor.CreateContainerVisual()?;
-        shape.SetClip(&compositor.CreateGeometricClipWithGeometry(&geometry)?)?;
-
-        let blur = compositor.CreateSpriteVisual()?;
-        blur.SetBrush(&compositor.CreateHostBackdropBrush()?)?;
-        blur.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
-
-        let tint_brush = compositor.CreateColorBrushWithColor(ui_color(tint))?;
-        let tint_layer = compositor.CreateSpriteVisual()?;
-        tint_layer.SetBrush(&tint_brush)?;
-        tint_layer.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
-
-        let children = shape.Children()?;
-        children.InsertAtTop(&blur)?;
-        children.InsertAtTop(&tint_layer)?;
         let style = glass;
-        let glass = if let Some(style) = style {
-            let g = Glass::new(&compositor, tint.r + tint.g + tint.b < 1.5, style)?;
-            children.InsertAtTop(&g._layers.0)?;
-            children.InsertAtTop(&g._layers.1)?;
-            Some(g)
-        } else {
-            None
+        let glass = style.map(|style| Glass::new(&compositor, tint.r + tint.g + tint.b < 1.5, style)).transpose()?;
+        let tint_brush = compositor.CreateColorBrushWithColor(ui_color(tint))?;
+        let mut brushes: Vec<CompositionBrush> = vec![compositor.CreateHostBackdropBrush()?.cast()?, tint_brush.cast()?];
+        if let Some(g) = &glass {
+            brushes.push(g.sheen.cast()?);
+        }
+
+        // Width from the window (see `set_shape`).
+        let shape = compositor.CreateContainerVisual()?;
+        shape.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 0.0 })?;
+        let children = shape.Children()?;
+        let [left, middle, right] = [(); 3].map(|_| compositor.CreateContainerVisual());
+        let parts = [left?, middle?, right?];
+        parts[1].SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 0.0 })?;
+        parts[2].SetRelativeOffsetAdjustment(Vector3 { X: 1.0, Y: 0.0, Z: 0.0 })?;
+        let rounded = |part: &ContainerVisual| -> Result<CompositionRoundedRectangleGeometry> {
+            let geometry = compositor.CreateRoundedRectangleGeometry()?;
+            part.SetClip(&compositor.CreateGeometricClipWithGeometry(&geometry)?)?;
+            Ok(geometry)
         };
+        let clips = [rounded(&parts[0])?, rounded(&parts[2])?];
+        let mut layers = Vec::new();
+        for part in &parts {
+            for brush in &brushes {
+                let layer = compositor.CreateSpriteVisual()?;
+                layer.SetBrush(brush)?;
+                layer.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
+                part.Children()?.InsertAtTop(&layer)?;
+                layers.push(layer);
+            }
+            children.InsertAtTop(part)?;
+        }
+
         let refraction = if let Some(style) = style.filter(|_| crate::win::glass::enabled()) {
             Pane::new(hwnd, tint, style, source).and_then(|(pane, swapchain)| {
-                let layer = (|| -> Result<SpriteVisual> {
+                let brush = (|| -> Result<CompositionNineGridBrush> {
                     let interop: ICompositorInterop = compositor.cast()?;
                     let surface = unsafe { interop.CreateCompositionSurfaceForSwapChain(&swapchain)? };
+                    let brush = compositor.CreateNineGridBrush()?;
+                    brush.SetSource(&compositor.CreateSurfaceBrushWithSurface(&surface)?)?;
+                    // The shader rounds the pane itself, so it needs no clip.
                     let layer = compositor.CreateSpriteVisual()?;
-                    layer.SetBrush(&compositor.CreateSurfaceBrushWithSurface(&surface)?)?;
+                    layer.SetBrush(&brush)?;
                     layer.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
                     children.InsertAtTop(&layer)?;
-                    Ok(layer)
+                    layers.push(layer);
+                    Ok(brush)
                 })();
-                layer.map_err(|e| log!("glass layer failed: {e}")).ok().map(|l| (pane, l))
+                brush.map_err(|e| log!("glass layer failed: {e}")).ok().map(|b| (pane, b))
             })
         } else {
             None
         };
+        // Refraction draws its own rim. This one isn't split like the rest, so
+        // it can lag a resize.
+        if let Some(g) = glass.as_ref().filter(|_| refraction.is_none()) {
+            children.InsertAtTop(&g.rim_layer)?;
+        }
         root.Children()?.InsertAtTop(&shape)?;
 
-        Ok(Self { _target: target, root, shape, geometry, tint: tint_brush, glass, refraction, _layers: (blur, tint_layer) })
+        Ok(Self { _target: target, root, shape, parts, clips, tint: tint_brush, glass, refraction, _layers: layers })
     }
 
     /// Position, size and corner radius in window-local physical pixels.
+    /// The shape spans the window's width whatever `w` says.
     pub fn set_shape(&self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
         let size = Vector2 { X: w.max(0.0), Y: h.max(0.0) };
         let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+        let corner = Vector2 { X: r, Y: r };
         let _ = self.shape.SetOffset(Vector3 { X: x, Y: y, Z: 0.0 });
-        let _ = self.shape.SetSize(size);
-        let _ = self.geometry.SetSize(size);
-        let _ = self.geometry.SetCornerRadius(Vector2 { X: r, Y: r });
+        let _ = self.shape.SetSize(Vector2 { X: 0.0, Y: size.Y });
+        let [left, middle, right] = &self.parts;
+        let end = Vector2 { X: r, Y: size.Y };
+        let _ = left.SetSize(end);
+        let _ = middle.SetOffset(Vector3 { X: r, Y: 0.0, Z: 0.0 });
+        let _ = middle.SetSize(Vector2 { X: -2.0 * r, Y: size.Y });
+        let _ = right.SetOffset(Vector3 { X: -r, Y: 0.0, Z: 0.0 });
+        let _ = right.SetSize(end);
+        // Each end's clip is a whole rounded rect 2r wide, half of it past the end.
+        for (clip, dx) in self.clips.iter().zip([0.0, -r]) {
+            let _ = clip.SetOffset(Vector2 { X: dx, Y: 0.0 });
+            let _ = clip.SetSize(Vector2 { X: 2.0 * r, Y: size.Y });
+            let _ = clip.SetCornerRadius(corner);
+        }
         if let Some(g) = &self.glass {
             // Inset by half the stroke so the whole rim sits inside the clip.
             // Square shapes (the full-width menu bar) get no rim, like macOS.
@@ -236,7 +277,9 @@ impl CompositionBackdrop {
             let _ = g.rim.SetSize(rim);
             let _ = g.rim.SetCornerRadius(Vector2 { X: (r - h).max(0.0), Y: (r - h).max(0.0) });
         }
-        if let Some((pane, _)) = &self.refraction {
+        if let Some((pane, nine)) = &self.refraction {
+            let _ = nine.SetLeftInset(r);
+            let _ = nine.SetRightInset(r);
             pane.set_shape(size.X, size.Y, r);
         }
     }

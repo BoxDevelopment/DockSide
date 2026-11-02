@@ -471,31 +471,206 @@ pub fn hangup(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
     }
 }
 
-/// Home: a house.
-pub fn house(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
-    let k = s / 16.0;
-    let geom = p.gfx.path(|g| unsafe {
-        g.BeginFigure(pt(cx - 6.5 * k, cy - 0.5 * k), D2D1_FIGURE_BEGIN_HOLLOW);
-        g.AddLine(pt(cx, cy - 6.8 * k));
-        g.AddLine(pt(cx + 6.5 * k, cy - 0.5 * k));
-        g.EndFigure(D2D1_FIGURE_END_OPEN);
-        g.BeginFigure(pt(cx - 4.6 * k, cy - 2.0 * k), D2D1_FIGURE_BEGIN_HOLLOW);
-        g.AddLine(pt(cx - 4.6 * k, cy + 6.0 * k));
-        g.AddLine(pt(cx + 4.6 * k, cy + 6.0 * k));
-        g.AddLine(pt(cx + 4.6 * k, cy - 2.0 * k));
-        g.EndFigure(D2D1_FIGURE_END_OPEN);
-    });
-    if let Some(g) = geom {
-        p.stroke_geometry(&g, c, 1.6 * k);
+//// Claude Code's pixel mascot, `h` tall and 1.6 × `h` wide: a block with two
+/// eyes, arms out to the sides and four legs (the middle pair shorter).
+pub fn clawd(p: &Painter, cx: f32, cy: f32, h: f32, c: Color) {
+    // In units of a 61 × 38 drawing.
+    let k = h / 38.0;
+    let (x0, y0) = (cx - 30.5 * k, cy - 19.0 * k);
+    let r = |x: f32, y: f32, w: f32, h: f32| Rect::new(x0 + x * k, y0 + y * k, w * k, h * k);
+    // Body and arms; the legs overlap the body a little so there's no seam.
+    p.fill_rect(r(9.0, 0.0, 43.6, 30.0), c);
+    p.fill_rect(r(0.0, 10.0, 9.4, 9.0), c);
+    p.fill_rect(r(52.2, 10.0, 8.8, 9.0), c);
+    for (x, len) in [(13.0, 36.0), (22.0, 32.6), (35.0, 36.0), (44.0, 32.6)] {
+        p.fill_rect(r(x, 29.0, 4.4, len - 29.0), c);
     }
-    p.fill_round(Rect::new(cx - 1.4 * k, cy + 1.8 * k, 2.8 * k, 4.2 * k), 0.8 * k, c);
+    // The eyes are holes, in the island's black.
+    let eye = Color::BLACK.alpha(c.a);
+    p.fill_rect(r(19.0, 7.0, 5.0, 9.0), eye);
+    p.fill_rect(r(37.0, 7.0, 5.0, 9.0), eye);
 }
 
-/// Widgets: four rounded tiles.
-pub fn grid(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+/// Progress (SF's checklist): a checked and an open circle, each with a line.
+pub fn checklist(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 17.0;
+    let (x, y1, y2, r) = (cx - 5.1 * k, cy - 4.4 * k, cy + 4.3 * k, 3.45 * k);
+    p.fill_circle(x, y1, r, c);
+    let ink = Color::BLACK.alpha(c.a * 0.85);
+    p.line(x - 1.6 * k, y1 + 0.1 * k, x - 0.4 * k, y1 + 1.3 * k, ink, 1.1 * k);
+    p.line(x - 0.4 * k, y1 + 1.3 * k, x + 1.7 * k, y1 - 1.4 * k, ink, 1.1 * k);
+    p.stroke_circle(x, y2, r - 0.65 * k, c, 1.3 * k);
+    for y in [y1, y2] {
+        p.line(cx + 0.4 * k, y, cx + 7.8 * k, y, c, 1.8 * k);
+    }
+}
+
+/// Usage (SF's gauge): a ring with ticks round the top and a needle.
+pub fn gauge(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 17.0;
+    p.stroke_circle(cx, cy, 6.8 * k, c, 1.5 * k);
+    for a in [-1.2f32, -0.6, 0.6, 1.2] {
+        let (sx, sy) = (a.sin(), -a.cos());
+        p.fill_circle(cx + sx * 4.1 * k, cy + sy * 4.1 * k, 0.8 * k, c);
+    }
+    p.line(cx, cy + 0.6 * k, cx, cy - 4.0 * k, c, 1.5 * k);
+    p.fill_circle(cx, cy + 0.6 * k, 1.5 * k, c);
+}
+
+/// A plain check mark (a finished step), about 12.5 × 12 points at `s` 16.
+pub fn tick(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
     let k = s / 16.0;
+    p.line(cx - 5.6 * k, cy + 0.9 * k, cx - 1.25 * k, cy + 5.25 * k, c, 1.9 * k);
+    p.line(cx - 1.25 * k, cy + 5.25 * k, cx + 6.25 * k, cy - 5.4 * k, c, 1.9 * k);
+}
+
+/// A terminal: a rounded tile with a prompt in its corner, in `ink`.
+pub fn terminal(p: &Painter, cx: f32, cy: f32, s: f32, c: Color, ink: Color) {
+    let k = s / 16.5;
+    let (x0, y0) = (cx - 8.25 * k, cy - 6.75 * k);
+    p.fill_round(Rect::new(x0, y0, 16.5 * k, 13.5 * k), 2.6 * k, c);
+    p.line(x0 + 3.0 * k, y0 + 3.0 * k, x0 + 5.6 * k, y0 + 5.0 * k, ink, 1.5 * k);
+    p.line(x0 + 5.6 * k, y0 + 5.0 * k, x0 + 3.0 * k, y0 + 7.0 * k, ink, 1.5 * k);
+    p.line(x0 + 7.4 * k, y0 + 7.8 * k, x0 + 10.6 * k, y0 + 7.8 * k, ink, 1.4 * k);
+}
+
+/// A page (SF's doc.text.fill): a folded corner and two lines, in `ink`.
+pub fn page(p: &Painter, cx: f32, cy: f32, s: f32, c: Color, ink: Color) {
+    let k = s / 15.5;
+    let (x0, y0, x1, y1, f) = (cx - 6.0 * k, cy - 7.75 * k, cx + 6.0 * k, cy + 7.75 * k, 5.4 * k);
+    let geom = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(x0, y0), D2D1_FIGURE_BEGIN_FILLED);
+        g.AddLine(pt(x1 - f, y0));
+        g.AddLine(pt(x1, y0 + f));
+        g.AddLine(pt(x1, y1));
+        g.AddLine(pt(x0, y1));
+        g.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = geom {
+        p.fill_geometry(&g, c);
+        p.stroke_geometry(&g, c, 1.8 * k);
+    }
+    // The fold, drawn as its crease.
+    p.line(x1 - f, y0 + 0.2 * k, x1 - f, y0 + f, ink, 1.1 * k);
+    p.line(x1 - f, y0 + f, x1 - 0.2 * k, y0 + f, ink, 1.1 * k);
+    for y in [cy + 1.6 * k, cy + 4.4 * k] {
+        p.line(x0 + 3.0 * k, y, x1 - 3.0 * k, y, ink, 1.3 * k);
+    }
+}
+
+/// A magnifying glass.
+pub fn magnifier(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    p.stroke_circle(cx - 1.4 * k, cy - 1.4 * k, 5.0 * k, c, 1.8 * k);
+    p.line(cx + 2.4 * k, cy + 2.4 * k, cx + 6.4 * k, cy + 6.4 * k, c, 2.2 * k);
+}
+
+/// A globe: an outline, the equator and a meridian.
+pub fn globe(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 16.0;
+    p.stroke_circle(cx, cy, 7.0 * k, c, 1.4 * k);
+    p.stroke_round(Rect::new(cx - 3.2 * k, cy - 7.0 * k, 6.4 * k, 14.0 * k), 3.2 * k, c, 1.3 * k);
+    p.line(cx - 7.0 * k, cy, cx + 7.0 * k, cy, c, 1.3 * k);
+}
+
+/// Claude's logo mark: a burst of uneven rounded rays.
+pub fn claude_mark(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    const RAYS: [(f32, f32); 12] = [
+        (0.0, 1.0), (0.52, 0.82), (1.05, 0.95), (1.57, 0.78), (2.09, 0.9), (2.62, 0.72),
+        (3.14, 0.96), (3.67, 0.8), (4.19, 0.92), (4.71, 0.86), (5.24, 1.0), (5.76, 0.76),
+    ];
+    let r = s * 0.5;
+    for (a, len) in RAYS {
+        let (sx, sy) = (a.sin(), -a.cos());
+        p.line(cx + sx * r * 0.18, cy + sy * r * 0.18, cx + sx * r * len, cy + sy * r * len, c, s * 0.115);
+    }
+    p.fill_circle(cx, cy, r * 0.26, c);
+}
+
+/// Codex's app icon: a white tile with a blue-violet cloud and a prompt.
+pub fn codex_tile(p: &Painter, t: Rect, radius: f32, a: f32) {
+    p.fill_round(t, radius, Color::gray(250, a));
+    let (cx, cy, k) = (t.cx(), t.cy(), t.w / 31.5);
+    // The cloud: lobes round a middle, violet on top shading to blue below.
+    for i in 0..8 {
+        let ang = i as f32 * std::f32::consts::TAU / 8.0 + 0.3;
+        let (lx, ly) = (cx + ang.cos() * 6.6 * k, cy + ang.sin() * 6.0 * k);
+        let up = (1.0 - (ly - cy + 9.0 * k) / (18.0 * k)).clamp(0.0, 1.0);
+        let col = Color::rgba(lerp_u8(70, 160, up), lerp_u8(80, 120, up), 245, a);
+        p.fill_circle(lx, ly, 4.6 * k, col);
+    }
+    p.fill_circle(cx, cy, 7.2 * k, Color::rgba(105, 100, 245, a));
+    let w = Color::gray(255, a);
+    p.line(cx - 5.0 * k, cy - 2.6 * k, cx - 2.4 * k, cy, w, 1.5 * k);
+    p.line(cx - 2.4 * k, cy, cx - 5.0 * k, cy + 2.6 * k, w, 1.5 * k);
+    p.line(cx - 0.2 * k, cy + 2.8 * k, cx + 4.4 * k, cy + 2.8 * k, w, 1.5 * k);
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+/// Home, filled (SF's house.fill): a roof with a chimney over a block with a door.
+pub fn house_fill(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 15.0;
+    // Chimney, roof (a thick round-capped chevron) and walls.
+    p.fill_rect(Rect::new(cx + 3.4 * k, cy - 6.6 * k, 1.8 * k, 3.4 * k), c);
+    p.line(cx - 6.6 * k, cy - 0.8 * k, cx, cy - 6.4 * k, c, 1.9 * k);
+    p.line(cx, cy - 6.4 * k, cx + 6.6 * k, cy - 0.8 * k, c, 1.9 * k);
+    let geom = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(cx - 4.8 * k, cy - 1.2 * k), D2D1_FIGURE_BEGIN_FILLED);
+        g.AddLine(pt(cx, cy - 5.2 * k));
+        g.AddLine(pt(cx + 4.8 * k, cy - 1.2 * k));
+        g.AddLine(pt(cx + 4.8 * k, cy + 6.4 * k));
+        g.AddLine(pt(cx - 4.8 * k, cy + 6.4 * k));
+        g.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = geom {
+        p.fill_geometry(&g, c);
+        p.stroke_geometry(&g, c, 0.8 * k);
+    }
+    p.fill_rect(Rect::new(cx - 1.3 * k, cy + 1.6 * k, 2.6 * k, 4.8 * k), Color::BLACK.alpha(c.a));
+}
+
+/// Shelf, filled (SF's tray.fill): a tray with a notch in its lip.
+pub fn tray_fill(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 15.0;
+    let geom = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(cx - 7.5 * k, cy - 1.4 * k), D2D1_FIGURE_BEGIN_FILLED);
+        g.AddLine(pt(cx - 5.2 * k, cy - 5.2 * k));
+        g.AddLine(pt(cx + 5.2 * k, cy - 5.2 * k));
+        g.AddLine(pt(cx + 7.5 * k, cy - 1.4 * k));
+        g.AddLine(pt(cx + 7.5 * k, cy + 5.2 * k));
+        g.AddLine(pt(cx - 7.5 * k, cy + 5.2 * k));
+        g.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = geom {
+        p.fill_geometry(&g, c);
+        p.stroke_geometry(&g, c, 1.2 * k);
+    }
+    // The opening, cut out in black, with the dip in the middle.
+    let hole = Color::BLACK.alpha(c.a);
+    let g2 = p.gfx.path(|g| unsafe {
+        g.BeginFigure(pt(cx - 5.0 * k, cy - 2.0 * k), D2D1_FIGURE_BEGIN_FILLED);
+        g.AddLine(pt(cx - 3.9 * k, cy - 3.9 * k));
+        g.AddLine(pt(cx + 3.9 * k, cy - 3.9 * k));
+        g.AddLine(pt(cx + 5.0 * k, cy - 2.0 * k));
+        g.AddLine(pt(cx + 2.2 * k, cy - 2.0 * k));
+        g.AddLine(pt(cx + 1.4 * k, cy - 0.4 * k));
+        g.AddLine(pt(cx - 1.4 * k, cy - 0.4 * k));
+        g.AddLine(pt(cx - 2.2 * k, cy - 2.0 * k));
+        g.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = g2 {
+        p.fill_geometry(&g, hole);
+    }
+}
+
+/// Widgets, filled (SF's square.grid.2x2.fill): four rounded tiles.
+pub fn grid_fill(p: &Painter, cx: f32, cy: f32, s: f32, c: Color) {
+    let k = s / 15.0;
     for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-        let (x, y) = (cx + dx * 3.6 * k, cy + dy * 3.6 * k);
-        p.stroke_round(Rect::new(x - 2.8 * k, y - 2.8 * k, 5.6 * k, 5.6 * k), 1.6 * k, c, 1.5 * k);
+        let (x, y) = (cx + dx * 3.4 * k, cy + dy * 3.4 * k);
+        p.fill_round(Rect::new(x - 2.9 * k, y - 2.9 * k, 5.8 * k, 5.8 * k), 1.4 * k, c);
     }
 }

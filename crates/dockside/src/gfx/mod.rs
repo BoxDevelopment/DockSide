@@ -36,6 +36,7 @@ pub enum Align {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Weight {
     Regular,
+    SemiBold,
     Bold,
 }
 
@@ -43,6 +44,7 @@ impl Weight {
     fn dwrite(self) -> DWRITE_FONT_WEIGHT {
         match self {
             Weight::Regular => DWRITE_FONT_WEIGHT_NORMAL,
+            Weight::SemiBold => DWRITE_FONT_WEIGHT_SEMI_BOLD,
             Weight::Bold => DWRITE_FONT_WEIGHT_BOLD,
         }
     }

@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
+use windows::Win32::Graphics::DirectWrite::{IDWriteTextFormat, DWRITE_TEXT_METRICS};
 
 use super::calendar::CalEvent;
-use super::claude::{Session, State};
+use super::claude::{Agent, Card, Kind, Limit, Session, State};
 use super::glyphs as g;
 use super::holding::{self, Item};
 use super::live::{Activity, Live};
@@ -90,8 +91,13 @@ pub struct View<'a> {
     pub alert_img: Option<&'a ID2D1Bitmap>,
     pub accent: Color,
     pub time: f32,
+    /// The Claude session to show (working, else just finished), how many
+    /// others are working, the panel's page and the Usage page's limits.
     pub claude: Option<&'a Session>,
     pub claude_more: usize,
+    pub claude_view: u8,
+    pub claude_flip: f32,
+    pub usage: &'a [(Agent, Limit)],
     pub live: &'a Live,
     pub live_icons: &'a HashMap<PathBuf, ID2D1Bitmap>,
     pub notes: &'a [Note],
@@ -854,47 +860,282 @@ pub fn calendar_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     }
 }
 
+/// Droppy's Claude colors (sampled from Droppy itself).
+const CL_ORANGE: Color = Color::rgba(232, 138, 94, 1.0);
+const CL_MASCOT: Color = Color::rgba(214, 120, 100, 1.0);
+const CL_MINT: Color = Color::rgba(96, 224, 150, 1.0);
+const CL_GREEN: Color = Color::rgba(88, 212, 140, 1.0);
+const CL_RED: Color = Color::rgba(255, 105, 97, 1.0);
+const CL_TILE: Color = Color::rgba(217, 105, 82, 1.0);
+const CODEX_BLUE: Color = Color::rgba(90, 155, 245, 1.0);
+
+/// White at `k` of full strength, faded by `a`.
+fn ink(k: f32, a: f32) -> Color {
+    Color::gray(255, k * a)
+}
+
+/// Claude Code, open, laid out as Droppy's: a Progress page (the turn's steps
+/// and the latest tool call in detail) and a Usage page (how much of each plan
+/// is left), with a round button for each in the corner. Points are measured
+/// off Droppy's 549 × 231 panel.
 pub fn claude_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
-    let _ = hits;
-    let Some(s) = v.claude else { return };
+    const SLIDE: f32 = 28.0;
     let f = v.fonts;
-    let waiting = matches!(s.state, State::Waiting(_));
-    g::spark(p, r.x + 30.0, r.y + 26.0, 18.0, spark_angle(v), CLAUDE.alpha(a));
-    p.text("Claude Code", &f.header, Rect::new(r.x + 46.0, r.y + 17.0, 120.0, 18.0), WHITE.alpha(a));
-    let more = if v.claude_more > 0 { format!("  +{} more", v.claude_more) } else { String::new() };
-    p.text(&format!("{}{more}", s.project), &f.small_r, Rect::new(r.x, r.y + 18.0, r.w - 22.0, 16.0), SECONDARY.alpha(a));
-
-    // What it's doing now.
-    let (line, color) = match &s.state {
-        State::Waiting(m) => (if m.is_empty() { "Needs your input".to_string() } else { m.clone() }, ORANGE),
-        _ => (s.status(), WHITE),
-    };
-    p.text(&line, &f.title, Rect::new(r.x + 22.0, r.y + 46.0, r.w - 44.0, 22.0), color.alpha(a));
-    if !s.prompt.is_empty() {
-        let quoted = format!("\u{201C}{}\u{201D}", s.prompt);
-        p.text(&quoted, &f.body, Rect::new(r.x + 22.0, r.y + 70.0, r.w - 44.0, 18.0), SECONDARY.alpha(a));
-    }
-
-    // Elapsed and tool count, with a shimmer bar while it works.
-    let y = r.bottom() - 26.0;
-    let stat = format!("{} · {} tool{}", fmt_time(s.elapsed()), s.tools, if s.tools == 1 { "" } else { "s" });
-    p.text_tabular(&stat, &f.small_l, Rect::new(r.x + 22.0, y - 8.0, 140.0, 16.0), SECONDARY.alpha(a));
-    let bar = Rect::new(r.x + 150.0, y - 2.0, r.w - 172.0, 4.0);
-    p.fill_round(bar, 2.0, Color::gray(255, 0.12 * a));
-    if !waiting {
-        let t = (v.time * 0.6).fract();
-        let w = bar.w * 0.28;
-        let x = bar.x - w + (bar.w + w) * t;
-        let seg = Rect::new(x.max(bar.x), bar.y, (x + w).min(bar.right()) - x.max(bar.x), bar.h);
-        if seg.w > 0.0 {
-            p.fill_round(seg, 2.0, CLAUDE.alpha(0.9 * a));
+    let hy = r.y + 37.0;
+    // 0 on Progress, 1 on Usage, gliding between: the pages cross-fade and slide.
+    let t = v.claude_flip.clamp(0.0, 1.0);
+    let shown = [1.0 - t, t];
+    for (page, k) in shown.into_iter().enumerate() {
+        if k < 0.01 {
+            continue;
         }
-    } else {
-        p.fill_round(bar, 2.0, ORANGE.alpha(0.6 * a));
+        let (dx, c) = ((page as f32 - t) * SLIDE * 0.4, ink(0.6, a * k));
+        p.transformed(dx, 0.0, 1.0, || {
+            if page == 0 {
+                g::checklist(p, r.x + 31.5, hy, 17.0, c);
+            } else {
+                g::gauge(p, r.x + 31.5, hy, 17.0, c);
+            }
+            let name = if page == 0 { "Progress" } else { "Usage" };
+            p.text(name, &f.cl_head, Rect::new(r.x + 49.5, hy - 12.0, 160.0, 24.0), c);
+        });
+    }
+    for i in 0..2u8 {
+        let cx = r.right() - if i == 0 { 74.0 } else { 36.75 };
+        let hit = Hit::ClaudeView(i);
+        let on = shown[i as usize];
+        let (hot, pressed) = button_state(v, hit, v.claude_view != i);
+        let off = ink(if pressed { 0.2 } else if hot { 0.17 } else { 0.125 }, a);
+        p.fill_circle(cx, hy, 15.25, off.mix(CL_MINT.alpha(0.25 * a), on));
+        let c = ink(0.6, a).mix(CL_MINT.alpha(a), on);
+        if i == 0 {
+            g::checklist(p, cx, hy, 16.0, c);
+        } else {
+            g::gauge(p, cx, hy, 16.0, c);
+        }
+        hits.push((Rect::new(cx - 17.0, hy - 17.0, 34.0, 34.0), hit));
+    }
+    if shown[0] > 0.01 {
+        p.transformed(-t * SLIDE, 0.0, 1.0, || claude_progress(p, r, v, a * shown[0]));
+    }
+    if shown[1] > 0.01 {
+        p.transformed((1.0 - t) * SLIDE, 0.0, 1.0, || claude_usage(p, r, v, a * shown[1], t));
     }
 }
 
-/// An expanded Live Activity: its icon, title and subtitle, the time or value,
+/// The Progress page's rows: the turn's last few steps, then what it's doing between them.
+fn step_rows(s: &Session) -> Vec<(&str, bool)> {
+    let mut rows: Vec<(&str, bool)> = s.steps.iter().map(|x| (x.label.as_str(), x.done)).collect();
+    let busy = s.steps.iter().any(|x| !x.done);
+    match &s.state {
+        State::Waiting(_) => rows.push(("Waiting for you", false)),
+        State::Thinking if !busy => rows.push(("Thinking...", false)),
+        State::Idle if rows.is_empty() => rows.push(("Finished", true)),
+        _ => {}
+    }
+    let skip = rows.len().saturating_sub(3);
+    rows.split_off(skip)
+}
+
+fn claude_progress(p: &Painter, r: Rect, v: &View, a: f32) {
+    let Some(s) = v.claude else { return };
+    let f = v.fonts;
+    // Who, and what the session is about.
+    let ty = r.y + 86.0;
+    g::clawd(p, r.x + 40.0, r.y + 86.5, 19.0, CL_MASCOT.alpha(a));
+    let nx = r.x + 68.5;
+    p.text("Claude", &f.cl_name, Rect::new(nx, ty - 15.0, 120.0, 30.0), ink(1.0, a));
+    let dot = nx + p.gfx.measure("Claude", &f.cl_name) + 16.0;
+    p.fill_circle(dot, ty, 4.0, CL_ORANGE.alpha(a));
+    let more = if v.claude_more > 0 { format!("+{} more", v.claude_more) } else { String::new() };
+    let mw = if more.is_empty() { 0.0 } else { p.gfx.measure(&more, &f.cl_status) + 12.0 };
+    let tr = Rect::new(dot + 10.5, ty - 12.0, r.right() - 24.0 - mw - dot - 10.5, 24.0);
+    p.text(s.heading(), &f.cl_title, tr, CL_ORANGE.alpha(a));
+    if !more.is_empty() {
+        p.text(&more, &f.cl_status, Rect::new(r.right() - 24.0 - mw + 12.0, ty - 10.0, mw, 20.0), ink(0.6, a));
+    }
+
+    // Its steps on the left; the latest in detail on the right.
+    let card = Rect::new(r.x + 283.5, r.y + 113.0, 244.0, 93.0);
+    for (i, (label, done)) in step_rows(s).into_iter().enumerate() {
+        let cy = r.y + 123.5 + i as f32 * 28.75;
+        let waiting = !done && matches!(s.state, State::Waiting(_));
+        let mark = if waiting { ORANGE } else { CL_ORANGE }.alpha(a);
+        if done {
+            g::tick(p, r.x + 29.75, cy, 16.0, mark);
+        } else {
+            g::play(p, r.x + 30.75, cy, 12.5, mark);
+        }
+        let c = if waiting { ORANGE.alpha(a) } else { ink(0.89, a) };
+        // Long names keep both ends ("Write Releas...tesPage.swift").
+        let w = card.x - 24.0 - r.x - 49.5;
+        p.text(&middle_fit(p, label, &f.cl_step, w, "..."), &f.cl_step, Rect::new(r.x + 49.5, cy - 12.0, w + 4.0, 24.0), c);
+    }
+    claude_card(p, card, s, v, a);
+}
+
+/// The card beside the steps: the tool running (or just finished), else what
+/// Claude last said, what it's waiting on, or how the turn went.
+fn claude_card(p: &Painter, c: Rect, s: &Session, v: &View, a: f32) {
+    let f = v.fonts;
+    p.fill_round(c, 20.0, ink(0.04, a));
+    let tool = s.card.as_ref().filter(|k| s.working() && k.end.map_or(true, |e| e.elapsed().as_secs_f32() < 1.2));
+    let text = c.inset(40.0, 12.0);
+    match (&s.state, tool) {
+        (State::Waiting(m), _) => {
+            let m = if m.is_empty() { "Claude needs your input" } else { m };
+            centered_block(p, m, &f.cl_said, text, ORANGE.alpha(a));
+        }
+        (State::Idle, _) => {
+            let said = if s.said.is_empty() { "All done" } else { &s.said };
+            centered_block(p, said, &f.cl_said, Rect::new(text.x, c.y + 10.0, text.w, c.h - 36.0), ink(0.81, a));
+            let n = s.tools;
+            let stat = format!("Done in {} \u{B7} {n} tool{}", fmt_time(s.elapsed()), if n == 1 { "" } else { "s" });
+            p.text(&stat, &f.small_c, Rect::new(c.x, c.bottom() - 26.0, c.w, 16.0), ink(0.5, a));
+        }
+        (_, Some(k)) => tool_card(p, c, k, v, a),
+        _ => {
+            let t = if !s.said.is_empty() {
+                s.said.clone()
+            } else if !s.prompt.is_empty() {
+                s.prompt.clone()
+            } else {
+                "Thinking...".to_string()
+            };
+            centered_block(p, &t, &f.cl_said, text, ink(0.81, a));
+        }
+    }
+}
+
+/// A tool call: its icon and target (with lines added and removed), how it's
+/// going, and a bar that fills as it finishes.
+fn tool_card(p: &Painter, c: Rect, k: &Card, v: &View, a: f32) {
+    let f = v.fonts;
+    let (ix, iy) = (c.x + 24.75, c.y + 29.25);
+    let hole = Color::BLACK.alpha(0.8 * a);
+    let accent = CL_ORANGE.alpha(a);
+    match k.kind {
+        Kind::Terminal => g::terminal(p, ix + 2.75, iy, 17.0, accent, hole),
+        Kind::File => g::page(p, ix, iy, 15.5, accent, hole),
+        Kind::Search => g::magnifier(p, ix, iy, 16.0, accent),
+        Kind::Web => g::globe(p, ix, iy, 16.0, accent),
+        Kind::Agent | Kind::Other => {
+            let turn = if k.end.is_none() { v.time * 1.6 } else { 0.0 };
+            g::spark(p, ix, iy, 17.0, turn, accent);
+        }
+    }
+    // Lines in and out, at the right.
+    let mut right = c.x + 226.0;
+    let removed = k.removed.filter(|&n| n > 0);
+    let added = k.added.filter(|&n| n > 0 || removed.is_none());
+    for (n, color, sign) in [(removed, CL_RED, "\u{2212}"), (added, CL_GREEN, "+")] {
+        let Some(n) = n else { continue };
+        let t = format!("{sign}{n}");
+        let w = p.gfx.measure(&t, &f.mono_b);
+        p.text(&t, &f.mono_b, Rect::new(right - w, iy - 12.0, w + 2.0, 24.0), color.alpha(a));
+        right -= w + 9.0;
+    }
+    let tx = c.x + if k.kind == Kind::Terminal { 48.0 } else { 43.0 };
+    let tw = right - 8.0 - tx;
+    let name = if k.target.is_empty() { k.tool.clone() } else { k.target.clone() };
+    // Paths keep both ends ("content/R…eNotes.md"); commands trail off.
+    let name = if k.kind == Kind::File { middle_fit(p, &name, &f.mono_b, tw, "…") } else { name };
+    let tc = if k.kind == Kind::File { accent } else { ink(1.0, a) };
+    p.text(&name, &f.mono_b, Rect::new(tx, iy - 12.0, tw, 24.0), tc);
+
+    let sy = c.y + 53.5;
+    let (label, value) = k.status();
+    let lf = if k.kind == Kind::Terminal { &f.mono } else { &f.cl_status };
+    p.text_tabular(&label, lf, Rect::new(c.x + 17.5, sy - 10.0, c.w - 35.0, 20.0), ink(0.615, a));
+    if let Some(value) = value {
+        let x = c.x + 17.5 + p.gfx.measure(&label, lf) + 6.0;
+        p.text_tabular(&value, &f.cl_value, Rect::new(x, sy - 10.0, c.right() - 18.0 - x, 20.0), ink(1.0, a));
+    }
+    let bar = Rect::new(c.x + 17.0, c.y + 70.0, 209.0, 4.0);
+    p.fill_round(bar, 2.0, CL_ORANGE.alpha(0.18 * a));
+    let fw = bar.w * k.progress();
+    if fw > 0.5 {
+        p.fill_round(Rect::new(bar.x, bar.y, fw.max(bar.h), bar.h), 2.0, accent);
+    }
+}
+
+/// `text` shortened in the middle (keeping both ends, joined by `dots`) to fit `w`.
+fn middle_fit(p: &Painter, text: &str, fmt: &IDWriteTextFormat, w: f32, dots: &str) -> String {
+    if p.gfx.measure(text, fmt) <= w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let cut = |n: usize| {
+        let head = n / 2;
+        let mut s: String = chars[..head].iter().collect();
+        s.push_str(dots);
+        s.extend(&chars[chars.len() - (n - head)..]);
+        s
+    };
+    // The most characters that fit.
+    let (mut lo, mut hi) = (0, chars.len() - 1);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        if p.gfx.measure(&cut(mid), fmt) <= w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    cut(lo)
+}
+
+/// Wrapping text centered both ways in `r` (clipped to it).
+fn centered_block(p: &Painter, text: &str, fmt: &IDWriteTextFormat, r: Rect, c: Color) {
+    let Some(layout) = p.gfx.shared_layout(text, fmt, r.w, r.h) else { return };
+    let mut m = DWRITE_TEXT_METRICS::default();
+    let h = if unsafe { layout.GetMetrics(&mut m) }.is_ok() { m.height.min(r.h) } else { r.h };
+    p.clipped(r, || p.text_layout(&layout, r.x, r.y + (r.h - h) / 2.0, c));
+}
+
+/// The Usage page: a ring per agent, filled with how much of its 5-hour limit
+/// is left (`fill` 0–1 sweeps the rings in as the page appears).
+fn claude_usage(p: &Painter, r: Rect, v: &View, a: f32, fill: f32) {
+    const PITCH: f32 = 106.5;
+    const RING: f32 = 36.5;
+    const TILE: f32 = 31.5;
+    let f = v.fonts;
+    if v.usage.is_empty() {
+        p.text("No usage reported yet", &f.ring_name, Rect::new(r.x, r.y + 104.0, r.w, 22.0), ink(0.82, a));
+        let sub = "Claude's shows up once Claude Code runs, Codex's once Codex has.";
+        p.text(sub, &f.ring_sub, Rect::new(r.x, r.y + 128.0, r.w, 18.0), ink(0.5, a));
+        return;
+    }
+    let n = v.usage.len() as f32;
+    let x0 = r.cx() - PITCH * (n - 1.0) / 2.0;
+    let cy = r.y + 115.0;
+    for (i, (agent, limit)) in v.usage.iter().enumerate() {
+        let x = x0 + i as f32 * PITCH;
+        let left = limit.left();
+        let color = match agent {
+            Agent::Claude => CL_ORANGE,
+            Agent::Codex => CODEX_BLUE,
+        };
+        p.stroke_circle(x, cy, RING, color.alpha(0.18 * a), 5.5);
+        // The rings sweep round to their level as the page comes in.
+        let sweep = 1.0 - (1.0 - fill.clamp(0.0, 1.0)).powi(3);
+        g::arc(p, x, cy, RING, left * sweep, color.alpha(a), 5.5);
+        let tile = Rect::new(x - TILE / 2.0, cy - TILE / 2.0, TILE, TILE);
+        match agent {
+            Agent::Claude => {
+                p.fill_round(tile, 7.5, CL_TILE.alpha(a));
+                g::claude_mark(p, x, cy, 21.0, ink(1.0, a));
+            }
+            Agent::Codex => g::codex_tile(p, tile, 7.5, a),
+        }
+        let col = Rect::new(x - PITCH / 2.0, 0.0, PITCH, 20.0);
+        p.text(agent.name(), &f.ring_name, Rect::new(col.x, cy + 43.5, col.w, 20.0), ink(0.82, a));
+        let sub = format!("{:.0}% left", left * 100.0);
+        p.text_tabular(&sub, &f.ring_sub, Rect::new(col.x, cy + 62.0, col.w, 19.0), ink(0.5, a));
+    }
+}
+
+// An expanded Live Activity: its icon, title and subtitle, the time or value,
 /// and a progress bar. Clicking the top opens what it links to.
 pub fn live_panel(p: &Painter, r: Rect, key: u32, v: &View, a: f32, hits: &mut Hits) {
     let Some(act) = v.live.get(key) else { return };
@@ -1065,42 +1306,44 @@ fn running_label(v: &View, which: Persist) -> String {
     }
 }
 
-/// The open island's page buttons, floating under it: Home, Shelf, Widgets
-/// (and Notifications while there are some). The current page's is filled.
+/// The open island's page buttons, in a pill floating under it: Home, Shelf, Widgets
+/// (and Notifications while there are some). The current page's is highlighted.
 pub fn tab_buttons(p: &Painter, pill: Rect, tabs: &[super::Panel], current: super::Panel, v: &View, a: f32, hits: &mut Hits) {
     use super::Panel;
-    const D: f32 = 30.0;
-    const GAP: f32 = 10.0;
-    let y = pill.bottom() + 8.0 + D / 2.0;
-    let x0 = pill.cx() - (tabs.len() as f32 * (D + GAP) - GAP) / 2.0 + D / 2.0;
+    // Droppy's tab bar: a black capsule under the island, the current page's
+    // icon on a lighter capsule of its own.
+    const H: f32 = 36.0;
+    const PAD: f32 = 3.5;
+    const TAB_W: f32 = 37.0;
+    const TAB_H: f32 = 29.0;
+    const GAP: f32 = 1.5;
+    // An activity's panel (Claude, media...) counts as part of Home, as in Droppy.
+    let current = if tabs.contains(&current) { current } else { Panel::Home };
+    let n = tabs.len() as f32;
+    let w = 2.0 * PAD + n * TAB_W + (n - 1.0) * GAP;
+    let bar = Rect::new(pill.cx() - w / 2.0, pill.bottom() + 16.5, w, H);
+    p.fill_round(bar, H / 2.0, Color::BLACK.alpha(a));
     for (i, &tab) in tabs.iter().enumerate() {
-        let x = x0 + i as f32 * (D + GAP);
+        let t = Rect::new(bar.x + PAD + i as f32 * (TAB_W + GAP), bar.cy() - TAB_H / 2.0, TAB_W, TAB_H);
         let on = tab == current;
         let hit = Hit::Tab(i as u8);
         let (hot, pressed) = button_state(v, hit, !on);
-        let k = if pressed { 0.92 } else { 1.0 };
-        // A soft shadow keeps the buttons readable over any window.
-        for j in 0..5 {
-            let g = j as f32 * 1.4;
-            p.fill_circle(x, y + 2.0, D / 2.0 + g, Color::BLACK.alpha(0.07 * a * (5 - j) as f32 / 5.0));
+        if on || hot {
+            p.fill_round(t, TAB_H / 2.0, Color::gray(255, if on { 0.19 } else if pressed { 0.14 } else { 0.09 } * a));
         }
-        p.fill_circle(x, y, D / 2.0 * k, if on { WHITE } else { Color::BLACK }.alpha(a));
-        if !on {
-            p.stroke_circle(x, y, D / 2.0 * k - 0.5, Color::gray(255, if hot { 0.35 } else { 0.18 } * a), 1.0);
-        }
-        let ink = if on { Color::BLACK.alpha(a) } else { Color::gray(255, if hot { 1.0 } else { 0.78 } * a) };
-        let s = 15.0 * k;
+        let ink = Color::gray(255, if on { 1.0 } else if hot { 0.75 } else { 0.52 } * a);
+        let (x, y) = (t.cx(), t.cy());
         match tab {
-            Panel::Home => g::house(p, x, y, s, ink),
-            Panel::Shelf => g::tray(p, x, y, s, ink),
-            Panel::Notes => g::bell(p, x, y, s, ink),
-            _ => g::grid(p, x, y, s, ink),
+            Panel::Home => g::house_fill(p, x, y, 15.0, ink),
+            Panel::Shelf => g::tray_fill(p, x, y, 15.0, ink),
+            Panel::Notes => g::bell(p, x, y, 15.0, ink),
+            _ => g::grid_fill(p, x, y, 13.5, ink),
         }
-        hits.push((Rect::new(x - D / 2.0 - GAP / 2.0, y - D / 2.0 - 4.0, D + GAP, D + 8.0), hit));
+        hits.push((t.inset(-GAP / 2.0, -(H - TAB_H) / 2.0), hit));
     }
 }
 
-/// The Widgets page: weather, the system, world clocks and batteries, in a 2x2 grid.
+// The Widgets page: weather, the system, world clocks and batteries, in a 2x2 grid.
 pub fn widgets_panel(p: &Painter, r: Rect, v: &View, a: f32) {
     let pad = 16.0;
     let gap = 12.0;

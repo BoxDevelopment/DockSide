@@ -473,7 +473,7 @@ fn execute(action: Action) {
             let path = claude::settings_path();
             if on {
                 let ask = format!(
-                    "DockSide will add hooks to {} so the Dynamic Island can show what Claude Code is doing.\n\n\
+                    "DockSide will add hooks (and, if you don't have one, a status line) to {} so the Dynamic Island can show what Claude Code is doing and how much of your plan is left.\n\n\
                      Each step Claude takes runs DockSide briefly to pass the event along. Your other settings are kept, \
                      and a backup is saved next to the file.",
                     path.display()
@@ -481,9 +481,14 @@ fn execute(action: Action) {
                 if system::confirm("Connect Claude Code", &ask) {
                     let exe = std::env::current_exe().unwrap_or_default();
                     match claude::connect(&exe) {
-                        Ok(_) => system::notice(
+                        Ok(status) => system::notice(
                             "Claude Code connected",
-                            "New Claude Code sessions will show up in the Dynamic Island. Sessions that are already open pick it up after a restart.",
+                            if status {
+                                "New Claude Code sessions will show up in the Dynamic Island. Sessions that are already open pick it up after a restart."
+                            } else {
+                                "New Claude Code sessions will show up in the Dynamic Island. Sessions that are already open pick it up after a restart.\n\n\
+                                 Your own status line was kept, so the island's Usage page can't show Claude's limits."
+                            },
                         ),
                         Err(e) => system::notice("Couldn't connect Claude Code", &format!("{e:#}")),
                     }

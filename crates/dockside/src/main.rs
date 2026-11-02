@@ -47,6 +47,11 @@ fn main() {
         island::claude::relay();
         return;
     }
+    // Claude Code's status line: pass the plan's usage along, print a line, exit.
+    if std::env::args().any(|a| a == island::claude::STATUS_ARG) {
+        island::claude::status_line();
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
     // `dockside activity start build --title Build …`: a Live Activity for the island.
     if args.get(1).is_some_and(|a| a == "activity") {

@@ -72,9 +72,9 @@ use sources::{Inbox, Privacy, Signal, Stop, VolumeKey};
 use timer::Clock;
 use views::View;
 
-/// Transparent room around the pill for its shadow, in points.
+/// Transparent room around the pill for its shadow (and, below, the page tab bar), in points.
 const MARGIN_X: f32 = 28.0;
-const MARGIN_BOTTOM: f32 = 40.0;
+const MARGIN_BOTTOM: f32 = 56.0;
 /// Icons inside alerts don't grow past a compact pill's height.
 const COMPACT_MAX: f32 = 30.0;
 /// How long after the Caps Lock alert appears its switch flips.
@@ -85,6 +85,8 @@ const PANEL_RADIUS: f32 = 36.0;
 /// Notch style: bottom corner radius when compact (relative to its height) and as a panel.
 const NOTCH_COMPACT_RADIUS: f32 = 0.34;
 const NOTCH_PANEL_RADIUS: f32 = 22.0;
+/// The Claude panel's corners, as round as Droppy's.
+const CLAUDE_RADIUS: f32 = 45.0;
 /// Extra height at the bottom of a panel for its page dots.
 const DOTS_H: f32 = 16.0;
 /// Horizontal scroll needed for one page (a notch is 120), and the pause after
@@ -328,6 +330,8 @@ pub enum Hit {
     NoteClose(usize),
     NotesClear,
     NotesBack,
+    /// The Claude panel's page buttons: 0 Progress, 1 Usage.
+    ClaudeView(u8),
 }
 
 /// One row of the notification stack: an app's notifications stacked up, or
@@ -406,10 +410,29 @@ pub struct Fonts {
     big: IDWriteTextFormat,
     chip: IDWriteTextFormat,
     header: IDWriteTextFormat,
+    /// The Claude panel: its page name, "Claude", the session's title, a step,
+    /// the card's target and status (monospaced), Claude's words, and the Usage rings' labels.
+    cl_head: IDWriteTextFormat,
+    cl_name: IDWriteTextFormat,
+    cl_title: IDWriteTextFormat,
+    cl_step: IDWriteTextFormat,
+    mono_b: IDWriteTextFormat,
+    mono: IDWriteTextFormat,
+    cl_status: IDWriteTextFormat,
+    cl_value: IDWriteTextFormat,
+    cl_said: IDWriteTextFormat,
+    ring_name: IDWriteTextFormat,
+    ring_sub: IDWriteTextFormat,
 }
 
 impl Fonts {
     fn new(gfx: &Gfx, font: &str) -> Self {
+        static MONO: std::sync::OnceLock<&str> = std::sync::OnceLock::new();
+        let mono = *MONO.get_or_init(|| {
+            ["SF Mono", "Cascadia Mono"].into_iter().find(|f| gfx.font_exists(f)).unwrap_or("Consolas")
+        });
+        // Big headings use SF's display cut, as macOS does, when it's there.
+        let display = if font == "SF Pro Text" && gfx.font_exists("SF Pro Display") { "SF Pro Display" } else { font };
         Self {
             title: gfx.format(font, 15.0, Weight::Bold, Align::Leading),
             body: gfx.format(font, 13.5, Weight::Regular, Align::Leading),
@@ -423,6 +446,17 @@ impl Fonts {
             big: gfx.format(font, 34.0, Weight::Regular, Align::Leading),
             chip: gfx.format(font, 12.5, Weight::Bold, Align::Center),
             header: gfx.format(font, 12.5, Weight::Bold, Align::Leading),
+            cl_head: gfx.format(font, 15.0, Weight::SemiBold, Align::Leading),
+            cl_name: gfx.format(display, 20.0, Weight::Bold, Align::Leading),
+            cl_title: gfx.format(font, 14.8, Weight::SemiBold, Align::Leading),
+            cl_step: gfx.format(font, 16.0, Weight::Regular, Align::Leading),
+            mono_b: gfx.format(mono, 15.5, Weight::Bold, Align::Leading),
+            mono: gfx.format(mono, 14.0, Weight::Regular, Align::Leading),
+            cl_status: gfx.format(font, 13.0, Weight::SemiBold, Align::Leading),
+            cl_value: gfx.format(font, 13.0, Weight::Bold, Align::Leading),
+            cl_said: gfx.format_block(font, 14.5, Weight::SemiBold, Align::Center),
+            ring_name: gfx.format(font, 14.0, Weight::SemiBold, Align::Center),
+            ring_sub: gfx.format(font, 13.0, Weight::SemiBold, Align::Center),
         }
     }
 }
@@ -599,6 +633,12 @@ pub struct Island {
     dnd: Option<bool>,
     last_bt: Option<(String, Instant)>,
     claude: claude::Claude,
+    /// The Claude panel's page (0 Progress, 1 Usage), and Codex's limit with when it was last read.
+    claude_view: u8,
+    /// Glides between the pages (0 Progress, 1 Usage) for the switch animation.
+    claude_flip: Spring,
+    codex: Option<claude::Limit>,
+    codex_read: Option<Instant>,
 
     // Alerts.
     alert: Option<Showing>,
@@ -651,6 +691,8 @@ pub struct Island {
     preferred: Option<Persist>,
     page_dir: f32,
     slide: Spring,
+    /// 1 while the Claude panel (with its rounder corners) is shown.
+    corner: Spring,
     dot_pos: Spring,
     swipe: f32,
     swipe_at: Instant,
@@ -783,7 +825,11 @@ impl Island {
             caps: sources::caps_lock(),
             dnd: sources::do_not_disturb(),
             last_bt: None,
-            claude: claude::Claude::default(),
+            claude: claude::Claude::load(),
+            claude_view: 0,
+            claude_flip: Spring::new(0.0, 0.34, 0.92),
+            codex: None,
+            codex_read: None,
             alert: None,
             prev_alert: None,
             queue: VecDeque::new(),
@@ -819,6 +865,7 @@ impl Island {
             preferred: None,
             page_dir: 0.0,
             slide: Spring::new(0.0, 0.36, 0.86),
+            corner: Spring::new(0.0, 0.4, 1.0),
             dot_pos: Spring::new(0.0, 0.32, 0.78),
             swipe: 0.0,
             swipe_at: Instant::now(),
@@ -1120,7 +1167,8 @@ impl Island {
     fn panel_valid(&self, p: Panel) -> bool {
         match p {
             Panel::Media => self.media_visible(),
-            Panel::Claude => self.claude.current().is_some(),
+            // A finished turn stays up while you look at it.
+            Panel::Claude => self.claude.shown().is_some(),
             Panel::Timer => self.cfg.timers && self.clock.is_some(),
             Panel::Shelf => self.cfg.shelf,
             Panel::Calendar => self.cfg.calendar,
@@ -1219,7 +1267,7 @@ impl Island {
                 Panel::Media => (372.0, 166.0 + if self.lyrics_row() { views::LYRICS_H } else { 0.0 }),
                 Panel::Discord => (372.0, 176.0),
                 Panel::Mixer => (372.0, 56.0 + views::MIX_ROW * (1 + self.mixer.len().min(views::MIX_ROWS)) as f32 + 8.0),
-                Panel::Claude => (372.0, 126.0),
+                Panel::Claude => (549.0, 231.0),
                 Panel::Timer => (340.0, 96.0),
                 Panel::Shelf if self.preview.is_some() && !self.drag_over => (420.0, 360.0),
                 Panel::Shelf => (if self.drag_over && !self.tiles().is_empty() { 460.0 } else { 420.0 }, 140.0),
@@ -1269,6 +1317,7 @@ impl Island {
             self.w.set(tw);
             self.h.set(th);
         }
+        self.corner.set(if want == Content::Panel(Panel::Claude) { 1.0 } else { 0.0 });
         // Cross-fade: the old content fades out, then the new one fades in as the pill reaches its size.
         if self.shown != want {
             if self.content.value < 0.05 {
@@ -1670,6 +1719,9 @@ impl Island {
             d.size = std::fs::metadata(&d.path).map(|m| m.len()).unwrap_or(d.size);
         }
         self.claude.prune();
+        if self.shown == Content::Panel(Panel::Claude) && self.claude_view == 1 {
+            self.read_codex(false);
+        }
         self.live.prune();
         self.tick_demo();
         if self.shown == Content::Panel(Panel::Mixer) {
@@ -1724,6 +1776,23 @@ impl Island {
         self.shelf = kept;
         holding::save(&self.shelf);
         holding::discard(gone.into_iter().map(|i| i.path).collect());
+    }
+
+    /// Re-reads Codex's limit from its logs (at most every few seconds unless `now`).
+    fn read_codex(&mut self, now: bool) {
+        if now || self.codex_read.map_or(true, |t| t.elapsed() >= Duration::from_secs(15)) {
+            self.codex = claude::codex_limit();
+            self.codex_read = Some(Instant::now());
+            self.dirty = true;
+        }
+    }
+
+    /// The Usage page's rings: each agent that has reported its limit.
+    fn usage(&self) -> Vec<(claude::Agent, claude::Limit)> {
+        [(claude::Agent::Claude, self.claude.usage), (claude::Agent::Codex, self.codex)]
+            .into_iter()
+            .filter_map(|(agent, l)| Some((agent, l?)))
+            .collect()
     }
 
     /// A Claude Code hook event relayed by `dockside --claude-hook`.
@@ -2369,6 +2438,13 @@ impl Island {
                 self.dismiss_notes(ids);
             }
             Hit::NotesBack => self.note_open = None,
+            Hit::ClaudeView(i) => {
+                self.claude_view = i;
+                self.claude_flip.set(i as f32);
+                if i == 1 {
+                    self.read_codex(true);
+                }
+            }
             Hit::NotesClear => {
                 self.notes.clear();
                 self.note_open = None;
@@ -2761,6 +2837,8 @@ impl Island {
             &mut self.art_shift,
             &mut self.lyric_fade,
             &mut self.slide,
+            &mut self.corner,
+            &mut self.claude_flip,
             &mut self.dot_pos,
             &mut self.desk,
             &mut self.caps_knob,
@@ -2922,10 +3000,12 @@ impl Island {
         // The black shape. A notch runs up past the window top so its top
         // corners are cut off square and only the bottom ones show rounded.
         let (shape, radius) = if self.notch {
-            let radius = (ph / 2.0).min(lerp(ch * NOTCH_COMPACT_RADIUS, NOTCH_PANEL_RADIUS, grown));
+            let open = lerp(NOTCH_PANEL_RADIUS, CLAUDE_RADIUS, self.corner.value);
+            let radius = (ph / 2.0).min(lerp(ch * NOTCH_COMPACT_RADIUS, open, grown));
             (Rect::new(pill.x, -radius, pw, ph + lip + radius), radius)
         } else {
-            let radius = if ph <= ch * 1.05 { ph / 2.0 } else { (ph / 2.0).min(lerp(ch / 2.0, PANEL_RADIUS, grown)) };
+            let open = lerp(PANEL_RADIUS, CLAUDE_RADIUS, self.corner.value);
+            let radius = if ph <= ch * 1.05 { ph / 2.0 } else { (ph / 2.0).min(lerp(ch / 2.0, open, grown)) };
             (pill, radius)
         };
         let presence = self.presence.value.clamp(0.0, 1.0);
@@ -2953,6 +3033,7 @@ impl Island {
         let note_rows = self.note_rows();
         let tab_row = self.tabs();
         let home_acts = self.home_acts();
+        let usage = self.usage();
         let weather = self.wfeeds.as_ref().and_then(|f| f.weather.lock().ok().map(|w| w.clone()));
         let devices = self.wfeeds.as_ref().and_then(|f| f.devices.lock().ok().map(|d| d.clone())).unwrap_or_default();
         let tiles: Vec<(Tile, bool)> = self.tiles().into_iter().map(|t| (t, self.tile_ok(t, &self.drop_paths))).collect();
@@ -3020,8 +3101,11 @@ impl Island {
             },
             accent: self.accent,
             time: self.time,
-            claude: self.claude.current(),
+            claude: self.claude.shown(),
             claude_more: self.claude.others(),
+            claude_view: self.claude_view,
+            claude_flip: self.claude_flip.value,
+            usage: &usage,
         };
         let shown = self.shown;
         let alert = match shown {

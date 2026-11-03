@@ -1,2 +1,5 @@
 // The first icon resource is what Explorer shows for the exe.
 1 ICON "../../assets/dockside.ico"
+
+// The application manifest (RT_MANIFEST): see dockside.manifest.
+1 24 "dockside.manifest"

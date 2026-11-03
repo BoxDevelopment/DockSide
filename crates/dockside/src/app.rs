@@ -1749,7 +1749,9 @@ impl App {
     /// moves far quicker than the display refreshes, and each one would
     /// otherwise redraw whatever it touched, only for most never to be seen.
     fn flush_input(&mut self) {
-        if !self.animating {
+        // Only while frames are really arriving: if the clock went quiet with an
+        // animation still marked running, nothing would ever draw the input.
+        if !self.animating || self.last_frame.elapsed() > std::time::Duration::from_millis(100) {
             self.flush();
         }
     }

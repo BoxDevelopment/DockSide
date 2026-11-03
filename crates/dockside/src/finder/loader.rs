@@ -24,6 +24,9 @@ const LARGE_THUMB: i32 = 1024;
 const LARGE_ICON: i32 = 256;
 /// Large previews kept in the cache (they are several MB each).
 const LARGE_KEEP: usize = 6;
+/// Bytes of per-file icons and thumbnails kept (64 KB to 256 KB each), least
+/// recently used going first. Per-type icons are few and always kept.
+const BUDGET: usize = 32 << 20;
 
 /// Extensions whose icon depends on the file itself (not just its type).
 const PER_FILE: &[&str] = &["exe", "lnk", "ico", "url", "appref-ms", "msc", "cpl"];
@@ -39,6 +42,10 @@ pub struct IconLoader {
     rx: Receiver<(String, Option<IconPixels>)>,
     pending: HashSet<String>,
     cache: HashMap<String, Option<Rc<IconPixels>>>,
+    /// When each per-file entry was last asked for (a counter), and its bytes.
+    used: HashMap<String, (u64, usize)>,
+    clock: u64,
+    bytes: usize,
     /// Large preview keys, oldest first.
     large: VecDeque<String>,
     /// A ping is on its way that `drain` hasn't handled yet.
@@ -70,7 +77,17 @@ impl IconLoader {
                 }
             })
             .expect("spawn icon loader");
-        Self { tx: req_tx, rx: res_rx, pending: HashSet::new(), cache: HashMap::new(), large: VecDeque::new(), pinged }
+        Self {
+            tx: req_tx,
+            rx: res_rx,
+            pending: HashSet::new(),
+            cache: HashMap::new(),
+            used: HashMap::new(),
+            clock: 0,
+            bytes: 0,
+            large: VecDeque::new(),
+            pinged,
+        }
     }
 
     /// Cache key and whether to ask for a content thumbnail. Ordinary files share
@@ -91,6 +108,10 @@ impl IconLoader {
     /// Returns the icon if loaded; otherwise queues it (once) and returns None.
     pub fn get(&mut self, key: &str, path: &Path, thumbnail: bool, size: i32) -> Option<Rc<IconPixels>> {
         if let Some(px) = self.cache.get(key) {
+            if let Some(u) = self.used.get_mut(key) {
+                self.clock += 1;
+                u.0 = self.clock;
+            }
             return px.clone();
         }
         if self.pending.insert(key.to_string()) {
@@ -126,6 +147,14 @@ impl IconLoader {
         self.pinged.store(false, Ordering::Release);
         while let Ok((key, px)) = self.rx.try_recv() {
             self.pending.remove(&key);
+            if !key.starts_with("ext:") && !key.starts_with("large:") {
+                let size = px.as_ref().map_or(0, |p| p.data.len());
+                self.clock += 1;
+                if let Some((_, old)) = self.used.insert(key.clone(), (self.clock, size)) {
+                    self.bytes -= old;
+                }
+                self.bytes += size;
+            }
             self.cache.insert(key, px.map(Rc::new));
             any = true;
         }
@@ -134,9 +163,19 @@ impl IconLoader {
                 self.cache.remove(&old);
             }
         }
-        if self.cache.len() > 4000 {
-            // Crude bound: thumbnails are ~64 KB each.
-            self.cache.retain(|k, _| k.starts_with("ext:") || k.starts_with("dir:"));
+        if self.bytes > BUDGET {
+            // Down to three quarters, so this doesn't run again on the next icon.
+            let mut by_age: Vec<(u64, String)> = self.used.iter().map(|(k, (t, _))| (*t, k.clone())).collect();
+            by_age.sort_unstable();
+            for (_, key) in by_age {
+                if self.bytes <= BUDGET / 4 * 3 {
+                    break;
+                }
+                if let Some((_, size)) = self.used.remove(&key) {
+                    self.bytes -= size;
+                    self.cache.remove(&key);
+                }
+            }
         }
         any
     }

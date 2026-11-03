@@ -559,17 +559,30 @@ impl Engine {
         if rendered {
             self.last = Some(Instant::now());
         }
-        self.scene.prune();
+        self.prune();
+    }
+
+    /// Stops unneeded captures (see `Scene::prune`). Direct3D only frees what
+    /// was released once the context is flushed, and with no glass on screen
+    /// nothing else would flush it: a maximized window's capture would stay
+    /// allocated (~29 MB) until the next render.
+    fn prune(&mut self) {
+        if self.scene.prune() {
+            unsafe { self.context.Flush() };
+        }
     }
 
     /// Looks for changed windows, while any screen pane is on screen.
     fn poll(&mut self) {
         let panes = self.screen_panes();
         if !panes.iter().any(|p| p.try_borrow().is_ok_and(|s| !s.layers.is_empty())) {
-            if let Some(t) = &self.poll {
-                let _ = t.Stop();
+            // Keeps going until the last capture has been let go (see `scene::GRACE`).
+            self.prune();
+            if self.scene.hwnds().is_empty() {
+                if let Some(t) = &self.poll {
+                    let _ = t.Stop();
+                }
             }
-            self.scene.prune();
             return;
         }
         // A frame whose arrival we missed (the engine was busy) would otherwise

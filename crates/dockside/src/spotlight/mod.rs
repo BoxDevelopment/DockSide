@@ -275,7 +275,7 @@ impl Spotlight {
             scored.into_iter().take(n).map(|(s, it)| (s, it.clone())).collect()
         };
         let mut apps = top_n(&index.apps, MAX_APPS + 1);
-        let mut files = top_n(&index.files, MAX_FILES + 1);
+        let mut files = index.files.top(&q, MAX_FILES + 1);
 
         let row = |section: &'static str, it: &Item| {
             let (subtitle, action) = match it.kind {

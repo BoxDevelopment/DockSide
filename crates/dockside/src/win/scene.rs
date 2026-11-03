@@ -405,10 +405,13 @@ impl Scene {
         }
     }
 
-    /// Stops captures no pane has needed for a while, and those of closed windows.
-    pub fn prune(&mut self) {
+    /// Stops captures no pane has needed for a while, and those of closed
+    /// windows. True when any stopped: their buffers are only freed once the
+    /// device context is next flushed.
+    pub fn prune(&mut self) -> bool {
         let now = Instant::now();
         self.failed.retain(|&h| unsafe { IsWindow(HWND(h as _)) }.as_bool());
+        let before = self.captures.len();
         self.captures.retain_mut(|c| {
             let keep = unsafe { IsWindow(HWND(c.hwnd as _)) }.as_bool() && now.duration_since(c.used) < GRACE;
             if !keep {
@@ -416,6 +419,7 @@ impl Scene {
             }
             keep
         });
+        self.captures.len() != before
     }
 
     /// Every window being captured.

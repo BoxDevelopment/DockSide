@@ -13,7 +13,7 @@ pub mod search;
 pub mod shell;
 pub mod text;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -2924,6 +2924,7 @@ impl FinderWindow {
         let kinds = &mut *ctx.kinds;
         let loader = &mut *ctx.loader;
         let bitmaps = &mut self.bitmaps;
+        let used = std::cell::RefCell::new(HashSet::new());
         let (entries, columns, selected) = (&self.entries, &self.columns, &self.selected);
         let (view, hover, error, rename) = (self.view, self.hover, &self.error, &self.rename);
         let scroll = self.scroll.offset_px(self.scale);
@@ -2986,6 +2987,7 @@ impl FinderWindow {
                 let (key, _) = IconLoader::key_for(e);
                 let size = fit.map_or((0, 0), |r| ((r.w * px).round() as u32, (r.h * px).round() as u32));
                 let key = (key, size);
+                used.borrow_mut().insert(key.clone());
                 if let Some(b) = bitmaps.get(&key) {
                     return b.clone();
                 }
@@ -3737,6 +3739,13 @@ impl FinderWindow {
                 hits.push((r, Hit::Light(light)));
             }
         }));
+        // Icons scaled for files no longer on screen (scrolled past, another
+        // folder, an old icon size) go once there are well more of them than
+        // what's shown. Only a full redraw knows everything that's shown.
+        let used = used.into_inner();
+        if part.is_none() && self.bitmaps.len() > used.len() * 2 + 64 {
+            self.bitmaps.retain(|k, _| used.contains(k));
+        }
         self.hits = hits;
         self.search_xs = search_xs;
         self.address_xs = address_xs;

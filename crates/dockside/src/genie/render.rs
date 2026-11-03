@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use windows::core::{s, w, Interface, PCSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, S_OK, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HMODULE, HWND, LPARAM, LRESULT, RECT, S_OK, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::*;
@@ -30,6 +30,12 @@ use super::effect::{self, GenieParams};
 use super::shared::{wide, GHOST_WNDCLASS};
 
 const SHADER: &str = include_str!("genie.hlsl");
+/// How long ghost windows keep buffers sized for the last animation. A
+/// maximized window's genie leaves one holding ~95 MB (its swap chain and a
+/// 4x multisampled target); the next animation within this time reuses them,
+/// a later one grows them back from `GHOST_IDLE_PX` in a few milliseconds.
+const GHOST_IDLE_MS: u32 = 10_000;
+const GHOST_IDLE_PX: i32 = 256;
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
@@ -369,22 +375,24 @@ unsafe extern "system" fn ghost_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
     }
 }
 
-/// The lowest always-on-top window (other than the ghost itself): a ghost placed right
-/// after it is under the Dock, the menu bar and every other always-on-top window, and
-/// above all programs. Not right after the taskbar: while the desktop is shown (Win+D),
-/// Windows draws the desktop's own windows (the widgets) over a window placed there.
-fn lowest_topmost_window(ghost: HWND) -> Option<HWND> {
-    let mut lowest = None;
+/// The always-on-top windows (other than the ghost itself), lowest first: a ghost
+/// placed right after the lowest is under the Dock, the menu bar and every other
+/// always-on-top window, and above all programs. Not right after the taskbar: while
+/// the desktop is shown (Win+D), Windows draws the desktop's own windows (the
+/// widgets) over a window placed there.
+fn topmost_windows(ghost: HWND) -> Vec<HWND> {
+    let mut out = Vec::new();
     unsafe {
         let mut h = GetTopWindow(None).unwrap_or_default();
         while !h.is_invalid() && GetWindowLongW(h, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 {
             if h != ghost {
-                lowest = Some(h);
+                out.push(h);
             }
             h = GetWindow(h, GW_HWNDNEXT).unwrap_or_default();
         }
     }
-    lowest
+    out.reverse();
+    out
 }
 
 fn round_up(v: i32, step: i32) -> i32 {
@@ -596,8 +604,19 @@ impl RenderThread {
 
             pump_messages();
             if self.anims.is_empty() && self.superseded.is_empty() {
-                // Idle: sleep until a job arrives (no polling, no timer).
-                unsafe { MsgWaitForMultipleObjectsEx(Some(&[wake]), INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+                // Idle: sleep until a job arrives (no polling), waking once to
+                // let go of big ghost buffers if none comes for a while.
+                // What the last animation let go of (its snapshot, the upload) is
+                // only freed once the context is flushed, and nothing else will.
+                if let Some(c) = &self.p.ctx {
+                    unsafe { c.Flush() };
+                }
+                let big = self.slots.len() > 1 || self.slots.iter().any(|s| s.alloc_w > GHOST_IDLE_PX || s.alloc_h > GHOST_IDLE_PX);
+                let timeout = if big { GHOST_IDLE_MS } else { INFINITE };
+                let r = unsafe { MsgWaitForMultipleObjectsEx(Some(&[wake]), timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
+                if r == WAIT_TIMEOUT {
+                    self.shrink_slots();
+                }
                 continue;
             }
 
@@ -698,12 +717,14 @@ impl RenderThread {
         // Minimize snapshots wait on the GPU for the restore. Integrated graphics and WARP
         // take that memory from the system RAM, so they get a smaller budget.
         const MB: usize = 1 << 20;
+        // (A maximized 1440p window's snapshot is about 19 MB. A restore with no
+        // snapshot cached just takes a fresh one, a little later.)
         lock(&self.shared.cache).budget = if self.warp {
-            96 * MB
+            32 * MB
         } else if ad.DedicatedVideoMemory >= 2 << 30 {
             384 * MB
         } else {
-            160 * MB
+            64 * MB
         };
         let dcomp: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi)? };
 
@@ -1071,6 +1092,31 @@ impl RenderThread {
         Some(i)
     }
 
+    /// Idle: keeps one ghost window, with small buffers (see `GHOST_IDLE_MS`).
+    fn shrink_slots(&mut self) {
+        for s in self.slots.drain(1.min(self.slots.len())..) {
+            destroy_slot(&s);
+        }
+        let Some(mut s) = self.slots.pop() else { return };
+        if s.alloc_w > GHOST_IDLE_PX || s.alloc_h > GHOST_IDLE_PX {
+            s.rtv = None;
+            s.msaa = None;
+            unsafe {
+                self.ctx().OMSetRenderTargets(None, None);
+                self.ctx().Flush();
+            }
+            let px = GHOST_IDLE_PX as u32;
+            let resized = unsafe { s.swap.as_ref().map(|c| c.ResizeBuffers(2, px, px, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))) };
+            s.alloc_w = GHOST_IDLE_PX;
+            s.alloc_h = GHOST_IDLE_PX;
+            if !matches!(resized, Some(Ok(()))) || self.create_slot_targets(&mut s).is_err() {
+                destroy_slot(&s);
+                return;
+            }
+        }
+        self.slots.push(s);
+    }
+
     fn drop_slots(&mut self) {
         for a in &mut self.anims {
             a.slot = None;
@@ -1122,9 +1168,20 @@ impl RenderThread {
                 let _ = v.SetClip2(&D2D_RECT_F { left: 0.0, top: 0.0, right: g.canvas_width as f32, bottom: g.canvas_height as f32 });
             }
         }
-        let insert_after = lowest_topmost_window(ghost).unwrap_or(HWND_TOPMOST);
-        unsafe {
-            let _ = SetWindowPos(ghost, insert_after, g.canvas_left, g.canvas_top, g.canvas_width, g.canvas_height, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        // Placed after the lowest always-on-top window Windows lets us place it after.
+        // Running without admin rights, an elevated app's window (Task Manager on top)
+        // refuses: "access denied", and the ghost, never moved or shown, animated unseen.
+        // Last resort, above every always-on-top window, the Dock included.
+        let mut insert_after = HWND_TOPMOST;
+        for (i, h) in topmost_windows(ghost).into_iter().take(8).chain([HWND_TOPMOST]).enumerate() {
+            let placed = unsafe { SetWindowPos(ghost, h, g.canvas_left, g.canvas_top, g.canvas_width, g.canvas_height, SWP_NOACTIVATE | SWP_NOOWNERZORDER) };
+            if placed.is_ok() {
+                if i > 0 {
+                    log!("genie: ghost placed after {:#x} ({} always-on-top window(s) below refused)", h.0 as usize, i);
+                }
+                insert_after = h;
+                break;
+            }
         }
         self.anims.push(Anim {
             hwnd: job.hwnd,
@@ -1244,7 +1301,12 @@ impl RenderThread {
                 if !a.shown {
                     if let Some(slot) = a.slot {
                         unsafe {
-                            let _ = SetWindowPos(self.slots[slot].hwnd, a.insert_after, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+                            let hwnd = self.slots[slot].hwnd;
+                            let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER;
+                            // That window may have gone (or turned elevated) since: shown on top then.
+                            if SetWindowPos(hwnd, a.insert_after, 0, 0, 0, 0, flags).is_err() {
+                                let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+                            }
                         }
                     }
                     a.shown = true;

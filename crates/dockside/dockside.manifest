@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
+  <!-- The segment heap (Windows 10 2004+) gives freed memory back to the system;
+       the default heap keeps what it once grew to committed, so a burst like
+       building the Spotlight index stayed tens of MB for the life of the process. -->
+  <asmv3:application>
+    <asmv3:windowsSettings xmlns="http://schemas.microsoft.com/SMI/2020/WindowsSettings">
+      <heapType>SegmentHeap</heapType>
+    </asmv3:windowsSettings>
+  </asmv3:application>
+</assembly>

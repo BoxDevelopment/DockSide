@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 
 use windows::core::{s, Interface, Result};
 use windows::Foundation::{TimeSpan, TypedEventHandler};
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Graphics::SizeInt32;
+use windows::Graphics::{RectInt32, SizeInt32};
 use windows::System::{DispatcherQueue, DispatcherQueueTimer};
 use windows::Win32::Foundation::{HMODULE, HWND, RECT};
 use crate::win::wallpaper;
@@ -106,18 +106,22 @@ float sd(float2 p, float2 b, float r) {
     return length(max(q, 0)) + min(max(q.x, q.y), 0) - r;
 }
 
-float3 frosted(float2 px) {
-    static const float2 ring[8] = {
-        float2(1, 0), float2(0.707, 0.707), float2(0, 1), float2(-0.707, 0.707),
-        float2(-1, 0), float2(-0.707, -0.707), float2(0, -1), float2(0.707, -0.707)
-    };
+float2 texel(float2 px) {
     float2 inv = 1.0 / texSize;
-    float2 lo = 0.5 * inv, hi = 1 - 0.5 * inv;
-    float3 c = src.SampleLevel(smp, clamp(px * inv, lo, hi), 1.0 + lod).rgb * 2;
-    [unroll] for (int i = 0; i < 8; i++) {
-        c += src.SampleLevel(smp, clamp((px + ring[i] * frost) * inv, lo, hi), 1.5 + lod).rgb;
+    return clamp(px * inv, 0.5 * inv, 1 - 0.5 * inv);
+}
+
+// `extra`: more blur, in mip levels, where the lens squeezes the background.
+float3 frosted(float2 px, float extra) {
+    static const float2 ring[6] = {
+        float2(1, 0), float2(0.5, 0.866), float2(-0.5, 0.866),
+        float2(-1, 0), float2(-0.5, -0.866), float2(0.5, -0.866)
+    };
+    float3 c = src.SampleLevel(smp, texel(px), 1.0 + lod + extra).rgb * 2;
+    [unroll] for (int i = 0; i < 6; i++) {
+        c += src.SampleLevel(smp, texel(px + ring[i] * frost), 1.5 + lod + extra).rgb;
     }
-    return c / 10;
+    return c / 8;
 }
 
 float4 ps(V i) : SV_Target {
@@ -128,10 +132,12 @@ float4 ps(V i) : SV_Target {
     float alpha = saturate(0.5 - d);
     if (alpha <= 0) return 0;
 
-    float e = 0.5;
-    float2 n = float2(sd(p + float2(e, 0), h, r) - sd(p - float2(e, 0), h, r),
-                      sd(p + float2(0, e), h, r) - sd(p - float2(0, e), h, r));
-    n = n / max(length(n), 1e-4);
+    // The outline's normal, rounded to at least the bezel's radius so the lens
+    // turns smoothly around tight corners instead of creasing on the diagonal.
+    float R = min(max(r, bezel), min(h.x, h.y));
+    float2 g = abs(p) - h + R;
+    float2 n = max(g.x, g.y) > 0 ? normalize(max(g, 1e-4)) : (g.x > g.y ? float2(1, 0) : float2(0, 1));
+    n *= p >= 0 ? 1.0 : -1.0;
     float depth = -d;
 
     // Convex bezel with a circular profile: what's behind is pulled in from
@@ -141,12 +147,18 @@ float4 ps(V i) : SV_Target {
     float u = 1 - t;
     float bend = refract * (1 - sqrt(saturate(1 - u * u)));
     float2 q = p - n * bend + h + origin;
-    float3 c;
+    // Near the rim the bend outruns the pixel, folding a wide band of the
+    // background into a few pixels; blur it by as much so it doesn't shimmer.
+    float squeeze = bezel > 0 ? abs(1 - refract / bezel * u * rsqrt(max(1 - u * u, 1e-3))) : 1;
+    float extra = log2(max(squeeze, 1));
+    float3 c = frosted(q, extra);
     if (bend > 0.4) {
+        // Dispersion: red and blue shift along the normal, as a delta on the frost.
         float ca = bend * 0.14;
-        c = float3(frosted(q + n * ca).r, frosted(q).g, frosted(q - n * ca).b);
-    } else {
-        c = frosted(q);
+        float L = 1.5 + lod + extra;
+        float3 mid = src.SampleLevel(smp, texel(q), L).rgb;
+        c.r += src.SampleLevel(smp, texel(q + n * ca), L).r - mid.r;
+        c.b += src.SampleLevel(smp, texel(q - n * ca), L).b - mid.b;
     }
 
     // Vibrancy, then the body of the glass.
@@ -218,8 +230,12 @@ struct Monitor {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     _item: GraphicsCaptureItem,
-    /// Latest captured frame.
-    frame: Option<ID3D11Texture2D>,
+    /// Latest captured frame, held open (rather than copied) until the next one.
+    frame: Option<(Direct3D11CaptureFrame, ID3D11Texture2D)>,
+    /// What changed in it, in monitor pixels; None when unknown (all of it).
+    dirty: Option<Vec<RectInt32>>,
+    /// Shortest time between renders.
+    interval: Duration,
     /// When its panes were last rendered from a new frame.
     last: Option<Instant>,
     /// Renders a frame that arrived too soon after the last one, once it's due.
@@ -418,6 +434,10 @@ impl Engine {
         let _ = session.SetIsCursorCaptureEnabled(false);
         // No yellow capture border (Windows 11).
         let _ = session.SetIsBorderRequired(false);
+        // Half rate on battery saver. Windows 11 24H2+ throttles frames itself;
+        // older builds fall back to `Monitor::defer`.
+        let interval = if crate::win::controls::low_power_mode() { MIN_INTERVAL * 2 } else { MIN_INTERVAL };
+        let _ = session.SetMinUpdateInterval(TimeSpan { Duration: (interval.as_nanos() / 100) as i64 });
         let key = handle.0 as isize;
         pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
             on_frame(key);
@@ -436,6 +456,8 @@ impl Engine {
             session,
             _item: item,
             frame: None,
+            dirty: None,
+            interval,
             last: None,
             timer: None,
         })
@@ -484,34 +506,35 @@ impl Engine {
     fn take_frame(&mut self, key: isize) -> bool {
         let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return false };
         let Ok(mut frame) = m.pool.TryGetNextFrame() else { return false };
-        // Frames queue up while a render waits; only the newest matters.
-        while let Ok(newer) = m.pool.TryGetNextFrame() {
+        // Frames queue up while a render waits; only the newest matters, but
+        // what changed in each one does.
+        let mut dirty = Some(Vec::new());
+        loop {
+            match (&mut dirty, frame.DirtyRegions()) {
+                (Some(d), Ok(regions)) => d.extend(regions),
+                // Older Windows: no dirty regions, so all of it changed.
+                _ => dirty = None,
+            }
+            let Ok(newer) = m.pool.TryGetNextFrame() else { break };
             let _ = frame.Close();
             frame = newer;
         }
-        let result = (|| -> Result<()> {
-            let size = frame.ContentSize()?;
+        m.dirty = dirty.filter(|d| !d.is_empty());
+        let tex = (|| -> Result<ID3D11Texture2D> {
             let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
-            let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            unsafe { tex.GetDesc(&mut desc) };
-            let fits = m.frame.as_ref().is_some_and(|f| {
-                let mut d = D3D11_TEXTURE2D_DESC::default();
-                unsafe { f.GetDesc(&mut d) };
-                d.Width == desc.Width && d.Height == desc.Height
-            });
-            if !fits {
-                desc.BindFlags = 0;
-                desc.MiscFlags = 0;
-                desc.CPUAccessFlags = 0;
-                desc.Usage = D3D11_USAGE_DEFAULT;
-                let mut copy = None;
-                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut copy))? };
-                m.frame = copy;
-            }
-            if let Some(f) = &m.frame {
-                unsafe { self.context.CopyResource(f, &tex) };
-            }
+            unsafe { access.GetInterface() }
+        })();
+        let Ok(tex) = tex else {
+            let _ = frame.Close();
+            return false;
+        };
+        let size = frame.ContentSize();
+        // The pool's two buffers: we hold one while the other fills.
+        if let Some((old, _)) = m.frame.replace((frame, tex)) {
+            let _ = old.Close();
+        }
+        let result = (|| -> Result<()> {
+            let size = size?;
             if size.Width != m.size.Width || size.Height != m.size.Height {
                 // Resolution changed: the next frames come at the new size.
                 m.size = size;
@@ -524,7 +547,6 @@ impl Engine {
             }
             Ok(())
         })();
-        let _ = frame.Close();
         result.is_ok()
     }
 
@@ -549,6 +571,9 @@ impl Engine {
                 if let Some(t) = &m.timer {
                     let _ = t.Stop();
                 }
+                if let Some((f, _)) = &m.frame {
+                    let _ = f.Close();
+                }
                 let _ = m.session.Close();
                 let _ = m.pool.Close();
             }
@@ -561,14 +586,27 @@ impl Engine {
         if !self.take_frame(key) {
             return;
         }
-        if let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) {
-            m.last = Some(Instant::now());
-        }
+        let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return };
+        m.last = Some(Instant::now());
+        let (origin, dirty) = (m.origin, m.dirty.take());
         let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
         for pane in panes {
             let Ok(mut state) = pane.try_borrow_mut() else { continue };
+            // Nothing changed behind it (and the margin it samples): the last render stands.
+            let changed = || {
+                let Some(dirty) = &dirty else { return true };
+                let mut wr = RECT::default();
+                if unsafe { GetWindowRect(state.hwnd, &mut wr) }.is_err() {
+                    return true;
+                }
+                let (x0, y0) = (wr.left - origin.0 - MARGIN, wr.top - origin.1 - MARGIN);
+                let (x1, y1) = (wr.right - origin.0 + MARGIN, wr.bottom - origin.1 + MARGIN);
+                dirty.iter().any(|r| r.X < x1 && x0 < r.X + r.Width && r.Y < y1 && y0 < r.Y + r.Height)
+            };
             // Wallpaper panes redraw when they move or the wallpaper changes, not per frame.
-            if state.source == Source::Screen && (state.monitor.0 as isize == key || !state.shown) {
+            if state.source == Source::Screen
+                && (!state.shown || state.monitor.0 as isize == key && changed())
+            {
                 if let Err(e) = self.render(&mut state) {
                     log!("glass render failed: {e}");
                 }
@@ -593,7 +631,7 @@ impl Engine {
             Source::Screen => {
                 let Some(mi) = self.monitor(monitor) else { return Ok(()) };
                 let m = &self.monitors[mi];
-                let Some(frame) = m.frame.clone() else { return Ok(()) };
+                let Some((_, frame)) = m.frame.clone() else { return Ok(()) };
                 (frame, m.origin, (m.size.Width, m.size.Height))
             }
             Source::Wallpaper => {
@@ -756,7 +794,7 @@ fn on_frame(key: isize) {
         let Some(m) = engine.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return };
         // Too soon after the last render: the frame waits in the pool (which holds
         // back newer ones until it's taken) and is rendered once it's due.
-        if let Some(wait) = m.last.and_then(|t| MIN_INTERVAL.checked_sub(t.elapsed())) {
+        if let Some(wait) = m.last.and_then(|t| m.interval.checked_sub(t.elapsed())) {
             if m.defer(key, wait) {
                 return;
             }
@@ -877,5 +915,14 @@ impl Drop for Pane {
         if s.source == Source::Screen {
             exclude_from_capture(s.hwnd, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shader_compiles() {
+        super::compile(windows::core::s!("vs"), windows::core::s!("vs_4_0")).unwrap();
+        super::compile(windows::core::s!("ps"), windows::core::s!("ps_4_0")).unwrap();
     }
 }

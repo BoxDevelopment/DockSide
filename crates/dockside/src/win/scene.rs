@@ -1,0 +1,462 @@
+//! What's behind a glass pane, rebuilt from other apps' windows.
+//!
+//! Glass can't capture the monitor without seeing itself, and hiding our
+//! windows from capture hides them from screenshots and recordings too. So
+//! instead each window under some glass is captured on its own with
+//! Windows.Graphics.Capture, and the windows are drawn back to front, from the
+//! top-most one that hides everything under it. Explorer's desktop (Progman:
+//! wallpaper and icons) is a window like any other, at the bottom. Our own
+//! windows are simply left out, so DockSide stays visible to every capture.
+//!
+//! Some things never make it in: what DWM draws itself (window shadows,
+//! open / minimize animations), and windows we may not capture (an elevated
+//! app while we aren't), which are drawn as a solid fill instead.
+
+use std::time::{Duration, Instant};
+
+use windows::core::{s, Interface, Result};
+use windows::Foundation::{TimeSpan, TypedEventHandler};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem, GraphicsCaptureSession,
+};
+use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Graphics::Direct3D::*;
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
+use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::WindowsAndMessaging::*;
+
+use crate::win::glass;
+
+/// Windows under one pane, at most; the lowest ones are dropped past this.
+const MAX_LAYERS: usize = 8;
+/// A window's rounded corners: one only hides what's behind if it covers
+/// this much more than the pane's region on every side (or is maximized).
+const CORNER: i32 = 12;
+/// How long a capture no pane needs keeps running, so a window that only
+/// briefly stops being under glass (a drag across the Dock) needn't restart.
+const GRACE: Duration = Duration::from_secs(5);
+/// Drawn for a window that can't be captured.
+const FILL: [f32; 4] = [0.16, 0.16, 0.17, 1.0];
+
+const SHADER: &str = r#"
+Texture2D src : register(t0);
+SamplerState smp : register(s0);
+
+cbuffer B : register(b0) {
+    float4 dst;     // x, y, w, h in target px
+    float2 target;  // target size, px
+    float2 uvMax;   // content size / texture size
+    float4 color;   // fill, premultiplied
+};
+
+struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+
+V vs(uint id : SV_VertexID) {
+    float2 t = float2(id & 1, id >> 1);
+    V o;
+    o.uv = t * uvMax;
+    o.pos = float4((dst.xy + t * dst.zw) / target * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+
+float4 ps(V i) : SV_Target { return src.SampleLevel(smp, i.uv, 0); }
+float4 fill(V i) : SV_Target { return color; }
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Constants {
+    dst: [f32; 4],
+    target: [f32; 2],
+    uv_max: [f32; 2],
+    color: [f32; 4],
+}
+
+/// A window under some glass: its handle and visible frame in screen pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Layer {
+    pub hwnd: isize,
+    pub rect: RECT,
+}
+
+/// A window that could be under glass.
+pub struct Window {
+    layer: Layer,
+    /// Hides what's behind it wherever it covers (no transparency to show through).
+    opaque: bool,
+    maximized: bool,
+}
+
+fn intersects(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+fn contains(outer: &RECT, inner: &RECT, inset: i32) -> bool {
+    outer.left + inset <= inner.left && outer.top + inset <= inner.top && outer.right - inset >= inner.right && outer.bottom - inset >= inner.bottom
+}
+
+struct Enum {
+    pid: u32,
+    out: Vec<Window>,
+}
+
+unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
+    let e = &mut *(lp.0 as *mut Enum);
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+        return TRUE;
+    }
+    let mut pid = 0;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == e.pid {
+        return TRUE;
+    }
+    // Other virtual desktops, suspended Store apps, windows still opening.
+    let mut cloaked = 0u32;
+    let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as _, 4);
+    if cloaked != 0 {
+        return TRUE;
+    }
+    let mut rect = RECT::default();
+    if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut rect as *mut _ as _, std::mem::size_of::<RECT>() as u32).is_err() {
+        let _ = GetWindowRect(hwnd, &mut rect);
+    }
+    if rect.right - rect.left < 2 || rect.bottom - rect.top < 2 {
+        return TRUE;
+    }
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let see_through = ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) != 0;
+    e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect }, opaque: !see_through, maximized: IsZoomed(hwnd).as_bool() });
+    TRUE
+}
+
+/// Every other app's window on screen, top-most first.
+pub fn windows() -> Vec<Window> {
+    let mut e = Enum { pid: std::process::id(), out: Vec::new() };
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut e as *mut _ as isize));
+    }
+    e.out
+}
+
+/// The windows that show in `region`, bottom-most first: from the top-most
+/// one that hides everything under it, up.
+pub fn layers(windows: &[Window], region: &RECT) -> Vec<Layer> {
+    let mut out = Vec::new();
+    for w in windows.iter().filter(|w| intersects(&w.layer.rect, region)) {
+        out.push(w.layer);
+        let inset = if w.maximized { 0 } else { CORNER };
+        if (w.opaque && contains(&w.layer.rect, region, inset)) || out.len() == MAX_LAYERS {
+            break;
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// One window's capture.
+struct Capture {
+    hwnd: isize,
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    _item: GraphicsCaptureItem,
+    size: SizeInt32,
+    /// Latest frame, held until a newer one arrives, with a view to draw it
+    /// from and the size of its content.
+    frame: Option<(Direct3D11CaptureFrame, ID3D11ShaderResourceView, SizeInt32, (u32, u32))>,
+    reports_dirty: bool,
+    /// Last needed by a pane.
+    used: Instant,
+}
+
+impl Capture {
+    fn close(&mut self) {
+        if let Some((f, ..)) = self.frame.take() {
+            let _ = f.Close();
+        }
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+/// What changed in a window's newest frames, in screen pixels; None for all of it.
+pub type Dirty = Option<Vec<RECT>>;
+
+pub struct Scene {
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    fill: ID3D11PixelShader,
+    blend: ID3D11BlendState,
+    sampler: ID3D11SamplerState,
+    constants: ID3D11Buffer,
+    captures: Vec<Capture>,
+    /// Windows that couldn't be captured; not retried while they exist.
+    failed: Vec<isize>,
+}
+
+impl Scene {
+    pub fn new(device: &ID3D11Device) -> Result<Self> {
+        let vs_code = glass::compile(SHADER, s!("scene.hlsl"), s!("vs"), s!("vs_4_0"))?;
+        let ps_code = glass::compile(SHADER, s!("scene.hlsl"), s!("ps"), s!("ps_4_0"))?;
+        let fill_code = glass::compile(SHADER, s!("scene.hlsl"), s!("fill"), s!("ps_4_0"))?;
+        let (mut vs, mut ps, mut fill, mut blend, mut sampler, mut constants) = (None, None, None, None, None, None);
+        unsafe {
+            device.CreateVertexShader(&vs_code, None, Some(&mut vs))?;
+            device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
+            device.CreatePixelShader(&fill_code, None, Some(&mut fill))?;
+            // Captured windows are premultiplied (their rounded corners fade out).
+            let mut desc = D3D11_BLEND_DESC::default();
+            desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            device.CreateBlendState(&desc, Some(&mut blend))?;
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            device.CreateSamplerState(&desc, Some(&mut sampler))?;
+            let desc = D3D11_BUFFER_DESC {
+                ByteWidth: std::mem::size_of::<Constants>() as u32,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                ..Default::default()
+            };
+            device.CreateBuffer(&desc, None, Some(&mut constants))?;
+        }
+        Ok(Self {
+            vs: vs.unwrap(),
+            ps: ps.unwrap(),
+            fill: fill.unwrap(),
+            blend: blend.unwrap(),
+            sampler: sampler.unwrap(),
+            constants: constants.unwrap(),
+            captures: Vec::new(),
+            failed: Vec::new(),
+        })
+    }
+
+    /// Starts capturing any of `layers` not captured yet, and marks them all in use.
+    pub fn capture(&mut self, layers: &[Layer], winrt: &IDirect3DDevice, interval: Duration) {
+        let now = Instant::now();
+        for l in layers {
+            if let Some(c) = self.captures.iter_mut().find(|c| c.hwnd == l.hwnd) {
+                c.used = now;
+                continue;
+            }
+            if self.failed.contains(&l.hwnd) {
+                continue;
+            }
+            match start(l.hwnd, winrt, interval) {
+                Ok(c) => self.captures.push(c),
+                Err(e) => {
+                    log!("glass can't capture window {:#x}: {e}", l.hwnd);
+                    self.failed.push(l.hwnd);
+                }
+            }
+        }
+    }
+
+    /// Takes `hwnd`'s newest frame. Returns what changed, or None when no new frame came.
+    pub fn take(&mut self, device: &ID3D11Device, winrt: &IDirect3DDevice, hwnd: isize, rect: Option<RECT>) -> Option<Dirty> {
+        let c = self.captures.iter_mut().find(|c| c.hwnd == hwnd)?;
+        let mut frame = c.pool.TryGetNextFrame().ok()?;
+        let mut dirty: Dirty = Some(Vec::new());
+        let mut add = |f: &Direct3D11CaptureFrame| {
+            let rects = c.reports_dirty.then(|| f.DirtyRegions().ok()).flatten();
+            match (dirty.as_mut(), rects, rect) {
+                (Some(d), Some(rects), Some(at)) => d.extend(rects.into_iter().map(|r| RECT {
+                    left: at.left + r.X,
+                    top: at.top + r.Y,
+                    right: at.left + r.X + r.Width,
+                    bottom: at.top + r.Y + r.Height,
+                })),
+                _ => dirty = None,
+            }
+        };
+        add(&frame);
+        while let Ok(newer) = c.pool.TryGetNextFrame() {
+            let _ = frame.Close();
+            frame = newer;
+            add(&frame);
+        }
+        let view = (|| -> Result<(ID3D11ShaderResourceView, SizeInt32, (u32, u32))> {
+            let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
+            let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe { tex.GetDesc(&mut desc) };
+            let mut srv = None;
+            unsafe { device.CreateShaderResourceView(&tex, None, Some(&mut srv))? };
+            Ok((srv.unwrap(), frame.ContentSize()?, (desc.Width, desc.Height)))
+        })();
+        let Ok((srv, size, tex_size)) = view else {
+            let _ = frame.Close();
+            return Some(None);
+        };
+        if let Some((old, ..)) = c.frame.replace((frame, srv, size, tex_size)) {
+            let _ = old.Close();
+        }
+        if size.Width != c.size.Width || size.Height != c.size.Height {
+            // The window resized: later frames come at the new size.
+            c.size = size;
+            dirty = None;
+            if let Err(e) = c.pool.Recreate(winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size) {
+                log!("glass window capture resize failed: {e}");
+            }
+        }
+        Some(dirty)
+    }
+
+    /// Draws `layers` into `target` (`size` px, showing the screen from `origin`).
+    pub fn draw(&self, context: &ID3D11DeviceContext, target: &ID3D11RenderTargetView, origin: (i32, i32), size: (u32, u32), layers: &[Layer]) {
+        let c = context;
+        unsafe {
+            c.ClearRenderTargetView(target, &FILL);
+            c.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+            c.OMSetBlendState(&self.blend, None, u32::MAX);
+            c.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: size.0 as f32, Height: size.1 as f32, MaxDepth: 1.0, ..Default::default() }]));
+            c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            c.IASetInputLayout(None);
+            c.VSSetShader(&self.vs, None);
+            c.VSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+            c.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+            c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+        }
+        for l in layers {
+            let (x, y) = ((l.rect.left - origin.0) as f32, (l.rect.top - origin.1) as f32);
+            let mut k = Constants { dst: [0.0; 4], target: [size.0 as f32, size.1 as f32], uv_max: [1.0, 1.0], color: FILL };
+            if let Some((_, srv, content, tex)) = self.captures.iter().find(|c| c.hwnd == l.hwnd).and_then(|c| c.frame.as_ref()) {
+                k.dst = [x, y, content.Width as f32, content.Height as f32];
+                k.uv_max = [content.Width as f32 / tex.0 as f32, content.Height as f32 / tex.1 as f32];
+                unsafe {
+                    c.UpdateSubresource(&self.constants, 0, None, &k as *const _ as _, 0, 0);
+                    c.PSSetShader(&self.ps, None);
+                    c.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                    c.Draw(4, 0);
+                }
+            } else if self.failed.contains(&l.hwnd) {
+                k.dst = [x, y, (l.rect.right - l.rect.left) as f32, (l.rect.bottom - l.rect.top) as f32];
+                unsafe {
+                    c.UpdateSubresource(&self.constants, 0, None, &k as *const _ as _, 0, 0);
+                    c.PSSetShader(&self.fill, None);
+                    c.Draw(4, 0);
+                }
+            }
+            // Otherwise its first frame hasn't come yet; it draws once it does.
+        }
+        unsafe {
+            c.PSSetShaderResources(0, Some(&[None]));
+            c.OMSetBlendState(None, None, u32::MAX);
+            c.OMSetRenderTargets(None, None);
+        }
+    }
+
+    /// Stops captures no pane has needed for a while, and those of closed windows.
+    pub fn prune(&mut self) {
+        let now = Instant::now();
+        self.failed.retain(|&h| unsafe { IsWindow(HWND(h as _)) }.as_bool());
+        self.captures.retain_mut(|c| {
+            let keep = unsafe { IsWindow(HWND(c.hwnd as _)) }.as_bool() && now.duration_since(c.used) < GRACE;
+            if !keep {
+                c.close();
+            }
+            keep
+        });
+    }
+
+    /// Every window being captured.
+    pub fn hwnds(&self) -> Vec<isize> {
+        self.captures.iter().map(|c| c.hwnd).collect()
+    }
+
+    /// Re-paces every capture (battery saver turned on or off).
+    pub fn set_interval(&self, interval: Duration) {
+        for c in &self.captures {
+            let _ = c.session.SetMinUpdateInterval(timespan(interval));
+        }
+    }
+
+    pub fn close(&mut self) {
+        for c in &mut self.captures {
+            c.close();
+        }
+        self.captures.clear();
+    }
+}
+
+pub fn timespan(d: Duration) -> TimeSpan {
+    TimeSpan { Duration: (d.as_nanos() / 100) as i64 }
+}
+
+fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration) -> Result<Capture> {
+    let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
+    let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(HWND(hwnd as _))? };
+    let size = item.Size()?;
+    let pool = Direct3D11CaptureFramePool::Create(winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
+    let session = pool.CreateCaptureSession(&item)?;
+    let _ = session.SetIsCursorCaptureEnabled(false);
+    // No yellow capture border (Windows 11).
+    let _ = session.SetIsBorderRequired(false);
+    // Windows 11 24H2+: Windows paces the frames and reports what changed, so
+    // panes over a still part of a window skip the redraw.
+    let _ = session.SetMinUpdateInterval(timespan(interval));
+    let reports_dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
+    pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
+        glass::on_window_frame(hwnd);
+        Ok(())
+    }))?;
+    session.StartCapture()?;
+    Ok(Capture { hwnd, pool, session, _item: item, size, frame: None, reports_dirty, used: Instant::now() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn win(id: isize, l: i32, t: i32, r: i32, b: i32, opaque: bool) -> Window {
+        Window { layer: Layer { hwnd: id, rect: RECT { left: l, top: t, right: r, bottom: b } }, opaque, maximized: false }
+    }
+
+    #[test]
+    fn shader_compiles() {
+        for (entry, target) in [(s!("vs"), s!("vs_4_0")), (s!("ps"), s!("ps_4_0")), (s!("fill"), s!("ps_4_0"))] {
+            glass::compile(SHADER, s!("scene.hlsl"), entry, target).unwrap();
+        }
+    }
+
+    #[test]
+    fn stops_at_a_covering_window() {
+        let region = RECT { left: 100, top: 100, right: 200, bottom: 150 };
+        let ws = [
+            win(1, 0, 0, 50, 50, true),     // elsewhere
+            win(2, 90, 120, 300, 300, true), // overlaps, doesn't cover
+            win(3, 0, 0, 400, 400, true),   // covers
+            win(4, 0, 0, 500, 500, true),   // hidden under 3
+        ];
+        let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![3, 2]);
+    }
+
+    #[test]
+    fn sees_through_layered_and_rounded_windows() {
+        let region = RECT { left: 100, top: 100, right: 200, bottom: 150 };
+        // Covers, but layered; then one that covers only up to its rounded corners.
+        let ws = [win(1, 0, 0, 400, 400, false), win(2, 95, 95, 205, 155, true), win(3, 0, 0, 400, 400, true)];
+        let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![3, 2, 1]);
+    }
+}

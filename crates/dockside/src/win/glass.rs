@@ -1,67 +1,59 @@
 //! Liquid Glass refraction.
 //!
 //! DWM's host backdrop is a fixed, heavy blur, so it can't bend light. For
-//! real glass we capture each monitor with Windows.Graphics.Capture (our glass
-//! windows are excluded from capture, so they never see themselves), copy the
-//! region behind each pane into a mipmapped texture, and run a pixel shader
-//! into a composition swap chain: a convex bezel that bends and magnifies what's
-//! behind near the edges with a little chromatic dispersion, a light frost and
-//! saturation boost, and specular highlights that catch light from the top-left.
+//! real glass we rebuild what's behind each pane from captures of the other
+//! apps' windows under it (see [`scene`]), into a mipmapped texture, and run a
+//! pixel shader into a composition swap chain: a convex bezel that bends and
+//! magnifies what's behind near the edges with a little chromatic dispersion,
+//! a light frost and saturation boost, and specular highlights that catch
+//! light from the top-left. Our own windows never go into that picture, so
+//! nothing needs hiding from capture, and the glass shows in screenshots and
+//! recordings as it does on screen.
 //!
 //! Panes that only ever sit over the desktop (the menu bar and Dock with
 //! reserved space, desktop widgets) refract the wallpaper image instead (see
-//! [`Source`]). They need no capture, so they aren't hidden from it and appear
-//! in screenshots and recordings.
+//! [`Source`]), which needs no capture at all.
 //!
-//! Everything runs on the UI thread: the frame pool is created with
-//! `Create` (not free-threaded), so frames arrive through its DispatcherQueue.
+//! Everything runs on the UI thread: frame pools are created with `Create`
+//! (not free-threaded), so frames arrive through its DispatcherQueue.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
-use windows::core::{s, Interface, Result};
-use windows::Foundation::{TimeSpan, TypedEventHandler};
-use windows::Graphics::Capture::{
-    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem, GraphicsCaptureSession,
-};
+use windows::core::{s, Interface, Result, PCSTR};
+use windows::Foundation::TypedEventHandler;
+use windows::Graphics::Capture::GraphicsCaptureSession;
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
-use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Graphics::SizeInt32;
 use windows::System::{DispatcherQueue, DispatcherQueueTimer};
 use windows::Win32::Foundation::{HMODULE, HWND, RECT};
-use crate::win::wallpaper;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-use windows::Win32::System::WinRT::Direct3D11::{CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess};
-use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsIconic, IsWindowVisible, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
-};
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindowVisible};
 
 use crate::geom::Color;
+use crate::win::scene::{self, timespan, Layer, Scene};
+use crate::win::wallpaper;
 
-/// Captured pixels kept around each pane, for the frost to sample past its edges.
+/// Pixels kept around each pane, for the frost to sample past its edges.
 const MARGIN: i32 = 16;
-/// Shortest time between renders of one monitor's panes (about 60 Hz): a busy
-/// screen (video, scrolling) sends a frame every refresh, up to 144+ a second.
+/// Shortest time between renders of the screen panes (about 60 Hz): a busy
+/// window (video, scrolling) sends a frame every refresh, up to 144+ a second.
 const MIN_INTERVAL: Duration = Duration::from_millis(16);
 /// The same in battery saver and Energy Saver (about 30 Hz).
 const LOW_POWER_INTERVAL: Duration = Duration::from_millis(33);
-/// Dirty rectangles kept per monitor before they're merged into one.
-const MAX_DIRTY: usize = 16;
+/// How often to look for windows that moved, opened or closed under glass
+/// without telling us (the foreground window's moves come right away).
+const POLL: Duration = Duration::from_millis(250);
 
 fn min_interval() -> Duration {
     if crate::win::controls::low_power_mode() { LOW_POWER_INTERVAL } else { MIN_INTERVAL }
-}
-
-fn timespan(d: Duration) -> TimeSpan {
-    TimeSpan { Duration: (d.as_nanos() / 100) as i64 }
 }
 
 /// How assertive a pane's glass is.
@@ -77,8 +69,7 @@ const MIPS: u32 = 5;
 /// What a pane refracts.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Source {
-    /// A live capture of the screen: right over apps, but the pane must hide
-    /// from all screen capture so it never refracts itself.
+    /// Whatever is on screen behind it, rebuilt from the windows there.
     Screen,
     /// The desktop wallpaper, drawn directly, for panes that only sit over the
     /// desktop. Falls back to `Screen` under a live wallpaper.
@@ -236,100 +227,6 @@ pub fn enabled() -> bool {
     ENABLED.with(|e| e.get()) && !FAILED.with(|f| f.get())
 }
 
-/// Hides (or shows again) a window from screenshots and screen capture.
-pub fn exclude_from_capture(hwnd: HWND, exclude: bool) {
-    unsafe {
-        let _ = SetWindowDisplayAffinity(hwnd, if exclude { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE });
-    }
-}
-
-struct Monitor {
-    handle: HMONITOR,
-    origin: (i32, i32),
-    size: SizeInt32,
-    pool: Direct3D11CaptureFramePool,
-    session: GraphicsCaptureSession,
-    _item: GraphicsCaptureItem,
-    /// Latest captured frame and its surface, held (not copied) until a newer
-    /// one arrives. The pool reuses its buffer once the frame is closed.
-    frame: Option<(Direct3D11CaptureFrame, ID3D11Texture2D)>,
-    /// Whether frames report which parts of the screen changed (Windows 11 24H2+).
-    reports_dirty: bool,
-    /// What changed since its panes last rendered, monitor-local; None for
-    /// everything (the first frame, or no dirty regions reported).
-    dirty: Option<Vec<RECT>>,
-    /// When its panes were last rendered from a new frame.
-    last: Option<Instant>,
-    /// Renders a frame that arrived too soon after the last one, once it's due.
-    timer: Option<DispatcherQueueTimer>,
-}
-
-impl Monitor {
-    /// Renders `key`'s waiting frame after `wait`. False when no timer could be made.
-    fn defer(&mut self, key: isize, wait: Duration) -> bool {
-        if self.timer.is_none() {
-            let timer = (|| -> Result<DispatcherQueueTimer> {
-                let t = DispatcherQueue::GetForCurrentThread()?.CreateTimer()?;
-                t.SetIsRepeating(false)?;
-                t.Tick(&TypedEventHandler::new(move |_, _| {
-                    with_engine(|engine| {
-                        engine.prune();
-                        engine.present(key);
-                    });
-                    Ok(())
-                }))?;
-                Ok(t)
-            })();
-            self.timer = timer.map_err(|e| log!("glass timer failed: {e}")).ok();
-        }
-        let Some(t) = &self.timer else { return false };
-        // Already waiting: that render takes the newest frame.
-        if t.IsRunning().unwrap_or(false) {
-            return true;
-        }
-        let _ = t.SetInterval(timespan(wait));
-        t.Start().is_ok()
-    }
-
-    /// Adds a frame's changed areas to what its panes haven't rendered yet.
-    fn add_dirty(&mut self, frame: &Direct3D11CaptureFrame) {
-        let rects = self.reports_dirty.then(|| frame.DirtyRegions().ok()).flatten();
-        let (Some(dirty), Some(rects)) = (self.dirty.as_mut(), rects) else {
-            self.dirty = None;
-            return;
-        };
-        dirty.extend(rects.into_iter().map(|r| RECT { left: r.X, top: r.Y, right: r.X + r.Width, bottom: r.Y + r.Height }));
-        if dirty.len() > MAX_DIRTY {
-            let all = dirty.iter().fold(dirty[0], |a, r| RECT {
-                left: a.left.min(r.left),
-                top: a.top.min(r.top),
-                right: a.right.max(r.right),
-                bottom: a.bottom.max(r.bottom),
-            });
-            *dirty = vec![all];
-        }
-    }
-
-    /// Whether anything changed in `r` (monitor-local) since panes last rendered.
-    fn changed(&self, r: &RECT) -> bool {
-        self.dirty.as_ref().map_or(true, |d| {
-            d.iter().any(|a| a.left < r.right && r.left < a.right && a.top < r.bottom && r.top < a.bottom)
-        })
-    }
-
-    /// Releases the held frame and ends the capture.
-    fn close(&mut self) {
-        if let Some(t) = &self.timer {
-            let _ = t.Stop();
-        }
-        if let Some((f, _)) = self.frame.take() {
-            let _ = f.Close();
-        }
-        let _ = self.session.Close();
-        let _ = self.pool.Close();
-    }
-}
-
 /// A monitor's wallpaper, as `Source::Wallpaper` panes see it.
 struct Wallpaper {
     handle: HMONITOR,
@@ -362,6 +259,24 @@ fn monitor_rect(handle: HMONITOR) -> RECT {
     info.rcMonitor
 }
 
+fn intersects(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+/// A timer on this thread's DispatcherQueue that runs `f` on the engine.
+fn engine_timer(repeating: bool, f: fn(&mut Engine)) -> Option<DispatcherQueueTimer> {
+    let timer = (|| -> Result<DispatcherQueueTimer> {
+        let t = DispatcherQueue::GetForCurrentThread()?.CreateTimer()?;
+        t.SetIsRepeating(repeating)?;
+        t.Tick(&TypedEventHandler::new(move |_, _| {
+            with_running(f);
+            Ok(())
+        }))?;
+        Ok(t)
+    })();
+    timer.map_err(|e| log!("glass timer failed: {e}")).ok()
+}
+
 struct Engine {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
@@ -371,21 +286,30 @@ struct Engine {
     ps: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     constants: ID3D11Buffer,
-    monitors: Vec<Monitor>,
+    scene: Scene,
     wallpapers: Vec<Wallpaper>,
     panes: Vec<Weak<RefCell<PaneState>>>,
-    /// Shortest time between a monitor's renders (see `min_interval`).
+    /// Shortest time between renders (see `min_interval`).
     interval: Duration,
+    /// When screen panes last rendered for new frames.
+    last: Option<Instant>,
+    /// Renders what changed too soon after the last render, once it's due.
+    timer: Option<DispatcherQueueTimer>,
+    /// Looks for windows that changed under glass (see `POLL`).
+    poll: Option<DispatcherQueueTimer>,
+    /// Windows may have moved, opened or closed since panes last rendered.
+    restack: bool,
 }
 
-fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<Vec<u8>> {
+/// Compiles one entry point of an HLSL source.
+pub(crate) fn compile(source: &str, name: PCSTR, entry: PCSTR, target: PCSTR) -> Result<Vec<u8>> {
     let mut code = None;
     let mut errors = None;
     let r = unsafe {
         D3DCompile(
-            SHADER.as_ptr() as _,
-            SHADER.len(),
-            s!("glass.hlsl"),
+            source.as_ptr() as _,
+            source.len(),
+            name,
             None,
             None,
             entry,
@@ -432,8 +356,8 @@ impl Engine {
         let factory: IDXGIFactory2 = unsafe { dxgi.GetAdapter()?.GetParent()? };
         let winrt: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi)? }.cast()?;
 
-        let vs_code = compile(s!("vs"), s!("vs_4_0"))?;
-        let ps_code = compile(s!("ps"), s!("ps_4_0"))?;
+        let vs_code = compile(SHADER, s!("glass.hlsl"), s!("vs"), s!("vs_4_0"))?;
+        let ps_code = compile(SHADER, s!("glass.hlsl"), s!("ps"), s!("ps_4_0"))?;
         let (mut vs, mut ps, mut sampler, mut constants) = (None, None, None, None);
         unsafe {
             device.CreateVertexShader(&vs_code, None, Some(&mut vs))?;
@@ -455,6 +379,7 @@ impl Engine {
             };
             device.CreateBuffer(&desc, None, Some(&mut constants))?;
         }
+        let scene = Scene::new(&device)?;
         Ok(Self {
             device,
             context,
@@ -464,67 +389,14 @@ impl Engine {
             ps: ps.unwrap(),
             sampler: sampler.unwrap(),
             constants: constants.unwrap(),
-            monitors: Vec::new(),
+            scene,
             wallpapers: Vec::new(),
             panes: Vec::new(),
             interval: min_interval(),
-        })
-    }
-
-    /// The capture for `handle`, started on first use.
-    fn monitor(&mut self, handle: HMONITOR) -> Option<usize> {
-        if let Some(i) = self.monitors.iter().position(|m| m.handle == handle) {
-            return Some(i);
-        }
-        match self.start_capture(handle) {
-            Ok(m) => {
-                self.monitors.push(m);
-                Some(self.monitors.len() - 1)
-            }
-            Err(e) => {
-                log!("glass capture failed: {e}");
-                None
-            }
-        }
-    }
-
-    fn start_capture(&self, handle: HMONITOR) -> Result<Monitor> {
-        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
-        let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(handle)? };
-        let size = item.Size()?;
-        let pool = Direct3D11CaptureFramePool::Create(&self.winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
-        let session = pool.CreateCaptureSession(&item)?;
-        let _ = session.SetIsCursorCaptureEnabled(false);
-        // No yellow capture border (Windows 11).
-        let _ = session.SetIsBorderRequired(false);
-        // Windows 11 24H2+: Windows paces the frames itself, so a busy screen
-        // doesn't wake us every refresh only for the timer to hold them back,
-        // and reports what changed, so panes over a still part of the screen
-        // skip the redraw. Older systems fall back to the timer and full redraws.
-        let _ = session.SetMinUpdateInterval(timespan(self.interval));
-        let reports_dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
-        let key = handle.0 as isize;
-        pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
-            on_frame(key);
-            Ok(())
-        }))?;
-        session.StartCapture()?;
-        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        unsafe {
-            let _ = GetMonitorInfoW(handle, &mut info);
-        }
-        Ok(Monitor {
-            handle,
-            origin: (info.rcMonitor.left, info.rcMonitor.top),
-            size,
-            pool,
-            session,
-            _item: item,
-            frame: None,
-            reports_dirty,
-            dirty: None,
             last: None,
             timer: None,
+            poll: None,
+            restack: false,
         })
     }
 
@@ -567,155 +439,145 @@ impl Engine {
         Ok(tex.unwrap())
     }
 
-    /// Takes the newest frame for a monitor; true when there was one.
-    fn take_frame(&mut self, key: isize) -> bool {
-        let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return false };
-        let Ok(mut frame) = m.pool.TryGetNextFrame() else { return false };
-        // Frames queue up while a render waits; only the newest matters, but
-        // what changed in every one of them does.
-        m.add_dirty(&frame);
-        while let Ok(newer) = m.pool.TryGetNextFrame() {
-            let _ = frame.Close();
-            frame = newer;
-            m.add_dirty(&frame);
-        }
-        let surface = (|| -> Result<(SizeInt32, ID3D11Texture2D)> {
-            let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
-            Ok((frame.ContentSize()?, unsafe { access.GetInterface()? }))
-        })();
-        let Ok((size, tex)) = surface else {
-            let _ = frame.Close();
-            m.dirty = None;
-            return false;
-        };
-        if let Some((old, _)) = m.frame.replace((frame, tex)) {
-            let _ = old.Close();
-        }
-        if size.Width != m.size.Width || size.Height != m.size.Height {
-            // Resolution changed: the next frames come at the new size.
-            m.size = size;
-            m.dirty = None;
-            if let Err(e) = m.pool.Recreate(&self.winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size) {
-                log!("glass capture resize failed: {e}");
-            }
-            m.origin = {
-                let r = monitor_rect(m.handle);
-                (r.left, r.top)
-            };
-        }
-        true
-    }
-
-    /// Stops captures no pane on screen needs. A pane that shows again starts its
-    /// capture back up when it next renders (see `Surface::show_windows`).
-    fn prune(&mut self) {
+    fn screen_panes(&mut self) -> Vec<Rc<RefCell<PaneState>>> {
         self.panes.retain(|p| p.strong_count() > 0);
-        let used: Vec<isize> = self
-            .panes
+        self.panes
             .iter()
             .filter_map(|p| p.upgrade())
-            .filter_map(|p| {
-                p.try_borrow()
-                    .ok()
-                    .filter(|s| s.source == Source::Screen && on_screen(s.hwnd))
-                    .map(|s| s.monitor.0 as isize)
-            })
-            .collect();
-        self.monitors.retain_mut(|m| {
-            let keep = used.contains(&(m.handle.0 as isize));
-            if !keep {
-                m.close();
-            }
-            keep
-        });
+            .filter(|p| p.try_borrow().is_ok_and(|s| s.source == Source::Screen))
+            .collect()
     }
 
-    /// Takes `key`'s newest frame and re-renders the screen panes it shows
-    /// through where the screen behind them changed.
-    fn present(&mut self, key: isize) {
-        if !self.take_frame(key) {
-            return;
-        }
-        let Some(mi) = self.monitors.iter().position(|m| m.handle.0 as isize == key) else { return };
-        let origin = self.monitors[mi].origin;
-        let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
-        let mut rendered = false;
-        for pane in panes {
-            let Ok(mut state) = pane.try_borrow_mut() else { continue };
-            // Wallpaper panes redraw when they move or the wallpaper changes, not per frame.
-            if state.source != Source::Screen || !(state.monitor.0 as isize == key || !state.shown) {
-                continue;
+    /// Takes a window's newest frame and marks the panes it shows through
+    /// where it changed.
+    fn window_frame(&mut self, hwnd: isize) {
+        let panes = self.screen_panes();
+        let rect = panes.iter().find_map(|p| p.try_borrow().ok()?.layers.iter().find(|l| l.hwnd == hwnd).map(|l| l.rect));
+        let Some(dirty) = self.scene.take(&self.device, &self.winrt, hwnd, rect) else { return };
+        let mut any = false;
+        for pane in &panes {
+            let Ok(mut s) = pane.try_borrow_mut() else { continue };
+            let changed = dirty.as_ref().map_or(true, |d| d.iter().any(|r| intersects(r, &s.region)));
+            if changed && s.layers.iter().any(|l| l.hwnd == hwnd) {
+                s.stale = true;
+                any = true;
             }
-            if state.shown && state.monitor.0 as isize == key {
-                // What the pane samples: its rectangle plus the frost margin.
-                let mut wr = RECT::default();
-                if unsafe { GetWindowRect(state.hwnd, &mut wr) }.is_ok() {
-                    let r = RECT {
-                        left: wr.left - origin.0 - MARGIN,
-                        top: wr.top - origin.1 - MARGIN,
-                        right: wr.right - origin.0 + MARGIN,
-                        bottom: wr.bottom - origin.1 + MARGIN,
-                    };
-                    if !self.monitors[mi].changed(&r) {
-                        continue;
-                    }
+        }
+        if any {
+            self.schedule();
+        }
+    }
+
+    /// Renders stale panes now, or once `interval` has passed since the last render.
+    fn schedule(&mut self) {
+        if let Some(wait) = self.last.and_then(|t| self.interval.checked_sub(t.elapsed())) {
+            if self.timer.is_none() {
+                self.timer = engine_timer(false, Engine::flush);
+            }
+            if let Some(t) = &self.timer {
+                // Already waiting: that render takes everything changed until then.
+                if t.IsRunning().unwrap_or(false) {
+                    return;
+                }
+                let _ = t.SetInterval(timespan(wait));
+                if t.Start().is_ok() {
+                    return;
                 }
             }
-            rendered = true;
-            if let Err(e) = self.render(&mut state) {
-                log!("glass render failed: {e}");
+        }
+        self.flush();
+    }
+
+    /// Re-renders the screen panes whose windows changed.
+    fn flush(&mut self) {
+        let panes = self.screen_panes();
+        if std::mem::take(&mut self.restack) {
+            let windows = scene::windows();
+            for pane in &panes {
+                let Ok(mut s) = pane.try_borrow_mut() else { continue };
+                if on_screen(s.hwnd) && (!s.shown || scene::layers(&windows, &s.region) != s.layers) {
+                    s.stale = true;
+                }
             }
         }
-        // `render` may have pruned captures, moving this one.
-        if let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) {
-            m.dirty = Some(Vec::new());
-            // Only an actual render holds the next frame back.
-            if rendered {
-                m.last = Some(Instant::now());
+        let mut rendered = false;
+        for pane in &panes {
+            let Ok(mut s) = pane.try_borrow_mut() else { continue };
+            if s.stale {
+                rendered = true;
+                if let Err(e) = self.render(&mut s) {
+                    log!("glass render failed: {e}");
+                }
+            }
+        }
+        if rendered {
+            self.last = Some(Instant::now());
+        }
+        self.scene.prune();
+    }
+
+    /// Looks for changed windows, while any screen pane is on screen.
+    fn poll(&mut self) {
+        let panes = self.screen_panes();
+        if !panes.iter().any(|p| p.try_borrow().is_ok_and(|s| !s.layers.is_empty())) {
+            if let Some(t) = &self.poll {
+                let _ = t.Stop();
+            }
+            self.scene.prune();
+            return;
+        }
+        // A frame whose arrival we missed (the engine was busy) would otherwise
+        // sit in its pool and stall that capture.
+        for hwnd in self.scene.hwnds() {
+            self.window_frame(hwnd);
+        }
+        self.restack = true;
+        self.schedule();
+    }
+
+    fn start_poll(&mut self) {
+        if self.poll.is_none() {
+            self.poll = engine_timer(true, Engine::poll);
+            if let Some(t) = &self.poll {
+                let _ = t.SetInterval(timespan(POLL));
+            }
+        }
+        if let Some(t) = &self.poll {
+            if !t.IsRunning().unwrap_or(true) {
+                let _ = t.Start();
             }
         }
     }
 
     fn render(&mut self, pane: &mut PaneState) -> Result<()> {
+        pane.stale = false;
         if pane.size.0 == 0 || pane.size.1 == 0 {
             return Ok(());
         }
-        // Hidden, minimized or slid away: nothing to show, and no capture to keep running.
+        // Hidden, minimized or slid away: nothing to show, and no windows to keep capturing.
         if pane.source == Source::Screen && !on_screen(pane.hwnd) {
+            pane.layers.clear();
             return Ok(());
         }
         let monitor = unsafe { MonitorFromWindow(pane.hwnd, MONITOR_DEFAULTTONEAREST) };
-        if monitor != pane.monitor {
-            pane.monitor = monitor;
-            self.prune();
-        }
-        let (frame, origin, (mw, mh)) = match pane.source {
-            Source::Screen => {
-                let Some(mi) = self.monitor(monitor) else { return Ok(()) };
-                let m = &self.monitors[mi];
-                let Some((_, frame)) = m.frame.clone() else { return Ok(()) };
-                (frame, m.origin, (m.size.Width, m.size.Height))
-            }
-            Source::Wallpaper => {
-                let Some(w) = self.wallpaper(monitor) else { return Ok(()) };
-                w
-            }
-        };
+        pane.monitor = monitor;
 
-        // Region behind the pane, plus a margin, in monitor-local texels.
+        // Region behind the pane, plus a margin, in screen pixels, kept to its monitor.
         let mut wr = RECT::default();
         unsafe { GetWindowRect(pane.hwnd, &mut wr)? };
-        let (px, py) = (wr.left - origin.0, wr.top - origin.1);
         let (w, h) = (pane.size.0 as i32, pane.size.1 as i32);
-        let x0 = (px - MARGIN).clamp(0, mw);
-        let y0 = (py - MARGIN).clamp(0, mh);
-        let x1 = (px + w + MARGIN).clamp(0, mw);
-        let y1 = (py + h + MARGIN).clamp(0, mh);
-        if x1 - x0 < 1 || y1 - y0 < 1 {
+        let m = monitor_rect(monitor);
+        let region = RECT {
+            left: (wr.left - MARGIN).clamp(m.left, m.right),
+            top: (wr.top - MARGIN).clamp(m.top, m.bottom),
+            right: (wr.left + w + MARGIN).clamp(m.left, m.right),
+            bottom: (wr.top + h + MARGIN).clamp(m.top, m.bottom),
+        };
+        if region.right - region.left < 1 || region.bottom - region.top < 1 {
             return Ok(());
         }
-        let src_size = ((x1 - x0) as u32, (y1 - y0) as u32);
-        if pane.src.as_ref().map(|s| s.2) != Some(src_size) {
+        let src_size = ((region.right - region.left) as u32, (region.bottom - region.top) as u32);
+        if pane.src.as_ref().map(|s| s.3) != Some(src_size) {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: src_size.0,
                 Height: src_size.1,
@@ -728,14 +590,48 @@ impl Engine {
                 CPUAccessFlags: 0,
                 MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
             };
-            let (mut tex, mut srv) = (None, None);
+            let (mut tex, mut srv, mut rtv) = (None, None, None);
             unsafe {
                 self.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
-                self.device.CreateShaderResourceView(tex.as_ref().unwrap(), None, Some(&mut srv))?;
+                let tex = tex.as_ref().unwrap();
+                self.device.CreateShaderResourceView(tex, None, Some(&mut srv))?;
+                // Mip 0 only: GenerateMips makes the rest for the frost.
+                let rdesc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 } },
+                };
+                self.device.CreateRenderTargetView(tex, Some(&rdesc), Some(&mut rtv))?;
             }
-            pane.src = Some((tex.unwrap(), srv.unwrap(), src_size));
+            pane.src = Some((tex.unwrap(), srv.unwrap(), rtv.unwrap(), src_size));
         }
-        let (tex, srv, _) = pane.src.as_ref().unwrap();
+
+        match pane.source {
+            Source::Screen => {
+                let layers = scene::layers(&scene::windows(), &region);
+                self.scene.capture(&layers, &self.winrt, self.interval);
+                let rtv = &pane.src.as_ref().unwrap().2;
+                self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, &layers);
+                pane.layers = layers;
+                self.start_poll();
+            }
+            Source::Wallpaper => {
+                let Some((wall, origin, _)) = self.wallpaper(monitor) else { return Ok(()) };
+                // The wallpaper spans the monitor, which holds the region.
+                let bx = D3D11_BOX {
+                    left: (region.left - origin.0) as u32,
+                    top: (region.top - origin.1) as u32,
+                    front: 0,
+                    right: (region.right - origin.0) as u32,
+                    bottom: (region.bottom - origin.1) as u32,
+                    back: 1,
+                };
+                let tex = &pane.src.as_ref().unwrap().0;
+                unsafe { self.context.CopySubresourceRegion(tex, 0, 0, 0, 0, &wall, 0, Some(&bx)) };
+            }
+        }
+        pane.region = region;
+        let (_, srv, _, _) = pane.src.as_ref().unwrap();
 
         let dpi = unsafe { GetDpiForWindow(pane.hwnd) }.max(96) as f32;
         let scale = dpi / 96.0;
@@ -746,7 +642,7 @@ impl Engine {
         let subtle = pane.style == Style::Subtle;
         let consts = Constants {
             size: [w as f32, h as f32],
-            origin: [(px - x0) as f32, (py - y0) as f32],
+            origin: [(wr.left - region.left) as f32, (wr.top - region.top) as f32],
             tex_size: [src_size.0 as f32, src_size.1 as f32],
             radius: r,
             scale,
@@ -761,8 +657,6 @@ impl Engine {
         };
 
         unsafe {
-            let bx = D3D11_BOX { left: x0 as u32, top: y0 as u32, front: 0, right: x1 as u32, bottom: y1 as u32, back: 1 };
-            self.context.CopySubresourceRegion(tex, 0, 0, 0, 0, &frame, 0, Some(&bx));
             self.context.GenerateMips(srv);
             self.context.UpdateSubresource(&self.constants, 0, None, &consts as *const _ as _, 0, 0);
 
@@ -794,30 +688,49 @@ impl Engine {
     }
 }
 
-/// Stops every screen capture and releases the GPU device. Called on quit,
+/// Stops every window capture and releases the GPU device. Called on quit,
 /// while the UI thread still runs: left to process exit, open capture
 /// sessions can hang the process in the graphics driver for good.
 pub fn shutdown() {
     // Nothing may start the engine again.
     FAILED.with(|f| f.set(true));
     let Some(mut engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
-    for m in &mut engine.monitors {
-        m.close();
+    for t in [&engine.timer, &engine.poll].into_iter().flatten() {
+        let _ = t.Stop();
     }
+    engine.scene.close();
     unsafe {
         engine.context.ClearState();
         engine.context.Flush();
     }
 }
 
-/// Re-paces the screen captures after battery saver or Energy Saver turned on or off.
-pub fn power_changed() {
+/// Runs `f` on the engine if it's already running (never starts it).
+fn with_running(f: impl FnOnce(&mut Engine)) {
     ENGINE.with(|e| {
-        let Ok(mut e) = e.try_borrow_mut() else { return };
-        let Some(engine) = e.as_mut() else { return };
+        if let Ok(mut e) = e.try_borrow_mut() {
+            if let Some(engine) = e.as_mut() {
+                f(engine);
+            }
+        }
+    });
+}
+
+/// Re-paces the window captures after battery saver or Energy Saver turned on or off.
+pub fn power_changed() {
+    with_running(|engine| {
         engine.interval = min_interval();
-        for m in &engine.monitors {
-            let _ = m.session.SetMinUpdateInterval(timespan(engine.interval));
+        engine.scene.set_interval(engine.interval);
+    });
+}
+
+/// Some window may have moved, opened, closed or come forward: screen panes
+/// check what's behind them (at most once per `interval`).
+pub fn windows_changed() {
+    with_running(|engine| {
+        if engine.poll.as_ref().is_some_and(|t| t.IsRunning().unwrap_or(false)) {
+            engine.restack = true;
+            engine.schedule();
         }
     });
 }
@@ -825,9 +738,7 @@ pub fn power_changed() {
 /// Reloads the wallpaper under `Source::Wallpaper` panes (after the user
 /// changed it, or a slideshow moved on).
 pub fn wallpaper_changed() {
-    ENGINE.with(|e| {
-        let Ok(mut e) = e.try_borrow_mut() else { return };
-        let Some(engine) = e.as_mut() else { return };
+    with_running(|engine| {
         engine.wallpapers.clear();
         let panes: Vec<_> = engine.panes.iter().filter_map(|p| p.upgrade()).collect();
         for pane in panes {
@@ -861,19 +772,9 @@ fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
     })
 }
 
-fn on_frame(key: isize) {
-    with_engine(|engine| {
-        engine.prune();
-        let Some(m) = engine.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return };
-        // Too soon after the last render: the frame waits in the pool (which holds
-        // back newer ones until it's taken) and is rendered once it's due.
-        if let Some(wait) = m.last.and_then(|t| engine.interval.checked_sub(t.elapsed())) {
-            if m.defer(key, wait) {
-                return;
-            }
-        }
-        engine.present(key);
-    });
+/// A captured window sent a new frame.
+pub(crate) fn on_window_frame(hwnd: isize) {
+    with_running(|engine| engine.window_frame(hwnd));
 }
 
 struct PaneState {
@@ -885,7 +786,13 @@ struct PaneState {
     style: Style,
     source: Source,
     monitor: HMONITOR,
-    src: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, (u32, u32))>,
+    src: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, ID3D11RenderTargetView, (u32, u32))>,
+    /// What it last sampled, in screen pixels.
+    region: RECT,
+    /// The windows behind it when it last rendered, bottom-most first.
+    layers: Vec<Layer>,
+    /// Something behind it changed since it last rendered.
+    stale: bool,
     /// Has presented at least once.
     shown: bool,
 }
@@ -894,8 +801,7 @@ struct PaneState {
 pub struct Pane(Rc<RefCell<PaneState>>);
 
 impl Pane {
-    /// Returns the pane with its swap chain. A `Screen` pane's window is
-    /// excluded from capture.
+    /// Returns the pane with its swap chain.
     pub fn new(hwnd: HWND, tint: Color, style: Style, source: Source) -> Option<(Self, IDXGISwapChain1)> {
         let swapchain = with_engine(|engine| -> Result<IDXGISwapChain1> {
             let desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -921,9 +827,6 @@ impl Pane {
             Source::Wallpaper if with_engine(|e| e.wallpaper(monitor).is_none()).unwrap_or(true) => Source::Screen,
             s => s,
         };
-        if source == Source::Screen {
-            exclude_from_capture(hwnd, true);
-        }
         let state = Rc::new(RefCell::new(PaneState {
             hwnd,
             swapchain: swapchain.clone(),
@@ -934,20 +837,13 @@ impl Pane {
             source,
             monitor,
             src: None,
+            region: RECT::default(),
+            layers: Vec::new(),
+            stale: false,
             shown: false,
         }));
-        with_engine(|engine| {
-            engine.panes.push(Rc::downgrade(&state));
-            if source == Source::Screen {
-                engine.monitor(monitor);
-            }
-        });
+        with_engine(|engine| engine.panes.push(Rc::downgrade(&state)));
         Some((Self(state), swapchain))
-    }
-
-    /// Whether the pane's window is hidden from screenshots and recordings.
-    pub fn hidden_from_capture(&self) -> bool {
-        self.0.borrow().source == Source::Screen
     }
 
     /// Size and corner radius in physical pixels.
@@ -981,23 +877,13 @@ impl Pane {
     }
 }
 
-impl Drop for Pane {
-    fn drop(&mut self) {
-        // The capture itself stops on the next frame, once `prune` sees no pane on its monitor.
-        let s = self.0.borrow();
-        if s.source == Source::Screen {
-            exclude_from_capture(s.hwnd, false);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn shader_compiles() {
-        compile(s!("vs"), s!("vs_4_0")).unwrap();
-        compile(s!("ps"), s!("ps_4_0")).unwrap();
+        compile(SHADER, s!("glass.hlsl"), s!("vs"), s!("vs_4_0")).unwrap();
+        compile(SHADER, s!("glass.hlsl"), s!("ps"), s!("ps_4_0")).unwrap();
     }
 }

@@ -296,12 +296,6 @@ impl CompositionBackdrop {
         }
     }
 
-    /// True when a pane refracting the live screen covers this backdrop, so its
-    /// window (and anything drawn over it) must be hidden from capture.
-    pub fn hidden_from_capture(&self) -> bool {
-        self.refraction.as_ref().is_some_and(|(pane, _)| pane.hidden_from_capture())
-    }
-
     /// Re-renders the refraction after the window moved or reshaped.
     pub fn refresh(&self) {
         if let Some((pane, _)) = &self.refraction {

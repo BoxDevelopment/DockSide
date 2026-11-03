@@ -737,7 +737,7 @@ impl FinderWindow {
             show_hidden: prefs.show_hidden,
             tabs: vec![None],
             active_tab: 0,
-            backdrop: Self::new_backdrop(hwnd, prefs, ctx.theme),
+            backdrop: Self::new_backdrop(prefs, ctx.theme),
             motion: Motion::default(),
             window: WindowAnim::opening(),
             side_glide: Glide::default(),
@@ -830,14 +830,14 @@ impl FinderWindow {
         }
     }
 
-    fn new_backdrop(hwnd: HWND, prefs: &crate::config::FinderCfg, theme: &Theme) -> Option<SidebarBackdrop> {
-        SidebarBackdrop::new(theme, hwnd, prefs.sidebar)
+    fn new_backdrop(prefs: &crate::config::FinderCfg, theme: &Theme) -> Option<SidebarBackdrop> {
+        SidebarBackdrop::new(theme, prefs.sidebar)
     }
 
     /// Recreates the sidebar backdrop after its settings changed.
     pub fn set_sidebar(&mut self, prefs: &crate::config::FinderCfg, theme: &Theme) {
         self.backdrop = None;
-        self.backdrop = Self::new_backdrop(self.hwnd, prefs, theme);
+        self.backdrop = Self::new_backdrop(prefs, theme);
         self.dirty = true;
     }
 

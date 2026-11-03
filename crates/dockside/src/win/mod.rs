@@ -8,6 +8,7 @@ pub mod controls;
 pub mod desktops;
 pub mod elevation;
 pub mod glass;
+pub mod scene;
 pub mod startup;
 pub mod system;
 pub mod taskbar;

@@ -245,7 +245,6 @@ pub fn traffic_lights(p: &Painter, body: Rect, hover: f32, zoom_enabled: bool) -
 /// an app window, showing through its translucent sidebar.
 pub struct SidebarBackdrop {
     hwnd: HWND,
-    owner: HWND,
     composition: CompositionBackdrop,
     tint: Color,
     kind: Backdrop,
@@ -272,10 +271,10 @@ impl SidebarBackdrop {
         Color::gray(128, 0.012)
     }
 
-    /// A see-through backdrop for `owner`'s sidebar pane. `None` for a solid
+    /// A see-through backdrop for an app window's sidebar pane. `None` for a solid
     /// sidebar, when Composition is unavailable, or when Transparency effects
     /// are off and nothing would refract.
-    pub fn new(theme: &Theme, owner: HWND, kind: Backdrop) -> Option<Self> {
+    pub fn new(theme: &Theme, kind: Backdrop) -> Option<Self> {
         let glass = kind == Backdrop::Glass;
         if matches!(kind, Backdrop::None | Backdrop::Clear) || (!system::transparency_enabled() && !(glass && glass::enabled())) {
             return None;
@@ -286,11 +285,7 @@ impl SidebarBackdrop {
         let tint = Self::tint(theme, kind);
         match CompositionBackdrop::new(hwnd, tint, glass.then_some(glass::Style::Subtle), glass::Source::Screen) {
             Ok(composition) => {
-                if composition.hidden_from_capture() {
-                    // The pane shows through the owner, so the owner mustn't be captured either.
-                    glass::exclude_from_capture(owner, true);
-                }
-                Some(Self { hwnd, owner, composition, tint, kind, placed: None, opacity: 1.0 })
+                Some(Self { hwnd, composition, tint, kind, placed: None, opacity: 1.0 })
             }
             Err(e) => {
                 log!("sidebar backdrop unavailable: {e}");
@@ -348,9 +343,6 @@ impl SidebarBackdrop {
 
 impl Drop for SidebarBackdrop {
     fn drop(&mut self) {
-        if self.composition.hidden_from_capture() {
-            glass::exclude_from_capture(self.owner, false);
-        }
         unsafe {
             let _ = DestroyWindow(self.hwnd);
         }

@@ -2591,10 +2591,18 @@ impl App {
                 WM_APP_FOREGROUND => {
                     self.update_foreground();
                     self.timer(TIMER_REFRESH, 100);
+                    win::glass::windows_changed();
                 }
-                WM_APP_WINDOWS_CHANGED => self.timer(TIMER_REFRESH, 150),
-                // Drags fire this per frame; settle first.
-                WM_APP_FG_MOVED => self.timer(TIMER_FULLSCREEN, 60),
+                WM_APP_WINDOWS_CHANGED => {
+                    self.timer(TIMER_REFRESH, 150);
+                    win::glass::windows_changed();
+                }
+                // Drags fire this per frame; settle first. Glass keeps up with
+                // them (at its own frame rate).
+                WM_APP_FG_MOVED => {
+                    self.timer(TIMER_FULLSCREEN, 60);
+                    win::glass::windows_changed();
+                }
                 WM_APP_CLOSE_MENU => self.close_menu(),
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),

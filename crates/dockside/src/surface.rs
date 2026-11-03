@@ -130,10 +130,6 @@ impl Surface {
         };
         let content = create_window(ex | WS_EX_LAYERED, WS_POPUP, rect, backdrop.unwrap_or_default())?;
         accent::prepare(content);
-        if composition.as_ref().is_some_and(|c| c.hidden_from_capture()) {
-            // Glass refracting the screen mustn't see its own content.
-            glass::exclude_from_capture(content, true);
-        }
         let canvas = Canvas::new(gfx, w, h, scale)?;
         Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0, applied: 1.0 })
     }
@@ -146,9 +142,6 @@ impl Surface {
         let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WINDOW_EX_STYLE(topmost);
         let hwnd = create_window(ex, WS_POPUP, RECT { left: 0, top: 0, right: 1, bottom: 1 }, HWND::default())?;
         accent::prepare(hwnd);
-        if self.composition.as_ref().is_some_and(|c| c.hidden_from_capture()) {
-            glass::exclude_from_capture(hwnd, true);
-        }
         unsafe {
             // Owned windows stay above their owner, so the surface always covers its shadow.
             SetWindowLongPtrW(owned, GWLP_HWNDPARENT, hwnd.0 as isize);

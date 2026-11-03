@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 
 use windows::core::{s, Interface, Result};
 use windows::Foundation::{TimeSpan, TypedEventHandler};
-use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession};
+use windows::Graphics::Capture::{
+    Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem, GraphicsCaptureSession,
+};
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
@@ -49,6 +51,18 @@ const MARGIN: i32 = 16;
 /// Shortest time between renders of one monitor's panes (about 60 Hz): a busy
 /// screen (video, scrolling) sends a frame every refresh, up to 144+ a second.
 const MIN_INTERVAL: Duration = Duration::from_millis(16);
+/// The same in battery saver and Energy Saver (about 30 Hz).
+const LOW_POWER_INTERVAL: Duration = Duration::from_millis(33);
+/// Dirty rectangles kept per monitor before they're merged into one.
+const MAX_DIRTY: usize = 16;
+
+fn min_interval() -> Duration {
+    if crate::win::controls::low_power_mode() { LOW_POWER_INTERVAL } else { MIN_INTERVAL }
+}
+
+fn timespan(d: Duration) -> TimeSpan {
+    TimeSpan { Duration: (d.as_nanos() / 100) as i64 }
+}
 
 /// How assertive a pane's glass is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -106,16 +120,21 @@ float sd(float2 p, float2 b, float r) {
     return length(max(q, 0)) + min(max(q.x, q.y), 0) - r;
 }
 
-float3 frosted(float2 px) {
+float3 tap(float2 px, float level) {
+    float2 inv = 1.0 / texSize;
+    return src.SampleLevel(smp, clamp(px * inv, 0.5 * inv, 1 - 0.5 * inv), level).rgb;
+}
+
+// Nine taps: a sharper middle (returned in `mid`) and a ring a mip blurrier.
+float3 frosted(float2 px, float lv, out float3 mid) {
     static const float2 ring[8] = {
         float2(1, 0), float2(0.707, 0.707), float2(0, 1), float2(-0.707, 0.707),
         float2(-1, 0), float2(-0.707, -0.707), float2(0, -1), float2(0.707, -0.707)
     };
-    float2 inv = 1.0 / texSize;
-    float2 lo = 0.5 * inv, hi = 1 - 0.5 * inv;
-    float3 c = src.SampleLevel(smp, clamp(px * inv, lo, hi), 1.0 + lod).rgb * 2;
+    mid = tap(px, 1.0 + lv);
+    float3 c = mid * 2;
     [unroll] for (int i = 0; i < 8; i++) {
-        c += src.SampleLevel(smp, clamp((px + ring[i] * frost) * inv, lo, hi), 1.5 + lod).rgb;
+        c += tap(px + ring[i] * frost, 1.5 + lv);
     }
     return c / 10;
 }
@@ -128,9 +147,13 @@ float4 ps(V i) : SV_Target {
     float alpha = saturate(0.5 - d);
     if (alpha <= 0) return 0;
 
+    // The lens normal comes from the shape rounded to at least the bezel's
+    // width, so it turns smoothly through tight corners instead of snapping
+    // between the two edges along the diagonal.
+    float rn = min(max(r, bezel), min(h.x, h.y));
     float e = 0.5;
-    float2 n = float2(sd(p + float2(e, 0), h, r) - sd(p - float2(e, 0), h, r),
-                      sd(p + float2(0, e), h, r) - sd(p - float2(0, e), h, r));
+    float2 n = float2(sd(p + float2(e, 0), h, rn) - sd(p - float2(e, 0), h, rn),
+                      sd(p + float2(0, e), h, rn) - sd(p - float2(0, e), h, rn));
     n = n / max(length(n), 1e-4);
     float depth = -d;
 
@@ -141,12 +164,21 @@ float4 ps(V i) : SV_Target {
     float u = 1 - t;
     float bend = refract * (1 - sqrt(saturate(1 - u * u)));
     float2 q = p - n * bend + h + origin;
-    float3 c;
+
+    // Toward the rim the bend outruns the pixels, so each one spans several
+    // texels of what's behind; sample a mip that covers them, or moving
+    // content shimmers there.
+    float slope = bezel > 0 ? refract * u / (bezel * sqrt(max(1 - u * u, 1e-3))) : 0;
+    float lv = lod + clamp(log2(max(abs(1 - slope), 1)), 0, 3);
+
+    // Dispersion: red and blue shift apart along the normal, as a correction
+    // on top of the frost rather than a frost per channel.
+    float3 mid;
+    float3 c = frosted(q, lv, mid);
     if (bend > 0.4) {
         float ca = bend * 0.14;
-        c = float3(frosted(q + n * ca).r, frosted(q).g, frosted(q - n * ca).b);
-    } else {
-        c = frosted(q);
+        c.r += 0.6 * (tap(q + n * ca, 1.0 + lv).r - mid.r);
+        c.b += 0.6 * (tap(q - n * ca, 1.0 + lv).b - mid.b);
     }
 
     // Vibrancy, then the body of the glass.
@@ -218,8 +250,14 @@ struct Monitor {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
     _item: GraphicsCaptureItem,
-    /// Latest captured frame.
-    frame: Option<ID3D11Texture2D>,
+    /// Latest captured frame and its surface, held (not copied) until a newer
+    /// one arrives. The pool reuses its buffer once the frame is closed.
+    frame: Option<(Direct3D11CaptureFrame, ID3D11Texture2D)>,
+    /// Whether frames report which parts of the screen changed (Windows 11 24H2+).
+    reports_dirty: bool,
+    /// What changed since its panes last rendered, monitor-local; None for
+    /// everything (the first frame, or no dirty regions reported).
+    dirty: Option<Vec<RECT>>,
     /// When its panes were last rendered from a new frame.
     last: Option<Instant>,
     /// Renders a frame that arrived too soon after the last one, once it's due.
@@ -249,8 +287,46 @@ impl Monitor {
         if t.IsRunning().unwrap_or(false) {
             return true;
         }
-        let _ = t.SetInterval(TimeSpan { Duration: (wait.as_nanos() / 100) as i64 });
+        let _ = t.SetInterval(timespan(wait));
         t.Start().is_ok()
+    }
+
+    /// Adds a frame's changed areas to what its panes haven't rendered yet.
+    fn add_dirty(&mut self, frame: &Direct3D11CaptureFrame) {
+        let rects = self.reports_dirty.then(|| frame.DirtyRegions().ok()).flatten();
+        let (Some(dirty), Some(rects)) = (self.dirty.as_mut(), rects) else {
+            self.dirty = None;
+            return;
+        };
+        dirty.extend(rects.into_iter().map(|r| RECT { left: r.X, top: r.Y, right: r.X + r.Width, bottom: r.Y + r.Height }));
+        if dirty.len() > MAX_DIRTY {
+            let all = dirty.iter().fold(dirty[0], |a, r| RECT {
+                left: a.left.min(r.left),
+                top: a.top.min(r.top),
+                right: a.right.max(r.right),
+                bottom: a.bottom.max(r.bottom),
+            });
+            *dirty = vec![all];
+        }
+    }
+
+    /// Whether anything changed in `r` (monitor-local) since panes last rendered.
+    fn changed(&self, r: &RECT) -> bool {
+        self.dirty.as_ref().map_or(true, |d| {
+            d.iter().any(|a| a.left < r.right && r.left < a.right && a.top < r.bottom && r.top < a.bottom)
+        })
+    }
+
+    /// Releases the held frame and ends the capture.
+    fn close(&mut self) {
+        if let Some(t) = &self.timer {
+            let _ = t.Stop();
+        }
+        if let Some((f, _)) = self.frame.take() {
+            let _ = f.Close();
+        }
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
     }
 }
 
@@ -298,6 +374,8 @@ struct Engine {
     monitors: Vec<Monitor>,
     wallpapers: Vec<Wallpaper>,
     panes: Vec<Weak<RefCell<PaneState>>>,
+    /// Shortest time between a monitor's renders (see `min_interval`).
+    interval: Duration,
 }
 
 fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<Vec<u8>> {
@@ -389,6 +467,7 @@ impl Engine {
             monitors: Vec::new(),
             wallpapers: Vec::new(),
             panes: Vec::new(),
+            interval: min_interval(),
         })
     }
 
@@ -418,6 +497,12 @@ impl Engine {
         let _ = session.SetIsCursorCaptureEnabled(false);
         // No yellow capture border (Windows 11).
         let _ = session.SetIsBorderRequired(false);
+        // Windows 11 24H2+: Windows paces the frames itself, so a busy screen
+        // doesn't wake us every refresh only for the timer to hold them back,
+        // and reports what changed, so panes over a still part of the screen
+        // skip the redraw. Older systems fall back to the timer and full redraws.
+        let _ = session.SetMinUpdateInterval(timespan(self.interval));
+        let reports_dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
         let key = handle.0 as isize;
         pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
             on_frame(key);
@@ -436,6 +521,8 @@ impl Engine {
             session,
             _item: item,
             frame: None,
+            reports_dirty,
+            dirty: None,
             last: None,
             timer: None,
         })
@@ -484,48 +571,39 @@ impl Engine {
     fn take_frame(&mut self, key: isize) -> bool {
         let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return false };
         let Ok(mut frame) = m.pool.TryGetNextFrame() else { return false };
-        // Frames queue up while a render waits; only the newest matters.
+        // Frames queue up while a render waits; only the newest matters, but
+        // what changed in every one of them does.
+        m.add_dirty(&frame);
         while let Ok(newer) = m.pool.TryGetNextFrame() {
             let _ = frame.Close();
             frame = newer;
+            m.add_dirty(&frame);
         }
-        let result = (|| -> Result<()> {
-            let size = frame.ContentSize()?;
+        let surface = (|| -> Result<(SizeInt32, ID3D11Texture2D)> {
             let access: IDirect3DDxgiInterfaceAccess = frame.Surface()?.cast()?;
-            let tex: ID3D11Texture2D = unsafe { access.GetInterface()? };
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            unsafe { tex.GetDesc(&mut desc) };
-            let fits = m.frame.as_ref().is_some_and(|f| {
-                let mut d = D3D11_TEXTURE2D_DESC::default();
-                unsafe { f.GetDesc(&mut d) };
-                d.Width == desc.Width && d.Height == desc.Height
-            });
-            if !fits {
-                desc.BindFlags = 0;
-                desc.MiscFlags = 0;
-                desc.CPUAccessFlags = 0;
-                desc.Usage = D3D11_USAGE_DEFAULT;
-                let mut copy = None;
-                unsafe { self.device.CreateTexture2D(&desc, None, Some(&mut copy))? };
-                m.frame = copy;
-            }
-            if let Some(f) = &m.frame {
-                unsafe { self.context.CopyResource(f, &tex) };
-            }
-            if size.Width != m.size.Width || size.Height != m.size.Height {
-                // Resolution changed: the next frames come at the new size.
-                m.size = size;
-                m.pool.Recreate(&self.winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
-                let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-                unsafe {
-                    let _ = GetMonitorInfoW(m.handle, &mut info);
-                }
-                m.origin = (info.rcMonitor.left, info.rcMonitor.top);
-            }
-            Ok(())
+            Ok((frame.ContentSize()?, unsafe { access.GetInterface()? }))
         })();
-        let _ = frame.Close();
-        result.is_ok()
+        let Ok((size, tex)) = surface else {
+            let _ = frame.Close();
+            m.dirty = None;
+            return false;
+        };
+        if let Some((old, _)) = m.frame.replace((frame, tex)) {
+            let _ = old.Close();
+        }
+        if size.Width != m.size.Width || size.Height != m.size.Height {
+            // Resolution changed: the next frames come at the new size.
+            m.size = size;
+            m.dirty = None;
+            if let Err(e) = m.pool.Recreate(&self.winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size) {
+                log!("glass capture resize failed: {e}");
+            }
+            m.origin = {
+                let r = monitor_rect(m.handle);
+                (r.left, r.top)
+            };
+        }
+        true
     }
 
     /// Stops captures no pane on screen needs. A pane that shows again starts its
@@ -543,35 +621,57 @@ impl Engine {
                     .map(|s| s.monitor.0 as isize)
             })
             .collect();
-        self.monitors.retain(|m| {
+        self.monitors.retain_mut(|m| {
             let keep = used.contains(&(m.handle.0 as isize));
             if !keep {
-                if let Some(t) = &m.timer {
-                    let _ = t.Stop();
-                }
-                let _ = m.session.Close();
-                let _ = m.pool.Close();
+                m.close();
             }
             keep
         });
     }
 
-    /// Takes `key`'s newest frame and re-renders the screen panes it shows through.
+    /// Takes `key`'s newest frame and re-renders the screen panes it shows
+    /// through where the screen behind them changed.
     fn present(&mut self, key: isize) {
         if !self.take_frame(key) {
             return;
         }
-        if let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) {
-            m.last = Some(Instant::now());
-        }
+        let Some(mi) = self.monitors.iter().position(|m| m.handle.0 as isize == key) else { return };
+        let origin = self.monitors[mi].origin;
         let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
+        let mut rendered = false;
         for pane in panes {
             let Ok(mut state) = pane.try_borrow_mut() else { continue };
             // Wallpaper panes redraw when they move or the wallpaper changes, not per frame.
-            if state.source == Source::Screen && (state.monitor.0 as isize == key || !state.shown) {
-                if let Err(e) = self.render(&mut state) {
-                    log!("glass render failed: {e}");
+            if state.source != Source::Screen || !(state.monitor.0 as isize == key || !state.shown) {
+                continue;
+            }
+            if state.shown && state.monitor.0 as isize == key {
+                // What the pane samples: its rectangle plus the frost margin.
+                let mut wr = RECT::default();
+                if unsafe { GetWindowRect(state.hwnd, &mut wr) }.is_ok() {
+                    let r = RECT {
+                        left: wr.left - origin.0 - MARGIN,
+                        top: wr.top - origin.1 - MARGIN,
+                        right: wr.right - origin.0 + MARGIN,
+                        bottom: wr.bottom - origin.1 + MARGIN,
+                    };
+                    if !self.monitors[mi].changed(&r) {
+                        continue;
+                    }
                 }
+            }
+            rendered = true;
+            if let Err(e) = self.render(&mut state) {
+                log!("glass render failed: {e}");
+            }
+        }
+        // `render` may have pruned captures, moving this one.
+        if let Some(m) = self.monitors.iter_mut().find(|m| m.handle.0 as isize == key) {
+            m.dirty = Some(Vec::new());
+            // Only an actual render holds the next frame back.
+            if rendered {
+                m.last = Some(Instant::now());
             }
         }
     }
@@ -593,7 +693,7 @@ impl Engine {
             Source::Screen => {
                 let Some(mi) = self.monitor(monitor) else { return Ok(()) };
                 let m = &self.monitors[mi];
-                let Some(frame) = m.frame.clone() else { return Ok(()) };
+                let Some((_, frame)) = m.frame.clone() else { return Ok(()) };
                 (frame, m.origin, (m.size.Width, m.size.Height))
             }
             Source::Wallpaper => {
@@ -700,15 +800,26 @@ impl Engine {
 pub fn shutdown() {
     // Nothing may start the engine again.
     FAILED.with(|f| f.set(true));
-    let Some(engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
-    for m in &engine.monitors {
-        let _ = m.session.Close();
-        let _ = m.pool.Close();
+    let Some(mut engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
+    for m in &mut engine.monitors {
+        m.close();
     }
     unsafe {
         engine.context.ClearState();
         engine.context.Flush();
     }
+}
+
+/// Re-paces the screen captures after battery saver or Energy Saver turned on or off.
+pub fn power_changed() {
+    ENGINE.with(|e| {
+        let Ok(mut e) = e.try_borrow_mut() else { return };
+        let Some(engine) = e.as_mut() else { return };
+        engine.interval = min_interval();
+        for m in &engine.monitors {
+            let _ = m.session.SetMinUpdateInterval(timespan(engine.interval));
+        }
+    });
 }
 
 /// Reloads the wallpaper under `Source::Wallpaper` panes (after the user
@@ -756,7 +867,7 @@ fn on_frame(key: isize) {
         let Some(m) = engine.monitors.iter_mut().find(|m| m.handle.0 as isize == key) else { return };
         // Too soon after the last render: the frame waits in the pool (which holds
         // back newer ones until it's taken) and is rendered once it's due.
-        if let Some(wait) = m.last.and_then(|t| MIN_INTERVAL.checked_sub(t.elapsed())) {
+        if let Some(wait) = m.last.and_then(|t| engine.interval.checked_sub(t.elapsed())) {
             if m.defer(key, wait) {
                 return;
             }
@@ -877,5 +988,16 @@ impl Drop for Pane {
         if s.source == Source::Screen {
             exclude_from_capture(s.hwnd, false);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shader_compiles() {
+        compile(s!("vs"), s!("vs_4_0")).unwrap();
+        compile(s!("ps"), s!("ps_4_0")).unwrap();
     }
 }

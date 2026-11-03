@@ -2525,6 +2525,7 @@ impl App {
                 WM_APP_FRAME => self.on_frame(),
                 WM_POWERBROADCAST => {
                     if wp.0 as u32 == PBT_POWERSETTINGCHANGE {
+                        win::glass::power_changed();
                         // Give DWM a moment to switch its effects first.
                         self.timer(TIMER_THEME, 800);
                     }

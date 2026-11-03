@@ -32,6 +32,7 @@ use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -259,6 +260,30 @@ fn monitor_rect(handle: HMONITOR) -> RECT {
     info.rcMonitor
 }
 
+/// A texture size for `need`: `have` while it holds `need` and isn't more
+/// than twice as big, else `need` rounded up to `STEP`, at most `max`.
+fn fit(have: Option<(u32, u32)>, need: (u32, u32), max: (u32, u32)) -> (u32, u32) {
+    const STEP: u32 = 64;
+    let ok = |have: u32, need: u32, max: u32| have >= need.min(max) && have <= max && have <= need * 2 + STEP;
+    let up = |need: u32, max: u32| (need.div_ceil(STEP) * STEP).min(max).max(1);
+    match have {
+        Some(h) if ok(h.0, need.0, max.0) && ok(h.1, need.1, max.1) => h,
+        _ => (up(need.0, max.0), up(need.1, max.1)),
+    }
+}
+
+/// How often the display refreshes, from DWM (60 Hz if it can't say).
+fn refresh_period() -> Duration {
+    let mut info = DWM_TIMING_INFO { cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32, ..Default::default() };
+    let r = unsafe { DwmGetCompositionTimingInfo(HWND::default(), &mut info) };
+    let (n, d) = (info.rateRefresh.uiNumerator, info.rateRefresh.uiDenominator);
+    if r.is_ok() && n > 0 && d > 0 {
+        Duration::from_secs_f64(d as f64 / n as f64).clamp(Duration::from_millis(2), Duration::from_millis(34))
+    } else {
+        Duration::from_micros(16_667)
+    }
+}
+
 fn intersects(a: &RECT, b: &RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
@@ -297,8 +322,14 @@ struct Engine {
     timer: Option<DispatcherQueueTimer>,
     /// Looks for windows that changed under glass (see `POLL`).
     poll: Option<DispatcherQueueTimer>,
+    /// The display's refresh period: moved panes render at most this often.
+    refresh: Duration,
+    /// Renders panes that moved too soon after their last render (see `request`).
+    moved: Option<DispatcherQueueTimer>,
     /// Windows may have moved, opened or closed since panes last rendered.
     restack: bool,
+    /// See `windows()`.
+    windows: Option<(Vec<scene::Window>, Instant)>,
 }
 
 /// Compiles one entry point of an HLSL source.
@@ -396,7 +427,10 @@ impl Engine {
             last: None,
             timer: None,
             poll: None,
+            refresh: refresh_period(),
+            moved: None,
             restack: false,
+            windows: None,
         })
     }
 
@@ -488,14 +522,26 @@ impl Engine {
         self.flush();
     }
 
+    /// Other apps' windows, as last listed. Listing asks DWM about every
+    /// window, so a pane that only moves or reshapes (the Dock magnifying under
+    /// the pointer) reuses the list; it's made afresh when windows change,
+    /// and at least every `POLL`.
+    fn windows(&mut self) -> &[scene::Window] {
+        if self.windows.as_ref().map_or(true, |(_, at)| at.elapsed() >= POLL) {
+            self.windows = Some((scene::windows(), Instant::now()));
+        }
+        &self.windows.as_ref().unwrap().0
+    }
+
     /// Re-renders the screen panes whose windows changed.
     fn flush(&mut self) {
         let panes = self.screen_panes();
         if std::mem::take(&mut self.restack) {
-            let windows = scene::windows();
+            self.windows = None;
+            let windows = self.windows();
             for pane in &panes {
                 let Ok(mut s) = pane.try_borrow_mut() else { continue };
-                if on_screen(s.hwnd) && (!s.shown || scene::layers(&windows, &s.region) != s.layers) {
+                if on_screen(s.hwnd) && (!s.shown || scene::layers(windows, &s.region) != s.layers) {
                     s.stale = true;
                 }
             }
@@ -535,6 +581,48 @@ impl Engine {
         self.schedule();
     }
 
+    /// Renders a pane that moved or reshaped, at most once per display
+    /// refresh: a widget dragged with a fast mouse moves several times a
+    /// refresh, and each render presents a frame no one would see.
+    fn request(&mut self, pane: &mut PaneState) {
+        // Some slack: a surface animating at the refresh rate shouldn't be held back by jitter.
+        let min = self.refresh.mul_f32(0.75);
+        // Resized buffers show nothing until drawn into, so those can't wait.
+        let resized = pane.drawn.map_or(true, |k| k.1 != pane.size);
+        if let Some(wait) = pane.presented.filter(|_| !resized).and_then(|t| min.checked_sub(t.elapsed())) {
+            pane.moved = true;
+            if self.moved.is_none() {
+                self.moved = engine_timer(false, Engine::render_moved);
+            }
+            if let Some(t) = &self.moved {
+                // Already waiting: that render picks this pane up too.
+                if t.IsRunning().unwrap_or(false) {
+                    return;
+                }
+                let _ = t.SetInterval(timespan(wait));
+                if t.Start().is_ok() {
+                    return;
+                }
+            }
+            pane.moved = false;
+        }
+        if let Err(e) = self.render(pane) {
+            log!("glass render failed: {e}");
+        }
+    }
+
+    fn render_moved(&mut self) {
+        let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
+        for pane in panes {
+            let Ok(mut s) = pane.try_borrow_mut() else { continue };
+            if std::mem::take(&mut s.moved) {
+                if let Err(e) = self.render(&mut s) {
+                    log!("glass render failed: {e}");
+                }
+            }
+        }
+    }
+
     fn start_poll(&mut self) {
         if self.poll.is_none() {
             self.poll = engine_timer(true, Engine::poll);
@@ -550,13 +638,14 @@ impl Engine {
     }
 
     fn render(&mut self, pane: &mut PaneState) -> Result<()> {
-        pane.stale = false;
+        let stale = std::mem::take(&mut pane.stale);
         if pane.size.0 == 0 || pane.size.1 == 0 {
             return Ok(());
         }
         // Hidden, minimized or slid away: nothing to show, and no windows to keep capturing.
         if pane.source == Source::Screen && !on_screen(pane.hwnd) {
             pane.layers.clear();
+            pane.drawn = None;
             return Ok(());
         }
         let monitor = unsafe { MonitorFromWindow(pane.hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -565,18 +654,34 @@ impl Engine {
         // Region behind the pane, plus a margin, in screen pixels, kept to its monitor.
         let mut wr = RECT::default();
         unsafe { GetWindowRect(pane.hwnd, &mut wr)? };
+        // A surface often moves and reshapes in separate calls within one
+        // frame; once it's drawn for where it ends up, the other is a no-op.
+        let t = pane.tint;
+        let key = (wr, pane.size, pane.radius.to_bits(), [t.r, t.g, t.b, t.a].map(f32::to_bits));
+        if !stale && pane.drawn == Some(key) {
+            return Ok(());
+        }
         let (w, h) = (pane.size.0 as i32, pane.size.1 as i32);
         let m = monitor_rect(monitor);
-        let region = RECT {
+        let need = RECT {
             left: (wr.left - MARGIN).clamp(m.left, m.right),
             top: (wr.top - MARGIN).clamp(m.top, m.bottom),
             right: (wr.left + w + MARGIN).clamp(m.left, m.right),
             bottom: (wr.top + h + MARGIN).clamp(m.top, m.bottom),
         };
-        if region.right - region.left < 1 || region.bottom - region.top < 1 {
+        if need.right - need.left < 1 || need.bottom - need.top < 1 {
             return Ok(());
         }
-        let src_size = ((region.right - region.left) as u32, (region.bottom - region.top) as u32);
+        // The texture is kept a size up from what's needed, so a pane that
+        // grows a little each frame (Dock magnification) doesn't reallocate it
+        // every frame. It holds more of the screen to fill it, slid back
+        // inside the monitor at its edges.
+        let need_size = ((need.right - need.left) as u32, (need.bottom - need.top) as u32);
+        let mon_size = ((m.right - m.left) as u32, (m.bottom - m.top) as u32);
+        let src_size = fit(pane.src.as_ref().map(|s| s.3), need_size, mon_size);
+        let left = need.left.min(m.right - src_size.0 as i32).max(m.left);
+        let top = need.top.min(m.bottom - src_size.1 as i32).max(m.top);
+        let region = RECT { left, top, right: left + src_size.0 as i32, bottom: top + src_size.1 as i32 };
         if pane.src.as_ref().map(|s| s.3) != Some(src_size) {
             let desc = D3D11_TEXTURE2D_DESC {
                 Width: src_size.0,
@@ -608,7 +713,7 @@ impl Engine {
 
         match pane.source {
             Source::Screen => {
-                let layers = scene::layers(&scene::windows(), &region);
+                let layers = scene::layers(self.windows(), &region);
                 self.scene.capture(&layers, &self.winrt, self.interval);
                 let rtv = &pane.src.as_ref().unwrap().2;
                 self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, &layers);
@@ -660,11 +765,13 @@ impl Engine {
             self.context.GenerateMips(srv);
             self.context.UpdateSubresource(&self.constants, 0, None, &consts as *const _ as _, 0, 0);
 
-            let back: ID3D11Texture2D = pane.swapchain.GetBuffer(0)?;
-            let mut rtv = None;
-            self.device.CreateRenderTargetView(&back, None, Some(&mut rtv))?;
+            // Flip model: buffer 0 is always the one to draw into next, so its view lasts.
+            if pane.rtv.is_none() {
+                let back: ID3D11Texture2D = pane.swapchain.GetBuffer(0)?;
+                self.device.CreateRenderTargetView(&back, None, Some(&mut pane.rtv))?;
+            }
             let c = &self.context;
-            c.OMSetRenderTargets(Some(&[rtv.clone()]), None);
+            c.OMSetRenderTargets(Some(&[pane.rtv.clone()]), None);
             c.RSSetViewports(Some(&[D3D11_VIEWPORT {
                 Width: w as f32,
                 Height: h as f32,
@@ -683,6 +790,8 @@ impl Engine {
             c.OMSetRenderTargets(None, None);
             pane.swapchain.Present(0, DXGI_PRESENT(0)).ok()?;
         }
+        pane.drawn = Some(key);
+        pane.presented = Some(Instant::now());
         pane.shown = true;
         Ok(())
     }
@@ -695,7 +804,7 @@ pub fn shutdown() {
     // Nothing may start the engine again.
     FAILED.with(|f| f.set(true));
     let Some(mut engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
-    for t in [&engine.timer, &engine.poll].into_iter().flatten() {
+    for t in [&engine.timer, &engine.poll, &engine.moved].into_iter().flatten() {
         let _ = t.Stop();
     }
     engine.scene.close();
@@ -744,6 +853,7 @@ pub fn wallpaper_changed() {
         for pane in panes {
             let Ok(mut state) = pane.try_borrow_mut() else { continue };
             if state.source == Source::Wallpaper {
+                state.stale = true;
                 if let Err(e) = engine.render(&mut state) {
                     log!("glass render failed: {e}");
                 }
@@ -786,6 +896,9 @@ struct PaneState {
     style: Style,
     source: Source,
     monitor: HMONITOR,
+    /// A view of its back buffer, made once per resize.
+    rtv: Option<ID3D11RenderTargetView>,
+    /// What's behind it, with views to draw it and read it, and its size.
     src: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, ID3D11RenderTargetView, (u32, u32))>,
     /// What it last sampled, in screen pixels.
     region: RECT,
@@ -793,6 +906,12 @@ struct PaneState {
     layers: Vec<Layer>,
     /// Something behind it changed since it last rendered.
     stale: bool,
+    /// What it was last drawn for: window rect, size, radius and tint.
+    drawn: Option<(RECT, (u32, u32), u32, [u32; 4])>,
+    /// When it last presented a frame.
+    presented: Option<Instant>,
+    /// Moved while too recently presented; renders on `Engine::moved`.
+    moved: bool,
     /// Has presented at least once.
     shown: bool,
 }
@@ -836,10 +955,14 @@ impl Pane {
             style,
             source,
             monitor,
+            rtv: None,
             src: None,
             region: RECT::default(),
             layers: Vec::new(),
             stale: false,
+            drawn: None,
+            presented: None,
+            moved: false,
             shown: false,
         }));
         with_engine(|engine| engine.panes.push(Rc::downgrade(&state)));
@@ -851,12 +974,18 @@ impl Pane {
         let mut s = self.0.borrow_mut();
         let size = (w.round().max(0.0) as u32, h.round().max(0.0) as u32);
         s.radius = radius;
-        if size != s.size && size.0 > 0 && size.1 > 0 {
-            s.size = size;
-            unsafe {
-                if let Err(e) = s.swapchain.ResizeBuffers(2, size.0, size.1, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0)) {
-                    log!("glass resize failed: {e}");
-                }
+        if size == s.size || size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        s.size = size;
+        // Exactly the pane's size: Composition shows a swap chain's whole
+        // buffer (it ignores SetSourceSize), stretched over the visual, so
+        // spare room in it would shrink the glass out of its shape.
+        // The view holds a buffer, which must be let go first.
+        s.rtv = None;
+        unsafe {
+            if let Err(e) = s.swapchain.ResizeBuffers(2, size.0, size.1, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0)) {
+                log!("glass resize failed: {e}");
             }
         }
     }
@@ -869,11 +998,7 @@ impl Pane {
     /// Re-renders now (after the window moved or reshaped).
     pub fn render(&self) {
         let Ok(mut s) = self.0.try_borrow_mut() else { return };
-        with_engine(|engine| {
-            if let Err(e) = engine.render(&mut s) {
-                log!("glass render failed: {e}");
-            }
-        });
+        with_engine(|engine| engine.request(&mut s));
     }
 }
 

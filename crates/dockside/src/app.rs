@@ -47,7 +47,7 @@ use crate::win::{
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
-    WM_APP_DRAG_WATCH, WM_APP_RECORD_KEY, WM_APP_SHELF_KEY, WM_APP_SPOTLIGHT_TAP,
+    WM_APP_DRAG_WATCH, WM_APP_RECORD_KEY, WM_APP_SHELF_KEY, WM_APP_SPOTLIGHT_TAP, WM_APP_CLOAKED,
 };
 
 thread_local! {
@@ -602,6 +602,7 @@ unsafe extern "system" fn win_event(
         // Scoped to the foreground app's process; its other windows don't matter.
         EVENT_OBJECT_LOCATIONCHANGE if hwnd != GetForegroundWindow() => return,
         EVENT_OBJECT_LOCATIONCHANGE => WM_APP_FG_MOVED,
+        EVENT_OBJECT_CLOAKED | EVENT_OBJECT_UNCLOAKED => WM_APP_CLOAKED,
         _ => WM_APP_WINDOWS_CHANGED,
     };
     win::post(MSG_HWND.load(Ordering::Relaxed), msg);
@@ -933,6 +934,21 @@ impl App {
                 if !h.is_invalid() {
                     win_hooks.push(h);
                 }
+            }
+            // Our own windows only: a Finder window switched away to another
+            // desktop is cloaked, and its sidebar backdrop (a separate window,
+            // which no desktop owns) has to go with it.
+            let h = SetWinEventHook(
+                EVENT_OBJECT_CLOAKED,
+                EVENT_OBJECT_UNCLOAKED,
+                None,
+                Some(win_event),
+                std::process::id(),
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            );
+            if !h.is_invalid() {
+                win_hooks.push(h);
             }
         }
 
@@ -1725,6 +1741,16 @@ impl App {
         // The file watcher picks up the change and rebuilds.
         if let Err(e) = config::save_dock_apps(&self.cfg_path, &list) {
             log!("could not update dock apps: {e:#}");
+        }
+    }
+
+    /// Renders what input changed, unless an animation is running: then the
+    /// next frame (at most one refresh away) renders it. A fast mouse sends
+    /// moves far quicker than the display refreshes, and each one would
+    /// otherwise redraw whatever it touched, only for most never to be seen.
+    fn flush_input(&mut self) {
+        if !self.animating {
+            self.flush();
         }
     }
 
@@ -2717,6 +2743,11 @@ impl App {
                     }
                 },
                 WM_APP_DESKTOP => self.on_desktop_changed(),
+                WM_APP_CLOAKED => {
+                    for f in &mut self.finders {
+                        f.sync_backdrop();
+                    }
+                }
                 WM_APP_ISLAND_KEY => {
                     if let Some(i) = &mut self.island {
                         match wp.0 as u16 {
@@ -2771,27 +2802,27 @@ impl App {
 
         if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
             let r = self.on_settings_message(hwnd, msg, wp, lp);
-            self.flush();
+            self.flush_input();
             return r;
         }
         if self.onboarding.as_ref().is_some_and(|o| o.hwnd == hwnd) {
             let r = self.on_onboarding_message(hwnd, msg, wp, lp);
-            self.flush();
+            self.flush_input();
             return r;
         }
         if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
             let r = self.on_spotlight_message(msg, wp, lp);
-            self.flush();
+            self.flush_input();
             return r;
         }
         if self.icon_picker.as_ref().is_some_and(|p| p.surface.content == hwnd) {
             let r = self.on_picker_message(msg, wp, lp);
-            self.flush();
+            self.flush_input();
             return r;
         }
         if let Some(idx) = self.finders.iter().position(|f| f.hwnd == hwnd) {
             let r = self.on_finder_message(idx, hwnd, msg, wp, lp);
-            self.flush();
+            self.flush_input();
             return r;
         }
 
@@ -2810,7 +2841,7 @@ impl App {
         } else {
             None
         };
-        self.flush();
+        self.flush_input();
         result
     }
 

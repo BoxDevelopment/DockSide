@@ -191,5 +191,7 @@ pub const WM_APP_SPOTLIGHT_TAP: u32 = WM_APP + 27;
 pub const WM_APP_DRAG_WATCH: u32 = WM_APP + 28;
 /// A key the island's open shelf took (wParam: index into `island::ShelfKey::ALL`).
 pub const WM_APP_SHELF_KEY: u32 = WM_APP + 29;
+/// One of our windows was cloaked or uncloaked (another virtual desktop came forward).
+pub const WM_APP_CLOAKED: u32 = WM_APP + 30;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

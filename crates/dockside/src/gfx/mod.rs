@@ -536,6 +536,23 @@ impl Drop for Canvas {
     }
 }
 
+/// A bitmap drawn at a size that changes every frame (Dock icons as they
+/// magnify). High-quality downscaling is the slowest thing the CPU renderer
+/// does, so it's done once per half octave, and each frame takes the nearest
+/// copy at least as big and scales it the rest of the way bilinearly, which
+/// at no more than 1.41:1 looks the same.
+pub struct ScaledBitmap {
+    full: ID2D1Bitmap,
+    /// Copies at 2^(-k/2) of `full`'s size for k = 1, 2, ..., made on first use.
+    levels: RefCell<Vec<Option<ID2D1Bitmap>>>,
+}
+
+impl ScaledBitmap {
+    pub fn new(full: ID2D1Bitmap) -> Self {
+        Self { full, levels: RefCell::default() }
+    }
+}
+
 /// Immediate-mode drawing helpers over a render target, in points.
 pub struct Painter<'a> {
     pub rt: &'a ID2D1RenderTarget,
@@ -674,6 +691,52 @@ impl Painter<'_> {
                 None => self.rt.DrawBitmap(bmp, Some(&r.d2d()), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
             }
         }
+    }
+
+    /// Draws `bmp` over `r` (see [`ScaledBitmap`]) and returns the copy it
+    /// drew, for anything else drawn from it at the same size (a tint).
+    pub fn scaled_bitmap(&self, bmp: &ScaledBitmap, r: Rect, opacity: f32) -> ID2D1Bitmap {
+        let src = self.level(bmp, r);
+        unsafe { self.rt.DrawBitmap(&src, Some(&r.d2d()), opacity, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        src
+    }
+
+    /// The copy of `bmp` to draw over `r` from: the smallest at least as big, in device pixels.
+    fn level(&self, bmp: &ScaledBitmap, r: Rect) -> ID2D1Bitmap {
+        let (mut dpi, mut _y) = (96.0, 96.0);
+        unsafe { self.rt.GetDpi(&mut dpi, &mut _y) };
+        let scale = dpi / 96.0;
+        let full = unsafe { bmp.full.GetPixelSize() };
+        let ratio = full.width.max(full.height) as f32 / (r.w.max(r.h) * scale).max(1.0);
+        if ratio <= std::f32::consts::SQRT_2 {
+            return bmp.full.clone();
+        }
+        let k = (2.0 * ratio.log2()).floor().clamp(1.0, 16.0) as usize;
+        let mut levels = bmp.levels.borrow_mut();
+        if levels.len() < k {
+            levels.resize(k, None);
+        }
+        if levels[k - 1].is_none() {
+            let f = 0.5f32.powf(k as f32 / 2.0);
+            let px = D2D_SIZE_U { width: ((full.width as f32 * f).ceil() as u32).max(1), height: ((full.height as f32 * f).ceil() as u32).max(1) };
+            let dip = D2D_SIZE_F { width: px.width as f32 / scale, height: px.height as f32 / scale };
+            levels[k - 1] = unsafe {
+                (|| -> Result<ID2D1Bitmap> {
+                    let brt = self.rt.CreateCompatibleRenderTarget(Some(&dip), Some(&px), None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE)?;
+                    let dst = D2D_RECT_F { left: 0.0, top: 0.0, right: dip.width, bottom: dip.height };
+                    brt.BeginDraw();
+                    brt.Clear(Some(&Color::TRANSPARENT.d2d()));
+                    match brt.cast::<ID2D1DeviceContext>() {
+                        Ok(ctx) => ctx.DrawBitmap(&bmp.full, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None),
+                        Err(_) => brt.DrawBitmap(&bmp.full, Some(&dst), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+                    }
+                    brt.EndDraw(None, None)?;
+                    brt.GetBitmap()
+                })()
+                .ok()
+            };
+        }
+        levels[k - 1].clone().unwrap_or_else(|| bmp.full.clone())
     }
 
     /// A bitmap stretched over `r` with rounded corners (album art).
@@ -979,6 +1042,71 @@ mod bench {
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
+        }
+    }
+
+    /// What a magnifying Dock frame costs on the CPU renderer by how its icons
+    /// are scaled, and how far each way looks from high-quality cubic.
+    /// `cargo test --profile fast bench_dock_icons -- --ignored --nocapture --test-threads 1`
+    #[test]
+    #[ignore]
+    fn bench_dock_icons() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let gfx = Gfx::new().unwrap();
+        let s = 1.25;
+        let (w, h) = ((1500.0 * s) as i32, (220.0 * s) as i32);
+        let mut c = Canvas::new(&gfx, w, h, s).unwrap();
+        // A noisy 256px icon, like the shell's jumbo icons.
+        let data: Vec<u8> = (0..256 * 256).flat_map(|i: u32| { let v = (i.wrapping_mul(2654435761) >> 24) as u8; [v, v / 2, 255 - v, 255] }).collect();
+        let px = icons::IconPixels { width: 256, height: 256, data };
+        let bmp = px.to_bitmap(c.target()).unwrap();
+        let sizes: Vec<f32> = (0..14).map(|i| 48.0 + 48.0 * (-((i as f32 - 6.5) / 2.5).powi(2)).exp()).collect();
+        let sb = ScaledBitmap::new(bmp.clone());
+        let n = 120;
+        let mut frames = Vec::new();
+        for mode in ["cubic", "linear", "half-octave", "tiles+cubic", "tiles+half-octave"] {
+            let t = std::time::Instant::now();
+            for k in 0..n {
+                c.draw(&gfx, |p| {
+                    let mut x = 20.0 + (k % 3) as f32;
+                    for &sz in &sizes {
+                        let r = Rect::new(x, 200.0 - sz, sz, sz);
+                        match mode {
+                            "linear" => unsafe {
+                                p.rt.DrawBitmap(&bmp, Some(&r.d2d()), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None)
+                            },
+                            "half-octave" => {
+                                p.scaled_bitmap(&sb, r, 1.0);
+                            }
+                            "tiles+cubic" | "tiles+half-octave" => {
+                                let tile = r.inset(r.w * 0.06, r.w * 0.06);
+                                p.fill_round(tile.offset(0.0, r.w * 0.01), tile.w * 0.225, Color::gray(0, 0.12));
+                                p.fill_round(tile, tile.w * 0.225, Color::WHITE);
+                                p.stroke_round(tile.inset(0.25, 0.25), tile.w * 0.225, Color::gray(255, 0.14), 0.5);
+                                if mode == "tiles+cubic" {
+                                    p.bitmap(&bmp, tile.inset(tile.w * 0.16, tile.w * 0.16), 1.0);
+                                } else {
+                                    p.scaled_bitmap(&sb, tile.inset(tile.w * 0.16, tile.w * 0.16), 1.0);
+                                }
+                            }
+                            _ => p.bitmap(&bmp, r, 1.0),
+                        }
+                        x += sz + 8.0;
+                    }
+                })
+                .unwrap();
+            }
+            println!("{mode:18} {:.2} ms per {w}x{h} frame", t.elapsed().as_secs_f64() * 1000.0 / n as f64);
+            frames.push(c.pixels());
+        }
+        // How far each looks from cubic, on the last (same) frame.
+        for (i, mode) in [(1, "linear"), (2, "half-octave")] {
+            let d: Vec<u32> = frames[0].iter().zip(&frames[i]).map(|(a, b)| a.abs_diff(*b) as u32).collect();
+            let mean = d.iter().sum::<u32>() as f64 / d.len() as f64;
+            let off = d.iter().filter(|&&x| x > 8).count() as f64 / d.len() as f64 * 100.0;
+            println!("{mode:18} vs cubic: mean diff {mean:.3}, {off:.2}% of channels off by more than 8/255");
         }
     }
 }

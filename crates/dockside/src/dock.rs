@@ -7,7 +7,6 @@ use std::time::Instant;
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::UI::Shell::ABE_BOTTOM;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -400,7 +399,7 @@ pub struct Dock {
     monitor: Monitor,
     metrics: Metrics,
     items: Vec<Item>,
-    bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
+    bitmaps: HashMap<String, Option<crate::gfx::ScaledBitmap>>,
     hover_t: f32,
     hovering: bool,
     mouse: (f32, f32),
@@ -1117,7 +1116,7 @@ impl Dock {
                 (TRASH_EMPTY | TRASH_FULL, custom) => icons.get(&gfx.wic, RECYCLE_BIN, custom),
                 (_, custom) => icons.get(&gfx.wic, key, custom),
             };
-            let bmp = px.and_then(|px| px.to_bitmap(self.surface.canvas.target()));
+            let bmp = px.and_then(|px| px.to_bitmap(self.surface.canvas.target())).map(crate::gfx::ScaledBitmap::new);
             self.bitmaps.insert(item.bitmap_key().to_string(), bmp);
         }
 
@@ -1177,9 +1176,9 @@ impl Dock {
             } else {
                 rect
             };
-            p.bitmap(bmp, draw_rect, opacity);
+            let drawn = p.scaled_bitmap(bmp, draw_rect, opacity);
             if darken {
-                p.tint_bitmap(bmp, draw_rect, Color::gray(0, 0.35));
+                p.tint_bitmap(&drawn, draw_rect, Color::gray(0, 0.35));
             }
         };
 

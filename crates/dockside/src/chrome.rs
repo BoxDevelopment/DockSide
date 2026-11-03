@@ -3,6 +3,7 @@
 //! and an optional blurred (vibrant) or floating Liquid Glass sidebar backdrop.
 
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{lerp, Spring};
@@ -314,10 +315,14 @@ impl SidebarBackdrop {
     }
 
     /// Covers `r` (owner-local points) with a rounded backdrop just below `owner`
-    /// in z-order, or hides it while the owner is hidden or minimized.
+    /// in z-order, or hides it while the owner is hidden, minimized or cloaked
+    /// (on another virtual desktop: the backdrop isn't on any one desktop, so
+    /// it would show on all of them).
     pub fn sync(&mut self, owner: HWND, r: Rect, radius: f32, scale: f32) {
         unsafe {
-            if !IsWindowVisible(owner).as_bool() || IsIconic(owner).as_bool() {
+            let mut cloaked = 0u32;
+            let _ = DwmGetWindowAttribute(owner, DWMWA_CLOAKED, &mut cloaked as *mut _ as _, 4);
+            if !IsWindowVisible(owner).as_bool() || IsIconic(owner).as_bool() || cloaked != 0 {
                 if self.placed.take().is_some() {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }

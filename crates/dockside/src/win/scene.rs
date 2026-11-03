@@ -34,9 +34,12 @@ use crate::win::glass;
 
 /// Windows under one pane, at most; the lowest ones are dropped past this.
 const MAX_LAYERS: usize = 8;
-/// A window's rounded corners: one only hides what's behind if it covers
-/// this much more than the pane's region on every side (or is maximized).
+/// A window's rounded corners: these squares at each corner of a window
+/// (unless maximized) may show what's behind.
 const CORNER: i32 = 12;
+/// Uncovered pieces tracked per pane; past this, windows stop covering any
+/// more (so a few extra get drawn) rather than splitting it further.
+const MAX_OPEN: usize = 64;
 /// How long a capture no pane needs keeps running, so a window that only
 /// briefly stops being under glass (a drag across the Dock) needn't restart.
 const GRACE: Duration = Duration::from_secs(5);
@@ -96,10 +99,6 @@ fn intersects(a: &RECT, b: &RECT) -> bool {
     a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
-fn contains(outer: &RECT, inner: &RECT, inset: i32) -> bool {
-    outer.left + inset <= inner.left && outer.top + inset <= inner.top && outer.right - inset >= inner.right && outer.bottom - inset >= inner.bottom
-}
-
 struct Enum {
     pid: u32,
     out: Vec<Window>,
@@ -143,14 +142,55 @@ pub fn windows() -> Vec<Window> {
     e.out
 }
 
-/// The windows that show in `region`, bottom-most first: from the top-most
-/// one that hides everything under it, up.
+/// Cuts `cut` out of a set of rectangles.
+fn subtract(rects: &mut Vec<RECT>, cut: &RECT) {
+    let mut out = Vec::with_capacity(rects.len() + 4);
+    for r in rects.drain(..) {
+        if !intersects(&r, cut) {
+            out.push(r);
+            continue;
+        }
+        if r.top < cut.top {
+            out.push(RECT { bottom: cut.top, ..r });
+        }
+        if cut.bottom < r.bottom {
+            out.push(RECT { top: cut.bottom, ..r });
+        }
+        let (top, bottom) = (r.top.max(cut.top), r.bottom.min(cut.bottom));
+        if r.left < cut.left {
+            out.push(RECT { right: cut.left, top, bottom, ..r });
+        }
+        if cut.right < r.right {
+            out.push(RECT { left: cut.right, top, bottom, ..r });
+        }
+    }
+    *rects = out;
+}
+
+/// The windows that show in `region`, bottom-most first. Top-most first, each
+/// window that some still-uncovered part of the region shows is kept, and its
+/// opaque area covers that part for the windows below; a window only hidden
+/// by those above is skipped. (Maximized windows all overlap a pane at the top
+/// of the screen, but only the front one shows under it.)
 pub fn layers(windows: &[Window], region: &RECT) -> Vec<Layer> {
+    let mut open = vec![*region];
     let mut out = Vec::new();
-    for w in windows.iter().filter(|w| intersects(&w.layer.rect, region)) {
+    for w in windows {
+        if !open.iter().any(|r| intersects(r, &w.layer.rect)) {
+            continue;
+        }
         out.push(w.layer);
-        let inset = if w.maximized { 0 } else { CORNER };
-        if (w.opaque && contains(&w.layer.rect, region, inset)) || out.len() == MAX_LAYERS {
+        if w.opaque && open.len() < MAX_OPEN {
+            let r = w.layer.rect;
+            if w.maximized {
+                subtract(&mut open, &r);
+            } else {
+                // Everything but the four rounded corners.
+                subtract(&mut open, &RECT { left: r.left + CORNER, right: r.right - CORNER, ..r });
+                subtract(&mut open, &RECT { top: r.top + CORNER, bottom: r.bottom - CORNER, ..r });
+            }
+        }
+        if open.is_empty() || out.len() == MAX_LAYERS {
             break;
         }
     }
@@ -458,5 +498,15 @@ mod tests {
         let ws = [win(1, 0, 0, 400, 400, false), win(2, 95, 95, 205, 155, true), win(3, 0, 0, 400, 400, true)];
         let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn skips_windows_hidden_by_those_above() {
+        // A pane over the top of the screen, above where maximized windows start.
+        let region = RECT { left: 1000, top: 0, right: 1500, bottom: 45 };
+        let max = |id, opaque| Window { maximized: true, ..win(id, 0, 29, 2560, 1440, opaque) };
+        let ws = [max(1, true), max(2, true), max(3, true), win(4, 0, 0, 2560, 1440, true)];
+        let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![4, 1]);
     }
 }

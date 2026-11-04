@@ -77,6 +77,9 @@ pub struct MenuBar {
     /// The highlight capsule: shown the instant a menu opens, let go as it closes.
     motion: Motion<Anim>,
     pill_last: Option<Rect>,
+    /// The focused window is on this bar's display (with a bar on every
+    /// display, the others draw their contents dimmed, like macOS).
+    active: bool,
     pub dirty: bool,
 }
 
@@ -110,9 +113,11 @@ impl MenuBar {
             pressed: None,
             logo: None,
             reserved: m.reserve_space,
-            on_dark: (m.backdrop == Backdrop::Clear).then(|| wallpaper_top_is_dark(gfx).unwrap_or(theme.dark)),
+            on_dark: (m.backdrop == Backdrop::Clear)
+                .then(|| monitor_top_is_dark(&monitor).or_else(|| wallpaper_top_is_dark(gfx)).unwrap_or(theme.dark)),
             motion: Motion::default(),
             pill_last: None,
+            active: true,
             dirty: true,
         };
         bar.tick();
@@ -134,6 +139,18 @@ impl MenuBar {
         self.battery = battery;
         self.dirty |= changed;
         changed
+    }
+
+    pub fn monitor(&self) -> Monitor {
+        self.monitor
+    }
+
+    /// Whether the focused window is on this bar's display; the others dim.
+    pub fn set_active(&mut self, active: bool) {
+        if active != self.active {
+            self.active = active;
+            self.dirty = true;
+        }
     }
 
     pub fn set_app(&mut self, name: String, hwnd: HWND, exe: Option<String>) {
@@ -291,6 +308,8 @@ impl MenuBar {
             Some(false) => (Color::gray(0, 0.86), Color::gray(0, 0.10)),
             None => (theme.text, theme.menubar_highlight),
         };
+        // A bar on a display without the focused window fades back, like macOS.
+        let c = if self.active { c } else { c.alpha(c.a * 0.5) };
 
         let r = self.surface.render(gfx, |p| p.transformed(0.0, 0.0, k, || {
             // Paint every pixel so the whole bar hit-tests.
@@ -348,6 +367,25 @@ impl Drop for MenuBar {
 
 /// Whether the top strip of the desktop wallpaper is dark, from its average
 /// luminance. `None` without a readable wallpaper image.
+/// Whether the wallpaper as laid out on `monitor` is dark along its top (each
+/// display may have its own picture, or its own part of a spanned one).
+fn monitor_top_is_dark(monitor: &Monitor) -> Option<bool> {
+    let px = crate::win::wallpaper::render(monitor.rect).ok()?;
+    let w = (monitor.rect.right - monitor.rect.left) as usize;
+    let h = (monitor.rect.bottom - monitor.rect.top) as usize;
+    let rows = (h / 16).max(1);
+    let (mut sum, mut n) = (0.0f64, 0u32);
+    for y in (0..rows).step_by((rows / 24).max(1)) {
+        for x in (0..w).step_by((w / 96).max(1)) {
+            let i = (y * w + x) * 4;
+            let Some(p) = px.get(i..i + 3) else { continue };
+            sum += 0.2126 * p[2] as f64 + 0.7152 * p[1] as f64 + 0.0722 * p[0] as f64;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| sum / (n as f64) < 150.0)
+}
+
 fn wallpaper_top_is_dark(gfx: &Gfx) -> Option<bool> {
     use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETDESKWALLPAPER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
     let mut buf = [0u16; 520];

@@ -6,6 +6,7 @@ pub mod apps;
 pub mod composition;
 pub mod controls;
 pub mod desktops;
+pub mod displays;
 pub mod elevation;
 pub mod glass;
 pub mod scene;
@@ -60,10 +61,14 @@ pub struct Monitor {
 
 impl Monitor {
     pub fn primary() -> Monitor {
-        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY};
+        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+        Self::from_handle(unsafe { MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY) })
+    }
+
+    pub fn from_handle(hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> Monitor {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITORINFO};
         use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
         unsafe {
-            let hmon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
             let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
             let _ = GetMonitorInfoW(hmon, &mut mi);
             let (mut dx, mut dy) = (96u32, 96u32);
@@ -72,8 +77,37 @@ impl Monitor {
         }
     }
 
+    /// The monitor showing the physical-pixel point (x, y), or the nearest one.
+    pub fn at(x: i32, y: i32) -> Monitor {
+        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+        Self::from_handle(unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST) })
+    }
+
+    /// The monitor the pointer is on: where new windows and Spotlight open, like macOS's active display.
+    pub fn at_cursor() -> Monitor {
+        let mut p = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut p);
+        }
+        Self::at(p.x, p.y)
+    }
+
+    /// The monitor most of `hwnd` is on.
+    pub fn of_window(hwnd: HWND) -> Monitor {
+        use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+        Self::from_handle(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
+    }
+
+    pub fn contains(&self, x: i32, y: i32) -> bool {
+        (self.rect.left..self.rect.right).contains(&x) && (self.rect.top..self.rect.bottom).contains(&y)
+    }
+
     pub fn width_pt(&self) -> f32 {
         (self.rect.right - self.rect.left) as f32 / self.scale
+    }
+
+    pub fn height_pt(&self) -> f32 {
+        (self.rect.bottom - self.rect.top) as f32 / self.scale
     }
 }
 

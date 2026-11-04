@@ -1384,6 +1384,11 @@ impl Island {
         (w.max(1.0), h.max(1.0))
     }
 
+    /// The display the island is on.
+    pub fn monitor(&self) -> Monitor {
+        self.monitor
+    }
+
     pub fn set_fullscreen(&mut self, on: bool) {
         self.fullscreen = on;
         self.sync_visibility();

@@ -15,7 +15,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{feel, lerp, Glide, Motion, Scroll};
 use crate::chrome::{self, WindowAnim, SHADOW};
-use crate::config::{AnimSpeed, Appearance, Backdrop, Config, ConfigValue, IconStyle, IslandFinish, IslandStyle, MinimizeEffect, ShortcutStyle, WindowEffect};
+use crate::config::{
+    AnimSpeed, Appearance, Backdrop, Config, ConfigValue, DisplayMode, IconStyle, IslandFinish, IslandStyle, MinimizeEffect, ShortcutStyle,
+    WindowEffect,
+};
 use crate::dock::START_PATH;
 use crate::finder::text::TextField;
 use crate::finder::FINDER_PATH;
@@ -193,6 +196,7 @@ pub(crate) enum Key {
     MbSearch,
     MbControlCenter,
     MbTray,
+    MbDisplays,
     /// An on/off setting in `[island]`, by name.
     Island(&'static str),
     IslandIcs,
@@ -204,7 +208,10 @@ pub(crate) enum Key {
     IslandHoverDelay,
     IslandCollapseDelay,
     IslandOffset,
+    IslandDisplay,
     DockEnabled,
+    DockDisplays,
+    DockPerDisplay,
     DockSize,
     DockMag,
     DockMagSize,
@@ -262,6 +269,10 @@ impl Key {
             Key::MbSearch => ("menubar", "show_search"),
             Key::MbControlCenter => ("menubar", "show_control_center"),
             Key::MbTray => ("menubar", "show_tray"),
+            Key::MbDisplays => ("menubar", "displays"),
+            Key::IslandDisplay => ("island", "display"),
+            Key::DockDisplays => ("dock", "displays"),
+            Key::DockPerDisplay => ("dock", "per_display_apps"),
             Key::Island(name) => ("island", name),
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::IslandStyle => ("island", "style"),
@@ -951,6 +962,15 @@ impl SettingsWindow {
                     ],
                 },
                 Group {
+                    title: Some("Displays"),
+                    rows: vec![
+                        Row::Segmented("Show menu bar on", Key::MbDisplays),
+                        Row::Note(
+                            "With a menu bar on every display, the bars on displays without the active window are dimmed.",
+                        ),
+                    ],
+                },
+                Group {
                     title: Some("Status items"),
                     rows: vec![
                         Row::Toggle("Battery", Key::MbBattery),
@@ -978,6 +998,8 @@ impl SettingsWindow {
                         Row::Segmented("Finish", Key::IslandFinish),
                         Row::Slider("Vertical offset", Key::IslandOffset),
                     ])
+                    // Which display, once there's a choice.
+                    .chain((crate::win::displays::current().len() > 1).then_some(Row::Segmented("Display", Key::IslandDisplay)))
                     .collect(),
                 },
                 Group {
@@ -1106,6 +1128,19 @@ impl SettingsWindow {
                     .collect(),
                 },
                 Group {
+                    title: Some("Displays"),
+                    rows: std::iter::once(Row::Segmented("Show Dock on", Key::DockDisplays))
+                        // Only with a Dock on each display.
+                        .chain(
+                            (cfg.dock.displays == DisplayMode::All)
+                                .then_some(Row::Toggle("Show only apps open on that display", Key::DockPerDisplay)),
+                        )
+                        .chain((cfg.dock.displays == DisplayMode::Follow).then_some(Row::Note(
+                            "The Dock moves to whichever display you rest the pointer on the bottom edge of.",
+                        )))
+                        .collect(),
+                },
+                Group {
                     title: Some("Custom icons"),
                     rows: vec![
                         Row::Info("Change an app's icon", "Right-click it (or the Trash) in the Dock, then Change Icon\u{2026}".into()),
@@ -1232,6 +1267,7 @@ impl SettingsWindow {
             Key::MbTray => m.show_tray,
             Key::Island(name) => island_flag(&cfg.island, name),
             Key::DockEnabled => d.enabled,
+            Key::DockPerDisplay => d.per_display_apps,
             Key::DockMag => d.magnification,
             Key::DockAutohide => d.autohide,
             Key::DockShowOnDesktop => d.show_on_desktop,
@@ -1356,6 +1392,31 @@ impl SettingsWindow {
                 const AFTER: [(&str, &str); 5] = [("1 Hour", "60"), ("1 Day", "1440"), ("1 Week", "10080"), ("30 Days", "43200"), ("Never", "0")];
                 let current = cfg.island.shelf_expire_minutes.to_string();
                 fixed(&AFTER, AFTER.iter().position(|a| a.1 == current))
+            }
+            Key::DockDisplays => fixed(
+                &[("Main Display", "main"), ("All Displays", "all"), ("Follow Pointer", "follow")],
+                Some(match cfg.dock.displays {
+                    DisplayMode::Main => 0,
+                    DisplayMode::All => 1,
+                    DisplayMode::Follow => 2,
+                }),
+            ),
+            Key::MbDisplays => fixed(
+                &[("Main Display", "main"), ("All Displays", "all")],
+                Some((cfg.menubar.displays == DisplayMode::All) as usize),
+            ),
+            Key::IslandDisplay => {
+                // "" is the main display; the others by id, named as their monitors report.
+                let list = crate::win::displays::current();
+                let mut labels = vec!["Main Display".to_string()];
+                let mut values = vec![String::new()];
+                for d in list.iter().filter(|d| !d.primary) {
+                    labels.push(d.name.clone());
+                    values.push(d.id.clone());
+                }
+                let main = list.iter().find(|d| d.primary).is_some_and(|d| d.id.eq_ignore_ascii_case(&cfg.island.display));
+                let sel = if main { Some(0) } else { values.iter().position(|v| v.eq_ignore_ascii_case(&cfg.island.display)) };
+                (labels, values, sel)
             }
             Key::DockIconStyle => fixed(
                 &[("Native", "native"), ("Squircle", "squircle")],

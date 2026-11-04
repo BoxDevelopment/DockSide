@@ -62,6 +62,9 @@ show_tray = true
 desktop_app_name = "Finder"
 # Keep maximized windows from covering the menu bar.
 reserve_space = true
+# With more than one display: "all" puts a menu bar on each (dimmed on the
+# displays without the focused window, like macOS), "main" only on the main one.
+displays = "all"
 
 [dock]
 enabled = true
@@ -97,6 +100,12 @@ autohide = false
 show_on_desktop = false
 # Keep maximized windows from covering the Dock (ignored with autohide).
 reserve_space = true
+# With more than one display: "main" keeps the Dock on the main display, "all"
+# puts one on each, and "follow" moves it to whichever display you rest the
+# pointer on the bottom edge of (like macOS).
+displays = "main"
+# With a Dock on each display: show only the running apps with windows on that display.
+per_display_apps = false
 
 # Pinned apps, left to right.
 #   path  - .exe, .lnk, folder, URI, "shell:AppsFolder\<AUMID>" for Store apps,
@@ -202,6 +211,8 @@ style = "pill"
 finish = "black"
 # Points to move the island down from its spot; negative moves it up.
 vertical_offset = 0
+# The display the island is on ("" = the main display; System Settings lists the others).
+display = ""
 # Seconds paused media stays in the island; 0 keeps it until the app closes.
 hide_paused_after = 60
 
@@ -299,6 +310,7 @@ world_clocks = ["America/Los_Angeles", "America/New_York", "Europe/London", "Asi
 #          reminders, now_playing or system
 #   size - small, medium or large (not every widget has every size)
 #   zone - world_clock: the time zone of a small one (optional)
+#   display - the display it's on (optional; set by dragging it to another screen)
 [[widgets.items]]
 kind = "clock"
 size = "small"

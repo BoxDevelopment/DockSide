@@ -23,7 +23,7 @@ use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, ABN_FULLSCREENAPP, ABN_POSCH
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{approach, FrameClock, FRAME_PENDING};
-use crate::config::{self, Config, DockApp};
+use crate::config::{self, Config, DisplayMode, DockApp};
 use crate::dock::{Dock, FileDrop, START_PATH};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
@@ -41,6 +41,7 @@ use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::surface::Fading;
 use crate::theme::Theme;
 use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
+use crate::win::displays::{self, Display};
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
@@ -59,7 +60,8 @@ static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Windows the menu mouse hook must not treat as "outside" clicks.
 static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
 static OPEN_SUBMENU_HWND: AtomicIsize = AtomicIsize::new(0);
-static MENUBAR_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Every display's menu bar (clicks on any of them leave an open menu to the bar).
+static MENUBAR_HWNDS: [AtomicIsize; 8] = [const { AtomicIsize::new(0) }; 8];
 /// Whether the island's keyboard hook swallows volume keys (it shows its own HUD).
 static ISLAND_VOLUME_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Which desktop shortcuts the desktop key hook takes.
@@ -93,6 +95,10 @@ const TIMER_SPOTLIGHT_TAP: usize = 13;
 /// Elevated only: polls for another app's drag over the Dock, which OLE can't tell us about.
 const TIMER_DRAG_WATCH: usize = 14;
 const DRAG_WATCH_MS: u32 = 80;
+/// "follow": watches for the pointer resting on a display's bottom edge, to move the Dock there.
+const TIMER_DOCK_FOLLOW: usize = 15;
+const DOCK_FOLLOW_MS: u32 = 100;
+const DOCK_FOLLOW_DWELL_MS: u64 = 300;
 /// Long enough for DWM to present a new surface's backdrop.
 const RETIRE_MS: u32 = 250;
 /// Messages handled slower than this are logged.
@@ -201,7 +207,27 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 
 /// Where `hwnd`'s Dock icon is on screen, for the genie to go into.
 fn dock_icon(hwnd: HWND) -> Option<RECT> {
-    with_app(|app| app.dock.as_ref().and_then(|d| d.icon_rect(hwnd))).flatten()
+    // With a Dock on each display, the one on the window's own display.
+    with_app(|app| {
+        let mon = window_monitor(hwnd).rect;
+        let here = app.docks.iter().find(|d| d.monitor().rect == mon);
+        here.or(app.docks.first()).and_then(|d| d.icon_rect(hwnd))
+    })
+    .flatten()
+}
+
+/// The monitor a window is on, or (minimized) will restore onto.
+fn window_monitor(hwnd: HWND) -> Monitor {
+    use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONEAREST};
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let mut wp = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+            if GetWindowPlacement(hwnd, &mut wp).is_ok() {
+                return Monitor::from_handle(MonitorFromRect(&wp.rcNormalPosition, MONITOR_DEFAULTTONEAREST));
+            }
+        }
+    }
+    Monitor::of_window(hwnd)
 }
 
 fn push(action: Action) {
@@ -242,7 +268,21 @@ pub fn finder_drop_virtual(id: u32, dest: PathBuf, copy: bool) {
 pub fn dock_drag(phase: finder::dnd::Phase, paths: &[PathBuf]) -> FileDrop {
     use finder::dnd::Phase;
     let (drop, action) = with_app(|app| {
-        let d = app.dock.as_mut()?;
+        // The drag is over one Dock: the one under it (all of them hear it leave).
+        let inside = |d: &Dock, x: i32, y: i32| {
+            let r = d.surface.rect;
+            (r.left..r.right).contains(&x) && (r.top..r.bottom).contains(&y)
+        };
+        let i = match phase {
+            Phase::Over(x, y) | Phase::Drop(x, y) => app.docks.iter().position(|d| inside(d, x, y)),
+            Phase::Leave => {
+                for d in &mut app.docks {
+                    d.on_file_leave();
+                }
+                None
+            }
+        };
+        let d = app.docks.get_mut(i.unwrap_or(0))?;
         let (left, top, s) = (d.surface.rect.left, d.surface.rect.top, d.surface.scale);
         let at = |x: i32, y: i32| ((x - left) as f32 / s, (y - top) as f32 / s);
         let r = match phase {
@@ -326,7 +366,11 @@ fn execute(action: Action) {
         }
         Action::Launch { path, args } => {
             with_app(|app| {
-                if app.dock.as_mut().map(|d| d.bounce(&path)).unwrap_or(false) {
+                let mut bounced = false;
+                for d in &mut app.docks {
+                    bounced |= d.bounce(&path);
+                }
+                if bounced {
                     app.animate();
                 }
             });
@@ -617,7 +661,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         // Close on any click except on the menu itself, or on the menu bar
         // (which switches between its menus on its own).
         let keep = root != 0
-            && [&OPEN_MENU_HWND, &OPEN_SUBMENU_HWND, &MENUBAR_HWND].iter().any(|h| root == h.load(Ordering::Relaxed));
+            && [&OPEN_MENU_HWND, &OPEN_SUBMENU_HWND].into_iter().chain(&MENUBAR_HWNDS).any(|h| root == h.load(Ordering::Relaxed));
         if apps::window_pid(target) != GetCurrentProcessId() || !keep {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_MENU);
         }
@@ -828,8 +872,20 @@ pub struct App {
     last_frame: Instant,
     icons: IconStore,
     names: apps::AppNames,
-    menubar: Option<MenuBar>,
-    dock: Option<Dock>,
+    /// The connected displays (as of the last build).
+    displays: Vec<Display>,
+    /// One menu bar per display it's shown on, the main display's first.
+    menubars: Vec<MenuBar>,
+    /// One Dock per display it's shown on (with "follow", the one it's on).
+    docks: Vec<Dock>,
+    /// "follow": the display the Dock moved to, by id.
+    dock_home: Option<String>,
+    /// "follow": where and since when the pointer has rested on a bottom edge.
+    dock_dwell: Option<(RECT, Instant)>,
+    /// The menu bar or Dock window the open menu came from.
+    menu_opener: HWND,
+    /// The display the open menu is on (its submenus open there too).
+    menu_monitor: Monitor,
     island: Option<Island>,
     widgets: Option<Widgets>,
     menu: Option<PopupMenu>,
@@ -880,8 +936,8 @@ pub struct App {
     explorer_tray: Option<HWND>,
     /// Edge the taskbar was last seen on, to notice it being moved while we run.
     taskbar_edge: Option<u32>,
-    /// Shell surfaces are currently hidden for a fullscreen app.
-    fullscreen_hidden: bool,
+    /// The display (its rect) whose shell surfaces are hidden for a fullscreen app.
+    fullscreen_on: Option<RECT>,
     /// Sources of a retired island / widgets, for their replacements to take over.
     island_handover: Option<crate::island::Handover>,
     widgets_handover: Option<crate::widgets::Handover>,
@@ -975,8 +1031,13 @@ impl App {
             last_frame: Instant::now(),
             icons: IconStore::default(),
             names: apps::AppNames::default(),
-            menubar: None,
-            dock: None,
+            displays: Vec::new(),
+            menubars: Vec::new(),
+            docks: Vec::new(),
+            dock_home: None,
+            dock_dwell: None,
+            menu_opener: HWND::default(),
+            menu_monitor: Monitor::primary(),
             island: None,
             widgets: None,
             menu: None,
@@ -1008,7 +1069,7 @@ impl App {
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             explorer_tray: None,
             taskbar_edge: None,
-            fullscreen_hidden: false,
+            fullscreen_on: None,
             island_handover: None,
             widgets_handover: None,
             backdrop_state: backdrop_state(),
@@ -1028,7 +1089,8 @@ impl App {
         self.retire_menubar();
         self.theme = Theme::new(&self.cfg, &self.gfx);
         self.backdrop_state = backdrop_state();
-        self.monitor = Monitor::primary();
+        self.displays = displays::list();
+        self.monitor = self.displays.first().map_or_else(Monitor::primary, |d| d.monitor);
 
         self.apply_taskbar();
         if self.cfg.menubar.enabled && self.cfg.menubar.show_tray {
@@ -1038,26 +1100,8 @@ impl App {
         } else {
             crate::win::tray::stop();
         }
-        if self.cfg.menubar.enabled {
-            match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(m) => {
-                    MENUBAR_HWND.store(m.surface.content.0 as isize, Ordering::Relaxed);
-                    self.menubar = Some(m);
-                }
-                Err(e) => log!("menu bar failed: {e}"),
-            }
-        }
-        if self.cfg.dock.enabled {
-            match Dock::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(d) => {
-                    self.dock = Some(d);
-                    if win::elevation::is_elevated() {
-                        self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
-                    }
-                }
-                Err(e) => log!("dock failed: {e}"),
-            }
-        }
+        self.create_menubars();
+        self.create_docks(false);
         // Explorer releases the auto-hidden taskbar's work area after we've already
         // reserved ours; catch up even if no ABN_POSCHANGED arrives.
         self.taskbar_edge = taskbar::edge();
@@ -1067,7 +1111,7 @@ impl App {
         self.rebuild_island();
         self.rebuild_widgets();
         // The new surfaces start shown; hide them again if a fullscreen app is still up.
-        self.fullscreen_hidden = false;
+        self.fullscreen_on = None;
         self.update_fullscreen();
         self.setup_desktops();
         self.refresh_windows();
@@ -1076,7 +1120,13 @@ impl App {
         if self.index.lock().is_ok_and(|i| i.built.is_none()) {
             self.rebuild_index();
         }
-        log!("built surfaces in {:?} (scale {}, font {})", started.elapsed(), self.monitor.scale, self.theme.font);
+        log!(
+            "built surfaces in {:?} ({} display(s), scale {}, font {})",
+            started.elapsed(),
+            self.displays.len(),
+            self.monitor.scale,
+            self.theme.font
+        );
     }
 
     /// Applies a changed config with the least disruption: unchanged surfaces
@@ -1113,10 +1163,10 @@ impl App {
         if general_changed {
             // Font / accent / shortcut hints: same surfaces, new paint.
             self.theme = Theme::new(&self.cfg, &self.gfx);
-            if let Some(mb) = &mut self.menubar {
+            for mb in &mut self.menubars {
                 mb.dirty = true;
             }
-            if let Some(d) = &mut self.dock {
+            for d in &mut self.docks {
                 d.dirty = true;
             }
             if let Some(w) = &mut self.widgets {
@@ -1141,6 +1191,7 @@ impl App {
         };
         if old.island != self.cfg.island || old.menubar.enabled != self.cfg.menubar.enabled
             || old.menubar.height != self.cfg.menubar.height
+            || old.menubar.displays != self.cfg.menubar.displays
             || island_widgets(&old) != island_widgets(&self.cfg)
         {
             self.rebuild_island();
@@ -1148,6 +1199,7 @@ impl App {
         let (w0, w1) = (&old.widgets, &self.cfg.widgets);
         if w0.enabled != w1.enabled || w0.backdrop != w1.backdrop || old.menubar.enabled != self.cfg.menubar.enabled
             || old.menubar.height != self.cfg.menubar.height
+            || old.menubar.displays != self.cfg.menubar.displays
         {
             self.rebuild_widgets();
         } else if w0 != w1 || old.island.calendar_ics != self.cfg.island.calendar_ics
@@ -1162,12 +1214,13 @@ impl App {
         }
         if old.dock != self.cfg.dock || old.app_icons != self.cfg.app_icons {
             let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock) && old.app_icons == self.cfg.app_icons;
-            match &mut self.dock {
-                Some(d) if only_apps => {
+            if only_apps && !self.docks.is_empty() {
+                for d in &mut self.docks {
                     d.set_apps(&self.cfg.dock.apps);
-                    self.animate();
                 }
-                _ => self.rebuild_dock(),
+                self.animate();
+            } else {
+                self.rebuild_dock();
             }
         }
         self.refresh_windows();
@@ -1179,14 +1232,120 @@ impl App {
             self.close_menu();
         }
         self.retire_menubar();
-        if self.cfg.menubar.enabled {
-            match MenuBar::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(m) => {
-                    MENUBAR_HWND.store(m.surface.content.0 as isize, Ordering::Relaxed);
-                    self.menubar = Some(m);
-                }
+        self.create_menubars();
+        self.update_foreground();
+    }
+
+    /// The displays the menu bar goes on: the main one, or every one.
+    fn menubar_monitors(&self) -> Vec<Monitor> {
+        match self.cfg.menubar.displays {
+            DisplayMode::All => self.displays.iter().map(|d| d.monitor).collect(),
+            DisplayMode::Main | DisplayMode::Follow => vec![self.monitor],
+        }
+    }
+
+    /// Whether `monitor` gets a menu bar.
+    fn has_menubar(&self, monitor: &Monitor) -> bool {
+        self.cfg.menubar.enabled && self.menubar_monitors().iter().any(|m| m.rect == monitor.rect)
+    }
+
+    fn create_menubars(&mut self) {
+        if !self.cfg.menubar.enabled {
+            return;
+        }
+        for monitor in self.menubar_monitors() {
+            match MenuBar::new(&self.gfx, &self.theme, &self.cfg, monitor) {
+                Ok(m) => self.menubars.push(m),
                 Err(e) => log!("menu bar failed: {e}"),
             }
+        }
+        for (i, slot) in MENUBAR_HWNDS.iter().enumerate() {
+            slot.store(self.menubars.get(i).map_or(0, |m| m.surface.content.0 as isize), Ordering::Relaxed);
+        }
+    }
+
+    /// The displays the Dock goes on: the main one, every one, or (following
+    /// the pointer) the one it last moved to.
+    fn dock_monitors(&self) -> Vec<Monitor> {
+        match self.cfg.dock.displays {
+            DisplayMode::All => self.displays.iter().map(|d| d.monitor).collect(),
+            DisplayMode::Follow => {
+                let home = self.dock_home.as_deref().and_then(|id| displays::find(&self.displays, id));
+                vec![home.map_or(self.monitor, |d| d.monitor)]
+            }
+            DisplayMode::Main => vec![self.monitor],
+        }
+    }
+
+    /// Creates the Docks (`slide_in`: rising into place, after moving displays).
+    fn create_docks(&mut self, slide_in: bool) {
+        let follow = self.cfg.dock.enabled && self.cfg.dock.displays == DisplayMode::Follow && self.displays.len() > 1;
+        if follow {
+            self.timer(TIMER_DOCK_FOLLOW, DOCK_FOLLOW_MS);
+        } else {
+            unsafe {
+                let _ = KillTimer(self.msg_hwnd, TIMER_DOCK_FOLLOW);
+            }
+            self.dock_dwell = None;
+        }
+        if !self.cfg.dock.enabled {
+            return;
+        }
+        for monitor in self.dock_monitors() {
+            match Dock::new(&self.gfx, &self.theme, &self.cfg, monitor) {
+                Ok(mut d) => {
+                    if slide_in {
+                        d.slide_in();
+                    }
+                    self.docks.push(d);
+                }
+                Err(e) => log!("dock failed: {e}"),
+            }
+        }
+        if !self.docks.is_empty() && win::elevation::is_elevated() {
+            self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
+        }
+        if slide_in {
+            self.animate();
+        }
+    }
+
+    /// "follow": moves the Dock to the display whose bottom edge the pointer
+    /// has rested on (its last rows of pixels, so a shared edge counts too).
+    fn follow_pointer(&mut self) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        let Some(current) = self.docks.first().map(|d| d.monitor().rect) else { return };
+        let mut p = POINT::default();
+        // Not while dragging (a window being moved across, say).
+        let dragging = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
+        if dragging || unsafe { GetCursorPos(&mut p) }.is_err() {
+            self.dock_dwell = None;
+            return;
+        }
+        let edge = self.displays.iter().find(|d| d.monitor.contains(p.x, p.y) && p.y >= d.monitor.rect.bottom - 2);
+        let Some(target) = edge.filter(|d| d.monitor.rect != current) else {
+            self.dock_dwell = None;
+            return;
+        };
+        match self.dock_dwell {
+            Some((r, since)) if r == target.monitor.rect => {
+                if since.elapsed() >= std::time::Duration::from_millis(DOCK_FOLLOW_DWELL_MS) {
+                    self.dock_dwell = None;
+                    self.dock_home = Some(target.id.clone());
+                    log!("dock: moving to {}", target.name);
+                    if self.menu.as_ref().is_some_and(|m| matches!(m.source, MenuSource::Dock(_))) {
+                        self.close_menu();
+                    }
+                    // Gone from the old display at once; it rises on the new one.
+                    for d in &mut self.docks {
+                        d.surface.set_hidden(true);
+                    }
+                    self.retire_dock();
+                    self.create_docks(true);
+                    self.refresh_windows();
+                }
+            }
+            _ => self.dock_dwell = Some((target.monitor.rect, Instant::now())),
         }
     }
 
@@ -1197,14 +1356,17 @@ impl App {
     }
 
     fn retire_menubar(&mut self) {
-        if let Some(mut m) = self.menubar.take() {
+        for slot in &MENUBAR_HWNDS {
+            slot.store(0, Ordering::Relaxed);
+        }
+        for mut m in std::mem::take(&mut self.menubars) {
             m.release_space();
             self.retire(m);
         }
     }
 
     fn retire_dock(&mut self) {
-        if let Some(mut d) = self.dock.take() {
+        for mut d in std::mem::take(&mut self.docks) {
             // A fading-out Dock mustn't take drops meant for its replacement.
             crate::dock_drop::revoke(d.surface.content);
             d.release_space();
@@ -1233,7 +1395,11 @@ impl App {
         let handover = self.island_handover.take();
         if self.cfg.island.enabled {
             let hwnd = self.msg_hwnd.0 as isize;
-            match Island::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_ISLAND, handover) {
+            let monitor = displays::resolve(&self.displays, &self.cfg.island.display).map_or(self.monitor, |d| d.monitor);
+            // It tucks into the menu bar, unless its display doesn't have one.
+            let mut cfg = self.cfg.clone();
+            cfg.menubar.enabled = self.has_menubar(&monitor);
+            match Island::new(&self.gfx, &self.theme, &cfg, monitor, hwnd, WM_APP_ISLAND, handover) {
                 Ok(i) => self.island = Some(i),
                 Err(e) => log!("island failed: {e}"),
             }
@@ -1278,8 +1444,22 @@ impl App {
         let handover = self.widgets_handover.take();
         if self.cfg.widgets.enabled {
             let hwnd = self.msg_hwnd.0 as isize;
-            self.widgets = Some(Widgets::new(&self.gfx, &self.theme, &self.cfg, self.monitor, hwnd, WM_APP_WIDGETS, handover));
+            let screens = self.widget_screens();
+            self.widgets = Some(Widgets::new(&self.gfx, &self.theme, &self.cfg, screens, hwnd, WM_APP_WIDGETS, handover));
         }
+    }
+
+    /// Where widgets may go: every display, below its menu bar if it has one.
+    fn widget_screens(&self) -> Vec<crate::widgets::Screen> {
+        self.displays
+            .iter()
+            .map(|d| crate::widgets::Screen {
+                id: d.id.clone(),
+                main: d.primary,
+                monitor: d.monitor,
+                top: if self.has_menubar(&d.monitor) { self.cfg.menubar.height } else { 0.0 },
+            })
+            .collect()
     }
 
     /// Adds, removes or resizes a widget: written to the config, then applied.
@@ -1371,7 +1551,7 @@ impl App {
     fn open_onboarding(&mut self) {
         match &mut self.onboarding {
             Some(o) => o.show(),
-            None => match Onboarding::new(&self.gfx, &self.monitor) {
+            None => match Onboarding::new(&self.gfx, &Monitor::at_cursor()) {
                 Ok(o) => {
                     self.onboarding = Some(o);
                     self.animate();
@@ -1422,7 +1602,7 @@ impl App {
     fn open_settings(&mut self, page: Option<Page>) {
         match &mut self.settings {
             Some(s) => s.show_page(page),
-            None => match SettingsWindow::new(&self.gfx, &self.monitor, page.unwrap_or(Page::General)) {
+            None => match SettingsWindow::new(&self.gfx, &Monitor::at_cursor(), page.unwrap_or(Page::General)) {
                 Ok(s) => {
                     self.settings = Some(s);
                     self.animate();
@@ -1453,17 +1633,8 @@ impl App {
             self.close_menu();
         }
         self.retire_dock();
-        if self.cfg.dock.enabled {
-            match Dock::new(&self.gfx, &self.theme, &self.cfg, self.monitor) {
-                Ok(d) => {
-                    self.dock = Some(d);
-                    if win::elevation::is_elevated() {
-                        self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
-                    }
-                }
-                Err(e) => log!("dock failed: {e}"),
-            }
-        }
+        self.create_docks(false);
+        self.refresh_windows();
     }
 
     fn animate(&mut self) {
@@ -1485,14 +1656,14 @@ impl App {
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         let mut still = false;
-        if let Some(d) = &mut self.dock {
+        for d in &mut self.docks {
             still |= d.tick(dt);
         }
         if let Some(i) = &mut self.island {
             i.hold_open = self.menu.is_some();
             still |= i.tick(dt);
         }
-        if let Some(mb) = &mut self.menubar {
+        for mb in &mut self.menubars {
             still |= mb.animate(dt);
         }
         for m in self.menu.iter_mut().chain(self.submenu.as_mut().map(|(_, s)| s)) {
@@ -1572,7 +1743,7 @@ impl App {
     }
 
     fn on_tick(&mut self) {
-        if let Some(mb) = &mut self.menubar {
+        for mb in &mut self.menubars {
             mb.tick();
         }
         crate::win::tray::keep_on_top();
@@ -1585,8 +1756,15 @@ impl App {
         if self.hides_taskbar() {
             taskbar::reapply();
         }
-        if self.cfg.dock.show_trash && self.dock.as_mut().is_some_and(|d| d.set_trash_full(system::trash_full())) {
-            self.animate();
+        if self.cfg.dock.show_trash && !self.docks.is_empty() {
+            let full = system::trash_full();
+            let mut changed = false;
+            for d in &mut self.docks {
+                changed |= d.set_trash_full(full);
+            }
+            if changed {
+                self.animate();
+            }
         }
         self.refresh_windows();
     }
@@ -1594,7 +1772,20 @@ impl App {
     fn refresh_windows(&mut self) {
         let mut windows = apps::list_windows();
         windows.extend(self.own_app_windows());
-        if self.dock.as_mut().is_some_and(|d| d.update_running(&windows, &mut self.names, &self.cfg)) {
+        // With a Dock on each display, each may list only that display's windows.
+        let split = self.cfg.dock.per_display_apps && self.docks.len() > 1;
+        let on: Vec<RECT> = if split { windows.iter().map(|w| window_monitor(w.hwnd).rect).collect() } else { Vec::new() };
+        let mut moved = false;
+        for d in &mut self.docks {
+            if split {
+                let mine: Vec<apps::AppWindow> =
+                    windows.iter().zip(&on).filter(|(_, r)| **r == d.monitor().rect).map(|(w, _)| w.clone()).collect();
+                moved |= d.update_running(&mine, &mut self.names, &self.cfg);
+            } else {
+                moved |= d.update_running(&windows, &mut self.names, &self.cfg);
+            }
+        }
+        if moved {
             self.animate();
         }
         self.update_foreground();
@@ -1604,16 +1795,15 @@ impl App {
     /// maximized window over the topmost band. Raised bottom to top, so the
     /// island sits above the menu bar and an open menu / Spotlight above both.
     fn raise_surfaces(&self) {
+        let bars = self.docks.iter().map(|d| &d.surface).chain(self.menubars.iter().map(|m| &m.surface));
         let surfaces = [
-            self.dock.as_ref().map(|d| &d.surface),
-            self.menubar.as_ref().map(|m| &m.surface),
             self.island.as_ref().map(|i| &i.surface),
             self.menu.as_ref().map(|m| &m.surface),
             self.submenu.as_ref().map(|(_, s)| &s.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
         ];
-        for s in surfaces.into_iter().flatten() {
+        for s in bars.chain(surfaces.into_iter().flatten()) {
             s.raise();
         }
     }
@@ -1624,19 +1814,42 @@ impl App {
     /// and isn't always sent for in-place fullscreen (F11).
     fn update_fullscreen(&mut self) {
         let fg = unsafe { GetForegroundWindow() };
-        let hide = apps::is_fullscreen_app(fg, self.monitor.rect);
-        if hide == self.fullscreen_hidden {
+        self.update_active_bar(fg);
+        // Only that display's surfaces hide: a game on one screen leaves the others alone.
+        let mon = if fg.is_invalid() { self.monitor } else { Monitor::of_window(fg) };
+        let on = apps::is_fullscreen_app(fg, mon.rect).then_some(mon.rect);
+        if on == self.fullscreen_on {
             return;
         }
-        self.fullscreen_hidden = hide;
-        if let Some(mb) = &mut self.menubar {
-            mb.surface.set_hidden(hide);
+        self.fullscreen_on = on;
+        for mb in &mut self.menubars {
+            mb.surface.set_hidden(on == Some(mb.monitor().rect));
         }
-        if let Some(d) = &mut self.dock {
-            d.surface.set_hidden(hide);
+        for d in &mut self.docks {
+            d.surface.set_hidden(on == Some(d.monitor().rect));
         }
         if let Some(i) = &mut self.island {
-            i.set_fullscreen(hide);
+            i.set_fullscreen(on == Some(i.monitor().rect));
+        }
+    }
+
+    /// With a menu bar on each display, the one where the focused window is
+    /// draws at full strength; the others dim (for the desktop: where the pointer is).
+    fn update_active_bar(&mut self, fg: HWND) {
+        if self.menubars.len() < 2 {
+            return;
+        }
+        let shell = fg.is_invalid() || apps::is_desktop(fg) || win::class_name(fg) == "Shell_TrayWnd";
+        // Our Dock, menu bars and menus aren't windows to follow; Finder and Settings are.
+        let surface = !shell && apps::window_pid(fg) == self.pid && !self.finders.iter().any(|f| f.hwnd == fg)
+            && !self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
+            && !self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg);
+        if surface {
+            return;
+        }
+        let active = if shell { Monitor::at_cursor() } else { Monitor::of_window(fg) };
+        for mb in &mut self.menubars {
+            mb.set_active(mb.monitor().rect == active.rect);
         }
     }
 
@@ -1678,7 +1891,11 @@ impl App {
             Some(apps::is_desktop(fg) || win::class_name(fg) == "Shell_TrayWnd")
         };
         if let Some(on) = on_desktop {
-            if self.dock.as_mut().is_some_and(|d| d.set_on_desktop(on)) {
+            let mut changed = false;
+            for d in &mut self.docks {
+                changed |= d.set_on_desktop(on);
+            }
+            if changed {
                 self.animate();
             }
             // Show Desktop (Win+D) restacks the desktop; keep widgets right above it.
@@ -1689,19 +1906,19 @@ impl App {
             }
         }
         if self.finders.iter().any(|f| f.hwnd == fg) {
-            if let Some(mb) = &mut self.menubar {
+            for mb in &mut self.menubars {
                 mb.set_app("Finder".into(), fg, Some(FINDER_PATH.to_string()));
             }
             return;
         }
         if self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
-            if let Some(mb) = &mut self.menubar {
+            for mb in &mut self.menubars {
                 mb.set_app("System Settings".into(), fg, None);
             }
             return;
         }
         if self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg) {
-            if let Some(mb) = &mut self.menubar {
+            for mb in &mut self.menubars {
                 mb.set_app("Setup Assistant".into(), fg, None);
             }
             return;
@@ -1717,8 +1934,8 @@ impl App {
                 None => (apps::window_title(fg), None),
             }
         };
-        if let Some(mb) = &mut self.menubar {
-            mb.set_app(name, fg, exe);
+        for mb in &mut self.menubars {
+            mb.set_app(name.clone(), fg, exe.clone());
         }
     }
 
@@ -1758,15 +1975,11 @@ impl App {
 
     /// Renders whatever changed since the last frame.
     fn flush(&mut self) {
-        if let Some(mb) = &mut self.menubar {
-            if mb.dirty {
-                mb.render(&self.gfx, &self.theme, &mut self.icons);
-            }
+        for mb in self.menubars.iter_mut().filter(|m| m.dirty) {
+            mb.render(&self.gfx, &self.theme, &mut self.icons);
         }
-        if let Some(d) = &mut self.dock {
-            if d.dirty {
-                d.render(&self.gfx, &self.theme, &mut self.icons);
-            }
+        for d in self.docks.iter_mut().filter(|d| d.dirty) {
+            d.render(&self.gfx, &self.theme, &mut self.icons);
         }
         if let Some(i) = self.island.as_mut().filter(|i| i.dirty) {
             i.render(&self.gfx, &self.theme);
@@ -1799,7 +2012,7 @@ impl App {
     }
 
     fn wants_frames(&self) -> bool {
-        self.menubar.as_ref().is_some_and(|m| m.animating())
+        self.menubars.iter().any(|m| m.animating())
             || self.menu.as_ref().is_some_and(|m| m.animating())
             || self.submenu.as_ref().is_some_and(|(_, s)| s.animating())
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
@@ -1824,7 +2037,8 @@ impl App {
         if stale.unwrap_or(true) {
             self.rebuild_index();
         }
-        match Spotlight::new(&self.gfx, &self.theme, &self.cfg, &self.monitor) {
+        // On the display being worked on, like macOS.
+        match Spotlight::new(&self.gfx, &self.theme, &self.cfg, &Monitor::at_cursor()) {
             Ok(mut s) => {
                 s.render(&self.gfx, &self.theme, &mut self.loader);
                 s.focus();
@@ -1991,7 +2205,7 @@ impl App {
         self.close_menu();
         self.close_spotlight();
         let hwnd = self.msg_hwnd.0 as isize;
-        match IconPicker::new(&self.gfx, &self.theme, &self.cfg, &self.monitor, target, name, hwnd, WM_APP_ICON_PICKER) {
+        match IconPicker::new(&self.gfx, &self.theme, &self.cfg, &Monitor::at_cursor(), target, name, hwnd, WM_APP_ICON_PICKER) {
             Ok(mut p) => {
                 p.render(&self.gfx, &self.theme);
                 p.focus();
@@ -2089,7 +2303,8 @@ impl App {
         let cascade = self.finders.len() as i32;
         let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
         let prefs = &self.cfg.finder;
-        match FinderWindow::new(&mut ctx, &self.monitor, id, path, cascade, self.msg_hwnd.0 as isize, WM_APP_FINDER_CHANGED, prefs) {
+        let monitor = Monitor::at_cursor();
+        match FinderWindow::new(&mut ctx, &monitor, id, path, cascade, self.msg_hwnd.0 as isize, WM_APP_FINDER_CHANGED, prefs) {
             Ok(mut f) => {
                 f.render(&mut ctx);
                 unsafe {
@@ -2320,20 +2535,25 @@ impl App {
         if entries.is_empty() {
             return;
         }
-        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.monitor, source) {
+        // On the display of the bar or Dock it came from; otherwise where the pointer is.
+        let opener = self.menu_opener;
+        let from_bar = matches!(source, MenuSource::MenuBar(_) | MenuSource::Dock(_)) && !opener.is_invalid();
+        let monitor = if from_bar { Monitor::of_window(opener) } else { Monitor::at_cursor() };
+        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &monitor, source) {
             Ok(mut m) => {
                 m.render(&self.gfx, &self.theme);
                 OPEN_MENU_HWND.store(m.surface.content.0 as isize, Ordering::Relaxed);
                 self.menu = Some(m);
+                self.menu_monitor = monitor;
                 self.install_hooks();
                 match source {
                     MenuSource::MenuBar(hit) => {
-                        if let Some(mb) = &mut self.menubar {
+                        if let Some(mb) = self.menubars.iter_mut().find(|m| m.surface.content == opener) {
                             mb.set_open(Some(hit));
                         }
                     }
                     MenuSource::Dock(i) => {
-                        if let Some(d) = &mut self.dock {
+                        if let Some(d) = self.docks.iter_mut().find(|d| d.surface.content == opener) {
                             d.menu_item = Some(i);
                             d.dirty = true;
                         }
@@ -2379,7 +2599,7 @@ impl App {
         self.close_submenu();
         let Some(m) = &self.menu else { return };
         let Some((entries, placement)) = m.submenu(i) else { return };
-        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.monitor, m.source) {
+        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.menu_monitor, m.source) {
             Ok(mut sub) => {
                 if keys {
                     sub.select_first();
@@ -2418,19 +2638,26 @@ impl App {
     }
 
     fn reset_menu_openers(&mut self) {
-        if let Some(mb) = &mut self.menubar {
+        for mb in &mut self.menubars {
             mb.set_open(None);
         }
-        if let Some(d) = &mut self.dock {
+        let mut left = false;
+        for d in &mut self.docks {
             if d.menu_item.take().is_some() {
                 d.on_leave();
-                self.animate();
+                left = true;
             }
+        }
+        if left {
+            self.animate();
         }
     }
 
+    /// Opens a menu of the menu bar `menu_opener` names (the one last clicked).
     fn open_menubar_menu(&mut self, hit: Hit) {
-        let Some(mb) = &self.menubar else { return };
+        let opener = self.menu_opener;
+        let Some(mb) = self.menubars.iter().find(|m| m.surface.content == opener).or(self.menubars.first()) else { return };
+        self.menu_opener = mb.surface.content;
         let Some(placement) = mb.menu_placement(hit) else { return };
         let exe = mb.target_exe.clone();
         let app_name = mb.app_name.clone();
@@ -2447,7 +2674,7 @@ impl App {
             Hit::Title(i) => menu::title_menu(i, &ctx),
             Hit::Tray => {
                 use crate::win::tray::{self, Button};
-                let px = (16.0 * self.monitor.scale).round() as i32;
+                let px = (16.0 * mb.surface.scale).round() as i32;
                 let icons = tray::icons(px);
                 if icons.is_empty() {
                     vec![Entry::disabled("No tray icons")]
@@ -2595,10 +2822,11 @@ impl App {
                             log!("rebuilding: theme or backdrop state changed");
                             self.build()
                         }
-                        TIMER_DISPLAY if Monitor::primary() != self.monitor => {
-                            log!("rebuilding: primary monitor changed");
+                        TIMER_DISPLAY if displays::list() != self.displays => {
+                            log!("rebuilding: displays changed");
                             self.build()
                         }
+                        TIMER_DOCK_FOLLOW => self.follow_pointer(),
                         TIMER_DISPLAY => {
                             self.raise_surfaces();
                             if let Some(w) = &self.widgets {
@@ -2832,10 +3060,10 @@ impl App {
             self.on_menu_mouse(hwnd, msg, lp, false)
         } else if self.submenu.as_ref().is_some_and(|(_, s)| s.surface.content == hwnd) {
             self.on_menu_mouse(hwnd, msg, lp, true)
-        } else if self.menubar.as_ref().is_some_and(|m| m.surface.content == hwnd) {
-            self.on_menubar_mouse(hwnd, msg, lp)
-        } else if self.dock.as_ref().is_some_and(|d| d.surface.content == hwnd) {
-            self.on_dock_mouse(hwnd, msg, wp, lp)
+        } else if let Some(i) = self.menubars.iter().position(|m| m.surface.content == hwnd) {
+            self.on_menubar_mouse(i, hwnd, msg, lp)
+        } else if let Some(i) = self.docks.iter().position(|d| d.surface.content == hwnd) {
+            self.on_dock_mouse(i, hwnd, msg, wp, lp)
         } else if self.island.as_ref().is_some_and(|i| i.owns(hwnd)) {
             self.on_island_mouse(hwnd, msg, wp, lp)
         } else if self.widgets.as_ref().is_some_and(|w| w.owns(hwnd)) {
@@ -3035,8 +3263,8 @@ impl App {
         Some(LRESULT(0))
     }
 
-    fn on_menubar_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
-        let mb = self.menubar.as_mut()?;
+    fn on_menubar_mouse(&mut self, i: usize, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
+        let mb = self.menubars.get_mut(i)?;
         let (x, y) = mouse_pt(lp, mb.surface.scale);
         let hit = mb.hit_at(x, y);
         match msg {
@@ -3045,6 +3273,7 @@ impl App {
                 // With a menu open, sliding across titles switches menus.
                 if let (Some(open), Some(h)) = (mb.open, hit) {
                     if h.opens_menu() && h != open {
+                        self.menu_opener = hwnd;
                         self.open_menubar_menu(h);
                     }
                 }
@@ -3055,12 +3284,13 @@ impl App {
                     if mb.open == Some(h) {
                         self.close_menu();
                     } else {
+                        self.menu_opener = hwnd;
                         self.open_menubar_menu(h);
                     }
                 }
                 Some(h) => {
                     self.close_menu();
-                    if let Some(mb) = &mut self.menubar {
+                    if let Some(mb) = self.menubars.get_mut(i) {
                         mb.set_pressed(Some(h));
                     }
                     if let Some(a) = MenuBar::status_action(h, self.cfg.spotlight.enabled) {
@@ -3152,7 +3382,7 @@ impl App {
     fn on_widget_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
         let w = self.widgets.as_mut()?;
-        let (x, y) = mouse_pt(lp, w.scale());
+        let (x, y) = mouse_pt(lp, w.scale_of(hwnd));
         let event = match msg {
             WM_MOUSEMOVE => {
                 if w.on_move(hwnd, x, y) {
@@ -3220,33 +3450,38 @@ impl App {
     /// Elevated: shows the Dock (and spring-loads its icons) while another app's
     /// drag is over it, standing in for OLE's DragOver/DragLeave.
     fn watch_drag(&mut self) {
-        if self.dock.is_none() {
+        if self.docks.is_empty() {
             return;
         }
         self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
-        let Some(d) = self.dock.as_mut() else { return };
         let mut pt = POINT::default();
-        let r = d.surface.rect;
-        let over = crate::dock_drop::foreign_drag(d.surface.content)
-            && unsafe { GetCursorPos(&mut pt) }.is_ok()
-            && (r.left..r.right).contains(&pt.x)
-            && (r.top..r.bottom).contains(&pt.y);
-        if over {
-            let s = d.surface.scale;
-            let (_, spring) = d.on_file_drag((pt.x - r.left) as f32 / s, (pt.y - r.top) as f32 / s, &[]);
-            if let Some(a) = spring {
-                push(a);
+        let have_pt = unsafe { GetCursorPos(&mut pt) }.is_ok();
+        let mut animate = false;
+        for d in &mut self.docks {
+            let r = d.surface.rect;
+            let over = have_pt
+                && crate::dock_drop::foreign_drag(d.surface.content)
+                && (r.left..r.right).contains(&pt.x)
+                && (r.top..r.bottom).contains(&pt.y);
+            if over {
+                let s = d.surface.scale;
+                let (_, spring) = d.on_file_drag((pt.x - r.left) as f32 / s, (pt.y - r.top) as f32 / s, &[]);
+                if let Some(a) = spring {
+                    push(a);
+                }
+                animate = true;
+            } else if d.file_hovering() {
+                d.on_file_leave();
+                animate = true;
             }
-        } else if d.file_hovering() {
-            d.on_file_leave();
-        } else {
-            return;
         }
-        self.animate();
+        if animate {
+            self.animate();
+        }
     }
 
-    fn on_dock_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-        let d = self.dock.as_mut()?;
+    fn on_dock_mouse(&mut self, i: usize, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let d = self.docks.get_mut(i)?;
         let (x, y) = mouse_pt(lp, d.surface.scale);
         let mut animate = false;
         match msg {
@@ -3286,7 +3521,7 @@ impl App {
             }
             WM_LBUTTONDOWN => {
                 self.close_menu();
-                if let Some(d) = &mut self.dock {
+                if let Some(d) = self.docks.get_mut(i) {
                     d.on_down(x, y);
                 }
             }
@@ -3304,6 +3539,7 @@ impl App {
             }
             WM_RBUTTONUP => {
                 if let Some((idx, entries, placement)) = d.context_menu(x, y) {
+                    self.menu_opener = hwnd;
                     self.open_menu(entries, placement, MenuSource::Dock(idx));
                 }
             }
@@ -3341,8 +3577,8 @@ impl Drop for App {
         self.menu = None;
         self.island = None;
         self.widgets = None;
-        self.dock = None;
-        self.menubar = None;
+        self.docks.clear();
+        self.menubars.clear();
         crate::win::tray::stop();
         taskbar::restore();
     }

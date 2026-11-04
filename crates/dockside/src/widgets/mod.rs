@@ -249,6 +249,8 @@ pub enum WidgetCmd {
     Align(u32, Alignment),
     /// Move a widget to a column and row (each 0-2) of the screen.
     MoveTo(u32, u8, u8),
+    /// Move a widget to a free spot on another display (by its id).
+    MoveToDisplay(u32, String),
     /// Fetch the weather again now.
     Refresh,
     /// Put back the default widgets, where they start out (notes are cleared).
@@ -326,7 +328,8 @@ struct Drag {
     id: u32,
     /// Pointer offset inside the widget, in points.
     grab: (f32, f32),
-    start: (f32, f32),
+    /// Where the press was, in physical pixels.
+    start: POINT,
     moved: bool,
 }
 
@@ -402,12 +405,49 @@ fn place_on_desktop(hwnd: HWND) {
     PLACING.store(false, Ordering::Relaxed);
 }
 
-fn cursor_pt(monitor: &Monitor) -> (f32, f32) {
+/// The pointer, in physical pixels.
+fn cursor_px() -> POINT {
     let mut p = POINT::default();
     unsafe {
         let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p);
     }
-    ((p.x - monitor.rect.left) as f32 / monitor.scale, (p.y - monitor.rect.top) as f32 / monitor.scale)
+    p
+}
+
+/// A display widgets can go on.
+#[derive(Clone, Debug)]
+pub struct Screen {
+    /// Its id (`win::displays`), stored with the widgets placed on it.
+    pub id: String,
+    /// The main display: widgets without a display go here.
+    pub main: bool,
+    pub monitor: Monitor,
+    /// Points kept clear at the top (its menu bar).
+    pub top: f32,
+}
+
+impl Screen {
+    /// Where widgets may sit, in points from the display's top-left.
+    fn bounds(&self) -> Rect {
+        Rect::new(0.0, self.top, self.monitor.width_pt(), self.monitor.height_pt() - self.top)
+    }
+
+    /// The bounds less a margin, for placing and snapping.
+    fn area(&self) -> Rect {
+        let b = self.bounds();
+        Rect::new(b.x + EDGE, b.y + EDGE, b.w - 2.0 * EDGE, b.h - 2.0 * EDGE)
+    }
+
+    /// The pointer in this display's points.
+    fn local(&self, p: POINT) -> (f32, f32) {
+        let m = &self.monitor;
+        ((p.x - m.rect.left) as f32 / m.scale, (p.y - m.rect.top) as f32 / m.scale)
+    }
+
+    /// What a widget on this display stores as its display (nothing for the main one).
+    fn tag(&self) -> Option<String> {
+        (!self.main).then(|| self.id.clone())
+    }
 }
 
 /// Shadow, card and contents of one widget, in surface points.
@@ -435,9 +475,8 @@ pub struct Widgets {
     widgets: Vec<Widget>,
     cfg: WidgetsCfg,
     calendar_ics: String,
-    monitor: Monitor,
-    /// Screen area widgets may use, in points (below the menu bar).
-    screen: Rect,
+    /// Every display, the main one first.
+    screens: Vec<Screen>,
     pub data: Data,
     sources: Option<Sources>,
     sampler: Sampler,
@@ -464,19 +503,21 @@ impl Widgets {
         gfx: &Gfx,
         theme: &Theme,
         cfg: &Config,
-        monitor: Monitor,
+        mut screens: Vec<Screen>,
         hwnd: isize,
         msg_data: u32,
         handover: Option<Handover>,
     ) -> Widgets {
-        let top = if cfg.menubar.enabled { cfg.menubar.height } else { 0.0 };
-        let screen = Rect::new(0.0, top, monitor.width_pt(), (monitor.rect.bottom - monitor.rect.top) as f32 / monitor.scale - top);
+        if screens.is_empty() {
+            let monitor = Monitor::primary();
+            let top = if cfg.menubar.enabled { cfg.menubar.height } else { 0.0 };
+            screens.push(Screen { id: String::new(), main: true, monitor, top });
+        }
         let mut w = Widgets {
             widgets: Vec::new(),
             cfg: cfg.widgets.clone(),
             calendar_ics: cfg.island.calendar_ics.clone(),
-            monitor,
-            screen,
+            screens,
             data: Data {
                 weather: WeatherState::Loading,
                 events: Vec::new(),
@@ -516,13 +557,27 @@ impl Widgets {
         w
     }
 
+    /// The display `item` is on: the one it names, else (none named, or that
+    /// display isn't connected now) the main one. It keeps its display's name,
+    /// so it goes back when that display returns.
+    fn screen_of(&self, item: &WidgetItem) -> &Screen {
+        let named = item.display.as_deref().and_then(|id| self.screens.iter().find(|s| s.id.eq_ignore_ascii_case(id)));
+        named.or_else(|| self.screens.iter().find(|s| s.main)).unwrap_or(&self.screens[0])
+    }
+
+    fn same_screen(&self, a: &WidgetItem, b: &WidgetItem) -> bool {
+        std::ptr::eq(self.screen_of(a), self.screen_of(b))
+    }
+
     fn add_widget(&mut self, gfx: &Gfx, theme: &Theme, mut item: WidgetItem) {
         let (w, h) = dims(item.size);
+        let screen = self.screen_of(&item).clone();
+        let bounds = screen.bounds();
         // Keep it on screen (the resolution may have changed since it was placed).
-        item.x = item.x.clamp(self.screen.x, (self.screen.right() - w).max(self.screen.x));
-        item.y = item.y.clamp(self.screen.y, (self.screen.bottom() - h).max(self.screen.y));
-        let s = self.monitor.scale;
-        let (left, top) = (self.monitor.rect.left, self.monitor.rect.top);
+        item.x = item.x.clamp(bounds.x, (bounds.right() - w).max(bounds.x));
+        item.y = item.y.clamp(bounds.y, (bounds.bottom() - h).max(bounds.y));
+        let s = screen.monitor.scale;
+        let (left, top) = (screen.monitor.rect.left, screen.monitor.rect.top);
         let rect = RECT {
             left: left + ((item.x - SHADOW) * s).round() as i32,
             top: top + ((item.y - SHADOW) * s).round() as i32,
@@ -563,8 +618,9 @@ impl Widgets {
 
     /// Moves widget `i`'s windows to where its glide has got to.
     fn follow(&mut self, i: usize) {
-        let s = self.monitor.scale;
-        let (left, top) = (self.monitor.rect.left, self.monitor.rect.top);
+        let m = self.screen_of(&self.widgets[i].item).monitor;
+        let s = m.scale;
+        let (left, top) = (m.rect.left, m.rect.top);
         let w = &mut self.widgets[i];
         w.surface.move_to(left + ((w.at.0.value - SHADOW) * s).round() as i32, top + ((w.at.1.value - SHADOW) * s).round() as i32);
     }
@@ -592,7 +648,11 @@ impl Widgets {
         self.data.h24 = cfg.menubar.clock_format.contains("%H");
         let mut old = std::mem::take(&mut self.widgets);
         for item in &cfg.widgets.items {
-            let same = |w: &Widget| w.item.id == item.id && w.item.kind == item.kind && w.item.size == item.size;
+            // Moved to a display of another scale, it's drawn afresh at that scale.
+            let scale = self.screen_of(item).monitor.scale;
+            let same = |w: &Widget| {
+                w.item.id == item.id && w.item.kind == item.kind && w.item.size == item.size && w.surface.scale == scale
+            };
             match old.iter().position(same) {
                 Some(i) => {
                     let mut w = old.remove(i);
@@ -843,35 +903,50 @@ impl Widgets {
         self.index(hwnd).is_some()
     }
 
-    pub fn scale(&self) -> f32 {
-        self.monitor.scale
+    /// The scale widget window `hwnd` draws at.
+    pub fn scale_of(&self, hwnd: HWND) -> f32 {
+        self.index(hwnd).map_or(1.0, |i| self.widgets[i].surface.scale)
     }
 
     /// Pointer moved over a widget (or anywhere, while one is held).
     pub fn on_move(&mut self, hwnd: HWND, x: f32, y: f32) -> bool {
         let Some(i) = self.index(hwnd) else { return false };
         if let Some(d) = &mut self.drag {
-            let (cx, cy) = cursor_pt(&self.monitor);
-            if !d.moved && ((cx - d.start.0).powi(2) + (cy - d.start.1).powi(2)).sqrt() < DRAG_THRESHOLD {
+            let p = cursor_px();
+            let moved = (((p.x - d.start.x).pow(2) + (p.y - d.start.y).pow(2)) as f32).sqrt();
+            if !d.moved && moved < DRAG_THRESHOLD * self.widgets[i].surface.scale {
                 return false;
             }
             d.moved = true;
             let id = d.id;
             let (gx, gy) = d.grab;
             let Some(j) = self.widgets.iter().position(|w| w.item.id == id) else { return false };
+            // It goes onto whichever display the pointer is on.
+            let screen = match self.screens.iter().find(|s| s.monitor.contains(p.x, p.y)) {
+                Some(s) => s.clone(),
+                None => self.screen_of(&self.widgets[j].item).clone(),
+            };
+            let (cx, cy) = screen.local(p);
             let (w, h) = dims(self.widgets[j].item.size);
-            let others: Vec<Rect> = self.widgets.iter().filter(|o| o.item.id != id).map(|o| item_rect(&o.item)).collect();
-            let area = Rect::new(self.screen.x + EDGE, self.screen.y + EDGE, self.screen.w - 2.0 * EDGE, self.screen.h - 2.0 * EDGE);
-            let (nx, ny) = snap(cx - gx, cy - gy, w, h, &others, area, self.screen);
+            let display = screen.tag();
+            let probe = WidgetItem { display: display.clone(), ..self.widgets[j].item.clone() };
+            let others: Vec<Rect> = self
+                .widgets
+                .iter()
+                .filter(|o| o.item.id != id && self.same_screen(&o.item, &probe))
+                .map(|o| item_rect(&o.item))
+                .collect();
+            let (nx, ny) = snap(cx - gx, cy - gy, w, h, &others, screen.area(), screen.bounds());
             let wd = &mut self.widgets[j];
             // Whatever it was pressed on isn't being clicked any more.
             if wd.hover.take().is_some() {
                 wd.dirty = true;
             }
-            if (nx, ny) != (wd.item.x, wd.item.y) {
+            if (nx, ny) != (wd.item.x, wd.item.y) || display != wd.item.display {
                 // It follows the pointer exactly (this also stops any glide).
                 wd.item.x = nx;
                 wd.item.y = ny;
+                wd.item.display = display;
                 wd.at.0.snap(nx);
                 wd.at.1.snap(ny);
                 self.follow(j);
@@ -907,7 +982,7 @@ impl Widgets {
         // Any press may become a drag, even on text being typed into: a click
         // (released without moving) still places the caret or presses the button.
         let body = w.body();
-        self.drag = Some(Drag { id: w.item.id, grab: (x - body.x, y - body.y), start: cursor_pt(&self.monitor), moved: false });
+        self.drag = Some(Drag { id: w.item.id, grab: (x - body.x, y - body.y), start: cursor_px(), moved: false });
     }
 
     /// The mouse capture went away mid-drag: keep where it got to.
@@ -998,6 +1073,9 @@ impl Widgets {
         entries.push(Entry::Separator);
         entries.push(Entry::submenu("Align with Neighbour", self.align_entries(i)));
         entries.push(Entry::submenu("Move To", self.move_entries(i)));
+        if self.screens.len() > 1 {
+            entries.push(Entry::submenu("Move to Display", self.display_entries(i)));
+        }
         entries.push(Entry::Separator);
         if kind == WidgetKind::Weather {
             entries.push(Entry::item("Refresh Weather", Action::Widget(WidgetCmd::Refresh)));
@@ -1011,15 +1089,35 @@ impl Widgets {
         Some((entries, Placement::Below { x: r.left as f32 / s + x, y: r.top as f32 / s + y }))
     }
 
-    /// Widget `i`'s rect and everyone else's.
+    /// Widget `i`'s rect and those of the others on its display.
     fn rects(&self, i: usize) -> (Rect, Vec<Rect>) {
-        let others = self.widgets.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| item_rect(&o.item)).collect();
-        (item_rect(&self.widgets[i].item), others)
+        let me = &self.widgets[i].item;
+        let others = self
+            .widgets
+            .iter()
+            .enumerate()
+            .filter(|(j, o)| *j != i && self.same_screen(&o.item, me))
+            .map(|(_, o)| item_rect(&o.item))
+            .collect();
+        (item_rect(me), others)
     }
 
-    /// The area widgets are placed in: the screen, less a margin.
-    fn area(&self) -> Rect {
-        Rect::new(self.screen.x + EDGE, self.screen.y + EDGE, self.screen.w - 2.0 * EDGE, self.screen.h - 2.0 * EDGE)
+    /// "Move to Display": the other displays, by name.
+    fn display_entries(&self, i: usize) -> Vec<Entry> {
+        let item = &self.widgets[i].item;
+        let here = self.screen_of(item).id.clone();
+        let list = crate::win::displays::current();
+        self.screens
+            .iter()
+            .map(|s| {
+                let name = list.iter().find(|d| d.id == s.id).map_or_else(|| s.id.clone(), |d| d.name.clone());
+                if s.id == here {
+                    Entry::disabled(name).checked(true)
+                } else {
+                    Entry::item(name, Action::Widget(WidgetCmd::MoveToDisplay(item.id, s.id.clone())))
+                }
+            })
+            .collect()
     }
 
     /// "Align with Neighbour": ticked when already lined up, dimmed when there's no room.
@@ -1031,7 +1129,7 @@ impl Widgets {
             if how == Alignment::Top {
                 entries.push(Entry::Separator);
             }
-            entries.push(match aligned(r, &others, how, self.screen) {
+            entries.push(match aligned(r, &others, how, self.screen_of(&self.widgets[i].item).bounds()) {
                 Some(p) if p == (r.x, r.y) => Entry::disabled(how.label()).checked(true),
                 Some(_) => Entry::item(how.label(), Action::Widget(WidgetCmd::Align(id, how))),
                 None => Entry::disabled(how.label()),
@@ -1052,7 +1150,7 @@ impl Widgets {
                 entries.push(Entry::Separator);
             }
             for (col, name) in names.iter().enumerate() {
-                let (x, y) = spot(col as u8, row as u8, r.w, r.h, self.area());
+                let (x, y) = spot(col as u8, row as u8, r.w, r.h, self.screen_of(&self.widgets[i].item).area());
                 let taken = others.iter().any(|o| overlaps(*o, Rect::new(x, y, r.w, r.h)));
                 entries.push(if (x, y) == (r.x, r.y) {
                     Entry::disabled(*name).checked(true)
@@ -1203,13 +1301,27 @@ impl Widgets {
     /// The widget list after `cmd`, to be saved; None if nothing's to save.
     pub fn command(&mut self, cmd: WidgetCmd) -> Option<Vec<WidgetItem>> {
         let mut items = self.items();
-        let area = self.area();
         match cmd {
             WidgetCmd::Add(kind) => {
+                // Onto the display being worked on (where Settings is).
+                let p = cursor_px();
+                let screen = self.screens.iter().find(|s| s.monitor.contains(p.x, p.y)).unwrap_or(&self.screens[0]).clone();
+                let display = screen.tag();
+                let probe = WidgetItem { id: 0, kind, size: sizes(kind)[0], x: 0.0, y: 0.0, zone: None, display: display.clone() };
+                let here: Vec<WidgetItem> = items.iter().filter(|i| self.same_screen(i, &probe)).cloned().collect();
                 let size = sizes(kind)[0];
-                let (x, y) = free_spot(&items, size, area);
+                let (x, y) = free_spot(&here, size, screen.area());
                 let id = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
-                items.push(WidgetItem { id, kind, size, x, y, zone: None });
+                items.push(WidgetItem { id, kind, size, x, y, zone: None, display });
+            }
+            WidgetCmd::MoveToDisplay(id, to) => {
+                let screen = self.screens.iter().find(|s| s.id == to)?.clone();
+                let i = items.iter().position(|w| w.id == id)?;
+                let display = screen.tag();
+                let probe = WidgetItem { display: display.clone(), ..items[i].clone() };
+                let here: Vec<WidgetItem> = items.iter().filter(|o| o.id != id && self.same_screen(o, &probe)).cloned().collect();
+                let (x, y) = free_spot(&here, items[i].size, screen.area());
+                items[i] = WidgetItem { x, y, display, ..items[i].clone() };
             }
             WidgetCmd::Remove(id) => {
                 items.retain(|i| i.id != id);
@@ -1217,22 +1329,23 @@ impl Widgets {
             }
             WidgetCmd::Resize(id, size) => {
                 let (w, h) = dims(size);
-                for i in items.iter_mut().filter(|i| i.id == id) {
+                let bounds: Vec<Rect> = items.iter().map(|i| self.screen_of(i).bounds()).collect();
+                for (i, b) in items.iter_mut().zip(bounds).filter(|(i, _)| i.id == id) {
                     i.size = size;
-                    i.x = i.x.min((self.screen.right() - w).max(self.screen.x));
-                    i.y = i.y.min((self.screen.bottom() - h).max(self.screen.y));
+                    i.x = i.x.min((b.right() - w).max(b.x));
+                    i.y = i.y.min((b.bottom() - h).max(b.y));
                 }
             }
             WidgetCmd::Align(id, how) => {
                 let i = self.widgets.iter().position(|w| w.item.id == id)?;
                 let (r, others) = self.rects(i);
-                let (x, y) = aligned(r, &others, how, self.screen)?;
+                let (x, y) = aligned(r, &others, how, self.screen_of(&items[i]).bounds())?;
                 (items[i].x, items[i].y) = (x, y);
             }
             WidgetCmd::MoveTo(id, col, row) => {
                 let i = self.widgets.iter().position(|w| w.item.id == id)?;
                 let (r, others) = self.rects(i);
-                let (x, y) = spot(col, row, r.w, r.h, area);
+                let (x, y) = spot(col, row, r.w, r.h, self.screen_of(&items[i]).area());
                 if others.iter().any(|o| overlaps(*o, Rect::new(x, y, r.w, r.h))) {
                     return None;
                 }
@@ -1279,7 +1392,7 @@ mod tests {
     use super::*;
 
     fn item(id: u32, size: WidgetSize, x: f32, y: f32) -> WidgetItem {
-        WidgetItem { id, kind: WidgetKind::Clock, size, x, y, zone: None }
+        WidgetItem { id, kind: WidgetKind::Clock, size, x, y, zone: None, display: None }
     }
 
     /// Paints every widget, light and dark, with sample data into
@@ -1375,7 +1488,7 @@ mod tests {
                 }
             }
             for (kind, size, x, y) in placed {
-                let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None };
+                let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None, display: None };
                 let (w, h) = dims(size);
                 let (cw, ch) = ((w + 2.0 * SHADOW) as i32, (h + 2.0 * SHADOW) as i32);
                 let mut canvas = Canvas::new(&gfx, cw, ch, 1.0).unwrap();

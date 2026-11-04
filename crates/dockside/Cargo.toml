@@ -61,6 +61,7 @@ features = [
     "Win32_System_WinRT_Composition",
     "Win32_System_WinRT_Direct3D11",
     "Win32_System_WinRT_Graphics_Capture",
+    "Win32_Devices_Display",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct3D",

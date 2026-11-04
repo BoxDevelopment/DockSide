@@ -67,6 +67,18 @@ impl Backdrop {
     }
 }
 
+/// Which displays a Dock or menu bar appears on.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DisplayMode {
+    /// The main (primary) display only.
+    Main,
+    /// A copy on every display.
+    All,
+    /// Dock only: one Dock, on whichever display the pointer last pushed against the bottom of.
+    Follow,
+}
+
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum IconStyle {
@@ -173,6 +185,8 @@ pub struct MenuBarCfg {
     pub show_tray: bool,
     pub desktop_app_name: String,
     pub reserve_space: bool,
+    /// "main" or "all" ("follow" means "main").
+    pub displays: DisplayMode,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -202,6 +216,10 @@ pub struct DockCfg {
     pub autohide: bool,
     pub show_on_desktop: bool,
     pub reserve_space: bool,
+    /// "main", "all" or "follow".
+    pub displays: DisplayMode,
+    /// With a Dock on every display: each shows only the running apps with windows on its display.
+    pub per_display_apps: bool,
     #[serde(default)]
     pub apps: Vec<DockApp>,
 }
@@ -257,6 +275,8 @@ pub struct IslandCfg {
     pub collapse_delay_ms: u32,
     pub style: IslandStyle,
     pub finish: IslandFinish,
+    /// The display the island sits on, by id (see `win::displays`); "" = the main display.
+    pub display: String,
     /// Points to move the island down (negative moves it up).
     pub vertical_offset: f32,
     /// Seconds paused media stays in the island (0 = until the app ends its session).
@@ -364,6 +384,9 @@ pub struct WidgetItem {
     pub y: f32,
     /// World Clock (small): the zone to show, instead of the first of `world_clocks`.
     pub zone: Option<String>,
+    /// The display it's on, by id (see `win::displays`); none = the main display.
+    #[serde(default)]
+    pub display: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -622,6 +645,9 @@ pub fn save_widgets(path: &Path, items: &[WidgetItem]) -> Result<()> {
         t["y"] = value(w.y.round() as i64);
         if let Some(z) = &w.zone {
             t["zone"] = value(z.as_str());
+        }
+        if let Some(d) = &w.display {
+            t["display"] = value(d.as_str());
         }
         arr.push(t);
     }

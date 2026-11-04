@@ -740,6 +740,18 @@ impl Dock {
         true
     }
 
+    pub fn monitor(&self) -> Monitor {
+        self.monitor
+    }
+
+    /// Starts below the screen edge and rises into place (the Dock arriving on
+    /// another display); returns true so the caller animates.
+    pub fn slide_in(&mut self) -> bool {
+        self.hide_t = 1.0;
+        self.dirty = true;
+        true
+    }
+
     /// Records whether the desktop has focus; returns true when an animation should start.
     pub fn set_on_desktop(&mut self, on: bool) -> bool {
         let changed = self.on_desktop != on;
@@ -795,6 +807,11 @@ impl Dock {
                 animating = true;
                 self.dirty = true;
             }
+        } else if self.hide_t != 0.0 {
+            // Rising in after moving to another display.
+            self.hide_t = approach(self.hide_t, 0.0, dt, 11.0);
+            animating = true;
+            self.dirty = true;
         }
 
         if self.ease_left > 0.0 {

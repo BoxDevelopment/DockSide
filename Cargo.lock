@@ -109,7 +109,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "dockside"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "dockside-hook"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cc",
  "windows",

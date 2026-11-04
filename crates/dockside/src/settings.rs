@@ -107,6 +107,18 @@ fn discord_rows(cfg: &Config) -> Vec<Row> {
     rows
 }
 
+/// The words a row is found by in search: its label and the choices it offers.
+fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
+    match row {
+        Row::Toggle(l, _) | Row::Slider(l, _) | Row::Keybind(l, _) | Row::Text(l, _, _) | Row::Swatches(l) | Row::Info(l, _) | Row::Note(l) => {
+            l.to_string()
+        }
+        Row::Segmented(l, key) => format!("{l} {}", SettingsWindow::segments(fonts, *key, cfg).0.join(" ")),
+        Row::Buttons(l, buttons) => buttons.iter().fold(l.to_string(), |s, (b, _)| s + " " + b),
+        Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
+    }
+}
+
 /// The `[island]` on/off setting called `name`.
 fn island_flag(c: &crate::config::IslandCfg, name: &str) -> bool {
     match name {
@@ -303,6 +315,9 @@ pub(crate) enum Hit {
     Close,
     Minimize,
     Page(Page),
+    /// The sidebar's search field, and its clear button.
+    Search,
+    ClearSearch,
     Toggle(Key),
     Segment(Key, usize),
     Slider(Key),
@@ -621,6 +636,9 @@ pub struct SettingsWindow {
     pending: Option<(Key, f32)>,
     editing: Option<Editing>,
     recording: Option<Recording>,
+    /// The sidebar search: while it holds text, the content lists matches from every page.
+    search: TextField,
+    search_focus: bool,
     bitmaps: HashMap<String, Option<ID2D1Bitmap>>,
     login: bool,
     /// "Run as administrator" is on (its scheduled task exists).
@@ -671,6 +689,8 @@ impl SettingsWindow {
             pending: None,
             editing: None,
             recording: None,
+            search: TextField::default(),
+            search_focus: false,
             bitmaps: HashMap::new(),
             login: startup::is_enabled(),
             admin: win::elevation::task_enabled(),
@@ -778,8 +798,73 @@ impl SettingsWindow {
         self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h)
     }
 
-    fn groups(&self, cfg: &Config) -> Vec<Group> {
-        match self.page {
+    /// What the content area shows: the current page's groups, or while
+    /// searching, the matching rows from every page under "Page › Group" headings.
+    fn sections(&self, cfg: &Config) -> Vec<(Option<String>, Vec<Row>)> {
+        let query = self.search.string();
+        if query.trim().is_empty() {
+            return self.page_groups(self.page, cfg).into_iter().map(|g| (g.title.map(str::to_string), g.rows)).collect();
+        }
+        self.search_results(&query, cfg).into_iter().map(|(_, title, rows)| (Some(title), rows)).collect()
+    }
+
+    /// Rows matching every word of `query` (in the page name, group title or
+    /// the row's own text), grouped as they are on their pages.
+    fn search_results(&self, query: &str, cfg: &Config) -> Vec<(Page, String, Vec<Row>)> {
+        let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        // Each query word must start a word of the text ("on" doesn't find "Animation");
+        // one with punctuation in it ("wi-fi") may match anywhere.
+        let found = |w: &str, hay: &str| {
+            if w.chars().all(char::is_alphanumeric) {
+                hay.split(|c: char| !c.is_alphanumeric()).any(|h| h.starts_with(w))
+            } else {
+                hay.contains(w)
+            }
+        };
+        let (mut named, mut other) = (Vec::new(), Vec::new());
+        for (page, name) in PAGES {
+            for g in self.page_groups(page, cfg) {
+                let head = format!("{name} {}", g.title.unwrap_or("")).to_lowercase();
+                let rows: Vec<Row> = g
+                    .rows
+                    .into_iter()
+                    // Notes are prose: searching them finds too much.
+                    .filter(|r| !matches!(r, Row::Note(_)))
+                    .filter(|r| {
+                        let hay = format!("{head} {}", row_text(r, &self.fonts, cfg)).to_lowercase();
+                        words.iter().all(|w| found(w, &hay))
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    let title = g.title.map_or_else(|| name.to_string(), |t| format!("{name} \u{203A} {t}"));
+                    // Groups whose page or heading matches come first ("dock" leads with the Dock page).
+                    let list = if words.iter().any(|w| found(w, &head)) { &mut named } else { &mut other };
+                    list.push((page, title, rows));
+                }
+            }
+        }
+        named.extend(other);
+        named
+    }
+
+    fn searching(&self) -> bool {
+        !self.search.string().trim().is_empty()
+    }
+
+    /// The search text changed: show the new results from the top.
+    fn search_changed(&mut self) {
+        self.scroll.jump(0.0);
+        self.dirty = true;
+    }
+
+    /// The sidebar's search field.
+    fn search_rect() -> Rect {
+        let b = Self::body();
+        Rect::new(b.x + 10.0, b.y + 44.0, SIDEBAR - 20.0, 28.0)
+    }
+
+    fn page_groups(&self, page: Page, cfg: &Config) -> Vec<Group> {
+        match page {
             Page::General => vec![
                 Group {
                     title: None,
@@ -1352,7 +1437,7 @@ impl SettingsWindow {
             return SettingsEvent::None;
         }
         let Some(ed) = &mut self.editing else {
-            return if vk == ESC { SettingsEvent::Close } else { SettingsEvent::None };
+            return self.on_search_key(vk, ctrl, shift);
         };
         self.dirty = true;
         match vk {
@@ -1368,6 +1453,34 @@ impl SettingsWindow {
                 SettingsEvent::None
             }
         }
+    }
+
+    /// Keys while no text row is being edited: Ctrl+F focuses search, Esc
+    /// clears it (then leaves it, then closes the window), the rest edit it.
+    fn on_search_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> SettingsEvent {
+        const ESC: u16 = 0x1B;
+        if ctrl && vk == b'F' as u16 {
+            self.search_focus = true;
+            self.search.select_all();
+            self.dirty = true;
+        } else if vk == ESC {
+            if !self.search.is_empty() {
+                self.search.clear();
+                self.search_changed();
+            } else if self.search_focus {
+                self.search_focus = false;
+                self.dirty = true;
+            } else {
+                return SettingsEvent::Close;
+            }
+        } else if self.search_focus {
+            match self.search.on_key(vk, ctrl, shift) {
+                crate::finder::text::KeyResult::Edited => self.search_changed(),
+                crate::finder::text::KeyResult::Moved => self.dirty = true,
+                crate::finder::text::KeyResult::Ignored => {}
+            }
+        }
+        SettingsEvent::None
     }
 
     /// A key captured while a shortcut row is recording.
@@ -1391,10 +1504,18 @@ impl SettingsWindow {
     }
 
     pub fn on_char(&mut self, c: char) {
-        if let Some(ed) = self.editing.as_mut().filter(|_| !c.is_control()) {
+        if c.is_control() || self.recording.is_some() {
+            return;
+        }
+        if let Some(ed) = self.editing.as_mut() {
             ed.field.insert(&c.to_string());
             ed.invalid = false;
             self.dirty = true;
+        } else {
+            // Typing with nothing else focused searches, as in System Settings.
+            self.search_focus = true;
+            self.search.insert(&c.to_string());
+            self.search_changed();
         }
     }
 
@@ -1463,6 +1584,10 @@ impl SettingsWindow {
             return SettingsEvent::Action(action);
         }
         let hit = self.hit_at(x, y).filter(|h| Some(*h) == pressed);
+        // Clicking anywhere else leaves the search field (its results stay).
+        if !matches!(hit, Some(Hit::Search | Hit::ClearSearch)) {
+            self.search_focus = false;
+        }
         // Clicking anywhere outside the field being edited commits it.
         if let Some(ed) = &self.editing {
             if hit != Some(Hit::Field(ed.key)) {
@@ -1493,7 +1618,25 @@ impl SettingsWindow {
                 return SettingsEvent::None;
             }
             Hit::Page(p) => {
+                // Picking a page ends the search.
+                if !self.search.is_empty() {
+                    self.search.clear();
+                    self.scroll.jump(0.0);
+                }
                 self.go_to(p);
+                return SettingsEvent::None;
+            }
+            Hit::Search => {
+                if !self.search_focus {
+                    self.search_focus = true;
+                    self.search.select_all();
+                }
+                return SettingsEvent::None;
+            }
+            Hit::ClearSearch => {
+                self.search.clear();
+                self.search_focus = true;
+                self.search_changed();
                 return SettingsEvent::None;
             }
             Hit::Toggle(_) | Hit::Segment(..) | Hit::Swatch(_) => match control_action(hit, &mut self.login, &self.fonts, cfg) {
@@ -1544,8 +1687,9 @@ impl SettingsWindow {
         let header_font = gfx.format(&theme.font, 12.0, Weight::Bold, Align::Leading);
         let glyph_font = gfx.format("Segoe Fluent Icons", 12.0, Weight::Regular, Align::Center);
 
-        // Icons for the pinned-apps list.
-        if self.page == Page::Dock {
+        let searching = self.searching();
+        // Icons for the pinned-apps list (which search results can show too).
+        if self.page == Page::Dock || searching {
             for app in &cfg.dock.apps {
                 let key = app.icon.clone().unwrap_or_else(|| app.path.clone());
                 if !self.bitmaps.contains_key(&key) {
@@ -1560,7 +1704,13 @@ impl SettingsWindow {
             }
         }
 
-        let groups = self.groups(cfg);
+        let groups = self.sections(cfg);
+        // While searching, pages with nothing matching dim in the sidebar.
+        let found: Vec<Page> = if searching {
+            self.search_results(&self.search.string(), cfg).into_iter().map(|r| r.0).collect()
+        } else {
+            vec![]
+        };
         let body = Self::body();
         let content_x = body.x + SIDEBAR + CONTENT_PAD;
         let content_w = body.w - SIDEBAR - 2.0 * CONTENT_PAD;
@@ -1569,7 +1719,7 @@ impl SettingsWindow {
         // Measure content height for scrolling.
         let content_h: f32 = groups
             .iter()
-            .map(|g| if g.title.is_some() { 26.0 } else { 0.0 } + rows_height(&g.rows) + 20.0)
+            .map(|g| if g.0.is_some() { 26.0 } else { 0.0 } + rows_height(&g.1) + 20.0)
             .sum::<f32>()
             + 8.0;
         self.max_scroll = (content_h - viewport.h).max(0.0);
@@ -1589,15 +1739,18 @@ impl SettingsWindow {
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
         let motion = &self.motion;
         let scroll = self.scroll.offset_px(self.scale);
-        let page_row = |k: usize| Rect::new(body.x + 10.0, body.y + TITLE_H + k as f32 * 32.0, SIDEBAR - 20.0, 30.0);
+        let page_row = |k: usize| Rect::new(body.x + 10.0, body.y + TITLE_H + 32.0 + k as f32 * 32.0, SIDEBAR - 20.0, 30.0);
         let side_target = match self.hover {
             Some(Hit::Page(pg)) if pg != self.page => PAGES.iter().position(|(p, _)| *p == pg).map(page_row),
             _ => None,
         };
         let side_glide = self.side_glide.update(side_target);
-        let sel_glide = self.sel_glide.update(PAGES.iter().position(|(p, _)| *p == self.page).map(page_row));
+        // No page is selected while the content shows search results.
+        let sel_glide = self.sel_glide.update(PAGES.iter().position(|(p, _)| *p == self.page).filter(|_| !searching).map(page_row));
         let (hover, page, slider, pending) = (self.hover, self.page, self.slider, self.pending);
-        let page_title = PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("");
+        let page_title = if searching { "Search Results" } else { PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("") };
+        let (search, search_focus) = (&self.search, self.search_focus);
+        let query = search.string();
         let ctx = RowCtx {
             theme,
             cfg,
@@ -1630,10 +1783,14 @@ impl SettingsWindow {
                 let name_rect = |row: Rect| Rect::new(row.x + 34.0, row.y, row.w - 40.0, row.h);
                 for (k, (pg, name)) in PAGES.into_iter().enumerate() {
                     let row = page_row(k);
-                    draw_page_icon(p, pg, Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0), &glyph_font);
-                    p.text(name, regular, name_rect(row), theme.text);
+                    let dim = if searching && !found.contains(&pg) { 0.35 } else { 1.0 };
+                    p.faded(dim, || {
+                        draw_page_icon(p, pg, Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0), &glyph_font);
+                        p.text(name, regular, name_rect(row), theme.text);
+                    });
                     hits.push((row, Hit::Page(pg)));
                 }
+                draw_search(p, Self::search_rect(), search, search_focus, &style, theme, &glyph_font, &mut hits);
                 if let Some((g, a)) = sel_glide {
                     p.faded(a, || {
                         p.fill_round(g, 6.0, theme.accent);
@@ -1655,14 +1812,21 @@ impl SettingsWindow {
                 // Scrolling content.
                 p.clipped(viewport, || {
                     let mut y = viewport.y + 8.0 - scroll;
-                    for group in &groups {
-                        if let Some(t) = group.title {
+                    for (title, rows) in &groups {
+                        if let Some(t) = title {
                             p.text(t, &header_font, Rect::new(content_x + 4.0, y, content_w, 26.0), theme.text_secondary);
                             y += 26.0;
                         }
-                        let card = Rect::new(content_x, y, content_w, rows_height(&group.rows));
-                        draw_card(p, card, &group.rows, &ctx, &mut hits);
+                        let card = Rect::new(content_x, y, content_w, rows_height(rows));
+                        draw_card(p, card, rows, &ctx, &mut hits);
                         y += card.h + 20.0;
+                    }
+                    if searching && groups.is_empty() {
+                        let mid = viewport.y + viewport.h * 0.4;
+                        let centered = gfx.format(&theme.font, 15.0, Weight::Bold, Align::Center);
+                        let line = Rect::new(viewport.x, mid - 24.0, viewport.w, 24.0);
+                        p.text(&format!("No Results for \u{201C}{}\u{201D}", query.trim()), &centered, line, theme.text_secondary);
+                        p.text("Check the spelling or try a different word.", &style.button, line.offset(0.0, 24.0), theme.text_disabled);
                     }
                 });
             });
@@ -1671,7 +1835,7 @@ impl SettingsWindow {
             self.canvas.draw_part(gfx, part, draw)
         };
         // Content hits outside the viewport (scrolled away) must not be clickable.
-        hits.retain(|(r, h)| matches!(h, Hit::Close | Hit::Minimize | Hit::Page(_)) || (r.y >= viewport.y - 1.0 && r.bottom() <= viewport.bottom() + 1.0));
+        hits.retain(|(r, h)| matches!(h, Hit::Close | Hit::Minimize | Hit::Page(_) | Hit::Search | Hit::ClearSearch) || (r.y >= viewport.y - 1.0 && r.bottom() <= viewport.bottom() + 1.0));
         self.hits = hits;
 
         let presented = r.and_then(|_| self.canvas.present_part(self.hwnd, rc.left, rc.top, window_alpha, self.drawn_part));
@@ -1909,6 +2073,42 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
             let block = p.gfx.format_block(&theme.font, 12.0, Weight::Regular, Align::Leading);
             p.text(text, &block, Rect::new(r.x + 14.0, r.y + 8.0, r.w - 28.0, r.h - 16.0), theme.text_secondary);
         }
+    }
+}
+
+/// The sidebar's search field: magnifier, text (or placeholder), and a clear
+/// button while it holds text.
+#[allow(clippy::too_many_arguments)]
+fn draw_search(p: &Painter, f: Rect, field: &TextField, focus: bool, st: &Style, theme: &Theme, glyph_font: &IDWriteTextFormat, hits: &mut Vec<(Rect, Hit)>) {
+    p.fill_round(f, 7.0, st.control_bg);
+    if focus {
+        p.stroke_round(f.inset(-1.0, -1.0), 8.0, theme.accent.alpha(0.6), 3.0);
+    }
+    p.text("\u{E721}", glyph_font, Rect::new(f.x + 4.0, f.y, 22.0, f.h), theme.text_secondary);
+    let clear = !field.is_empty();
+    let tr = Rect::new(f.x + 27.0, f.y, f.w - 27.0 - if clear { 26.0 } else { 8.0 }, f.h);
+    if field.is_empty() && !focus {
+        p.text("Search", &st.regular, tr, theme.text_disabled);
+    }
+    if focus {
+        let prefix = |n: usize| p.gfx.measure(&field.text[..n].iter().collect::<String>(), &st.regular);
+        let (a, b) = field.range();
+        if a != b {
+            let (x0, x1) = (prefix(a), prefix(b));
+            p.fill_rect(Rect::new(tr.x + x0, f.y + 6.0, x1 - x0, f.h - 12.0), theme.accent.alpha(0.35));
+        } else {
+            let cx = tr.x + prefix(a) + 0.5;
+            p.line(cx, f.y + 7.0, cx, f.bottom() - 7.0, theme.text, 1.0);
+        }
+    }
+    p.clipped(tr, || p.text(&field.string(), &st.regular, tr, theme.text));
+    hits.push((f, Hit::Search));
+    if clear {
+        let (cx, cy) = (f.right() - 14.0, f.cy());
+        p.fill_circle(cx, cy, 7.0, theme.text_secondary.alpha(0.55));
+        p.line(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, Color::WHITE, 1.3);
+        p.line(cx - 2.5, cy + 2.5, cx + 2.5, cy - 2.5, Color::WHITE, 1.3);
+        hits.push((Rect::new(cx - 10.0, f.y, 20.0, f.h), Hit::ClearSearch));
     }
 }
 

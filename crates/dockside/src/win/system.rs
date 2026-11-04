@@ -259,6 +259,21 @@ pub fn pick_video(owner: HWND) -> Option<String> {
     pick_file(owner, w!("Choose a Video"), &filters)
 }
 
+/// A program the window animations must leave alone.
+pub fn pick_program(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("Programs"), pszSpec: w!("*.exe") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    pick_file(owner, w!("Exclude an App"), &filters)
+}
+
+/// A folder whose programs the window animations must leave alone.
+pub fn pick_excluded_folder(owner: HWND) -> Option<String> {
+    pick(owner, w!("Exclude Every App in a Folder"), &[], true)
+}
+
 /// A folder (a Photo widget's slideshow).
 pub fn pick_folder(owner: HWND) -> Option<String> {
     pick(owner, w!("Choose a Folder of Pictures"), &[], true)

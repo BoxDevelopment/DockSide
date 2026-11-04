@@ -428,9 +428,10 @@ fn execute(action: Action) {
             let go = !on
                 || system::confirm(
                     "Run as Administrator",
-                    "DockSide will restart with administrator rights, so the Dock, menu bar and shortcuts also work                      with apps running as administrator (like Task Manager).
-
-                     Apps you open from DockSide still start normally, without admin rights. While it runs as                      administrator, dragging files from File Explorer onto DockSide won't work.",
+                    "DockSide will restart with administrator rights, so the Dock, menu bar and shortcuts also work \
+                     with apps running as administrator (like Task Manager).\n\n\
+                     Apps you open from DockSide still start normally, without admin rights. While it runs as \
+                     administrator, dragging files from File Explorer onto DockSide won't work.",
                 );
             with_app(|app| if go { app.set_run_as_admin(on) } else { app.mark_settings_dirty() });
         }
@@ -445,6 +446,23 @@ fn execute(action: Action) {
                 .or_else(|| std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| path.clone());
                 with_app(|app| app.toggle_pin(&path, &name, true));
+            }
+        }
+        // The picker runs a modal loop: outside the App borrow.
+        Action::AddNoInject { folder } => {
+            let owner = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as _);
+            let picked = if folder { system::pick_excluded_folder(owner) } else { system::pick_program(owner) };
+            if let Some(path) = picked {
+                let mut list = config::load(&config::path()).map(|c| c.windows.no_inject).unwrap_or_default();
+                if !list.iter().any(|e| e.eq_ignore_ascii_case(&path)) {
+                    list.push(path);
+                    match config::save_value(&config::path(), "windows", "no_inject", &config::ConfigValue::List(list)) {
+                        Ok(()) => {
+                            with_app(|app| app.reload());
+                        }
+                        Err(e) => log!("could not update windows.no_inject: {e:#}"),
+                    }
+                }
             }
         }
         Action::ToggleSpotlight => {
@@ -564,7 +582,8 @@ fn execute(action: Action) {
         }
         // Confirmed outside the App borrow: the message box runs a modal loop.
         Action::Widget(WidgetCmd::Reset) => {
-            let ask = "Put the default widgets back where they started? Widgets you've added, moved or resized                        are replaced, and the text in Notes widgets is cleared. Your reminders and widget settings are kept.";
+            let ask = "Put the default widgets back where they started? Widgets you've added, moved or resized \
+                        are replaced, and the text in Notes widgets is cleared. Your reminders and widget settings are kept.";
             if system::confirm("Reset Widgets", ask) {
                 with_app(|app| app.widget_cmd(WidgetCmd::Reset));
             }

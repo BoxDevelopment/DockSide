@@ -37,6 +37,13 @@ open_effect = "genie"
 close_effect = "genie"
 # "slow", "normal" or "fast".
 speed = "normal"
+# Programs the animation hook must never be loaded into: their windows keep
+# Windows' own animations. Exe names ("Discord.exe", "obs*") or paths
+# ('D:\Games\*' or "D:/Games/*"), case-insensitive, with * and ? wildcards. Games and
+# launchers protected by BattlEye, EasyAntiCheat, Vanguard, FACEIT, ESEA,
+# Ricochet, GameGuard or XIGNCODE (and anything installed next to them) are
+# always left alone, whatever is listed here.
+no_inject = []
 
 [menubar]
 enabled = true

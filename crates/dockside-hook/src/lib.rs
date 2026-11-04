@@ -1,6 +1,7 @@
 // Portions from the Windhawk mod "MacOS Minimize Animation" (MIT, Abdullah Masood and Potassiumuncher).
 
-//! The hook DLL: loaded into other programs by DockSide's global `WH_CBT` hook. Its
+//! The hook DLL: loaded into other programs by DockSide's per-thread `WH_CBT` hooks
+//! (only in programs DockSide's `genie::guard` let through: never anti-cheat). Its
 //! inline hooks (`genie`) capture a window before it minimizes, closes or opens and
 //! ask DockSide to animate it, holding the real change back until the first frame
 //! is on screen.
@@ -196,11 +197,11 @@ extern "system" fn DllMain(inst: HINSTANCE, reason: u32, reserved: *mut c_void) 
     BOOL(1)
 }
 
-// Windows calls these in every GUI thread of the session. They are only the vehicle
+// Windows calls these in the GUI threads DockSide hooked. They are only the vehicle
 // that gets the DLL loaded; the real work is done by the inline hooks
 // `loader::ensure_init` installs. WH_CBT stays installed (it fires rarely: window
-// create / activate / min-max); WH_GETMESSAGE is installed for a moment at host
-// start-up so programs that were already running pick the DLL up right away.
+// create / activate / min-max); WH_GETMESSAGE is installed for a moment when a
+// thread is first hooked so it picks the DLL up at its next message.
 #[no_mangle]
 pub extern "system" fn dockside_cbt(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     loader::ensure_init();

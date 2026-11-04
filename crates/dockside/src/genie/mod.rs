@@ -11,6 +11,7 @@
 //! abandoned and the DLLs unload themselves).
 
 mod effect;
+mod guard;
 mod injector;
 mod ipc;
 mod render;
@@ -35,8 +36,6 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{AnimSpeed, MinimizeEffect, WindowEffect, WindowsCfg};
 use shared::*;
-
-const PRELOAD_TIMER: usize = 1;
 
 /// Windows the genie is animating, until when. The DLL cloaks a window while the
 /// animation stands in for it, which would otherwise make it look gone (the Dock
@@ -142,8 +141,8 @@ impl Settings {
     }
 }
 
-/// Programs that must never get the DLL: games whose anti-cheat reacts to foreign
-/// modules, and the folders games are installed to.
+/// The DLL's own second check (DllMain refuses these). The real gate is `guard`, in
+/// DockSide, which keeps the DLL from being mapped into such programs at all.
 const NO_INJECT: &[&str] = &[
     "robloxplayerbeta.exe",
     "valorant-win64-shipping.exe",
@@ -277,6 +276,8 @@ pub struct Genie {
     ipc_hwnd: HWND,
     inner: Box<RefCell<Inner>>,
     settings: Settings,
+    /// Which programs never get the DLL (`[windows] no_inject` plus the built-in list).
+    rules: guard::Rules,
 }
 
 unsafe extern "system" fn ipc_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -289,15 +290,6 @@ unsafe extern "system" fn ipc_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     Err(_) => REPLY_FAIL,
                 };
                 return LRESULT(reply as isize);
-            }
-            WM_TIMER if wp.0 == PRELOAD_TIMER => {
-                let _ = KillTimer(hwnd, PRELOAD_TIMER);
-                if let Ok(mut i) = inner.try_borrow_mut() {
-                    if let Some(inj) = &mut i.injector {
-                        inj.end_preload();
-                    }
-                }
-                return LRESULT(0);
             }
             _ => {}
         }
@@ -323,6 +315,7 @@ impl Genie {
             ipc_hwnd: HWND::default(),
             inner: Box::new(RefCell::new(Inner { server: None, injector: None })),
             settings: settings.clone(),
+            rules: guard::Rules::new(&cfg.no_inject),
         };
         // From here on, a failure drops `g`, which undoes whatever was made.
         unsafe {
@@ -386,15 +379,20 @@ impl Genie {
         g.inner.borrow_mut().server = Some(ipc::Server { renderer, settings, dock_icon, last_icon: Default::default() });
         g.publish(true);
 
-        let mut injector = injector::Injector::start()?;
-        injector.begin_preload();
+        let injector = injector::Injector::start(g.rules.clone())?;
         g.inner.borrow_mut().injector = Some(injector);
-        unsafe { SetTimer(g.ipc_hwnd, PRELOAD_TIMER, 2000, None) };
         log!("genie: ready");
         Some(g)
     }
 
     pub fn configure(&mut self, cfg: &WindowsCfg) {
+        let rules = guard::Rules::new(&cfg.no_inject);
+        if rules != self.rules {
+            self.rules = rules.clone();
+            if let Some(inj) = &self.inner.borrow().injector {
+                inj.set_rules(rules);
+            }
+        }
         let settings = Settings::from_cfg(cfg);
         if settings == self.settings {
             return;

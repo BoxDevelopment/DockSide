@@ -119,6 +119,32 @@ fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
         Row::Segmented(l, key) => format!("{l} {}", SettingsWindow::segments(fonts, *key, cfg).0.join(" ")),
         Row::Buttons(l, buttons) => buttons.iter().fold(l.to_string(), |s, (b, _)| s + " " + b),
         Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
+        Row::Excluded(i) => cfg.windows.no_inject.get(*i).map_or_else(String::new, |e| format!("Excluded {e}")),
+    }
+}
+
+/// A `[windows] no_inject` entry that names a real file or folder (not a pattern).
+fn excluded_path(entry: &str) -> Option<String> {
+    let path = entry.trim().replace('/', "\\");
+    (!path.contains(['*', '?']) && path.contains('\\') && std::path::Path::new(&path).exists()).then_some(path)
+}
+
+/// Title and detail for a `[windows] no_inject` row: an app by its name, a folder
+/// as "Everything in <name>", a pattern as itself.
+fn excluded_label(entry: &str) -> (String, String) {
+    let path = entry.trim().replace('/', "\\");
+    if path.contains(['*', '?']) || !path.contains('\\') {
+        return (entry.trim().to_string(), "Matching apps".to_string());
+    }
+    let name = path.trim_end_matches('\\').rsplit('\\').next().unwrap_or(&path).to_string();
+    let p = std::path::Path::new(&path);
+    if p.is_dir() {
+        (format!("Everything in {name}"), path)
+    } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
+        let title = crate::win::apps::file_description(&path).unwrap_or_else(|| name.trim_end_matches(".exe").to_string());
+        (title, path)
+    } else {
+        (name, path)
     }
 }
 
@@ -231,6 +257,7 @@ pub(crate) enum Key {
     OpenEffect,
     CloseEffect,
     WinSpeed,
+    WinNoInject,
     SpotlightEnabled,
     SpotlightHotkey,
     SearchEngine,
@@ -303,6 +330,7 @@ impl Key {
             Key::OpenEffect => ("windows", "open_effect"),
             Key::CloseEffect => ("windows", "close_effect"),
             Key::WinSpeed => ("windows", "speed"),
+            Key::WinNoInject => ("windows", "no_inject"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
             Key::SearchEngine => ("spotlight", "search_engine"),
@@ -334,6 +362,10 @@ pub(crate) enum Hit {
     Slider(Key),
     Swatch(usize),
     Remove(usize),
+    /// `[windows] no_inject`: remove entry i, or pick a program / folder to add.
+    RemoveExcluded(usize),
+    AddExcludedApp,
+    AddExcludedFolder,
     AddApp,
     AddStart,
     AddFinder,
@@ -378,6 +410,8 @@ pub(crate) enum Row {
     Slider(&'static str, Key),
     Swatches(&'static str),
     App(usize),
+    /// An entry of `[windows] no_inject`, with a remove button.
+    Excluded(usize),
     Buttons(&'static str, Vec<(&'static str, Hit)>),
     Info(&'static str, String),
     /// Label, key, placeholder.
@@ -1180,6 +1214,21 @@ impl SettingsWindow {
                         ],
                     },
                     Group { title: None, rows: vec![Row::Segmented("Animation speed", Key::WinSpeed)] },
+                    Group {
+                        title: Some("Excluded apps"),
+                        rows: (0..cfg.windows.no_inject.len())
+                            .map(Row::Excluded)
+                            .chain([
+                                Row::Buttons("", vec![("Add Folder\u{2026}", Hit::AddExcludedFolder), ("Add App\u{2026}", Hit::AddExcludedApp)]),
+                                Row::Text("Add by name", Key::WinNoInject, "Discord.exe, obs*"),
+                                Row::Note(
+                                "These apps keep Windows' own animations and never get DockSide's hook. Games protected by \
+                                 BattlEye, EasyAntiCheat, Vanguard and other anti-cheats are always left alone. \
+                                 Changes apply when an app next starts.",
+                                ),
+                            ])
+                            .collect(),
+                    },
                 ]
             }
             Page::Finder => vec![
@@ -1489,6 +1538,16 @@ impl SettingsWindow {
         if key == Key::WidgetsClocks {
             return SettingsEvent::Action(key.set(ConfigValue::List(zones)));
         }
+        // Names typed here are added to the list (shown as rows above the field).
+        if key == Key::WinNoInject {
+            let mut list = cfg.windows.no_inject.clone();
+            for z in zones {
+                if !list.iter().any(|e| e.eq_ignore_ascii_case(&z)) {
+                    list.push(z);
+                }
+            }
+            return SettingsEvent::Action(key.set(ConfigValue::List(list)));
+        }
         SettingsEvent::Action(key.set(ConfigValue::Str(text)))
     }
 
@@ -1715,6 +1774,15 @@ impl SettingsWindow {
                 }
                 Action::SetDockApps(apps)
             }
+            Hit::RemoveExcluded(i) => {
+                let mut list = cfg.windows.no_inject.clone();
+                if i < list.len() {
+                    list.remove(i);
+                }
+                Key::WinNoInject.set(ConfigValue::List(list))
+            }
+            Hit::AddExcludedApp => Action::AddNoInject { folder: false },
+            Hit::AddExcludedFolder => Action::AddNoInject { folder: true },
             Hit::AddApp => Action::AddDockApp,
             Hit::AddStart => Action::TogglePin { path: START_PATH.into(), name: "Start".into(), pin: true },
             Hit::AddFinder => Action::TogglePin { path: FINDER_PATH.into(), name: "Finder".into(), pin: true },
@@ -1763,6 +1831,15 @@ impl SettingsWindow {
                     };
                     let bmp = px.and_then(|px| px.to_bitmap(self.canvas.target()));
                     self.bitmaps.insert(key, bmp);
+                }
+            }
+        }
+        // Icons for the excluded apps and folders (patterns have none).
+        if self.page == Page::Windows || searching {
+            for e in &cfg.windows.no_inject {
+                if !self.bitmaps.contains_key(e) {
+                    let bmp = excluded_path(e).and_then(|p| icons.get(&gfx.wic, &p, None)).and_then(|px| px.to_bitmap(self.canvas.target()));
+                    self.bitmaps.insert(e.clone(), bmp);
                 }
             }
         }
@@ -2031,6 +2108,24 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 p.fill_circle(cx, cy, 9.0, control_bg.mix(Color::rgba(255, 82, 87, 1.0), hot));
                 p.line(cx - 4.0, cy, cx + 4.0, cy, theme.text_secondary.mix(Color::WHITE, hot), 1.6);
                 hits.push((Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), Hit::Remove(*i)));
+            }
+        }
+        Row::Excluded(i) => {
+            if let Some(entry) = cfg.windows.no_inject.get(*i) {
+                let icon = Rect::new(r.x + 12.0, r.cy() - 13.0, 26.0, 26.0);
+                if let Some(Some(bmp)) = ctx.bitmaps.and_then(|b| b.get(entry)) {
+                    p.bitmap(bmp, icon, 1.0);
+                }
+                let (name, detail) = excluded_label(entry);
+                p.text(&name, &regular, Rect::new(icon.right() + 10.0, r.y, r.w * 0.45, r.h), theme.text);
+                let detail_r = Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55 - 52.0, r.h);
+                p.text(&detail, &right, detail_r, theme.text_disabled);
+                let (cx, cy) = (right_edge - 9.0, r.cy());
+                let hit = Hit::RemoveExcluded(*i);
+                let hot = ctx.hover_t(hit);
+                p.fill_circle(cx, cy, 9.0, control_bg.mix(Color::rgba(255, 82, 87, 1.0), hot));
+                p.line(cx - 4.0, cy, cx + 4.0, cy, theme.text_secondary.mix(Color::WHITE, hot), 1.6);
+                hits.push((Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), hit));
             }
         }
         Row::Buttons(label, buttons) => {

@@ -128,6 +128,10 @@ pub struct WindowsCfg {
     pub open_effect: WindowEffect,
     pub close_effect: WindowEffect,
     pub speed: AnimSpeed,
+    /// Programs the animation hook is never loaded into (exe names or paths,
+    /// `*` / `?` wildcards), on top of the built-in anti-cheat list.
+    #[serde(default)]
+    pub no_inject: Vec<String>,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]

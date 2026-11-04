@@ -38,6 +38,8 @@ pub enum Action {
     SetRunAsAdmin(bool),
     /// File picker, then pin the chosen app.
     AddDockApp,
+    /// Program (or, with `folder`, folder) picker, then add it to `[windows] no_inject`.
+    AddNoInject { folder: bool },
     /// Open the icon picker for a Dock app (with its display name).
     ChangeIcon { target: crate::icon_picker::IconTarget, name: String },
     /// Set (or, with `None`, reset) a Dock app's custom icon.

@@ -362,6 +362,11 @@ pub enum WidgetKind {
     Reminders,
     NowPlaying,
     System,
+    MusicWave,
+    Photo,
+    Video,
+    Notifications,
+    User,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,6 +392,16 @@ pub struct WidgetItem {
     /// The display it's on, by id (see `win::displays`); none = the main display.
     #[serde(default)]
     pub display: Option<String>,
+    /// System: what it shows, in order (see `widgets::sensors`); none = the
+    /// defaults (CPU, memory, the system drive and network).
+    #[serde(default)]
+    pub sensors: Option<Vec<String>>,
+    /// Photo: a picture, GIF or folder (a slideshow); Video: a video file.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// User: which extras it shows ("greeting", "buttons", "device"); none = all.
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -648,6 +663,15 @@ pub fn save_widgets(path: &Path, items: &[WidgetItem]) -> Result<()> {
         }
         if let Some(d) = &w.display {
             t["display"] = value(d.as_str());
+        }
+        if let Some(s) = &w.sensors {
+            t["sensors"] = value(s.iter().map(String::as_str).collect::<toml_edit::Array>());
+        }
+        if let Some(p) = &w.path {
+            t["path"] = value(p.as_str());
+        }
+        if let Some(o) = &w.options {
+            t["options"] = value(o.iter().map(String::as_str).collect::<toml_edit::Array>());
         }
         arr.push(t);
     }

@@ -584,7 +584,7 @@ pub struct Island {
     /// The Widgets page: its settings, its watchers once opened, and the system sampler.
     wcfg: WidgetCfg,
     wfeeds: Option<WidgetFeeds>,
-    sys: crate::widgets::sources::Sampler,
+    sys: crate::widgets::sensors::Sampler,
     /// Where background sources post (the window and message).
     notify: (isize, u32),
     /// Discord voice (from its worker), and members' pictures by user id.
@@ -973,7 +973,7 @@ impl Island {
         let w = &self.wcfg;
         crate::widgets::sources::watch_weather(weather.clone(), stop.clone(), w.location.clone(), w.fahrenheit, w.h24, self.notify.0, self.notify.1);
         crate::widgets::sources::watch_devices(devices.clone(), stop.clone(), self.notify.0, self.notify.1);
-        self.sys.sample();
+        self.sys.sample(&[crate::widgets::sensors::system_drive()], None);
         self.wfeeds = Some(WidgetFeeds { stop, weather, devices });
     }
 
@@ -1733,7 +1733,7 @@ impl Island {
             self.refresh_mixer();
         }
         if self.shown == Content::Panel(Panel::Widgets) {
-            self.sys.sample();
+            self.sys.sample(&[crate::widgets::sensors::system_drive()], None);
         }
         self.expire_shelf();
         // A missed rename event must not leave a download spinning forever.

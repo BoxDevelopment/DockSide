@@ -50,6 +50,8 @@ features = [
     "UI_Notifications_Management",
     "UI_Composition",
     "UI_Composition_Desktop",
+    # GPU temperature for the System widget (D3DKMT adapter perf data).
+    "Wdk_Graphics_Direct3D",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinHttp",
@@ -74,6 +76,8 @@ features = [
     "Win32_Graphics_Dwm",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    # Video widget: decoding with the Source Reader.
+    "Win32_Media_MediaFoundation",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",

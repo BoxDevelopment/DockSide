@@ -1219,7 +1219,9 @@ impl SettingsWindow {
                         rows: vec![
                             add(&KINDS[..3]),
                             add(&KINDS[3..6]),
-                            add(&KINDS[6..]),
+                            add(&KINDS[6..9]),
+                            add(&KINDS[9..12]),
+                            add(&KINDS[12..]),
                             Row::Buttons("Start over with the default widgets", vec![("Reset Widgets…", Hit::ResetWidgets)]),
                         ],
                     },

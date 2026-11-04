@@ -239,12 +239,46 @@ pub fn pick_image(owner: HWND) -> Option<String> {
     pick_file(owner, w!("Choose an Icon"), &filters)
 }
 
+/// A picture or GIF for a Photo widget.
+pub fn pick_photo(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("Pictures and GIFs"), pszSpec: w!("*.jpg;*.jpeg;*.png;*.gif;*.bmp;*.webp;*.heic;*.heif;*.tif;*.tiff") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    pick_file(owner, w!("Choose a Picture"), &filters)
+}
+
+/// A video for a Video widget.
+pub fn pick_video(owner: HWND) -> Option<String> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("Videos"), pszSpec: w!("*.mp4;*.m4v;*.mov;*.wmv;*.avi;*.mkv;*.webm;*.3gp") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    pick_file(owner, w!("Choose a Video"), &filters)
+}
+
+/// A folder (a Photo widget's slideshow).
+pub fn pick_folder(owner: HWND) -> Option<String> {
+    pick(owner, w!("Choose a Folder of Pictures"), &[], true)
+}
+
 fn pick_file(owner: HWND, title: PCWSTR, filters: &[windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC]) -> Option<String> {
+    pick(owner, title, filters, false)
+}
+
+fn pick(owner: HWND, title: PCWSTR, filters: &[windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC], folder: bool) -> Option<String> {
     use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
-    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_PICKFOLDERS, SIGDN_FILESYSPATH};
     unsafe {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        dialog.SetFileTypes(filters).ok()?;
+        if folder {
+            let opts = dialog.GetOptions().ok()?;
+            dialog.SetOptions(opts | FOS_PICKFOLDERS).ok()?;
+        } else {
+            dialog.SetFileTypes(filters).ok()?;
+        }
         dialog.SetTitle(title).ok()?;
         dialog.Show(owner).ok()?; // Err when cancelled
         let item = dialog.GetResult().ok()?;

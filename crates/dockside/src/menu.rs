@@ -410,7 +410,8 @@ impl PopupMenu {
         // One item, in its plain colours or (`lit`) white for under the highlight.
         let draw_item = |p: &crate::gfx::Painter, i: usize, lit: bool| {
             let (Entry::Item(item), r) = (&entries[i], rects[i]) else { return };
-            let enabled = item.action.is_some();
+            // Submenu items have no action of their own, but they're live when they open one.
+            let enabled = item.action.is_some() || !item.submenu.is_empty();
             let color = if lit {
                 Color::WHITE
             } else if enabled {

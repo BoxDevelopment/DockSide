@@ -741,18 +741,30 @@ impl Painter<'_> {
 
     /// A bitmap stretched over `r` with rounded corners (album art).
     pub fn bitmap_round(&self, bmp: &ID2D1Bitmap, r: Rect, radius: f32, opacity: f32) {
+        self.bitmap_fill(bmp, r, radius, opacity, false);
+    }
+
+    /// A bitmap covering `r` with rounded corners, keeping its shape: what
+    /// spills over is cropped evenly (photos, video).
+    pub fn bitmap_cover(&self, bmp: &ID2D1Bitmap, r: Rect, radius: f32, opacity: f32) {
+        self.bitmap_fill(bmp, r, radius, opacity, true);
+    }
+
+    fn bitmap_fill(&self, bmp: &ID2D1Bitmap, r: Rect, radius: f32, opacity: f32, cover: bool) {
         unsafe {
             let size = bmp.GetSize();
             if size.width <= 0.0 || size.height <= 0.0 {
                 return;
             }
+            let (sx, sy) = (r.w / size.width, r.h / size.height);
+            let (sx, sy) = if cover { (sx.max(sy), sx.max(sy)) } else { (sx, sy) };
             let m = Matrix3x2 {
-                M11: r.w / size.width,
+                M11: sx,
                 M12: 0.0,
                 M21: 0.0,
-                M22: r.h / size.height,
-                M31: r.x,
-                M32: r.y,
+                M22: sy,
+                M31: r.x + (r.w - size.width * sx) / 2.0,
+                M32: r.y + (r.h - size.height * sy) / 2.0,
             };
             let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
             let brush_props = D2D1_BRUSH_PROPERTIES { opacity, transform: m };

@@ -13,8 +13,11 @@
 //!   with the app's one-second timer.
 
 pub(crate) mod glyphs;
+pub mod live;
+pub mod sensors;
 pub mod sources;
 mod store;
+pub mod user;
 mod views;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,13 +35,17 @@ use crate::gfx::icons::IconPixels;
 use crate::gfx::Gfx;
 use crate::island::calendar::{self, CalEvent};
 use crate::island::media::{Cmd, Media, NowPlaying};
+use crate::island::notifications::Note;
 use crate::island::sources::{Inbox, Signal, Stop};
+use live::{SharedBands, SharedFeed};
+use user::{SharedUser, UserInfo};
 use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
 use crate::theme::Theme;
 use crate::win::system::{self, Battery};
 use crate::win::{apps, Monitor};
-use sources::{Sampler, SharedDevices, SharedWeather, SysStats, WeatherState, Zone};
+use sensors::{Sampler, SharedGpus, SysStats};
+use sources::{SharedDevices, SharedWeather, WeatherState, Zone};
 use store::Store;
 
 pub const RADIUS: f32 = 22.0;
@@ -65,7 +72,7 @@ pub fn placing() -> bool {
     PLACING.load(Ordering::Relaxed)
 }
 
-pub const KINDS: [WidgetKind; 10] = [
+pub const KINDS: [WidgetKind; 15] = [
     WidgetKind::Clock,
     WidgetKind::WorldClock,
     WidgetKind::Weather,
@@ -73,9 +80,14 @@ pub const KINDS: [WidgetKind; 10] = [
     WidgetKind::UpNext,
     WidgetKind::Reminders,
     WidgetKind::Notes,
+    WidgetKind::Notifications,
     WidgetKind::Batteries,
     WidgetKind::NowPlaying,
+    WidgetKind::MusicWave,
+    WidgetKind::Photo,
+    WidgetKind::Video,
     WidgetKind::System,
+    WidgetKind::User,
 ];
 
 pub fn title(kind: WidgetKind) -> &'static str {
@@ -90,6 +102,11 @@ pub fn title(kind: WidgetKind) -> &'static str {
         WidgetKind::Reminders => "Reminders",
         WidgetKind::NowPlaying => "Now Playing",
         WidgetKind::System => "System",
+        WidgetKind::MusicWave => "Music Wave",
+        WidgetKind::Photo => "Photo",
+        WidgetKind::Video => "Video",
+        WidgetKind::Notifications => "Notifications",
+        WidgetKind::User => "User",
     }
 }
 
@@ -97,8 +114,8 @@ pub fn title(kind: WidgetKind) -> &'static str {
 pub fn sizes(kind: WidgetKind) -> &'static [WidgetSize] {
     use WidgetSize::*;
     match kind {
-        WidgetKind::Clock | WidgetKind::Batteries | WidgetKind::NowPlaying | WidgetKind::System => &[Small, Medium],
-        WidgetKind::Weather => &[Medium, Small, Large],
+        WidgetKind::Clock | WidgetKind::NowPlaying | WidgetKind::MusicWave | WidgetKind::User => &[Small, Medium],
+        WidgetKind::Weather | WidgetKind::Notifications => &[Medium, Small, Large],
         _ => &[Small, Medium, Large],
     }
 }
@@ -231,6 +248,13 @@ pub enum Hit {
     Play,
     Next,
     Art,
+    /// A notification in the list (by its place).
+    Notification(usize),
+    Lock,
+    SignOut,
+    Sleep,
+    /// "Choose…" on an empty Photo or Video widget.
+    Choose,
 }
 
 /// Text being typed into a Notes widget, or a new reminder.
@@ -251,6 +275,18 @@ pub enum WidgetCmd {
     MoveTo(u32, u8, u8),
     /// Move a widget to a free spot on another display (by its id).
     MoveToDisplay(u32, String),
+    /// System: show or hide a sensor (by config key).
+    ToggleSensor(u32, String),
+    /// System: move a sensor to the front (it gets the graph).
+    LeadSensor(u32, String),
+    /// System: back to what it shows by default.
+    DefaultSensors(u32),
+    /// Photo / Video: ask for a file (or, `true`, a folder) to show.
+    Choose(u32, bool),
+    /// User: show or hide one of its extras.
+    ToggleOption(u32, &'static str),
+    /// Notifications: clear them from Windows' notification center.
+    ClearNotifications,
     /// Fetch the weather again now.
     Refresh,
     /// Put back the default widgets, where they start out (notes are cleared).
@@ -279,6 +315,12 @@ pub struct Data {
     pub zones: Vec<Zone>,
     pub first_weekday: chrono::Weekday,
     pub h24: bool,
+    /// Music Wave: spectrum levels, 0..1 low to high (empty or zero when silent).
+    pub bands: Vec<f32>,
+    /// Notifications, newest first.
+    pub notes: Vec<Note>,
+    /// User: who's signed in (None until looked up).
+    pub user: Option<UserInfo>,
 }
 
 /// This PC's battery, then Bluetooth devices.
@@ -308,6 +350,27 @@ struct Widget {
     /// Where the card is on screen, in points: it glides to a new spot
     /// (aligned, or moved) rather than jumping.
     at: (Spring, Spring),
+    /// Photo / Video: the worker playing it.
+    live: Option<Live>,
+    /// The newest frame from `live`, not drawn yet.
+    frame: Option<live::Frame>,
+    /// Notification icons, by art id.
+    pictures: Vec<(u64, ID2D1Bitmap)>,
+    /// Hidden behind an app window: nothing moves.
+    covered: bool,
+}
+
+/// A Photo or Video widget's player; it stops when dropped.
+struct Live {
+    feed: SharedFeed,
+    /// What it was started for: the path and size in pixels.
+    key: (String, (u32, u32)),
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.feed.stop();
+    }
 }
 
 /// The glide to a new spot.
@@ -340,6 +403,11 @@ struct SourceKey {
     calendar: Option<String>,
     devices: bool,
     media: bool,
+    /// A System widget shows a GPU.
+    gpu: bool,
+    notes: bool,
+    music: bool,
+    user: bool,
 }
 
 struct Sources {
@@ -349,11 +417,18 @@ struct Sources {
     weather: Option<SharedWeather>,
     devices: Option<SharedDevices>,
     media: Option<Media>,
+    gpus: Option<SharedGpus>,
+    notes: Option<Inbox>,
+    bands: Option<SharedBands>,
+    user: Option<SharedUser>,
 }
 
 impl Drop for Sources {
     fn drop(&mut self) {
         self.stop.stop();
+        if let Some(b) = &self.bands {
+            b.stop();
+        }
     }
 }
 
@@ -365,6 +440,8 @@ pub struct Handover {
     events: Vec<CalEvent>,
     devices: Vec<(String, u8)>,
     now: Option<NowPlaying>,
+    notes: Vec<Note>,
+    user: Option<UserInfo>,
 }
 
 /// The top-level window that holds the desktop icons (Progman, or a WorkerW
@@ -450,6 +527,21 @@ impl Screen {
     }
 }
 
+/// Puts a Photo / Video frame into `slot`: into the bitmap already there
+/// when it's the same size (video frames), else a new one.
+fn upload_frame(rt: &windows::Win32::Graphics::Direct2D::ID2D1RenderTarget, slot: &mut Option<(u64, ID2D1Bitmap)>, f: live::Frame) {
+    if let Some((_, b)) = slot {
+        let size = unsafe { b.GetPixelSize() };
+        if size.width == f.w && size.height == f.h {
+            let ok = unsafe { b.CopyFromMemory(None, f.data.as_ptr() as *const _, f.w * 4) }.is_ok();
+            if ok {
+                return;
+            }
+        }
+    }
+    *slot = IconPixels { width: f.w, height: f.h, data: f.data }.to_bitmap(rt).map(|b| (1, b));
+}
+
 /// Shadow, card and contents of one widget, in surface points.
 fn paint(p: &crate::gfx::Painter, body: Rect, ctx: &views::Ctx, solid: bool, hits: &mut Vec<(Rect, Hit)>) {
     let theme = ctx.theme;
@@ -480,6 +572,8 @@ pub struct Widgets {
     pub data: Data,
     sources: Option<Sources>,
     sampler: Sampler,
+    /// The first GPU's id, as of the last System menu (what `gpu` stands for).
+    first_gpu: Option<String>,
     store: Store,
     drag: Option<Drag>,
     ticks: u64,
@@ -528,9 +622,13 @@ impl Widgets {
                 zones: cfg.widgets.world_clocks.iter().filter_map(|z| sources::parse_zone(z)).collect(),
                 first_weekday: sources::first_weekday(),
                 h24: cfg.menubar.clock_format.contains("%H"),
+                bands: Vec::new(),
+                notes: Vec::new(),
+                user: None,
             },
             sources: None,
             sampler: Sampler::default(),
+            first_gpu: None,
             store: Store::load(),
             drag: None,
             ticks: 0,
@@ -549,6 +647,8 @@ impl Widgets {
             w.data.events = h.events;
             w.data.devices = h.devices;
             w.data.now = h.now;
+            w.data.notes = h.notes;
+            w.data.user = h.user;
         }
         w.restart_sources();
         if w.has(WidgetKind::System) {
@@ -613,7 +713,40 @@ impl Widgets {
             appear,
             motion: Motion::default(),
             at,
+            live: None,
+            frame: None,
+            pictures: Vec::new(),
+            covered: false,
         });
+        self.refresh_live(self.widgets.len() - 1);
+    }
+
+    /// Starts (or restarts, for a new file or size) a Photo / Video widget's player.
+    fn refresh_live(&mut self, i: usize) {
+        let w = &mut self.widgets[i];
+        let want = match (w.item.kind, &w.item.path) {
+            (WidgetKind::Photo | WidgetKind::Video, Some(p)) if !p.is_empty() => {
+                let (pw, ph) = dims(w.item.size);
+                let s = w.surface.scale;
+                Some((p.clone(), ((pw * s).round() as u32, (ph * s).round() as u32)))
+            }
+            _ => None,
+        };
+        if w.live.as_ref().map(|l| &l.key) == want.as_ref() {
+            return;
+        }
+        w.live = None;
+        w.frame = None;
+        w.art = None;
+        w.dirty = true;
+        let Some(key) = want else { return };
+        let feed = SharedFeed::default();
+        let path = std::path::PathBuf::from(&key.0);
+        match w.item.kind {
+            WidgetKind::Video => live::play_video(path, key.1, feed.clone(), self.hwnd, self.msg_data),
+            _ => live::play_photo(path, key.1, feed.clone(), self.hwnd, self.msg_data),
+        }
+        w.live = Some(Live { feed, key });
     }
 
     /// Moves widget `i`'s windows to where its glide has got to.
@@ -664,6 +797,8 @@ impl Widgets {
                     self.widgets.push(w);
                     // With motion reduced, it's already there.
                     self.follow(self.widgets.len() - 1);
+                    // A new picture or video picked for it.
+                    self.refresh_live(self.widgets.len() - 1);
                 }
                 None => self.add_widget(gfx, theme, item.clone()),
             }
@@ -675,6 +810,10 @@ impl Widgets {
             self.leaving.push(w.surface);
         }
         self.restart_sources();
+        // Drives just picked are read now, not at the next tick.
+        if self.has(WidgetKind::System) {
+            self.sample();
+        }
     }
 
     fn source_key(&self) -> SourceKey {
@@ -683,7 +822,12 @@ impl Widgets {
             weather: self.has(WidgetKind::Weather).then(|| (self.cfg.location.clone(), fahrenheit, self.data.h24)),
             calendar: (self.has(WidgetKind::Calendar) || self.has(WidgetKind::UpNext)).then(|| self.calendar_ics.clone()),
             devices: self.has(WidgetKind::Batteries),
-            media: self.has(WidgetKind::NowPlaying),
+            // Music Wave names the track playing too.
+            media: self.has(WidgetKind::NowPlaying) || self.has(WidgetKind::MusicWave),
+            gpu: sensors::wants_gpu(self.system_items()),
+            notes: self.has(WidgetKind::Notifications),
+            music: self.has(WidgetKind::MusicWave),
+            user: self.has(WidgetKind::User),
         }
     }
 
@@ -715,10 +859,35 @@ impl Widgets {
             shared
         });
         let media = key.media.then(|| Media::shared(self.hwnd));
+        let gpus = key.gpu.then(|| {
+            let shared = SharedGpus::default();
+            sensors::watch_gpus(shared.clone(), stop.clone());
+            shared
+        });
+        let notes = key.notes.then(|| {
+            let inbox = Inbox::new(self.hwnd, self.msg_data);
+            crate::island::notifications::watch(inbox.clone(), stop.clone());
+            inbox
+        });
+        if !key.notes {
+            self.data.notes.clear();
+        }
+        let bands = key.music.then(|| {
+            let shared = SharedBands::default();
+            live::listen(shared.clone(), self.hwnd, self.msg_data);
+            shared
+        });
+        let user = key.user.then(|| {
+            let shared = SharedUser::default();
+            if self.data.user.is_none() {
+                user::load(shared.clone(), self.hwnd, self.msg_data);
+            }
+            shared
+        });
         if key.weather.is_some() {
             self.data.weather = WeatherState::Loading;
         }
-        self.sources = Some(Sources { key, stop, calendar, weather, devices, media });
+        self.sources = Some(Sources { key, stop, calendar, weather, devices, media, gpus, notes, bands, user });
     }
 
     /// Gives up the running sources (and their data) for the widgets replacing these.
@@ -729,6 +898,8 @@ impl Widgets {
             events: std::mem::take(&mut self.data.events),
             devices: std::mem::take(&mut self.data.devices),
             now: self.data.now.take(),
+            notes: std::mem::take(&mut self.data.notes),
+            user: self.data.user.take(),
         }
     }
 
@@ -743,8 +914,42 @@ impl Widgets {
 
     /// A background source has news.
     pub fn on_data(&mut self) {
+        // Photo / Video frames (their players aren't among the shared sources).
+        for w in &mut self.widgets {
+            if let Some(l) = &w.live {
+                if let Some(f) = l.feed.take() {
+                    w.frame = Some(f);
+                    w.dirty = true;
+                } else if w.frame.is_none() && w.art.is_none() && l.feed.error().is_some() {
+                    w.dirty = true;
+                }
+            }
+        }
         let Some(src) = &self.sources else { return };
         let mut changed = Vec::new();
+        if let Some(inbox) = &src.notes {
+            for s in inbox.drain() {
+                match s {
+                    Signal::NoteHistory(list) => self.data.notes = list,
+                    Signal::Notification(n) => {
+                        self.data.notes.retain(|o| o.id != n.id);
+                        self.data.notes.insert(0, n);
+                        self.data.notes.truncate(30);
+                    }
+                    Signal::NotesGone(ids) => self.data.notes.retain(|n| !ids.contains(&n.id)),
+                    _ => continue,
+                }
+                changed.push(WidgetKind::Notifications);
+            }
+        }
+        if let Some(u) = src.user.as_ref().and_then(|u| u.lock().ok().and_then(|mut u| u.take())) {
+            self.data.user = Some(u);
+            changed.push(WidgetKind::User);
+        }
+        if let Some(b) = src.bands.as_ref().and_then(|b| b.take()) {
+            self.data.bands = b;
+            changed.push(WidgetKind::MusicWave);
+        }
         if let Some(inbox) = &src.calendar {
             for s in inbox.drain() {
                 if let Signal::Calendar(events) = s {
@@ -771,12 +976,18 @@ impl Widgets {
     pub fn on_media(&mut self) {
         if let Some(m) = self.sources.as_ref().and_then(|s| s.media.as_ref()) {
             self.data.now = m.snapshot();
-            self.mark(&[WidgetKind::NowPlaying]);
+            self.mark(&[WidgetKind::NowPlaying, WidgetKind::MusicWave]);
         }
     }
 
+    /// The System widgets' items.
+    fn system_items(&self) -> impl Iterator<Item = &WidgetItem> {
+        self.widgets.iter().filter(|w| w.item.kind == WidgetKind::System).map(|w| &w.item)
+    }
+
     fn sample(&mut self) {
-        self.sampler.sample();
+        let drives = sensors::wanted_drives(self.system_items());
+        self.sampler.sample(&drives, self.sources.as_ref().and_then(|s| s.gpus.as_ref()));
         self.data.sys = self.sampler.stats.clone();
     }
 
@@ -803,12 +1014,37 @@ impl Widgets {
             self.minute = minute;
             let now = calendar::unix_now();
             self.data.events.retain(|e| e.end > now);
-            self.mark(&[WidgetKind::Calendar, WidgetKind::UpNext]);
+            // Also "5m ago" and the uptime.
+            self.mark(&[WidgetKind::Calendar, WidgetKind::UpNext, WidgetKind::Notifications, WidgetKind::User]);
         }
+        self.pause_covered();
         if self.store.sweep() {
             self.mark(&[WidgetKind::Reminders]);
         }
         self.store.save_if_dirty();
+    }
+
+    /// Moving widgets hidden behind app windows stop (their workers sleep);
+    /// Music Wave stops listening when every one of them is hidden.
+    fn pause_covered(&mut self) {
+        let moving = |k| matches!(k, WidgetKind::Photo | WidgetKind::Video | WidgetKind::MusicWave);
+        if !self.widgets.iter().any(|w| moving(w.item.kind)) {
+            return;
+        }
+        for w in self.widgets.iter_mut().filter(|w| moving(w.item.kind)) {
+            let r = w.surface.rect;
+            let s = w.surface.scale;
+            let pad = (SHADOW * s).round() as i32;
+            let body = RECT { left: r.left + pad, top: r.top + pad, right: r.right - pad, bottom: r.bottom - pad };
+            w.covered = live::covered(body);
+            if let Some(l) = &w.live {
+                l.feed.set_paused(w.covered);
+            }
+        }
+        let all_hidden = self.widgets.iter().filter(|w| w.item.kind == WidgetKind::MusicWave).all(|w| w.covered);
+        if let Some(b) = self.sources.as_ref().and_then(|s| s.bands.as_ref()) {
+            b.set_paused(all_hidden);
+        }
     }
 
     // --- animation ---------------------------------------------------------
@@ -851,7 +1087,7 @@ impl Widgets {
         let Widgets { widgets, data, store, .. } = self;
         for w in widgets.iter_mut().filter(|w| w.dirty) {
             w.dirty = false;
-            if w.item.kind == WidgetKind::NowPlaying {
+            if matches!(w.item.kind, WidgetKind::NowPlaying | WidgetKind::MusicWave) {
                 let art = data.now.as_ref().and_then(|n| n.art.clone());
                 if art.as_ref().map(|a| a.id) != w.art.as_ref().map(|(id, _)| *id) {
                     let rt = w.surface.canvas.target().clone();
@@ -861,9 +1097,38 @@ impl Widgets {
                     });
                 }
             }
+            match w.item.kind {
+                WidgetKind::Photo | WidgetKind::Video => {
+                    if let Some(f) = w.frame.take() {
+                        let rt = w.surface.canvas.target().clone();
+                        upload_frame(&rt, &mut w.art, f);
+                    }
+                }
+                WidgetKind::User => {
+                    let pic = data.user.as_ref().and_then(|u| u.picture.clone());
+                    if pic.as_ref().map(|a| a.id) != w.art.as_ref().map(|(id, _)| *id) {
+                        let rt = w.surface.canvas.target().clone();
+                        w.art = pic.and_then(|a| IconPixels { width: a.size, height: a.size, data: a.data.clone() }.to_bitmap(&rt).map(|b| (a.id, b)));
+                    }
+                }
+                WidgetKind::Notifications => {
+                    let rt = w.surface.canvas.target().clone();
+                    let icons: Vec<_> = data.notes.iter().filter_map(|n| n.icon.clone()).collect();
+                    w.pictures.retain(|(id, _)| icons.iter().any(|a| a.id == *id));
+                    for a in icons {
+                        if !w.pictures.iter().any(|(id, _)| *id == a.id) {
+                            if let Some(b) = (IconPixels { width: a.size, height: a.size, data: a.data.clone() }).to_bitmap(&rt) {
+                                w.pictures.push((a.id, b));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
             let body = w.body();
             let mut hits = Vec::new();
             w.motion.sweep();
+            let error = w.live.as_ref().and_then(|l| l.feed.error());
             let ctx = views::Ctx {
                 theme,
                 data,
@@ -873,6 +1138,8 @@ impl Widgets {
                 art: w.art.as_ref().map(|(_, b)| b),
                 hover: w.hover,
                 motion: Some(&w.motion),
+                pictures: &w.pictures,
+                error: error.as_deref(),
             };
             let result = w.surface.render(gfx, |p| paint(p, body, &ctx, solid, &mut hits));
             if let Err(e) = result {
@@ -1045,7 +1312,21 @@ impl Widgets {
                 w.dirty = true;
                 WidgetEvent::Focus(w.surface.content)
             }
+            Some(Hit::Notification(n)) => match self.data.notes.get(n) {
+                Some(note) => WidgetEvent::OpenMedia(note.app_id.clone()),
+                None => WidgetEvent::None,
+            },
+            Some(Hit::Lock) => WidgetEvent::Action(Action::Lock),
+            Some(Hit::SignOut) => WidgetEvent::Action(Action::LogOut),
+            Some(Hit::Sleep) => WidgetEvent::Action(Action::Sleep),
+            Some(Hit::Choose) => WidgetEvent::Action(Action::Widget(WidgetCmd::Choose(self.widgets[i].item.id, false))),
             None => match kind {
+                WidgetKind::Notifications => WidgetEvent::Action(Action::Open("ms-actioncenter:".into())),
+                WidgetKind::User => WidgetEvent::Action(Action::Open("ms-settings:yourinfo".into())),
+                WidgetKind::MusicWave => match &self.data.now {
+                    Some(n) => WidgetEvent::OpenMedia(n.app_id.clone()),
+                    None => WidgetEvent::None,
+                },
                 WidgetKind::Clock | WidgetKind::WorldClock => WidgetEvent::Action(Action::Open("ms-clock:".into())),
                 WidgetKind::Calendar | WidgetKind::UpNext => WidgetEvent::Action(Action::Open("outlookcal:".into())),
                 WidgetKind::Batteries => WidgetEvent::Action(Action::Open("ms-settings:bluetooth".into())),
@@ -1057,6 +1338,8 @@ impl Widgets {
 
     pub fn context_menu(&mut self, hwnd: HWND, x: f32, y: f32) -> Option<(Vec<Entry>, Placement)> {
         let i = self.index(hwnd)?;
+        let item = self.widgets[i].item.clone();
+        let sensor_entries = (item.kind == WidgetKind::System).then(|| self.sensor_entries(&item));
         let w = &self.widgets[i];
         let (id, kind) = (w.item.id, w.item.kind);
         let mut entries: Vec<Entry> = sizes(kind)
@@ -1081,12 +1364,106 @@ impl Widgets {
             entries.push(Entry::item("Refresh Weather", Action::Widget(WidgetCmd::Refresh)));
             entries.push(Entry::Separator);
         }
+        if let Some(s) = sensor_entries {
+            entries.extend(s);
+            entries.push(Entry::Separator);
+        }
+        match kind {
+            WidgetKind::Photo => {
+                entries.push(Entry::item("Choose Picture or GIF…", Action::Widget(WidgetCmd::Choose(id, false))));
+                entries.push(Entry::item("Choose Folder for a Slideshow…", Action::Widget(WidgetCmd::Choose(id, true))));
+                entries.push(Entry::Separator);
+            }
+            WidgetKind::Video => {
+                entries.push(Entry::item("Choose Video…", Action::Widget(WidgetCmd::Choose(id, false))));
+                entries.push(Entry::Separator);
+            }
+            WidgetKind::User => {
+                for (key, label) in user::OPTIONS {
+                    entries.push(Entry::item(label, Action::Widget(WidgetCmd::ToggleOption(id, key))).checked(user::shows(&w.item, key)));
+                }
+                entries.push(Entry::Separator);
+            }
+            WidgetKind::Notifications => {
+                let any = !self.data.notes.is_empty();
+                entries.push(if any {
+                    Entry::item("Clear All Notifications", Action::Widget(WidgetCmd::ClearNotifications))
+                } else {
+                    Entry::disabled("Clear All Notifications")
+                });
+                entries.push(Entry::Separator);
+            }
+            _ => {}
+        }
         entries.push(Entry::item("Edit Widgets…", Action::OpenSettings(Some(crate::settings::Page::Widgets))));
         entries.push(Entry::item("Reset Widgets…", Action::Widget(WidgetCmd::Reset)));
         entries.push(Entry::item(format!("Remove “{}”", title(kind)), Action::Widget(WidgetCmd::Remove(id))));
         let r = w.surface.rect;
         let s = w.surface.scale;
         Some((entries, Placement::Below { x: r.left as f32 / s + x, y: r.top as f32 / s + y }))
+    }
+
+    /// System: "Show ▸" with every sensor this PC has (ticked when shown), and
+    /// "Graph ▸" to pick which usage leads (and so gets the graph).
+    fn sensor_entries(&mut self, item: &WidgetItem) -> Vec<Entry> {
+        use sensors::Sensor;
+        let gpus = sensors::gpus();
+        let first_gpu = gpus.first().map(|g| g.id.clone());
+        self.first_gpu = first_gpu.clone();
+        let shown: Vec<Sensor> = sensors::of(item).into_iter().map(|s| sensors::canonical(s, first_gpu.as_deref())).collect();
+        let id = item.id;
+        let toggle = |label: String, s: Sensor| {
+            let on = shown.contains(&s);
+            Entry::item(label, Action::Widget(WidgetCmd::ToggleSensor(id, s.key()))).checked(on)
+        };
+        let mut show = vec![toggle("CPU".into(), Sensor::Cpu), toggle("Memory".into(), Sensor::Memory)];
+        // Menus open one level of submenu, so each GPU is a heading over its own items.
+        for g in &gpus {
+            let some = || Some(g.id.clone());
+            show.push(Entry::Separator);
+            show.push(Entry::disabled(g.name.clone()));
+            show.push(toggle("GPU Usage".into(), Sensor::Gpu(some())));
+            show.push(toggle("GPU Memory".into(), Sensor::GpuMemory(some())));
+            show.push(toggle("GPU Temperature".into(), Sensor::GpuTemp(some())));
+        }
+        show.push(Entry::Separator);
+        show.push(Entry::disabled("Drives"));
+        for d in sensors::drives() {
+            show.push(toggle(d.name, Sensor::Disk(Some(d.letter))));
+        }
+        show.push(Entry::Separator);
+        show.push(Entry::disabled("Network"));
+        show.push(toggle("All Adapters".into(), Sensor::Network(None)));
+        let mut adapters = sensors::adapters();
+        // Picked adapters stay listed while they're disconnected, so they can be unticked.
+        for s in &shown {
+            if let Sensor::Network(Some(n)) = s {
+                if !adapters.iter().any(|a| a.eq_ignore_ascii_case(n)) {
+                    adapters.push(n.clone());
+                }
+            }
+        }
+        for a in adapters {
+            show.push(toggle(a.clone(), Sensor::Network(Some(a))));
+        }
+        show.push(Entry::Separator);
+        let custom = item.sensors.is_some();
+        show.push(if custom { Entry::item("Show Defaults", Action::Widget(WidgetCmd::DefaultSensors(id))) } else { Entry::disabled("Show Defaults") });
+
+        let mut out = vec![Entry::submenu("Show", show)];
+        let graphs: Vec<&Sensor> = shown.iter().filter(|s| s.graphable()).collect();
+        if graphs.len() > 1 {
+            let name = |s: &Sensor| match s {
+                Sensor::Gpu(Some(g)) => gpus.iter().find(|x| x.id == *g).map_or_else(|| g.clone(), |x| x.name.clone()),
+                _ => "CPU".to_string(),
+            };
+            let lead = graphs[0];
+            out.push(Entry::submenu(
+                "Graph",
+                graphs.iter().map(|s| Entry::item(name(s), Action::Widget(WidgetCmd::LeadSensor(id, s.key()))).checked(*s == lead)).collect(),
+            ));
+        }
+        out
     }
 
     /// Widget `i`'s rect and those of the others on its display.
@@ -1298,6 +1675,33 @@ impl Widgets {
 
     // --- commands ----------------------------------------------------------
 
+    /// Ticks or unticks sensor `key` on widget `id` (or, `lead`, puts it first).
+    fn edit_sensors(&self, items: &mut [WidgetItem], id: u32, key: &str, lead: bool) -> Option<()> {
+        let first = self.first_gpu.as_deref();
+        let canon = |s| sensors::canonical(s, first);
+        let i = items.iter().position(|w| w.id == id)?;
+        let s = canon(sensors::Sensor::parse(key)?);
+        let mut list: Vec<sensors::Sensor> = Vec::new();
+        for x in sensors::of(&items[i]).into_iter().map(canon) {
+            if !list.contains(&x) {
+                list.push(x);
+            }
+        }
+        match list.iter().position(|x| *x == s) {
+            Some(p) if lead => {
+                let x = list.remove(p);
+                list.insert(0, x);
+            }
+            Some(p) => {
+                list.remove(p);
+            }
+            None if lead => return None,
+            None => list.push(s),
+        }
+        items[i].sensors = sensors::stored(&list, first);
+        Some(())
+    }
+
     /// The widget list after `cmd`, to be saved; None if nothing's to save.
     pub fn command(&mut self, cmd: WidgetCmd) -> Option<Vec<WidgetItem>> {
         let mut items = self.items();
@@ -1307,12 +1711,12 @@ impl Widgets {
                 let p = cursor_px();
                 let screen = self.screens.iter().find(|s| s.monitor.contains(p.x, p.y)).unwrap_or(&self.screens[0]).clone();
                 let display = screen.tag();
-                let probe = WidgetItem { id: 0, kind, size: sizes(kind)[0], x: 0.0, y: 0.0, zone: None, display: display.clone() };
+                let probe = WidgetItem { id: 0, kind, size: sizes(kind)[0], x: 0.0, y: 0.0, zone: None, display: display.clone(), sensors: None, path: None, options: None };
                 let here: Vec<WidgetItem> = items.iter().filter(|i| self.same_screen(i, &probe)).cloned().collect();
                 let size = sizes(kind)[0];
                 let (x, y) = free_spot(&here, size, screen.area());
                 let id = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
-                items.push(WidgetItem { id, kind, size, x, y, zone: None, display });
+                items.push(WidgetItem { id, kind, size, x, y, zone: None, display, sensors: None, path: None, options: None });
             }
             WidgetCmd::MoveToDisplay(id, to) => {
                 let screen = self.screens.iter().find(|s| s.id == to)?.clone();
@@ -1350,6 +1754,38 @@ impl Widgets {
                     return None;
                 }
                 (items[i].x, items[i].y) = (x, y);
+            }
+            WidgetCmd::ToggleSensor(id, key) => self.edit_sensors(&mut items, id, &key, false)?,
+            WidgetCmd::LeadSensor(id, key) => self.edit_sensors(&mut items, id, &key, true)?,
+            WidgetCmd::Choose(id, folder) => {
+                let i = items.iter().position(|w| w.id == id)?;
+                let owner = self.widgets.iter().find(|w| w.item.id == id).map(|w| w.surface.content).unwrap_or_default();
+                let picked = match (items[i].kind, folder) {
+                    (WidgetKind::Video, _) => system::pick_video(owner),
+                    (_, true) => system::pick_folder(owner),
+                    _ => system::pick_photo(owner),
+                }?;
+                items[i].path = Some(picked);
+            }
+            WidgetCmd::ToggleOption(id, key) => {
+                let w = items.iter_mut().find(|w| w.id == id)?;
+                let mut on: Vec<String> = user::OPTIONS.iter().filter(|(k, _)| user::shows(w, k)).map(|(k, _)| k.to_string()).collect();
+                match on.iter().position(|k| k == key) {
+                    Some(p) => {
+                        on.remove(p);
+                    }
+                    None => on.push(key.to_string()),
+                }
+                w.options = (on.len() != user::OPTIONS.len()).then_some(on);
+            }
+            WidgetCmd::ClearNotifications => {
+                crate::island::notifications::remove(None);
+                self.data.notes.clear();
+                self.mark(&[WidgetKind::Notifications]);
+                return None;
+            }
+            WidgetCmd::DefaultSensors(id) => {
+                items.iter_mut().find(|w| w.id == id)?.sensors = None;
             }
             WidgetCmd::Reset => {
                 items = crate::config::defaults().widgets.items;
@@ -1392,7 +1828,7 @@ mod tests {
     use super::*;
 
     fn item(id: u32, size: WidgetSize, x: f32, y: f32) -> WidgetItem {
-        WidgetItem { id, kind: WidgetKind::Clock, size, x, y, zone: None, display: None }
+        WidgetItem { id, kind: WidgetKind::Clock, size, x, y, zone: None, display: None, sensors: None, path: None, options: None }
     }
 
     /// Paints every widget, light and dark, with sample data into
@@ -1432,11 +1868,34 @@ mod tests {
                 mem: 0.62,
                 mem_used: 10 << 30,
                 mem_total: 16 << 30,
-                disk: 0.71,
-                disk_free: 140 << 30,
+                disks: vec![sensors::Disk { letter: 'C', used: 0.71, free: 140 << 30, total: 476 << 30 }],
+                nets: vec![sensors::Net { name: "Wi-Fi".into(), down: 1.2e6, up: 45e3 }],
                 down: 1.2e6,
                 up: 45e3,
-            },
+                gpus: vec![
+                    sensors::Gpu {
+                        id: "10de-2504".into(),
+                        name: "NVIDIA GeForce RTX 4070 Laptop GPU".into(),
+                        vendor: 0x10de,
+                        usage: 0.58,
+                        history: (0..60).map(|i| 0.5 + 0.3 * (i as f32 / 7.0).cos()).collect(),
+                        mem_used: 5 << 30,
+                        mem_total: 8 << 30,
+                        dedicated: true,
+                        temp: Some(64.0),
+                    },
+                    sensors::Gpu {
+                        id: "8086-9a49".into(),
+                        name: "Intel Iris Xe Graphics".into(),
+                        vendor: 0x8086,
+                        usage: 0.12,
+                        history: (0..60).map(|i| 0.1 + 0.05 * (i as f32 / 3.0).sin()).collect(),
+                        mem_used: 1 << 30,
+                        mem_total: 8 << 30,
+                        dedicated: false,
+                        temp: None,
+                    },
+                ],            },
             now: Some(NowPlaying {
                 app_id: "Spotify.exe".into(),
                 title: "Midnight City".into(),
@@ -1453,6 +1912,24 @@ mod tests {
             zones: crate::config::defaults().widgets.world_clocks.iter().filter_map(|z| sources::parse_zone(z)).collect(),
             first_weekday: chrono::Weekday::Mon,
             h24: false,
+            bands: (0..live::BANDS).map(|i| (0.85 - i as f32 / 48.0) * (0.55 + 0.45 * (i as f32 * 0.9).sin().abs())).collect(),
+            notes: {
+                let note = |id: u32, mins: u64, app: &str, title: &str, body: &str| Note {
+                    id,
+                    at: std::time::SystemTime::now() - std::time::Duration::from_secs(mins * 60),
+                    app: app.into(),
+                    app_id: String::new(),
+                    title: title.into(),
+                    body: body.into(),
+                    icon: None,
+                };
+                vec![
+                    note(1, 0, "Messages", "Sam", "Are we still on for lunch tomorrow? I booked the place by the river."),
+                    note(2, 12, "Outlook", "Design review moved", "The design review is now at 3 PM in room 4."),
+                    note(3, 95, "Discord", "#general", "Alex: the build is green again"),
+                ]
+            },
+            user: Some(UserInfo { name: "Ollie Box".into(), first: "Ollie".into(), picture: None, pc: "OLLIE-LAPTOP".into() }),
         };
         let mut store = Store::default();
         store.set_note(1, "Groceries\nMilk, eggs, coffee beans\nPick up the dry cleaning before 6pm on Thursday.".into());
@@ -1488,11 +1965,42 @@ mod tests {
                 }
             }
             for (kind, size, x, y) in placed {
-                let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None, display: None };
+                // System: a bit of everything, two GPUs (more than fits as rings).
+                let sensors = (kind == WidgetKind::System).then(|| {
+                    ["cpu", "gpu:10de-2504", "memory", "gpu_memory:10de-2504", "gpu_temp:10de-2504", "gpu:8086-9a49", "gpu_temp:8086-9a49", "disk:C", "network:Wi-Fi", "network"]
+                        .map(String::from)
+                        .to_vec()
+                });
+                let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None, display: None, sensors, path: None, options: None };
                 let (w, h) = dims(size);
                 let (cw, ch) = ((w + 2.0 * SHADOW) as i32, (h + 2.0 * SHADOW) as i32);
                 let mut canvas = Canvas::new(&gfx, cw, ch, 1.0).unwrap();
-                let ctx = views::Ctx { theme: &theme, data: &data, store: &store, item: &item, edit: None, art: None, hover: None, motion: None };
+                // Photo: a made-up 3:2 picture, to see it cover the card.
+                let photo = (kind == WidgetKind::Photo).then(|| {
+                    let (pw, ph) = (300u32, 200u32);
+                    let mut data = Vec::with_capacity((pw * ph * 4) as usize);
+                    for yy in 0..ph {
+                        for xx in 0..pw {
+                            let sun = ((xx as f32 - 210.0).hypot(yy as f32 - 60.0) < 26.0) as u8;
+                            let hill = (yy as f32 > 140.0 - 30.0 * (xx as f32 / 40.0).sin()) as u8;
+                            let (b, g, r) = if sun == 1 { (90, 210, 255) } else if hill == 1 { (60, 140, 50) } else { (230, 170, 90 + yy as u8 / 3) };
+                            data.extend([b, g, r, 255]);
+                        }
+                    }
+                    IconPixels { width: pw, height: ph, data }.to_bitmap(canvas.target()).unwrap()
+                });
+                let ctx = views::Ctx {
+                    theme: &theme,
+                    data: &data,
+                    store: &store,
+                    item: &item,
+                    edit: None,
+                    art: photo.as_ref(),
+                    hover: None,
+                    motion: None,
+                    pictures: &[],
+                    error: None,
+                };
                 let mut hits = Vec::new();
                 // Solid cards: there's no blurred backdrop window here.
                 canvas.draw(&gfx, |p| paint(p, Rect::new(SHADOW, SHADOW, w, h), &ctx, true, &mut hits)).unwrap();

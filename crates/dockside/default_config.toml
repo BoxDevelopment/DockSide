@@ -307,10 +307,21 @@ world_clocks = ["America/Los_Angeles", "America/New_York", "Europe/London", "Asi
 
 # Widgets and where they sit (top-left corner, in points from the screen's top-left).
 #   kind - clock, world_clock, weather, calendar, up_next, batteries, notes,
-#          reminders, now_playing or system
+#          reminders, notifications, now_playing, music_wave, photo, video,
+#          system or user
 #   size - small, medium or large (not every widget has every size)
 #   zone - world_clock: the time zone of a small one (optional)
 #   display - the display it's on (optional; set by dragging it to another screen)
+#   sensors - system: what it shows, in order (optional; right-click › Show to pick).
+#             "cpu", "memory", "disk" (system drive), "disk:D", "network" (all),
+#             "network:Wi-Fi" (by adapter name), and per GPU, by vendor-device id
+#             or "gpu" for the first one: "gpu:10de-2504" (usage),
+#             "gpu_memory:10de-2504" and "gpu_temp:10de-2504". The first CPU or
+#             GPU usage gets a graph (medium; large graphs the first two).
+#   path - photo: a picture, GIF or folder (a slideshow, 30 s a picture);
+#          video: a video file (loops, muted). Right-click › Choose… to pick.
+#   options - user: the extras it shows, from "greeting", "buttons" (Lock,
+#             Sign Out, Sleep) and "device" (PC name and uptime); none = all.
 [[widgets.items]]
 kind = "clock"
 size = "small"

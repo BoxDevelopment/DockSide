@@ -78,7 +78,7 @@ pub struct View<'a> {
     /// The Widgets page's readings (`None` until it's first opened).
     pub weather: Option<&'a crate::widgets::sources::WeatherState>,
     pub devices: &'a [(String, u8)],
-    pub sys: &'a crate::widgets::sources::SysStats,
+    pub sys: &'a crate::widgets::sensors::SysStats,
     pub zones: &'a [crate::widgets::sources::Zone],
     pub h24: bool,
     pub battery: Option<crate::win::system::Battery>,
@@ -1409,7 +1409,8 @@ fn system_cell(p: &Painter, r: Rect, v: &View, a: f32) {
     let pct = |x: f32| format!("{}%", (x * 100.0).round() as i32);
     meter(p, row(0), "CPU", s.cpu, &pct(s.cpu), v, a);
     meter(p, row(1), "Memory", s.mem, &pct(s.mem), v, a);
-    meter(p, row(2), "Disk", s.disk, &pct(s.disk), v, a);
+    let disk = s.disks.first().map_or(0.0, |d| d.used);
+    meter(p, row(2), "Disk", disk, &pct(disk), v, a);
     let net = format!("\u{2193} {}   \u{2191} {}", rate(s.down), rate(s.up));
     p.text(&net, &v.fonts.small_l, row(3), SECONDARY.alpha(a));
 }

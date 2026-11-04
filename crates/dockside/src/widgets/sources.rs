@@ -4,15 +4,13 @@
 //!   refreshed every 15 minutes,
 //! * Bluetooth device batteries, polled every minute,
 //!
-//! plus cheap readings taken on the UI thread: CPU / memory / disk / network
-//! for the System widget, World Clock zones and regional preferences.
+//! plus World Clock zones and regional preferences (System readings are in
+//! [`super::sensors`]).
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, NaiveDate, Timelike};
-use windows::core::HSTRING;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use crate::island::sources::Stop;
@@ -357,114 +355,6 @@ pub fn zone_time(z: &Zone) -> (u32, u32, u32, String) {
         format!("{:+}:{:02}", mins / 60, (mins % 60).abs())
     };
     (there.hour(), there.minute(), there.second(), format!("{day}, {offset}"))
-}
-
-// ---------------------------------------------------------------------------
-// System stats
-// ---------------------------------------------------------------------------
-
-/// Samples kept for the CPU graph.
-pub const HISTORY: usize = 60;
-
-#[derive(Clone, Debug, Default)]
-pub struct SysStats {
-    /// 0..1
-    pub cpu: f32,
-    pub cpu_history: VecDeque<f32>,
-    pub mem: f32,
-    pub mem_used: u64,
-    pub mem_total: u64,
-    pub disk: f32,
-    pub disk_free: u64,
-    /// Bytes per second.
-    pub down: f64,
-    pub up: f64,
-}
-
-#[derive(Default)]
-pub struct Sampler {
-    cpu: Option<(u64, u64)>,
-    net: Option<(u64, u64, Instant)>,
-    pub stats: SysStats,
-}
-
-fn ft(f: windows::Win32::Foundation::FILETIME) -> u64 {
-    ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64
-}
-
-impl Sampler {
-    pub fn sample(&mut self) {
-        use windows::Win32::Foundation::FILETIME;
-        use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        use windows::Win32::System::Threading::GetSystemTimes;
-
-        let s = &mut self.stats;
-        let (mut idle, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default());
-        if unsafe { GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)) }.is_ok() {
-            // Kernel time includes idle time.
-            let (busy_total, idle) = (ft(kernel) + ft(user), ft(idle));
-            if let Some((t0, i0)) = self.cpu {
-                let (dt, di) = (busy_total.saturating_sub(t0), idle.saturating_sub(i0));
-                if dt > 0 {
-                    s.cpu = (1.0 - di as f32 / dt as f32).clamp(0.0, 1.0);
-                    s.cpu_history.push_back(s.cpu);
-                    while s.cpu_history.len() > HISTORY {
-                        s.cpu_history.pop_front();
-                    }
-                }
-            }
-            self.cpu = Some((busy_total, idle));
-        }
-
-        let mut mem = MEMORYSTATUSEX { dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32, ..Default::default() };
-        if unsafe { GlobalMemoryStatusEx(&mut mem) }.is_ok() {
-            s.mem_total = mem.ullTotalPhys;
-            s.mem_used = mem.ullTotalPhys.saturating_sub(mem.ullAvailPhys);
-            s.mem = s.mem_used as f32 / s.mem_total.max(1) as f32;
-        }
-
-        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()) + "\\";
-        let (mut free, mut total) = (0u64, 0u64);
-        if unsafe { GetDiskFreeSpaceExW(&HSTRING::from(drive), None, Some(&mut total), Some(&mut free)) }.is_ok() && total > 0 {
-            s.disk_free = free;
-            s.disk = 1.0 - free as f32 / total as f32;
-        }
-
-        if let Some((rx, tx)) = net_octets() {
-            let now = Instant::now();
-            if let Some((rx0, tx0, t0)) = self.net {
-                let secs = (now - t0).as_secs_f64().max(0.1);
-                s.down = rx.saturating_sub(rx0) as f64 / secs;
-                s.up = tx.saturating_sub(tx0) as f64 / secs;
-            }
-            self.net = Some((rx, tx, now));
-        }
-    }
-}
-
-/// Bytes received / sent so far over physical network adapters that are up.
-fn net_octets() -> Option<(u64, u64)> {
-    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
-    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-    unsafe {
-        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-        if GetIfTable2(&mut table).is_err() || table.is_null() {
-            return None;
-        }
-        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
-        let (mut rx, mut tx) = (0u64, 0u64);
-        for r in rows {
-            // Bit 0: HardwareInterface (skips loopback, tunnels and virtual adapters).
-            let hardware = r.InterfaceAndOperStatusFlags._bitfield & 1 != 0;
-            if hardware && r.OperStatus == IfOperStatusUp {
-                rx += r.InOctets;
-                tx += r.OutOctets;
-            }
-        }
-        FreeMibTable(table as *const _);
-        Some((rx, tx))
-    }
 }
 
 /// "1.2 MB/s", "340 KB/s".

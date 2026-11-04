@@ -357,7 +357,7 @@ impl Worker {
 }
 
 /// Decodes an image stream (artwork, app logos) into a square [`Art`].
-pub(super) fn art_from(
+pub(crate) fn art_from(
     wic: &IWICImagingFactory,
     image: &windows::Storage::Streams::IRandomAccessStreamReference,
     max: u32,
@@ -369,7 +369,7 @@ pub(super) fn art_from(
     Some(Art { id, size, tint: accent_of(&data), data })
 }
 
-pub(super) fn wic() -> Option<IWICImagingFactory> {
+pub(crate) fn wic() -> Option<IWICImagingFactory> {
     unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok() }
 }
 

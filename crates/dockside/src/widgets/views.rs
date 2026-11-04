@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Direct2D::Common::{D2D1_FIGURE_BEGIN_HOLLOW, D2D1_
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
 use windows::Win32::Graphics::DirectWrite::*;
 
+use super::sensors::{self, Reading, Tint};
 use super::sources::{self, WeatherState, Zone};
 use super::store::Store;
 use super::{glyphs, Data, Edit, Hit, RADIUS};
@@ -47,6 +48,10 @@ pub struct Ctx<'a> {
     pub hover: Option<Hit>,
     /// Without springs (gallery renders), everything shows its end state.
     pub motion: Option<&'a Motion<Anim>>,
+    /// Notification icons, by art id.
+    pub pictures: &'a [(u64, ID2D1Bitmap)],
+    /// Photo / Video: why nothing's showing.
+    pub error: Option<&'a str>,
 }
 
 impl Ctx<'_> {
@@ -94,6 +99,10 @@ pub fn draw(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
         WidgetKind::Reminders => reminders(p, r, c, hits),
         WidgetKind::NowPlaying => now_playing(p, r, c, hits),
         WidgetKind::System => system(p, r, c),
+        WidgetKind::MusicWave => music_wave(p, r, c),
+        WidgetKind::Photo | WidgetKind::Video => picture(p, r, c, hits),
+        WidgetKind::Notifications => notifications(p, r, c, hits),
+        WidgetKind::User => user(p, r, c, hits),
     }
 }
 
@@ -565,6 +574,31 @@ fn batteries(p: &Painter, r: Rect, c: &Ctx) {
                 percent_label(p, c, d, Rect::new(cx - 40.0, cy + 28.0, 80.0, 16.0), 11.0);
             }
         }
+        WidgetSize::Large => {
+            // A row each: ring, name, percentage and a bar, like macOS.
+            let rows = devices.len().clamp(4, 8) as f32;
+            let row_h = (r.h - 2.0 * 14.0) / rows;
+            let rad = (row_h * 0.34).min(19.0);
+            for (i, d) in devices.iter().take(8).enumerate() {
+                let y = r.y + 14.0 + row_h * i as f32;
+                let cy = y + row_h / 2.0;
+                ring(p, c, d, r.x + PAD + rad, cy, rad, rad * 0.2);
+                let x = r.x + PAD + 2.0 * rad + 12.0;
+                let pct_w = 64.0;
+                let name_w = r.right() - PAD - pct_w - x;
+                let ns = fitted(p, c, &d.name, 14.0, Weight::Bold, name_w - 8.0);
+                text(p, c, &d.name, ns, Weight::Bold, Align::Leading, Rect::new(x, cy - 16.0, name_w, 20.0), c.theme.text);
+                let bar = Rect::new(x, cy + 6.0, name_w - 12.0, 5.0);
+                p.fill_round(bar, 2.5, c.faint());
+                let low = d.percent <= 20 && !d.charging;
+                let fill = Rect::new(bar.x, bar.y, (bar.w * d.percent as f32 / 100.0).max(bar.h), bar.h);
+                p.fill_round(fill, 2.5, if low { c.red() } else { GREEN });
+                percent_label(p, c, d, Rect::new(r.right() - PAD - pct_w, cy - 11.0, pct_w - 14.0, 22.0), 15.0);
+                if i + 1 < devices.len().min(8) {
+                    p.line(x, y + row_h, r.right() - PAD, y + row_h, c.faint(), 0.5);
+                }
+            }
+        }
         _ => {
             let col = (r.w - 16.0) / 4.0;
             for (i, d) in devices.iter().take(4).enumerate() {
@@ -833,17 +867,59 @@ fn now_playing(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
 // System
 // ---------------------------------------------------------------------------
 
-fn gauge(p: &Painter, c: &Ctx, cx: f32, cy: f32, rad: f32, frac: f32, color: Color, label: &str) {
-    p.stroke_circle(cx, cy, rad, c.faint(), rad * 0.22);
-    ig::arc(p, cx, cy, rad, frac, color, rad * 0.22);
-    let pct = format!("{:.0}%", frac * 100.0);
-    text(p, c, &pct, rad * 0.46, Weight::Bold, Align::Center, Rect::new(cx - rad, cy - rad * 0.4, 2.0 * rad, rad * 0.8), c.theme.text);
-    text(p, c, label, 10.0, Weight::Bold, Align::Center, Rect::new(cx - 40.0, cy + rad + 4.0, 80.0, 14.0), c.theme.text_secondary);
+const TEAL: Color = Color::rgba(48, 176, 199, 1.0);
+const PINK: Color = Color::rgba(255, 55, 95, 1.0);
+/// Height of a gauge's row: ring, label and detail line.
+const GAUGE_ROW: f32 = 84.0;
+
+fn tint(c: &Ctx, t: Tint) -> Color {
+    match t {
+        Tint::Accent => c.theme.accent,
+        Tint::Purple => PURPLE,
+        Tint::Orange => ORANGE,
+        Tint::Green => GREEN,
+        Tint::Teal => TEAL,
+        Tint::Pink => PINK,
+    }
 }
 
-fn net(p: &Painter, c: &Ctx, x: f32, y: f32, w: f32) {
-    let s = &c.data.sys;
-    let rows = [("↓", sources::rate(s.down), GREEN), ("↑", sources::rate(s.up), c.theme.accent)];
+/// `s` at `size`, or smaller (down to 7pt) until it fits `w`.
+fn fitted(p: &Painter, c: &Ctx, s: &str, size: f32, weight: Weight, w: f32) -> f32 {
+    let mut sz = size;
+    while sz > 7.0 && width(p, c, s, sz, weight) > w {
+        sz -= 0.5;
+    }
+    sz
+}
+
+/// A ring centred on (`cx`, `cy`), its label below in `room` points of width
+/// and, with `detail`, a line under that.
+fn gauge(p: &Painter, c: &Ctx, cx: f32, cy: f32, rad: f32, g: &Reading, room: f32, detail: bool) {
+    let color = tint(c, g.tint);
+    p.stroke_circle(cx, cy, rad, c.faint(), rad * 0.22);
+    ig::arc(p, cx, cy, rad, g.frac, color, rad * 0.22);
+    let vs = fitted(p, c, &g.value, rad * 0.46, Weight::Bold, rad * 1.5);
+    text(p, c, &g.value, vs, Weight::Bold, Align::Center, Rect::new(cx - rad, cy - vs * 0.87, 2.0 * rad, vs * 1.74), c.theme.text);
+    let ls = fitted(p, c, &g.label, 10.0, Weight::Bold, room);
+    text(p, c, &g.label, ls, Weight::Bold, Align::Center, Rect::new(cx - room / 2.0, cy + rad + 4.0, room, 14.0), c.theme.text_secondary);
+    if let Some(d) = g.detail.as_deref().filter(|_| detail) {
+        let ds = fitted(p, c, d, 10.0, Weight::Regular, room);
+        text(p, c, d, ds, Weight::Regular, Align::Center, Rect::new(cx - room / 2.0, cy + rad + 18.0, room, 14.0), c.theme.text_secondary);
+    }
+}
+
+/// A row of gauges spread evenly across `x`..`x + w`.
+fn gauge_row(p: &Painter, c: &Ctx, x: f32, w: f32, cy: f32, rad: f32, row: &[&Reading], cells: usize, detail: bool) {
+    let cell = w / cells.max(row.len()).max(1) as f32;
+    let x0 = x + (w - cell * row.len() as f32) / 2.0;
+    for (i, g) in row.iter().enumerate() {
+        gauge(p, c, x0 + cell * (i as f32 + 0.5), cy, rad, g, cell - 4.0, detail);
+    }
+}
+
+/// Down and up rates on two lines.
+fn net(p: &Painter, c: &Ctx, x: f32, y: f32, w: f32, (down, up): (f64, f64)) {
+    let rows = [("↓", sources::rate(down), GREEN), ("↑", sources::rate(up), c.theme.accent)];
     for (i, (arrow, rate, color)) in rows.iter().enumerate() {
         let ry = y + i as f32 * 18.0;
         text(p, c, arrow, 12.0, Weight::Bold, Align::Leading, Rect::new(x, ry, 14.0, 18.0), *color);
@@ -851,11 +927,25 @@ fn net(p: &Painter, c: &Ctx, x: f32, y: f32, w: f32) {
     }
 }
 
+/// An adapter on one line: its name, then down and up rates.
+fn net_line(p: &Painter, c: &Ctx, x: f32, y: f32, w: f32, g: &Reading) {
+    let (down, up) = g.net.unwrap_or_default();
+    let col = 78.0;
+    let name_w = w - 2.0 * col;
+    let ns = fitted(p, c, &g.label, 12.0, Weight::Bold, name_w - 6.0);
+    text(p, c, &g.label, ns, Weight::Bold, Align::Leading, Rect::new(x, y, name_w, 18.0), c.theme.text_secondary);
+    for (i, (arrow, rate, color)) in [("↓", sources::rate(down), GREEN), ("↑", sources::rate(up), c.theme.accent)].iter().enumerate() {
+        let cx = x + name_w + col * i as f32;
+        text(p, c, arrow, 12.0, Weight::Bold, Align::Leading, Rect::new(cx, y, 14.0, 18.0), *color);
+        text(p, c, rate, 12.0, Weight::Bold, Align::Leading, Rect::new(cx + 14.0, y, col - 14.0, 18.0), c.theme.text);
+    }
+}
+
 fn sparkline(p: &Painter, r: Rect, values: &[f32], color: Color) {
     if values.len() < 2 {
         return;
     }
-    let step = r.w / (sources::HISTORY - 1) as f32;
+    let step = r.w / (sensors::HISTORY - 1) as f32;
     let x0 = r.right() - step * (values.len() - 1) as f32;
     let at = |i: usize| pt(x0 + step * i as f32, r.bottom() - r.h * values[i].clamp(0.0, 1.0));
     let area = p.gfx.path(|g| unsafe {
@@ -881,37 +971,484 @@ fn sparkline(p: &Painter, r: Rect, values: &[f32], color: Color) {
     }
 }
 
-fn system(p: &Painter, r: Rect, c: &Ctx) {
-    let s = &c.data.sys;
-    let accent = c.theme.accent;
-    if c.item.size == WidgetSize::Small {
-        header(p, c, r, "System", c.theme.text_secondary);
-        let cy = r.y + 66.0;
-        for (i, (frac, color, label)) in [(s.cpu, accent, "CPU"), (s.mem, PURPLE, "MEMORY"), (s.disk, ORANGE, "DISK")].into_iter().enumerate() {
-            gauge(p, c, r.x + r.w * (0.2 + 0.3 * i as f32), cy, 20.0, frac, color, label);
+/// Label, big percentage and usage over time, filling `r`.
+fn graph(p: &Painter, c: &Ctx, r: Rect, g: &Reading) {
+    let color = tint(c, g.tint);
+    let ls = fitted(p, c, &g.label, 12.0, Weight::Bold, r.w);
+    text(p, c, &g.label, ls, Weight::Bold, Align::Leading, Rect::new(r.x, r.y, r.w, 18.0), c.theme.text_secondary);
+    text(p, c, &g.value, 28.0, Weight::Bold, Align::Leading, Rect::new(r.x, r.y + 16.0, r.w, 36.0), c.theme.text);
+    let area = Rect::new(r.x, r.y + 62.0, r.w, (r.h - 62.0).max(8.0));
+    p.line(area.x, area.bottom(), area.right(), area.bottom(), c.faint(), 0.8);
+    sparkline(p, area, g.history.as_deref().unwrap_or(&[]), color);
+}
+
+/// One reading on a slim row: its label, a bar and its value (an adapter:
+/// its name, then down and up rates).
+fn bar_row(p: &Painter, c: &Ctx, r: Rect, g: &Reading) {
+    let fs = (r.h * 0.6).clamp(9.0, 12.0);
+    if let Some((down, up)) = g.net {
+        let lw = (r.w * 0.3).min(80.0);
+        let ls = fitted(p, c, &g.label, fs, Weight::Bold, lw - 4.0);
+        text(p, c, &g.label, ls, Weight::Bold, Align::Leading, Rect::new(r.x, r.y, lw, r.h), c.theme.text_secondary);
+        let half = (r.w - lw) / 2.0;
+        for (i, (arrow, rate, color)) in [("↓", sources::rate(down), GREEN), ("↑", sources::rate(up), c.theme.accent)].iter().enumerate() {
+            let x = r.x + lw + half * i as f32;
+            let aw = fs + 1.0;
+            text(p, c, arrow, fs, Weight::Bold, Align::Leading, Rect::new(x, r.y, aw, r.h), *color);
+            let rs = fitted(p, c, rate, fs, Weight::Bold, half - aw - 2.0);
+            text(p, c, rate, rs, Weight::Bold, Align::Leading, Rect::new(x + aw, r.y, half - aw, r.h), c.theme.text);
         }
-        net(p, c, r.x + PAD, r.bottom() - 48.0, r.w - 2.0 * PAD);
         return;
     }
-    let half = r.w / 2.0;
-    text(p, c, "CPU", 12.0, Weight::Bold, Align::Leading, Rect::new(r.x + PAD, r.y + 12.0, 60.0, 18.0), c.theme.text_secondary);
-    text(p, c, &format!("{:.0}%", s.cpu * 100.0), 28.0, Weight::Bold, Align::Leading, Rect::new(r.x + PAD, r.y + 28.0, half, 36.0), c.theme.text);
-    let graph = Rect::new(r.x + PAD, r.y + 74.0, half - PAD - 8.0, r.h - 74.0 - PAD);
-    p.line(graph.x, graph.bottom(), graph.right(), graph.bottom(), c.faint(), 0.8);
-    let hist: Vec<f32> = s.cpu_history.iter().copied().collect();
-    sparkline(p, graph, &hist, accent);
-
-    let x = r.x + half + 4.0;
-    let w = r.right() - PAD - x;
-    gauge(p, c, x + w * 0.25, r.y + 46.0, 24.0, s.mem, PURPLE, "MEMORY");
-    gauge(p, c, x + w * 0.75, r.y + 46.0, 24.0, s.disk, ORANGE, "DISK");
-    let detail = [
-        format!("{} of {}", sources::gigabytes(s.mem_used), sources::gigabytes(s.mem_total)),
-        format!("{} free", sources::gigabytes(s.disk_free)),
-    ];
-    for (i, d) in detail.iter().enumerate() {
-        let cx = x + w * (0.25 + 0.5 * i as f32);
-        text(p, c, d, 10.0, Weight::Regular, Align::Center, Rect::new(cx - w / 4.0, r.y + 90.0, w / 2.0, 14.0), c.theme.text_secondary);
+    // Narrow (a small widget): labels get more of the row.
+    let lw = (r.w * if r.w < 160.0 { 0.44 } else { 0.36 }).min(110.0);
+    let vw = width(p, c, "100%", fs, Weight::Bold) + 4.0;
+    let ls = fitted(p, c, &g.label, fs, Weight::Bold, lw - 6.0);
+    text(p, c, &g.label, ls, Weight::Bold, Align::Leading, Rect::new(r.x, r.y, lw, r.h), c.theme.text_secondary);
+    let bar = Rect::new(r.x + lw, r.cy() - 2.5, (r.w - lw - vw - 6.0).max(4.0), 5.0);
+    p.fill_round(bar, 2.5, c.faint());
+    if g.frac > 0.0 {
+        p.fill_round(Rect::new(bar.x, bar.y, (bar.w * g.frac).max(bar.h), bar.h), 2.5, tint(c, g.tint));
     }
-    net(p, c, x + 8.0, r.bottom() - 50.0, w - 8.0);
+    text(p, c, &g.value, fs, Weight::Bold, Align::Trailing, Rect::new(r.right() - vw, r.y, vw, r.h), c.theme.text);
+}
+
+/// Every reading as slim rows filling `area`, in up to `cols` columns
+/// (whatever doesn't fit at the smallest row height is left out).
+fn bar_rows(p: &Painter, c: &Ctx, area: Rect, items: &[&Reading], cols: usize) {
+    const MIN_ROW: f32 = 12.0;
+    if items.is_empty() {
+        return;
+    }
+    let cols = cols.clamp(1, items.len());
+    let fit = (area.h / MIN_ROW).floor().max(1.0) as usize;
+    let per = items.len().div_ceil(cols).min(fit);
+    let gap = 16.0;
+    let cw = (area.w - gap * (cols - 1) as f32) / cols as f32;
+    let h = (area.h / per as f32).min(24.0);
+    // Fewer rows than room: keep them together, centred in the area.
+    let top = area.y + (area.h - h * per as f32) / 2.0;
+    for (k, g) in items.iter().enumerate().take(per * cols) {
+        let (col, row) = (k / per, k % per);
+        bar_row(p, c, Rect::new(area.x + col as f32 * (cw + gap), top + row as f32 * h, cw, h), g);
+    }
+}
+
+fn system(p: &Painter, r: Rect, c: &Ctx) {
+    let all = sensors::readings(&sensors::of(c.item), &c.data.sys);
+    let nets: Vec<&Reading> = all.iter().filter(|g| g.is_net()).collect();
+    let gauges: Vec<&Reading> = all.iter().filter(|g| !g.is_net()).collect();
+    if all.is_empty() {
+        header(p, c, r, "System", c.theme.text_secondary);
+        let msg = if c.item.sensors.as_ref().is_some_and(|s| s.is_empty()) { "Right-click › Show to pick what to show" } else { "Reading…" };
+        text(p, c, msg, 12.0, Weight::Regular, Align::Center, Rect::new(r.x + PAD, r.cy() - 16.0, r.w - 2.0 * PAD, 40.0), c.theme.text_secondary);
+        return;
+    }
+    let inner = Rect::new(r.x + PAD, r.y, r.w - 2.0 * PAD, r.h);
+    // Everything in reading order, for the slim rows.
+    let every: Vec<&Reading> = all.iter().collect();
+    match c.item.size {
+        WidgetSize::Small => {
+            header(p, c, r, "System", c.theme.text_secondary);
+            match (gauges.len(), nets.len()) {
+                (0..=3, 1) => {
+                    gauge_row(p, c, inner.x, inner.w, r.y + 66.0, 20.0, &gauges, 3, false);
+                    net(p, c, inner.x, r.bottom() - 48.0, inner.w, nets[0].net.unwrap_or_default());
+                }
+                (0..=3, 0) => gauge_row(p, c, inner.x, inner.w, r.y + 80.0, 22.0, &gauges, 3, true),
+                (4..=6, 0) => {
+                    gauge_row(p, c, inner.x, inner.w, r.y + 58.0, 17.0, &gauges[..3], 3, false);
+                    gauge_row(p, c, inner.x, inner.w, r.y + 118.0, 17.0, &gauges[3..], 3, false);
+                }
+                // More than rings can hold: a row each.
+                _ => bar_rows(p, c, Rect::new(inner.x, r.y + 34.0, inner.w, r.h - 34.0 - 10.0), &every, 1),
+            }
+        }
+        WidgetSize::Medium => {
+            let half = r.w / 2.0;
+            let Some(gi) = gauges.iter().position(|g| g.history.is_some()) else {
+                // No graph: gauges across and the adapter along the bottom, or two columns of rows.
+                if gauges.len() <= 4 && nets.len() <= 1 {
+                    gauge_row(p, c, inner.x, inner.w, r.y + 46.0, 24.0, &gauges, 4, true);
+                    if let Some(n) = nets.first() {
+                        net_line(p, c, inner.x, r.bottom() - PAD - 18.0, inner.w, n);
+                    }
+                } else {
+                    bar_rows(p, c, Rect::new(inner.x, r.y + 12.0, inner.w, r.h - 24.0), &every, 2);
+                }
+                return;
+            };
+            graph(p, c, Rect::new(inner.x, r.y + 12.0, half - PAD - 8.0, r.h - 12.0 - PAD), gauges[gi]);
+            let others: Vec<&Reading> = gauges.iter().enumerate().filter(|(i, _)| *i != gi).map(|(_, g)| *g).collect();
+            let x = r.x + half + 4.0;
+            let w = r.right() - PAD - x;
+            match (others.len(), nets.len()) {
+                (0..=2, 1) => {
+                    gauge_row(p, c, x, w, r.y + 46.0, 24.0, &others, 2, true);
+                    net(p, c, x + 8.0, r.bottom() - 50.0, w - 8.0, nets[0].net.unwrap_or_default());
+                }
+                (0..=2, 0) => gauge_row(p, c, x, w, r.y + 60.0, 26.0, &others, 2, true),
+                (3..=4, 0) => {
+                    gauge_row(p, c, x, w, r.y + 38.0, 18.0, &others[..2], 2, false);
+                    gauge_row(p, c, x, w, r.y + 110.0, 18.0, &others[2..], 2, false);
+                }
+                _ => {
+                    let rest: Vec<&Reading> = every.iter().copied().filter(|g| !std::ptr::eq(*g, gauges[gi])).collect();
+                    bar_rows(p, c, Rect::new(x + 4.0, r.y + 12.0, w - 4.0, r.h - 24.0), &rest, 1);
+                }
+            }
+        }
+        WidgetSize::Large => {
+            // Graphs for the first two usages, then rows of gauges, then adapters.
+            let graphs: Vec<usize> = gauges.iter().enumerate().filter(|(_, g)| g.history.is_some()).map(|(i, _)| i).take(2).collect();
+            let mut y = r.y + 12.0;
+            if !graphs.is_empty() {
+                let n = graphs.len() as f32;
+                let gw = (inner.w - 16.0 * (n - 1.0)) / n;
+                for (k, &i) in graphs.iter().enumerate() {
+                    graph(p, c, Rect::new(inner.x + k as f32 * (gw + 16.0), y, gw, 104.0), gauges[i]);
+                }
+                y += 116.0;
+            } else {
+                y += 4.0;
+            }
+            let rest: Vec<&Reading> = gauges.iter().enumerate().filter(|(i, _)| !graphs.contains(i)).map(|(_, g)| *g).collect();
+            let lines = nets.len();
+            let floor = r.bottom() - PAD - lines as f32 * 20.0 - if lines > 0 { 4.0 } else { 0.0 };
+            // The last row's detail line can sit in the bottom margin.
+            let rows = ((floor - y + 8.0) / GAUGE_ROW).floor().max(0.0) as usize;
+            if lines <= 4 && rest.len() <= rows * 4 {
+                for (k, row) in rest.chunks(4).enumerate() {
+                    gauge_row(p, c, inner.x, inner.w, y + k as f32 * GAUGE_ROW + 26.0, 20.0, row, 4, true);
+                }
+                for (k, n) in nets.iter().enumerate() {
+                    net_line(p, c, inner.x, floor + 4.0 + k as f32 * 20.0, inner.w, n);
+                }
+            } else {
+                // Too many for rings: everything below the graphs as rows.
+                let below: Vec<&Reading> = rest.iter().chain(nets.iter()).copied().collect();
+                let cols = if below.len() > 6 { 2 } else { 1 };
+                bar_rows(p, c, Rect::new(inner.x, y, inner.w, r.bottom() - PAD - y), &below, cols);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Music Wave
+// ---------------------------------------------------------------------------
+
+/// Rounded bars mirrored about their middle line: a live spectrum. Silent,
+/// they rest as dots.
+fn wave_bars(p: &Painter, r: Rect, levels: &[f32], n: usize, color: Color) {
+    let gap_ratio = 0.7;
+    let bar = r.w / (n as f32 + (n as f32 - 1.0) * gap_ratio);
+    let gap = bar * gap_ratio;
+    for i in 0..n {
+        // Pair up bands when fewer bars are drawn than worked out.
+        let per = (levels.len() / n).max(1);
+        let level = levels.get(i * per..((i + 1) * per).min(levels.len())).map_or(0.0, |s| s.iter().copied().fold(0.0, f32::max));
+        let h = (r.h * level).max(bar);
+        let x = r.x + i as f32 * (bar + gap);
+        p.fill_round(Rect::new(x, r.cy() - h / 2.0, bar, h), bar / 2.0, color.alpha(0.55 + 0.45 * level));
+    }
+}
+
+/// A little square of artwork (or a note on grey when there's none).
+fn artwork(p: &Painter, c: &Ctx, r: Rect, radius: f32) {
+    match c.art {
+        Some(b) => p.bitmap_round(b, r, radius, 1.0),
+        None => {
+            p.fill_round(r, radius, c.faint());
+            let f = p.gfx.format(ICONS, r.h * 0.42, Weight::Regular, Align::Center);
+            p.text("\u{E8D6}", &f, r, c.theme.text_secondary);
+        }
+    }
+}
+
+fn music_wave(p: &Painter, r: Rect, c: &Ctx) {
+    let np = c.data.now.as_ref();
+    let tint = np.and_then(|n| n.art.as_ref()).map_or(c.theme.accent, |a| a.tint);
+    // On a light card a pale artwork tint would vanish: the accent reads better.
+    let color = if !c.theme.dark && tint.r.min(tint.g).min(tint.b) > 0.7 { c.theme.accent } else { tint };
+    let (title, artist) = match np {
+        Some(n) => (n.title.as_str(), n.artist.as_str()),
+        None => ("Not Playing", ""),
+    };
+    match c.item.size {
+        WidgetSize::Small => {
+            let art = Rect::new(r.x + PAD, r.y + PAD, 40.0, 40.0);
+            artwork(p, c, art, 8.0);
+            let x = art.right() + 10.0;
+            let w = r.right() - PAD - x;
+            text(p, c, title, 13.0, Weight::Bold, Align::Leading, Rect::new(x, art.y, w, 20.0), c.theme.text);
+            text(p, c, artist, 11.0, Weight::Regular, Align::Leading, Rect::new(x, art.y + 20.0, w, 18.0), c.theme.text_secondary);
+            wave_bars(p, Rect::new(r.x + PAD, r.y + 70.0, r.w - 2.0 * PAD, r.h - 70.0 - PAD), &c.data.bands, 14, color);
+        }
+        _ => {
+            let art = Rect::new(r.x + PAD, r.y + PAD, 56.0, 56.0);
+            artwork(p, c, art, 10.0);
+            let x = art.right() + 12.0;
+            let w = r.right() - PAD - x;
+            text(p, c, title, 15.0, Weight::Bold, Align::Leading, Rect::new(x, art.y + 6.0, w, 22.0), c.theme.text);
+            text(p, c, artist, 13.0, Weight::Regular, Align::Leading, Rect::new(x, art.y + 28.0, w, 20.0), c.theme.text_secondary);
+            wave_bars(p, Rect::new(r.x + PAD, r.y + 84.0, r.w - 2.0 * PAD, r.h - 84.0 - PAD), &c.data.bands, 32, color);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Photo and Video
+// ---------------------------------------------------------------------------
+
+/// Segoe Fluent Icons, Windows 11's symbol font.
+const ICONS: &str = "Segoe Fluent Icons";
+
+fn picture(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
+    if let Some(b) = c.art {
+        p.bitmap_cover(b, r, RADIUS, 1.0);
+        return;
+    }
+    let video = c.item.kind == WidgetKind::Video;
+    let glyph = if video { "\u{E714}" } else { "\u{EB9F}" };
+    let small = c.item.size == WidgetSize::Small;
+    let gs = if small { 30.0 } else { 38.0 };
+    let f = p.gfx.format(ICONS, gs, Weight::Regular, Align::Center);
+    let top = r.cy() - if small { 44.0 } else { 50.0 };
+    p.text(glyph, &f, Rect::new(r.x, top, r.w, gs + 8.0), c.theme.text_secondary);
+    let msg = match (&c.item.path, c.error) {
+        (None, _) => if video { "Choose a video to loop here" } else { "Choose a picture, GIF or folder" },
+        (Some(_), Some(e)) => e,
+        (Some(_), None) => "Loading…",
+    };
+    let line = Rect::new(r.x + PAD, top + gs + 12.0, r.w - 2.0 * PAD, 18.0);
+    let ms = fitted(p, c, msg, 12.0, Weight::Regular, line.w);
+    text(p, c, msg, ms, Weight::Regular, Align::Center, line, c.theme.text_secondary);
+    if c.item.path.is_none() || c.error.is_some() {
+        let label = "Choose…";
+        let bw = width(p, c, label, 13.0, Weight::Bold) + 28.0;
+        let b = Rect::new(r.cx() - bw / 2.0, line.bottom() + 10.0, bw, 28.0);
+        let hot = c.hot(Hit::Choose);
+        p.fill_round(b, 14.0, c.theme.accent.alpha(0.85 + 0.15 * hot));
+        text(p, c, label, 13.0, Weight::Bold, Align::Center, b, Color::WHITE);
+        hits.push((b, Hit::Choose));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+/// "now", "5m", "3h", "Yesterday", "Mon", "12 Oct".
+fn ago(at: std::time::SystemTime) -> String {
+    let secs = std::time::SystemTime::now().duration_since(at).map_or(0, |d| d.as_secs());
+    match secs {
+        0..=59 => "now".into(),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => {
+            let when: chrono::DateTime<Local> = at.into();
+            let days = (Local::now().date_naive() - when.date_naive()).num_days();
+            match days {
+                ..=1 => "Yesterday".into(),
+                2..=6 => when.format("%a").to_string(),
+                _ => when.format("%-d %b").to_string(),
+            }
+        }
+    }
+}
+
+/// One notification on its own rounded platter.
+fn note_row(p: &Painter, c: &Ctx, r: Rect, n: &crate::island::notifications::Note, hit: Hit, hits: &mut Vec<(Rect, Hit)>, tall: bool) {
+    let hot = c.hot(hit);
+    let base = if c.theme.dark { Color::gray(255, 0.07) } else { Color::gray(0, 0.045) };
+    p.fill_round(r, 12.0, base.alpha(base.a * (1.0 + hot)));
+    let icon = Rect::new(r.x + 10.0, r.y + 10.0, 26.0, 26.0);
+    match n.icon.as_ref().and_then(|a| c.pictures.iter().find(|(id, _)| *id == a.id)) {
+        Some((_, b)) => p.bitmap_round(b, icon, 6.0, 1.0),
+        None => {
+            p.fill_round(icon, 6.0, c.faint());
+            let f = p.gfx.format(ICONS, 13.0, Weight::Regular, Align::Center);
+            p.text("\u{EA8F}", &f, icon, c.theme.text_secondary);
+        }
+    }
+    let x = icon.right() + 10.0;
+    let w = r.right() - 10.0 - x;
+    let when = ago(n.at);
+    let tw = width(p, c, &when, 11.0, Weight::Regular) + 2.0;
+    text(p, c, &n.app.to_uppercase(), 10.0, Weight::Bold, Align::Leading, Rect::new(x, r.y + 8.0, w - tw - 6.0, 14.0), c.theme.text_secondary);
+    text(p, c, &when, 11.0, Weight::Regular, Align::Trailing, Rect::new(r.right() - 10.0 - tw, r.y + 8.0, tw, 14.0), c.theme.text_secondary);
+    text(p, c, &n.title, 13.0, Weight::Bold, Align::Leading, Rect::new(x, r.y + 22.0, w, 18.0), c.theme.text);
+    if !n.body.is_empty() {
+        if tall {
+            // Room to wrap: the body runs on for a few lines.
+            let f = p.gfx.format_block(&c.theme.font, 12.0, Weight::Regular, Align::Leading);
+            p.text(&n.body, &f, Rect::new(x, r.y + 41.0, w, r.bottom() - 8.0 - (r.y + 41.0)), c.theme.text_secondary);
+        } else {
+            text(p, c, &n.body, 12.0, Weight::Regular, Align::Leading, Rect::new(x, r.y + 39.0, w, 16.0), c.theme.text_secondary);
+        }
+    }
+    hits.push((r, hit));
+}
+
+fn notifications(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
+    let notes = &c.data.notes;
+    header(p, c, r, "Notifications", c.red());
+    if !notes.is_empty() {
+        let count = notes.len().to_string();
+        let cw = (width(p, c, &count, 11.0, Weight::Bold) + 12.0).max(20.0);
+        let b = Rect::new(r.right() - PAD - cw, r.y + 13.0, cw, 18.0);
+        p.fill_round(b, 9.0, c.red());
+        text(p, c, &count, 11.0, Weight::Bold, Align::Center, b, Color::WHITE);
+    }
+    let area = Rect::new(r.x + 10.0, r.y + 40.0, r.w - 20.0, r.h - 40.0 - 10.0);
+    if notes.is_empty() {
+        let f = p.gfx.format(ICONS, 28.0, Weight::Regular, Align::Center);
+        p.text("\u{EA8F}", &f, Rect::new(r.x, area.cy() - 34.0, r.w, 36.0), c.theme.text_secondary);
+        text(p, c, "No Notifications", 13.0, Weight::Regular, Align::Center, Rect::new(r.x, area.cy() + 6.0, r.w, 20.0), c.theme.text_secondary);
+        return;
+    }
+    let gap = 6.0;
+    let (rows, tall) = match c.item.size {
+        // Just the newest, with room for its text.
+        WidgetSize::Small => (1, true),
+        WidgetSize::Medium => (2, false),
+        WidgetSize::Large => (5, false),
+    };
+    let n = rows.min(notes.len());
+    let row_h = if tall { area.h } else { ((area.h - gap * (rows as f32 - 1.0)) / rows as f32).min(62.0) };
+    for (i, note) in notes.iter().take(n).enumerate() {
+        let rr = Rect::new(area.x, area.y + i as f32 * (row_h + gap), area.w, row_h);
+        note_row(p, c, rr, note, Hit::Notification(i), hits, tall);
+    }
+    if notes.len() > n && c.item.size == WidgetSize::Large {
+        let more = format!("{} more", notes.len() - n);
+        text(p, c, &more, 11.0, Weight::Regular, Align::Center, Rect::new(r.x, r.bottom() - 22.0, r.w, 16.0), c.theme.text_secondary);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// User
+// ---------------------------------------------------------------------------
+
+/// The account picture in a circle (initials on grey without one).
+fn avatar(p: &Painter, c: &Ctx, cx: f32, cy: f32, d: f32, name: &str) {
+    let r = Rect::new(cx - d / 2.0, cy - d / 2.0, d, d);
+    match c.art {
+        Some(b) => p.bitmap_round(b, r, d / 2.0, 1.0),
+        None => {
+            p.fill_round_gradient(r, d / 2.0, Color::rgba(166, 170, 180, 1.0), Color::rgba(132, 136, 146, 1.0));
+            text(p, c, &super::user::initials(name), d * 0.4, Weight::Bold, Align::Center, r, Color::WHITE);
+        }
+    }
+    let rim = if c.theme.dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.08) };
+    p.stroke_circle(cx, cy, d / 2.0 - 0.25, rim, 0.5);
+}
+
+/// Lock / Sign Out / Sleep. `room` = Some(width): pills with words from `x`
+/// when they fit there (round icons otherwise); None: round icons centred on `x`.
+fn user_buttons(p: &Painter, c: &Ctx, x: f32, cy: f32, room: Option<f32>, hits: &mut Vec<(Rect, Hit)>) {
+    let buttons = [("\u{E72E}", "Lock", Hit::Lock), ("\u{F3B1}", "Sign Out", Hit::SignOut), ("\u{E708}", "Sleep", Hit::Sleep)];
+    let gap = 6.0;
+    let pill = |l: &str| width(p, c, l, 12.0, Weight::Bold) + 36.0;
+    let labelled: f32 = buttons.iter().map(|(_, l, _)| pill(l)).sum::<f32>() + gap * 2.0;
+    let labels = room.is_some_and(|w| labelled <= w);
+    let widths: Vec<f32> = buttons.iter().map(|(_, l, _)| if labels { pill(l) } else { 30.0 }).collect();
+    let total: f32 = widths.iter().sum::<f32>() + gap * (buttons.len() - 1) as f32;
+    let glyph_f = p.gfx.format(ICONS, if labels { 12.0 } else { 13.0 }, Weight::Regular, Align::Center);
+    let mut x = if room.is_some() { x } else { x - total / 2.0 };
+    let h = if labels { 28.0 } else { 30.0 };
+    for ((glyph, label, hit), w) in buttons.iter().zip(widths) {
+        let b = Rect::new(x, cy - h / 2.0, w, h);
+        let hot = c.hot(*hit);
+        let fill = if c.theme.dark { Color::gray(255, 0.1 + 0.08 * hot) } else { Color::gray(0, 0.06 + 0.05 * hot) };
+        p.fill_round(b, h / 2.0, fill);
+        if labels {
+            p.text(glyph, &glyph_f, Rect::new(b.x + 9.0, b.y, 16.0, h), c.theme.text);
+            text(p, c, label, 12.0, Weight::Bold, Align::Leading, Rect::new(b.x + 28.0, b.y, w - 32.0, h), c.theme.text);
+        } else {
+            p.text(glyph, &glyph_f, b, c.theme.text);
+        }
+        hits.push((b, *hit));
+        x += w + gap;
+    }
+}
+
+fn user(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
+    use super::user::{greeting, shows, uptime};
+    let Some(u) = &c.data.user else { return };
+    let greet = shows(c.item, "greeting").then(|| format!("{},", greeting(Local::now().hour())));
+    let device = shows(c.item, "device").then(|| {
+        let up = format!("Up {}", uptime());
+        if u.pc.is_empty() { up } else { format!("{} · {up}", u.pc) }
+    });
+    let buttons = shows(c.item, "buttons");
+    match c.item.size {
+        WidgetSize::Small => {
+            // Stacked and centred: picture, name, the extras that are on.
+            let d = if buttons && device.is_some() { 50.0 } else { 60.0 };
+            let mut parts: Vec<f32> = vec![d, 8.0];
+            if greet.is_some() {
+                parts.push(15.0);
+            }
+            parts.push(20.0);
+            if device.is_some() {
+                parts.push(16.0);
+            }
+            if buttons {
+                parts.extend([8.0, 30.0]);
+            }
+            let mut y = r.cy() - parts.iter().sum::<f32>() / 2.0;
+            avatar(p, c, r.cx(), y + d / 2.0, d, &u.name);
+            y += d + 8.0;
+            let line = |y: f32, h: f32| Rect::new(r.x + 10.0, y, r.w - 20.0, h);
+            if let Some(g) = &greet {
+                text(p, c, g, 11.0, Weight::Regular, Align::Center, line(y, 15.0), c.theme.text_secondary);
+                y += 15.0;
+            }
+            let ns = fitted(p, c, &u.first, 16.0, Weight::Bold, r.w - 20.0);
+            text(p, c, if greet.is_some() { &u.first } else { &u.name }, ns, Weight::Bold, Align::Center, line(y, 20.0), c.theme.text);
+            y += 20.0;
+            if let Some(dv) = &device {
+                let ds = fitted(p, c, dv, 10.0, Weight::Regular, r.w - 20.0);
+                text(p, c, dv, ds, Weight::Regular, Align::Center, line(y, 16.0), c.theme.text_secondary);
+                y += 16.0;
+            }
+            if buttons {
+                user_buttons(p, c, r.cx(), y + 8.0 + 15.0, None, hits);
+            }
+        }
+        _ => {
+            let d = 84.0;
+            avatar(p, c, r.x + PAD + 4.0 + d / 2.0, r.cy(), d, &u.name);
+            let x = r.x + PAD + 4.0 + d + 16.0;
+            let w = r.right() - PAD - x;
+            let mut parts: Vec<f32> = Vec::new();
+            if greet.is_some() {
+                parts.push(18.0);
+            }
+            parts.push(30.0);
+            if device.is_some() {
+                parts.push(18.0);
+            }
+            if buttons {
+                parts.extend([12.0, 28.0]);
+            }
+            let mut y = r.cy() - parts.iter().sum::<f32>() / 2.0;
+            if let Some(g) = &greet {
+                text(p, c, g, 13.0, Weight::Regular, Align::Leading, Rect::new(x, y, w, 18.0), c.theme.text_secondary);
+                y += 18.0;
+            }
+            let ns = fitted(p, c, &u.name, 24.0, Weight::Bold, w);
+            text(p, c, &u.name, ns, Weight::Bold, Align::Leading, Rect::new(x, y, w, 30.0), c.theme.text);
+            y += 30.0;
+            if let Some(dv) = &device {
+                text(p, c, dv, 12.0, Weight::Regular, Align::Leading, Rect::new(x, y, w, 18.0), c.theme.text_secondary);
+                y += 18.0;
+            }
+            if buttons {
+                user_buttons(p, c, x, y + 12.0 + 14.0, Some(w), hits);
+            }
+        }
+    }
 }

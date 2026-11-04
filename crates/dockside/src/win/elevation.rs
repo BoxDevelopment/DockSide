@@ -110,7 +110,12 @@ fn schtasks(args: &[&str]) -> Option<std::process::Output> {
 
 /// The exe the admin task starts, or `None` when there's no task.
 fn task_exe() -> Option<String> {
-    let out = schtasks(&["/Query", "/TN", TASK, "/XML"]).filter(|o| o.status.success())?;
+    task_command(TASK)
+}
+
+/// The exe scheduled task `name` starts, or `None` when there's no such task.
+pub(super) fn task_command(name: &str) -> Option<String> {
+    let out = schtasks(&["/Query", "/TN", name, "/XML"]).filter(|o| o.status.success())?;
     let xml = String::from_utf8_lossy(&out.stdout);
     let start = xml.find("<Command>")? + "<Command>".len();
     let end = start + xml[start..].find("</Command>")?;
@@ -148,15 +153,43 @@ pub fn run_task() -> bool {
     schtasks(&["/Run", "/TN", TASK]).is_some_and(|o| o.status.success())
 }
 
+/// Registers a task from its XML, replacing one of the same name.
+pub(super) fn create_task(name: &str, xml: &str) -> std::io::Result<()> {
+    // schtasks wants the file in UTF-16.
+    let path = std::env::temp_dir().join(format!("dockside-task-{}.xml", std::process::id()));
+    let bytes: Vec<u8> = std::iter::once(0xFEFFu16).chain(xml.encode_utf16()).flat_map(|c| c.to_le_bytes()).collect();
+    std::fs::write(&path, bytes)?;
+    let out = schtasks(&["/Create", "/TN", name, "/XML", &path.display().to_string(), "/F"]);
+    let _ = std::fs::remove_file(&path);
+    check(out)
+}
+
+pub(super) fn delete_task(name: &str) -> std::io::Result<()> {
+    check(schtasks(&["/Delete", "/TN", name, "/F"]))
+}
+
+fn check(out: Option<std::process::Output>) -> std::io::Result<()> {
+    match out {
+        Some(o) if o.status.success() => Ok(()),
+        Some(o) => Err(std::io::Error::other(String::from_utf8_lossy(&o.stderr).trim().to_string())),
+        None => Err(std::io::Error::other("schtasks didn't run")),
+    }
+}
+
+/// The signed-in user as Task Scheduler names them (`DOMAIN\name`).
+pub(super) fn user_id() -> String {
+    format!(
+        "{}\\{}",
+        std::env::var("USERDOMAIN").unwrap_or_default(),
+        std::env::var("USERNAME").unwrap_or_default()
+    )
+}
+
 /// Creates (or repoints) the task. Needs admin rights.
 pub fn install_task() -> std::io::Result<()> {
     let exe = current_exe();
     let dir = std::path::Path::new(&exe).parent().map(|p| p.display().to_string()).unwrap_or_default();
-    let user = format!(
-        "{}\\{}",
-        std::env::var("USERDOMAIN").unwrap_or_default(),
-        std::env::var("USERNAME").unwrap_or_default()
-    );
+    let user = user_id();
     // Task Scheduler's defaults would stop DockSide on battery and after 3 days,
     // and run it at below-normal priority.
     let xml = format!(
@@ -193,26 +226,12 @@ pub fn install_task() -> std::io::Result<()> {
         escape(&dir),
         user = escape(&user),
     );
-    // schtasks wants the file in UTF-16.
-    let path = std::env::temp_dir().join("dockside-task.xml");
-    let bytes: Vec<u8> = std::iter::once(0xFEFFu16).chain(xml.encode_utf16()).flat_map(|c| c.to_le_bytes()).collect();
-    std::fs::write(&path, bytes)?;
-    let out = schtasks(&["/Create", "/TN", TASK, "/XML", &path.display().to_string(), "/F"]);
-    let _ = std::fs::remove_file(&path);
-    match out {
-        Some(o) if o.status.success() => Ok(()),
-        Some(o) => Err(std::io::Error::other(String::from_utf8_lossy(&o.stderr).trim().to_string())),
-        None => Err(std::io::Error::other("schtasks didn't run")),
-    }
+    create_task(TASK, &xml)
 }
 
 /// Deletes the task. Needs admin rights.
 pub fn remove_task() -> std::io::Result<()> {
-    match schtasks(&["/Delete", "/TN", TASK, "/F"]) {
-        Some(o) if o.status.success() => Ok(()),
-        Some(o) => Err(std::io::Error::other(String::from_utf8_lossy(&o.stderr).trim().to_string())),
-        None => Err(std::io::Error::other("schtasks didn't run")),
-    }
+    delete_task(TASK)
 }
 
 /// `dockside --admin-task on|off`, run elevated: exit code 0 on success.
@@ -269,7 +288,7 @@ pub fn take_relaunch() -> Option<bool> {
     }
 }
 
-fn escape(s: &str) -> String {
+pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 

@@ -86,6 +86,9 @@ fn main() {
         }
     }
 
+    // Before the hand-off below: the elevated instance it starts doesn't wait.
+    win::startup::wait_for_shell();
+
     // "Run as administrator": hand off to the elevated task, releasing the lock first.
     if win::elevation::should_hand_off() {
         release(&mutex);
@@ -97,7 +100,7 @@ fn main() {
 
     config::migrate_legacy();
     log::init();
-    win::startup::refresh();
+    std::thread::spawn(win::startup::refresh);
     std::panic::set_hook(Box::new(|info| {
         win::taskbar::restore();
         log::write(&format!("panic: {info}"));

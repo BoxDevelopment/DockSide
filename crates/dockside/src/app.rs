@@ -1576,6 +1576,9 @@ impl App {
             mb.tick();
         }
         crate::win::tray::keep_on_top();
+        if win::wallpaper::moved() {
+            win::glass::wallpaper_changed();
+        }
         if self.island.as_mut().is_some_and(|i| i.on_tick(system::battery())) {
             self.animate();
         }

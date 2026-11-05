@@ -144,16 +144,14 @@ pub fn compact(p: &Painter, r: Rect, which: Persist, v: &View, a: f32, hits: &mu
             let Some(vc) = v.discord.voice.as_ref() else { return };
             voice_icon(p, icon_cx, r.cy(), h * 0.62, v.discord, a);
             p.text(&vc.channel, &v.fonts.alert, Rect::new(inner.x, r.y, inner.w - 24.0, h), WHITE.alpha(a));
-            // Someone talking: a pulsing green dot; otherwise how many are in.
+            // A steady green dot while in the call, pulsing while someone talks.
+            // (Speaking flickers between words, so swapping it for anything else jitters.)
             let (cx, cy) = (r.right() - h * 0.5 - 4.0, r.cy());
             if vc.members.iter().any(|m| m.speaking) {
                 let pulse = 0.5 + 0.5 * (v.time * 6.0).sin();
                 p.fill_circle(cx, cy, h * 0.3, GREEN.alpha(0.25 * pulse * a));
-                p.fill_circle(cx, cy, h * 0.15, GREEN.alpha(a));
-            } else {
-                let n = vc.members.len().to_string();
-                p.text_tabular(&n, &v.fonts.small_r, Rect::new(r.x, r.y, r.w - h * 0.5 + 2.0, h), SECONDARY.alpha(a));
             }
+            p.fill_circle(cx, cy, h * 0.15, GREEN.alpha(a));
         }
         Persist::Download => {
             g::download(p, icon_cx, r.cy(), h * 0.66, BLUE.alpha(a));

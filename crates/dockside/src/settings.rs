@@ -1167,6 +1167,9 @@ impl SettingsWindow {
                             Row::Segmented("Spotlight's Apps button opens", Key::LaunchpadSpotlight),
                             Row::Keybind("Keyboard shortcut", Key::LaunchpadHotkey),
                         ];
+                        if keybind::Hotkey::parse(&cfg.launchpad.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN)) {
+                            rows.push(Row::Info("Start menu", "Double-tap Win".to_string()));
+                        }
                         if !cfg.launchpad.hotkey.trim().is_empty() {
                             rows.push(Row::Segmented("The shortcut opens", Key::LaunchpadHotkeyOpens));
                         }

@@ -91,8 +91,6 @@ const TIMER_APPBAR: usize = 10;
 const TIMER_TASKBAR: usize = 11;
 /// The foreground window moved or resized: check whether it now fills the screen.
 const TIMER_FULLSCREEN: usize = 12;
-/// The Spotlight key is Win and was tapped once: open Spotlight unless a second tap (Start) follows.
-const TIMER_SPOTLIGHT_TAP: usize = 13;
 /// Elevated only: polls for another app's drag over the Dock, which OLE can't tell us about.
 const TIMER_DRAG_WATCH: usize = 14;
 const DRAG_WATCH_MS: u32 = 80;
@@ -2413,47 +2411,74 @@ impl App {
             let _ = UnregisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT);
             let _ = UnregisterHotKey(self.msg_hwnd, HOTKEY_LAUNCHPAD);
         }
-        // Launchpad's own shortcut (a combination only: a lone modifier is Spotlight's).
-        let lp = self.cfg.launchpad.hotkey.trim();
+        // One watch covers every lone-modifier shortcut (Spotlight's and Launchpad's).
+        self.spotlight_tap = None;
+        let mut taps = 0;
+        let spec = self.cfg.spotlight.hotkey.trim().to_string();
+        if self.cfg.spotlight.enabled && !spec.is_empty() {
+            match keybind::Hotkey::parse(&spec) {
+                None => log!("spotlight hotkey '{spec}' isn't valid"),
+                Some(keybind::Hotkey::Tap(m)) => taps |= m,
+                Some(keybind::Hotkey::Combo { mods, vk }) => {
+                    if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) }.is_err() {
+                        log!("spotlight hotkey '{spec}' is already used by another app");
+                    }
+                }
+            }
+        }
+        let lp = self.cfg.launchpad.hotkey.trim().to_string();
         if !lp.is_empty() {
-            match keybind::Hotkey::parse(lp) {
+            match keybind::Hotkey::parse(&lp) {
+                None => log!("launchpad hotkey '{lp}' isn't valid"),
+                Some(keybind::Hotkey::Tap(m)) if taps & m != 0 => log!("launchpad hotkey '{lp}' is Spotlight's too: Spotlight keeps it"),
+                Some(keybind::Hotkey::Tap(m)) => taps |= m,
                 Some(keybind::Hotkey::Combo { mods, vk }) => {
                     if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_LAUNCHPAD, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) }.is_err() {
                         log!("launchpad hotkey '{lp}' is already used by another app");
                     }
                 }
-                _ => log!("launchpad hotkey '{lp}' isn't a key combination"),
             }
         }
-        self.spotlight_tap = None;
-        let spec = &self.cfg.spotlight.hotkey;
-        if !self.cfg.spotlight.enabled || spec.trim().is_empty() {
-            return;
-        }
-        match keybind::Hotkey::parse(spec) {
-            None => log!("spotlight hotkey '{spec}' isn't valid"),
-            Some(keybind::Hotkey::Tap(m)) => self.spotlight_tap = keybind::TapWatch::new(m, self.msg_hwnd.0 as isize, WM_APP_SPOTLIGHT_TAP),
-            Some(keybind::Hotkey::Combo { mods, vk }) => {
-                if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) }.is_err() {
-                    log!("spotlight hotkey '{spec}' is already used by another app");
-                }
-            }
+        if taps != 0 {
+            self.spotlight_tap = keybind::TapWatch::new(taps, self.msg_hwnd.0 as isize, WM_APP_SPOTLIGHT_TAP);
         }
     }
 
-    /// The Spotlight modifier was tapped. Win waits a moment: a double tap opens Start instead.
-    fn on_spotlight_tap(&mut self, double: bool) {
-        if keybind::Hotkey::parse(&self.cfg.spotlight.hotkey) != Some(keybind::Hotkey::Tap(keybind::WIN)) {
-            return self.toggle_spotlight();
+    /// A lone modifier was tapped: Spotlight's or Launchpad's shortcut.
+    fn on_tap(&mut self, wp: usize) {
+        let (m, double) = keybind::tap_of(wp);
+        let tap = Some(keybind::Hotkey::Tap(m));
+        if self.cfg.spotlight.enabled && keybind::Hotkey::parse(&self.cfg.spotlight.hotkey) == tap {
+            self.on_spotlight_tap(double);
+        } else if keybind::Hotkey::parse(&self.cfg.launchpad.hotkey) == tap {
+            self.on_launchpad_tap(double);
         }
-        if double {
-            unsafe {
-                let _ = KillTimer(self.msg_hwnd, TIMER_SPOTLIGHT_TAP);
-            }
+    }
+
+    /// The Launchpad modifier was tapped: Launchpad opens at once. With Win, a
+    /// second quick tap closes it again and opens Start (no waiting to see
+    /// whether a second tap comes, which made every single tap lag).
+    fn on_launchpad_tap(&mut self, double: bool) {
+        let win = keybind::Hotkey::parse(&self.cfg.launchpad.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN));
+        if win && double {
+            self.close_launchpad();
             self.close_spotlight();
             system::open_start();
         } else {
-            self.timer(TIMER_SPOTLIGHT_TAP, keybind::DOUBLE_TAP_MS);
+            self.open_launchpad(self.cfg.launchpad.hotkey_opens);
+        }
+    }
+
+    /// The Spotlight modifier was tapped: Spotlight opens at once. With Win, a
+    /// second quick tap closes it again and opens Start (no waiting to see
+    /// whether a second tap comes, which made every single tap lag).
+    fn on_spotlight_tap(&mut self, double: bool) {
+        let win = keybind::Hotkey::parse(&self.cfg.spotlight.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN));
+        if win && double {
+            self.close_spotlight();
+            system::open_start();
+        } else {
+            self.toggle_spotlight();
         }
     }
 
@@ -3159,7 +3184,6 @@ impl App {
                         }
                         TIMER_APPBAR => self.on_appbar_change(),
                         TIMER_FULLSCREEN => self.update_fullscreen(),
-                        TIMER_SPOTLIGHT_TAP => self.toggle_spotlight(),
                         TIMER_SPOTLIGHT_POLL => self.poll_spotlight(),
                         TIMER_LAUNCHPAD_BLINK => {
                             if let Some(l) = &mut self.launchpad {
@@ -3220,7 +3244,7 @@ impl App {
                 WM_HOTKEY if wp.0 as i32 == HOTKEY_SPOTLIGHT => self.toggle_spotlight(),
                 WM_HOTKEY if wp.0 as i32 == HOTKEY_LAUNCHPAD => self.open_launchpad(self.cfg.launchpad.hotkey_opens),
                 WM_CLIPBOARDUPDATE => spotlight::clipboard::on_update(),
-                WM_APP_SPOTLIGHT_TAP => self.on_spotlight_tap(wp.0 == 2),
+                WM_APP_SPOTLIGHT_TAP => self.on_tap(wp.0),
                 // The hooks' keys, delivered as hotkeys while an admin window has focus.
                 WM_HOTKEY => {
                     let id = wp.0 as i32;

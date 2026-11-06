@@ -223,7 +223,7 @@ unsafe fn masked_release(info: &KBDLLHOOKSTRUCT) {
 
 // --- watching for taps ------------------------------------------------------
 
-/// The modifier bit being watched, and where to post taps.
+/// The modifier bits being watched, and where to post taps.
 static TAP_MOD: AtomicU32 = AtomicU32::new(0);
 static TAP_HWND: AtomicIsize = AtomicIsize::new(0);
 static TAP_MSG: AtomicU32 = AtomicU32::new(0);
@@ -232,17 +232,20 @@ static TAP_MSG: AtomicU32 = AtomicU32::new(0);
 static CANDIDATE: AtomicU32 = AtomicU32::new(0);
 static DOWN_AT: AtomicU32 = AtomicU32::new(0);
 static LAST_TAP: AtomicU32 = AtomicU32::new(0);
+/// The key the last tap was (a double tap is two of the same key).
+static LAST_TAP_VK: AtomicU32 = AtomicU32::new(0);
 
-/// Posts `msg` to `hwnd` whenever `modifier` is tapped on its own: wParam 1, or 2
-/// for the second tap of a quick double tap. Hooked while this is alive.
+/// Posts `msg` to `hwnd` whenever one of `modifiers` (bits) is tapped on its
+/// own: wParam 1, or 2 for the second tap of a quick double tap, plus the
+/// modifier's bit shifted left 8 (see [`tap_of`]). Hooked while this is alive.
 pub struct TapWatch {
     keys: isize,
     mouse: isize,
 }
 
 impl TapWatch {
-    pub fn new(modifier: u32, hwnd: isize, msg: u32) -> Option<TapWatch> {
-        TAP_MOD.store(modifier, Ordering::Relaxed);
+    pub fn new(modifiers: u32, hwnd: isize, msg: u32) -> Option<TapWatch> {
+        TAP_MOD.store(modifiers, Ordering::Relaxed);
         TAP_HWND.store(hwnd, Ordering::Relaxed);
         TAP_MSG.store(msg, Ordering::Relaxed);
         CANDIDATE.store(0, Ordering::Relaxed);
@@ -281,7 +284,8 @@ unsafe extern "system" fn tap_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRE
         let watched = TAP_MOD.load(Ordering::Relaxed);
         if !injected && vk != MASK_VK && watched != 0 {
             let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
-            let ours = modifier(vk) == Some(watched);
+            let tapped = modifier(vk).filter(|m| watched & m != 0);
+            let ours = tapped.is_some();
             if down {
                 // Key repeat sends more key-downs for the same key; anything else ends the tap.
                 if !ours {
@@ -293,14 +297,16 @@ unsafe extern "system" fn tap_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRE
             } else if ours && CANDIDATE.swap(0, Ordering::Relaxed) == vk as u32
                 && info.time.wrapping_sub(DOWN_AT.load(Ordering::Relaxed)) <= TAP_MS
             {
-                let double = info.time.wrapping_sub(LAST_TAP.swap(info.time, Ordering::Relaxed)) <= DOUBLE_TAP_MS;
+                let same = LAST_TAP_VK.swap(vk as u32, Ordering::Relaxed) == vk as u32;
+                let double = info.time.wrapping_sub(LAST_TAP.swap(info.time, Ordering::Relaxed)) <= DOUBLE_TAP_MS && same;
                 if double {
                     // A third tap starts over.
                     LAST_TAP.store(info.time.wrapping_sub(DOUBLE_TAP_MS + 1), Ordering::Relaxed);
                 }
-                win::post_wp(TAP_HWND.load(Ordering::Relaxed), TAP_MSG.load(Ordering::Relaxed), if double { 2 } else { 1 });
+                let m = tapped.unwrap_or(0);
+                win::post_wp(TAP_HWND.load(Ordering::Relaxed), TAP_MSG.load(Ordering::Relaxed), (if double { 2 } else { 1 }) | (m as usize) << 8);
                 // Releasing Win alone opens Start, and Alt alone an app's menu: mask them.
-                if watched & (WIN | ALT) != 0 {
+                if m & (WIN | ALT) != 0 {
                     masked_release(info);
                     return LRESULT(1);
                 }
@@ -308,6 +314,11 @@ unsafe extern "system" fn tap_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRE
         }
     }
     CallNextHookEx(None, code, wp, lp)
+}
+
+/// A tap message's wParam: (the modifier tapped, whether it's a double tap's second).
+pub fn tap_of(wp: usize) -> (u32, bool) {
+    ((wp >> 8) as u32, wp & 0xFF == 2)
 }
 
 unsafe extern "system" fn tap_mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {

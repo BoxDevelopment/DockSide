@@ -273,6 +273,9 @@ pub fn close(hwnd: HWND) {
 }
 
 pub fn launch(path: &str, args: Option<&str>) -> bool {
+    // A pinned app may have updated into a new versioned folder since the Dock loaded.
+    let current = (!Path::new(path).exists()).then(|| super::versioned::current(path)).flatten();
+    let path = current.as_deref().unwrap_or(path);
     let ok = super::elevation::shell_open(path, args, super::system::start_dir(path).as_deref());
     if !ok {
         log!("launch failed for {path}");

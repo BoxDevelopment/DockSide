@@ -470,6 +470,11 @@ fn parse(user: &str) -> Result<Config> {
         if app.path == crate::finder::LEGACY_FINDER_PATH {
             app.path = crate::finder::FINDER_PATH.to_string();
         }
+        // Apps that update into a new versioned folder keep their pin (saved
+        // back to the file the next time the Dock's apps are written).
+        if let Some(now) = crate::win::versioned::current(&app.path) {
+            app.path = now;
+        }
         app.icon = app.icon.as_deref().map(expand_env);
     }
     cfg.dock.trash_icon = expand_env(&cfg.dock.trash_icon);

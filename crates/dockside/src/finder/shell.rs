@@ -145,7 +145,8 @@ pub fn entry(item: &IShellItem2) -> Option<Entry> {
             type_text: if has(SFGAO_FILESYSTEM) && !is_dir { None } else { item.GetString(&PKEY_ItemTypeText).ok().map(|p| take(p)).filter(|t| !t.is_empty() && t != "File folder") },
         };
         if let (Ok(cap), Ok(free)) = (item.GetUInt64(&PKEY_Capacity), item.GetUInt64(&PKEY_FreeSpace)) {
-            if cap > 0 {
+            // Recycled items report their drive's capacity too; only drives should show it.
+            if cap > 0 && e.location.is_none() {
                 e.size = cap;
                 e.extra = Some(format!("{} free of {}", super::fs::format_size(free), super::fs::format_size(cap)));
             }

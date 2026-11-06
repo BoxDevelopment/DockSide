@@ -2803,8 +2803,11 @@ impl Island {
             let delay = self.cfg.hover_delay_ms as f32 / 1000.0;
             let resting = self.hover_since.is_some_and(|t| (now - t).as_secs_f32() > delay);
             if resting {
-                if let Content::Compact(p) = self.shown {
-                    self.expanded = Self::panel_for(p);
+                match self.shown {
+                    Content::Compact(p) => self.expanded = Self::panel_for(p),
+                    // Nothing going on: the same Home panel a click opens.
+                    Content::Idle => self.expanded = Some(Panel::Home),
+                    _ => {}
                 }
             }
         }
@@ -3144,12 +3147,15 @@ impl Island {
         }
 
         let r = self.surface.render(gfx, |p| {
-            // Soft shadow that grows in with the pill.
-            if grown > 0.01 {
+            // A soft shadow at all times: tight and light on the resting pill,
+            // deeper and lower as it opens (it never switches off, which made
+            // it blink as the island folded and unfolded).
+            if presence > 0.01 {
+                let (step, drop, k) = (lerp(1.0, 1.7, grown), lerp(3.0, 7.0, grown), lerp(0.55, 1.0, grown));
                 for i in 0..12 {
-                    let g = i as f32 * 1.7;
-                    let sa = 0.045 * grown * presence * (12 - i) as f32 / 12.0;
-                    p.fill_round(shape.inset(-g, -g).offset(0.0, 7.0), radius + g, Color::BLACK.alpha(sa));
+                    let g = i as f32 * step;
+                    let sa = 0.045 * k * presence * (12 - i) as f32 / 12.0;
+                    p.fill_round(shape.inset(-g, -g).offset(0.0, drop), radius + g, Color::BLACK.alpha(sa));
                 }
                 p.clear_round(shape, radius);
             }

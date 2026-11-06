@@ -221,12 +221,17 @@ pub fn reveal(path: &str) {
 
 /// Shows the system file picker for an app (.exe / .lnk) to add to the Dock.
 pub fn pick_app(owner: HWND) -> Option<String> {
+    pick_app_titled(owner, w!("Add to Dock"))
+}
+
+/// An app or shortcut, with the dialog titled `title`.
+pub fn pick_app_titled(owner: HWND, title: windows::core::PCWSTR) -> Option<String> {
     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
     let filters = [
-        COMDLG_FILTERSPEC { pszName: w!("Apps and shortcuts"), pszSpec: w!("*.exe;*.lnk") },
+        COMDLG_FILTERSPEC { pszName: w!("Apps and shortcuts"), pszSpec: w!("*.exe;*.lnk;*.url;*.bat;*.cmd") },
         COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
     ];
-    pick_file(owner, w!("Add to Dock"), &filters)
+    pick_file(owner, title, &filters)
 }
 
 /// An image for a Dock icon.

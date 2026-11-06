@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::anim::{approach, FrameClock, FRAME_PENDING};
 use crate::config::{self, Config, DisplayMode, DockApp};
-use crate::dock::{Dock, FileDrop, START_PATH};
+use crate::dock::{Dock, FileDrop, LAUNCHPAD_PATH, START_PATH};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
@@ -37,6 +37,7 @@ use crate::genie::Genie;
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
+use crate::launchpad::{Launchpad, LaunchpadEvent, LAUNCHPAD_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::surface::Fading;
 use crate::theme::Theme;
@@ -45,7 +46,7 @@ use crate::win::displays::{self, Display};
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
     WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
-    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_INDEX_READY, WM_APP_MEDIA,
+    WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_CLOSE_LAUNCHPAD, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
     WM_APP_DRAG_WATCH, WM_APP_RECORD_KEY, WM_APP_SHELF_KEY, WM_APP_SPOTLIGHT_TAP, WM_APP_CLOAKED,
@@ -97,6 +98,12 @@ const TIMER_DRAG_WATCH: usize = 14;
 const DRAG_WATCH_MS: u32 = 80;
 /// "follow": watches for the pointer resting on a display's bottom edge, to move the Dock there.
 const TIMER_DOCK_FOLLOW: usize = 15;
+/// Spotlight is open: polls the pointer, whose first move brings out the bubbles.
+const TIMER_SPOTLIGHT_POLL: usize = 16;
+const SPOTLIGHT_POLL_MS: u32 = 40;
+/// Launchpad is open: blinks its search caret.
+const TIMER_LAUNCHPAD_BLINK: usize = 17;
+const LAUNCHPAD_BLINK_MS: u32 = 265;
 const DOCK_FOLLOW_MS: u32 = 100;
 const DOCK_FOLLOW_DWELL_MS: u64 = 300;
 /// Long enough for DWM to present a new surface's backdrop.
@@ -116,6 +123,7 @@ fn backdrop_state() -> (bool, bool) {
 }
 
 const HOTKEY_SPOTLIGHT: i32 = 1;
+const HOTKEY_LAUNCHPAD: i32 = 2;
 
 // Registered hotkeys mirroring the keyboard hooks. A hook sees keys first and
 // swallows them, so these only fire when it can't: while an elevated (admin)
@@ -164,6 +172,9 @@ pub fn run() -> anyhow::Result<()> {
     MSG_HWND.store(msg_hwnd.0 as isize, Ordering::Relaxed);
     // A relaunch and Claude Code's hooks run unelevated, even when we're not.
     win::elevation::allow_messages(msg_hwnd, &[WM_APP_PING, WM_APP_OPEN_SETTINGS, WM_COPYDATA]);
+
+    // Spotlight's Clipboard history.
+    spotlight::clipboard::start(msg_hwnd);
 
     let app = App::new(msg_hwnd)?;
     for guid in [GUID_ENERGY_SAVER_STATUS, GUID_POWER_SAVING_STATUS] {
@@ -342,6 +353,85 @@ fn execute(action: Action) {
             with_app(|app| app.open_finder(None));
         }
         Action::Launch { path, .. } if path == START_PATH => system::open_start(),
+        Action::Launch { path, .. } if path == LAUNCHPAD_PATH => {
+            with_app(|app| app.open_launchpad(app.cfg.launchpad.dock));
+        }
+        Action::OpenLaunchpad(style) => {
+            with_app(|app| app.open_launchpad(style));
+        }
+        Action::LaunchpadHide { name, target } => {
+            with_app(|app| {
+                crate::launchpad::hide_app(&name, &target, app.launchpad.as_mut());
+                app.mark_settings_dirty();
+                app.animate();
+            });
+        }
+        Action::LaunchpadUnhide(target) => {
+            crate::launchpad::unhide_app(&target);
+            with_app(|app| app.mark_settings_dirty());
+        }
+        Action::LaunchpadRemoveAdded(target) => {
+            crate::launchpad::remove_added(&target);
+            with_app(|app| app.mark_settings_dirty());
+        }
+        Action::LaunchpadAddApp => {
+            let owner = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as _);
+            if let Some(path) = system::pick_app_titled(owner, windows::core::w!("Add to Launchpad")) {
+                let name = if path.to_lowercase().ends_with(".exe") { apps::file_description(&path) } else { None }
+                    .or_else(|| std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| path.clone());
+                crate::launchpad::add_app(&name, &path);
+                with_app(|app| app.mark_settings_dirty());
+            }
+        }
+        Action::LaunchpadEdit(on) => {
+            with_app(|app| {
+                if let Some(l) = &mut app.launchpad {
+                    l.set_editing(on);
+                    app.animate();
+                }
+            });
+        }
+        Action::LaunchpadSelect(target) => {
+            with_app(|app| {
+                if let Some(l) = &mut app.launchpad {
+                    l.select_for_hiding(&target);
+                    app.animate();
+                }
+            });
+        }
+        Action::LaunchpadAddHere => {
+            // The picker is modal: Launchpad mustn't close when it loses focus to it.
+            let owner = with_app(|app| {
+                app.launchpad_modal = true;
+                app.launchpad.as_ref().map(|l| l.hwnd)
+            })
+            .flatten();
+            let Some(owner) = owner else { return };
+            let picked = system::pick_app_titled(owner, windows::core::w!("Add to Launchpad"));
+            with_app(|app| {
+                app.launchpad_modal = false;
+                if let (Some(path), Some(l)) = (picked, app.launchpad.as_mut()) {
+                    let name = if path.to_lowercase().ends_with(".exe") { apps::file_description(&path) } else { None }
+                        .or_else(|| std::path::Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned()))
+                        .unwrap_or_else(|| path.clone());
+                    l.add_app(&name, &path);
+                }
+                if let Some(l) = &app.launchpad {
+                    l.focus();
+                }
+                app.mark_settings_dirty();
+                app.animate();
+            });
+        }
+        Action::LaunchpadRenameFolder(i) => {
+            with_app(|app| {
+                if let Some(l) = &mut app.launchpad {
+                    l.rename_folder(i);
+                    app.animate();
+                }
+            });
+        }
         Action::Launch { path, .. } if path == SETTINGS_PATH => {
             with_app(|app| app.open_settings(None));
         }
@@ -602,6 +692,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // Spotlight closes as soon as it loses focus (posted: we may be mid-dispatch).
         WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == SPOTLIGHT_HWND.load(Ordering::Relaxed) => {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_SPOTLIGHT);
+        }
+        WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == LAUNCHPAD_HWND.load(Ordering::Relaxed) => {
+            win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_LAUNCHPAD);
         }
         WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == PICKER_HWND.load(Ordering::Relaxed) => {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_PICKER);
@@ -926,6 +1019,11 @@ pub struct App {
     /// Finder windows whose folder changed on disk (reloaded on a short timer).
     finder_changed: Vec<u32>,
     spotlight: Option<Spotlight>,
+    /// Sequoia's full-screen Launchpad, and ones zooming away.
+    launchpad: Option<Launchpad>,
+    closing_launchpads: Vec<Launchpad>,
+    /// A file picker is up over Launchpad: losing focus to it mustn't close it.
+    launchpad_modal: bool,
     /// Watches for the Spotlight key when it's a modifier tapped on its own.
     spotlight_tap: Option<keybind::TapWatch>,
     /// Change Icon… for a Dock app.
@@ -1072,6 +1170,9 @@ impl App {
             kinds: finder::fs::KindCache::default(),
             finder_changed: Vec::new(),
             spotlight: None,
+            launchpad: None,
+            closing_launchpads: Vec::new(),
+            launchpad_modal: false,
             spotlight_tap: None,
             icon_picker: None,
             index: Default::default(),
@@ -1192,7 +1293,7 @@ impl App {
                 w.invalidate();
             }
         }
-        if old.spotlight != self.cfg.spotlight {
+        if old.spotlight != self.cfg.spotlight || old.launchpad != self.cfg.launchpad {
             self.register_hotkey();
         }
         if old.windows != self.cfg.windows {
@@ -1694,6 +1795,18 @@ impl App {
         if let Some(s) = &mut self.spotlight {
             still |= s.tick(dt);
         }
+        if let Some(l) = &mut self.launchpad {
+            still |= l.tick(dt);
+        }
+        for l in &mut self.closing_launchpads {
+            l.tick(dt);
+        }
+        let had = !self.closing_launchpads.is_empty();
+        self.closing_launchpads.retain(|l| !l.closed());
+        still |= !self.closing_launchpads.is_empty();
+        if had && self.closing_launchpads.is_empty() && self.launchpad.is_none() {
+            crate::launchpad::release();
+        }
         if let Some(p) = &mut self.icon_picker {
             still |= p.tick(dt);
         }
@@ -1814,6 +1927,10 @@ impl App {
     /// maximized window over the topmost band. Raised bottom to top, so the
     /// island sits above the menu bar and an open menu / Spotlight above both.
     fn raise_surfaces(&self) {
+        // Under the Dock, like macOS's: raised first, so the bars go above it.
+        if let Some(l) = &self.launchpad {
+            l.raise();
+        }
         let bars = self.docks.iter().map(|d| &d.surface).chain(self.menubars.iter().map(|m| &m.surface));
         let surfaces = [
             self.island.as_ref().map(|i| &i.surface),
@@ -1967,6 +2084,8 @@ impl App {
                 let at = match path {
                     START_PATH => 0,
                     FINDER_PATH => list.iter().position(|a| a.path != START_PATH).unwrap_or(list.len()),
+                    // Launchpad goes back beside Finder, like macOS's.
+                    LAUNCHPAD_PATH => list.iter().position(|a| a.path == FINDER_PATH).map_or(0, |i| i + 1),
                     _ => list.len(),
                 };
                 list.insert(at, app);
@@ -2020,6 +2139,9 @@ impl App {
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
         }
+        for l in self.launchpad.iter_mut().chain(&mut self.closing_launchpads).filter(|l| l.dirty) {
+            l.render(&self.gfx, &self.theme, &mut self.loader);
+        }
         for f in self.finders.iter_mut().chain(&mut self.closing_finders).filter(|f| f.dirty) {
             let mut ctx = finder::Ctx { gfx: &self.gfx, theme: &self.theme, loader: &mut self.loader, kinds: &mut self.kinds };
             f.render(&mut ctx);
@@ -2035,6 +2157,8 @@ impl App {
             || self.menu.as_ref().is_some_and(|m| m.animating())
             || self.submenu.as_ref().is_some_and(|(_, s)| s.animating())
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
+            || self.launchpad.as_ref().is_some_and(|l| l.animating())
+            || !self.closing_launchpads.is_empty()
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
             || self.settings.as_ref().is_some_and(|s| s.animating())
             || self.onboarding.as_ref().is_some_and(|o| o.animating())
@@ -2062,9 +2186,155 @@ impl App {
                 s.render(&self.gfx, &self.theme, &mut self.loader);
                 s.focus();
                 self.spotlight = Some(s);
+                self.timer(TIMER_SPOTLIGHT_POLL, SPOTLIGHT_POLL_MS);
             }
             Err(e) => log!("spotlight failed: {e}"),
         }
+    }
+
+    /// The pointer moved since Spotlight opened? Then the bubbles come out.
+    fn poll_spotlight(&mut self) {
+        let Some(s) = &mut self.spotlight else { return };
+        let (out, dirty) = (s.poll_cursor(), s.dirty);
+        if !out {
+            self.timer(TIMER_SPOTLIGHT_POLL, SPOTLIGHT_POLL_MS);
+        }
+        if dirty {
+            self.animate();
+        }
+    }
+
+    // --- Launchpad -----------------------------------------------------------
+
+    /// Opens Launchpad in `style`, or closes it if it's already showing.
+    pub fn open_launchpad(&mut self, style: crate::config::LaunchStyle) {
+        use crate::config::LaunchStyle;
+        if self.close_launchpad() {
+            return;
+        }
+        self.close_menu();
+        let stale = self.index.lock().map(|i| i.built.is_none_or(|t| t.elapsed() > spotlight::index::STALE_AFTER));
+        if stale.unwrap_or(true) {
+            self.rebuild_index();
+        }
+        match style {
+            LaunchStyle::Tahoe => {
+                // Spotlight's Apps panel: open Spotlight there (or close it if it's showing).
+                if self.spotlight.as_ref().is_some_and(|s| s.mode == spotlight::Mode::Apps) {
+                    self.close_spotlight();
+                    return;
+                }
+                if self.spotlight.is_none() {
+                    let enabled = self.cfg.spotlight.enabled;
+                    self.cfg.spotlight.enabled = true;
+                    self.toggle_spotlight();
+                    self.cfg.spotlight.enabled = enabled;
+                }
+                if let (Some(s), Ok(idx)) = (&mut self.spotlight, self.index.lock()) {
+                    s.open_apps(&idx);
+                }
+                self.animate();
+                self.flush();
+            }
+            LaunchStyle::Sequoia => {
+                self.close_spotlight();
+                let lp = {
+                    let Ok(idx) = self.index.lock() else { return };
+                    Launchpad::new(&self.gfx, &Monitor::at_cursor(), &idx)
+                };
+                match lp {
+                    Ok(mut l) => {
+                        l.render(&self.gfx, &self.theme, &mut self.loader);
+                        l.focus();
+                        self.launchpad = Some(l);
+                        self.timer(TIMER_LAUNCHPAD_BLINK, LAUNCHPAD_BLINK_MS);
+                        self.raise_surfaces();
+                        self.animate();
+                    }
+                    Err(e) => log!("launchpad failed: {e}"),
+                }
+            }
+        }
+    }
+
+    /// Zooms Launchpad away; returns whether it was open.
+    fn close_launchpad(&mut self) -> bool {
+        let Some(mut l) = self.launchpad.take() else { return false };
+        l.close();
+        self.closing_launchpads.push(l);
+        self.animate();
+        true
+    }
+
+    fn on_launchpad_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+        let l = self.launchpad.as_mut()?;
+        let (x, y) = mouse_pt(lp, l.scale);
+        let event = match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => l.on_key(wp.0 as u16, unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }),
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    l.on_char(c);
+                }
+                LaunchpadEvent::None
+            }
+            // Alt toggles edit mode; its release mustn't put the window in menu mode.
+            WM_SYSCHAR | WM_SYSKEYUP => LaunchpadEvent::None,
+            WM_LBUTTONDOWN => {
+                l.on_down(x, y);
+                LaunchpadEvent::None
+            }
+            WM_MOUSEMOVE => {
+                if !l.tracking {
+                    l.tracking = true;
+                    track_leave(l.hwnd);
+                }
+                l.on_move(x, y);
+                LaunchpadEvent::None
+            }
+            WM_MOUSELEAVE => {
+                l.tracking = false;
+                LaunchpadEvent::None
+            }
+            WM_LBUTTONUP => l.on_up(x, y),
+            WM_RBUTTONUP => {
+                if let Some((entries, sx, sy)) = l.context_menu(x, y) {
+                    self.open_menu(entries, Placement::Below { x: sx, y: sy }, MenuSource::Window);
+                    return Some(LRESULT(0));
+                }
+                LaunchpadEvent::None
+            }
+            WM_MOUSEWHEEL => {
+                l.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                LaunchpadEvent::None
+            }
+            WM_MOUSEHWHEEL => {
+                l.on_wheel(-(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32));
+                LaunchpadEvent::None
+            }
+            _ => return None,
+        };
+        let moving = l.animating();
+        match event {
+            LaunchpadEvent::None => {}
+            LaunchpadEvent::Close => {
+                self.close_launchpad();
+            }
+            LaunchpadEvent::Launch(target) => {
+                crate::launchpad::layout::State::record_launch(&target);
+                self.close_launchpad();
+                push(Action::Launch { path: target, args: None });
+            }
+            LaunchpadEvent::AddApp => push(Action::LaunchpadAddHere),
+            LaunchpadEvent::Settings => {
+                self.close_launchpad();
+                push(Action::OpenSettings(Some(crate::settings::Page::Launchpad)));
+            }
+        }
+        if moving {
+            self.animate();
+        }
+        Some(LRESULT(0))
     }
 
     fn close_icon_picker(&mut self) {
@@ -2079,8 +2349,9 @@ impl App {
 
     /// Fades Spotlight away; returns whether it was open.
     fn close_spotlight(&mut self) -> bool {
-        let Some(s) = self.spotlight.take() else { return false };
+        let Some(mut s) = self.spotlight.take() else { return false };
         SPOTLIGHT_HWND.store(0, Ordering::Relaxed);
+        s.hide_bubbles();
         apps::pass_focus_from(s.surface.content);
         s.surface.set_click_through();
         self.fading.push(Box::new(s));
@@ -2140,6 +2411,19 @@ impl App {
         use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT};
         unsafe {
             let _ = UnregisterHotKey(self.msg_hwnd, HOTKEY_SPOTLIGHT);
+            let _ = UnregisterHotKey(self.msg_hwnd, HOTKEY_LAUNCHPAD);
+        }
+        // Launchpad's own shortcut (a combination only: a lone modifier is Spotlight's).
+        let lp = self.cfg.launchpad.hotkey.trim();
+        if !lp.is_empty() {
+            match keybind::Hotkey::parse(lp) {
+                Some(keybind::Hotkey::Combo { mods, vk }) => {
+                    if unsafe { RegisterHotKey(self.msg_hwnd, HOTKEY_LAUNCHPAD, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk) }.is_err() {
+                        log!("launchpad hotkey '{lp}' is already used by another app");
+                    }
+                }
+                _ => log!("launchpad hotkey '{lp}' isn't a key combination"),
+            }
         }
         self.spotlight_tap = None;
         let spec = &self.cfg.spotlight.hotkey;
@@ -2202,11 +2486,24 @@ impl App {
                 SpotlightEvent::None
             }
             WM_LBUTTONUP => s.on_click(x, y, down(VK_CONTROL)),
+            WM_MOUSEWHEEL => {
+                s.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                SpotlightEvent::None
+            }
             _ => return None,
         };
         drop(idx);
+        self.on_spotlight_event(event);
+        Some(LRESULT(0))
+    }
+
+    fn on_spotlight_event(&mut self, event: SpotlightEvent) {
         match event {
-            SpotlightEvent::None => {}
+            SpotlightEvent::None => {
+                if self.spotlight.as_ref().is_some_and(|s| s.animating() || s.dirty) {
+                    self.animate();
+                }
+            }
             SpotlightEvent::Close => {
                 self.close_spotlight();
             }
@@ -2214,7 +2511,36 @@ impl App {
                 self.close_spotlight();
                 push(action);
             }
+            SpotlightEvent::RunAll(actions) => {
+                self.close_spotlight();
+                actions.into_iter().for_each(push);
+            }
         }
+    }
+
+    /// Mouse messages for Spotlight's bubbles.
+    fn on_bubble_message(&mut self, i: usize, hwnd: HWND, msg: u32) -> Option<LRESULT> {
+        let s = self.spotlight.as_mut()?;
+        let event = match msg {
+            WM_MOUSEMOVE => {
+                track_leave(hwnd);
+                s.on_bubble_move(i);
+                SpotlightEvent::None
+            }
+            WM_MOUSELEAVE => {
+                s.on_bubble_leave(i);
+                SpotlightEvent::None
+            }
+            WM_LBUTTONUP => {
+                let idx = self.index.lock().ok()?;
+                let e = s.on_bubble_click(i, &idx);
+                drop(idx);
+                e
+            }
+            WM_LBUTTONDOWN => SpotlightEvent::None,
+            _ => return None,
+        };
+        self.on_spotlight_event(event);
         Some(LRESULT(0))
     }
 
@@ -2827,10 +3153,20 @@ impl App {
                         // Same taskbar: just make sure it's still hidden and our space reserved.
                         TIMER_TASKBAR => self.on_appbar_change(),
                         TIMER_RETIRE => self.retired.clear(),
-                        TIMER_WALLPAPER => win::glass::wallpaper_changed(),
+                        TIMER_WALLPAPER => {
+                            win::glass::wallpaper_changed();
+                            crate::launchpad::wallpaper_changed();
+                        }
                         TIMER_APPBAR => self.on_appbar_change(),
                         TIMER_FULLSCREEN => self.update_fullscreen(),
                         TIMER_SPOTLIGHT_TAP => self.toggle_spotlight(),
+                        TIMER_SPOTLIGHT_POLL => self.poll_spotlight(),
+                        TIMER_LAUNCHPAD_BLINK => {
+                            if let Some(l) = &mut self.launchpad {
+                                l.blink();
+                                self.timer(TIMER_LAUNCHPAD_BLINK, LAUNCHPAD_BLINK_MS);
+                            }
+                        }
                         TIMER_DRAG_WATCH => self.watch_drag(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
@@ -2882,6 +3218,8 @@ impl App {
                 WM_APP_OPEN_SETTINGS if wp.0 == 1 => self.open_finder(None),
                 WM_APP_OPEN_SETTINGS => self.open_settings(None),
                 WM_HOTKEY if wp.0 as i32 == HOTKEY_SPOTLIGHT => self.toggle_spotlight(),
+                WM_HOTKEY if wp.0 as i32 == HOTKEY_LAUNCHPAD => self.open_launchpad(self.cfg.launchpad.hotkey_opens),
+                WM_CLIPBOARDUPDATE => spotlight::clipboard::on_update(),
                 WM_APP_SPOTLIGHT_TAP => self.on_spotlight_tap(wp.0 == 2),
                 // The hooks' keys, delivered as hotkeys while an admin window has focus.
                 WM_HOTKEY => {
@@ -2902,6 +3240,13 @@ impl App {
                 WM_APP_CLOSE_SPOTLIGHT => {
                     self.close_spotlight();
                 }
+                WM_APP_CLOSE_LAUNCHPAD if self.launchpad_modal => {}
+                WM_APP_CLOSE_LAUNCHPAD => {
+                    // A menu opened over Launchpad takes focus without closing it.
+                    if self.menu.is_none() {
+                        self.close_launchpad();
+                    }
+                }
                 WM_APP_CLOSE_PICKER => self.close_icon_picker(),
                 WM_APP_ICON_PICKER => {
                     if let Some(p) = &mut self.icon_picker {
@@ -2918,7 +3263,10 @@ impl App {
                         self.finders.iter_mut().for_each(|f| f.on_icons());
                         self.animate();
                         if let Some(s) = &mut self.spotlight {
-                            s.dirty = true;
+                            s.icons_arrived();
+                        }
+                        if let Some(l) = &mut self.launchpad {
+                            l.icons_arrived();
                         }
                     }
                 }
@@ -3061,6 +3409,25 @@ impl App {
         }
         if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
             let r = self.on_spotlight_message(msg, wp, lp);
+            self.flush_input();
+            return r;
+        }
+        // The rest of the window behind Spotlight's glass: a click there is outside it.
+        if self.spotlight.as_ref().is_some_and(|s| s.owns_backdrop(hwnd)) {
+            if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+                self.close_spotlight();
+                self.flush_input();
+                return Some(LRESULT(0));
+            }
+            return None;
+        }
+        if let Some(i) = self.spotlight.as_ref().and_then(|s| s.bubble_index(hwnd)) {
+            let r = self.on_bubble_message(i, hwnd, msg);
+            self.flush_input();
+            return r;
+        }
+        if self.launchpad.as_ref().is_some_and(|l| l.hwnd == hwnd) {
+            let r = self.on_launchpad_message(msg, wp, lp);
             self.flush_input();
             return r;
         }

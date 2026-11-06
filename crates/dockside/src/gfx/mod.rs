@@ -6,6 +6,7 @@
 
 pub mod finder_icon;
 pub mod icons;
+pub mod launchpad_icon;
 pub mod start_icon;
 
 use std::cell::RefCell;
@@ -825,21 +826,7 @@ impl Painter<'_> {
     /// target's resolution and in high quality: done once, so the copy can be
     /// stamped 1:1 every frame (scaling on the fly is slow in software).
     pub fn fitted(&self, bmp: &ID2D1Bitmap, w: f32, h: f32) -> Option<ID2D1Bitmap> {
-        unsafe {
-            let size = bmp.GetSize();
-            let k = (w / size.width.max(1.0)).min(h / size.height.max(1.0));
-            let size = D2D_SIZE_F { width: (size.width * k).max(1.0), height: (size.height * k).max(1.0) };
-            let brt = self.rt.CreateCompatibleRenderTarget(Some(&size), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE).ok()?;
-            let dst = D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: size.height };
-            brt.BeginDraw();
-            brt.Clear(Some(&Color::TRANSPARENT.d2d()));
-            match brt.cast::<ID2D1DeviceContext>() {
-                Ok(ctx) => ctx.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None),
-                Err(_) => brt.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
-            }
-            brt.EndDraw(None, None).ok()?;
-            brt.GetBitmap().ok()
-        }
+        fit_bitmap(self.rt, bmp, w, h)
     }
 
     /// Draws `bmp` at its own size with its top-left at (x, y), snapped to whole
@@ -850,6 +837,30 @@ impl Painter<'_> {
             let (x, y) = ((x * scale).round() / scale, (y * scale).round() / scale);
             let r = D2D_RECT_F { left: x, top: y, right: x + size.width, bottom: y + size.height };
             self.rt.DrawBitmap(bmp, Some(&r), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+        }
+    }
+
+    /// Draws `f` (which covers `bounds`, in points) into a new bitmap, for the
+    /// caller to keep and stamp (see [`Self::stamp`]): a whole page of icons
+    /// drawn once, then just moved about while it slides.
+    #[allow(dead_code)]
+    pub fn layer(&self, bounds: Rect, f: impl FnOnce(&Painter)) -> Option<ID2D1Bitmap> {
+        unsafe {
+            (|| -> Result<ID2D1Bitmap> {
+                let size = D2D_SIZE_F { width: bounds.w.max(1.0), height: bounds.h.max(1.0) };
+                let brt = self.rt.CreateCompatibleRenderTarget(Some(&size), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE)?;
+                brt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+                let brush = brt.CreateSolidColorBrush(&Color::BLACK.d2d(), None)?;
+                let ctx = brt.cast::<ID2D1DeviceContext>().ok();
+                brt.BeginDraw();
+                brt.Clear(Some(&Color::TRANSPARENT.d2d()));
+                brt.SetTransform(&Matrix3x2::translation(-bounds.x, -bounds.y));
+                let p = Painter { rt: &brt, ctx: ctx.as_ref(), brush: &brush, gfx: self.gfx, layers: self.layers };
+                f(&p);
+                brt.EndDraw(None, None)?;
+                brt.GetBitmap()
+            })()
+            .ok()
         }
     }
 
@@ -963,6 +974,39 @@ impl Painter<'_> {
             self.rt.SetTransform(&outer);
         }
     }
+}
+
+/// `bmp` scaled (keeping its aspect ratio) to fit `w` x `h` points of `rt`, in
+/// high quality, for stamping 1:1 (see [`Painter::fitted`]).
+pub fn fit_bitmap(rt: &ID2D1RenderTarget, bmp: &ID2D1Bitmap, w: f32, h: f32) -> Option<ID2D1Bitmap> {
+    unsafe {
+        let size = bmp.GetSize();
+        let k = (w / size.width.max(1.0)).min(h / size.height.max(1.0));
+        let size = D2D_SIZE_F { width: (size.width * k).max(1.0), height: (size.height * k).max(1.0) };
+        let brt = rt.CreateCompatibleRenderTarget(Some(&size), None, None, D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE).ok()?;
+        let dst = D2D_RECT_F { left: 0.0, top: 0.0, right: size.width, bottom: size.height };
+        brt.BeginDraw();
+        brt.Clear(Some(&Color::TRANSPARENT.d2d()));
+        match brt.cast::<ID2D1DeviceContext>() {
+            Ok(ctx) => ctx.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, None, None),
+            Err(_) => brt.DrawBitmap(bmp, Some(&dst), 1.0, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None),
+        }
+        brt.EndDraw(None, None).ok()?;
+        brt.GetBitmap().ok()
+    }
+}
+
+
+/// Draws with a [`Painter`] on a hardware device context (a composition
+/// surface's), already between BeginDraw and EndDraw.
+pub fn paint_context(gfx: &Gfx, ctx: &ID2D1DeviceContext, f: impl FnOnce(&Painter)) -> Result<()> {
+    let rt: ID2D1RenderTarget = ctx.cast()?;
+    unsafe { rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE) };
+    let brush = unsafe { rt.CreateSolidColorBrush(&Color::BLACK.d2d(), None)? };
+    let layers = RefCell::new(HashMap::new());
+    let p = Painter { rt: &rt, ctx: Some(ctx), brush: &brush, gfx, layers: &layers };
+    f(&p);
+    Ok(())
 }
 
 /// Saves premultiplied BGRA pixels as a PNG, for tests that want a look.

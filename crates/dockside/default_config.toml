@@ -133,6 +133,10 @@ name = "Finder"
 path = "dockside:finder"
 
 [[dock.apps]]
+name = "Launchpad"
+path = "dockside:launchpad"
+
+[[dock.apps]]
 name = "Microsoft Edge"
 path = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
 
@@ -166,6 +170,15 @@ search_engine = "google"
 # Used when search_engine = "custom". %s is replaced by the search text, e.g.
 # "https://search.example.com/?q=%s"
 custom_search_url = ""
+
+[launchpad]
+# Which launcher each way of opening it shows: "sequoia" (full-screen Launchpad
+# with pages and folders) or "tahoe" (Spotlight's Apps panel, sorted into categories).
+dock = "sequoia"
+spotlight = "tahoe"
+# Optional global shortcut for Launchpad, like the Spotlight one ("" = none).
+hotkey = ""
+hotkey_opens = "sequoia"
 
 [finder]
 # Saved automatically when you change them in a Finder window.

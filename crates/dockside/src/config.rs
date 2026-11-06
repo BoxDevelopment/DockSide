@@ -14,6 +14,7 @@ pub struct Config {
     pub menubar: MenuBarCfg,
     pub dock: DockCfg,
     pub spotlight: SpotlightCfg,
+    pub launchpad: LaunchpadCfg,
     pub finder: FinderCfg,
     pub island: IslandCfg,
     pub desktops: DesktopsCfg,
@@ -234,6 +235,28 @@ pub struct SpotlightCfg {
     pub hotkey: String,
     pub search_engine: String,
     pub custom_search_url: String,
+}
+
+/// Which app launcher a way of opening it shows.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchStyle {
+    /// macOS Sequoia's Launchpad: full screen, pages of icons, folders.
+    Sequoia,
+    /// macOS Tahoe's Apps: Spotlight's Applications panel, sorted into categories.
+    Tahoe,
+}
+
+/// Launchpad, and which look each way of opening it shows.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct LaunchpadCfg {
+    /// The Dock's Launchpad icon.
+    pub dock: LaunchStyle,
+    /// Spotlight's Apps button (and Ctrl+1 in Spotlight).
+    pub spotlight: LaunchStyle,
+    /// Global shortcut ("" = none), and what it opens.
+    pub hotkey: String,
+    pub hotkey_opens: LaunchStyle,
 }
 
 /// Finder window defaults. View, sort and hidden files are saved whenever they change in a Finder window.

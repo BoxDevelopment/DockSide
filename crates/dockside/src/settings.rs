@@ -19,13 +19,13 @@ use crate::config::{
     AnimSpeed, Appearance, Backdrop, Config, ConfigValue, DisplayMode, IconStyle, IslandFinish, IslandStyle, MinimizeEffect, ShortcutStyle,
     WindowEffect,
 };
-use crate::dock::START_PATH;
+use crate::dock::{LAUNCHPAD_PATH, START_PATH};
 use crate::finder::text::TextField;
 use crate::finder::FINDER_PATH;
 use crate::keybind;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
-use crate::gfx::{finder_icon, start_icon, Align, Canvas, Gfx, Painter, Weight};
+use crate::gfx::{finder_icon, launchpad_icon, start_icon, Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::Action;
 use crate::spotlight::web;
 use crate::theme::Theme;
@@ -42,6 +42,8 @@ const H: f32 = 560.0;
 const SIDEBAR: f32 = 210.0;
 const TITLE_H: f32 = 52.0;
 pub(crate) const ROW_H: f32 = 40.0;
+/// App icons in rows (pinned apps, excluded apps).
+const ROW_ICON: f32 = 26.0;
 const CONTENT_PAD: f32 = 24.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -50,6 +52,7 @@ pub enum Page {
     Appearance,
     MenuBar,
     Dock,
+    Launchpad,
     Windows,
     Finder,
     Desktops,
@@ -57,12 +60,13 @@ pub enum Page {
     Widgets,
 }
 
-const PAGES: [(Page, &str); 9] = [
+const PAGES: [(Page, &str); 10] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
     (Page::Island, "Dynamic Island"),
     (Page::Dock, "Dock"),
+    (Page::Launchpad, "Launchpad"),
     (Page::Windows, "Windows"),
     (Page::Widgets, "Widgets"),
     (Page::Finder, "Finder"),
@@ -118,6 +122,7 @@ fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
         }
         Row::Segmented(l, key) => format!("{l} {}", SettingsWindow::segments(fonts, *key, cfg).0.join(" ")),
         Row::Buttons(l, buttons) => buttons.iter().fold(l.to_string(), |s, (b, _)| s + " " + b),
+        Row::Named(l, b, _) => format!("{l} {b}"),
         Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
         Row::Excluded(i) => cfg.windows.no_inject.get(*i).map_or_else(String::new, |e| format!("Excluded {e}")),
     }
@@ -260,6 +265,10 @@ pub(crate) enum Key {
     WinNoInject,
     SpotlightEnabled,
     SpotlightHotkey,
+    LaunchpadDock,
+    LaunchpadSpotlight,
+    LaunchpadHotkey,
+    LaunchpadHotkeyOpens,
     SearchEngine,
     CustomSearchUrl,
     WidgetsEnabled,
@@ -333,6 +342,10 @@ impl Key {
             Key::WinNoInject => ("windows", "no_inject"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
+            Key::LaunchpadDock => ("launchpad", "dock"),
+            Key::LaunchpadSpotlight => ("launchpad", "spotlight"),
+            Key::LaunchpadHotkey => ("launchpad", "hotkey"),
+            Key::LaunchpadHotkeyOpens => ("launchpad", "hotkey_opens"),
             Key::SearchEngine => ("spotlight", "search_engine"),
             Key::CustomSearchUrl => ("spotlight", "custom_search_url"),
             Key::WidgetsEnabled => ("widgets", "enabled"),
@@ -369,6 +382,11 @@ pub(crate) enum Hit {
     AddApp,
     AddStart,
     AddFinder,
+    AddLaunchpad,
+    ResetLaunchpad,
+    LaunchpadUnhide(usize),
+    LaunchpadRemoveAdded(usize),
+    LaunchpadAddApp,
     OpenConfig,
     OpenLog,
     OpenUpdate,
@@ -413,6 +431,8 @@ pub(crate) enum Row {
     /// An entry of `[windows] no_inject`, with a remove button.
     Excluded(usize),
     Buttons(&'static str, Vec<(&'static str, Hit)>),
+    /// A label of its own (an app's name) with one button.
+    Named(String, &'static str, Hit),
     Info(&'static str, String),
     /// Label, key, placeholder.
     Text(&'static str, Key, &'static str),
@@ -490,6 +510,7 @@ impl Recording {
 fn keybind_value(key: Key, cfg: &Config) -> String {
     match key {
         Key::SpotlightHotkey => cfg.spotlight.hotkey.trim().to_lowercase(),
+        Key::LaunchpadHotkey => cfg.launchpad.hotkey.trim().to_lowercase(),
         _ => String::new(),
     }
 }
@@ -599,8 +620,9 @@ pub(crate) struct RowCtx<'a> {
     pub pending: Option<(Key, f32)>,
     pub login: bool,
     pub fonts: &'a [String],
-    /// Pinned-app icons (Dock page only).
+    /// Pinned-app icons (Dock page only), fitted to `ROW_ICON` at `scale`.
     pub bitmaps: Option<&'a HashMap<String, Option<ID2D1Bitmap>>>,
+    pub scale: f32,
     pub editing: Option<&'a Editing>,
     pub recording: Option<&'a Recording>,
     /// The window's springs; without them controls jump straight to their state.
@@ -1136,6 +1158,42 @@ impl SettingsWindow {
                     },
                 },
             ],
+            Page::Launchpad => vec![
+                Group {
+                    title: None,
+                    rows: {
+                        let mut rows = vec![
+                            Row::Segmented("The Dock's Launchpad opens", Key::LaunchpadDock),
+                            Row::Segmented("Spotlight's Apps button opens", Key::LaunchpadSpotlight),
+                            Row::Keybind("Keyboard shortcut", Key::LaunchpadHotkey),
+                        ];
+                        if !cfg.launchpad.hotkey.trim().is_empty() {
+                            rows.push(Row::Segmented("The shortcut opens", Key::LaunchpadHotkeyOpens));
+                        }
+                        let pinned = cfg.dock.apps.iter().any(|a| a.path == LAUNCHPAD_PATH);
+                        rows.push(Row::Buttons("Launchpad in the Dock", vec![(if pinned { "Remove from Dock" } else { "Add to Dock" }, Hit::AddLaunchpad)]));
+                        rows.push(Row::Buttons("Launchpad's pages and folders", vec![("Reset Layout", Hit::ResetLaunchpad)]));
+                        rows
+                    },
+                },
+                Group {
+                    title: Some("Apps in Launchpad"),
+                    rows: {
+                        let state = crate::launchpad::layout::State::load();
+                        let mut rows = vec![Row::Note(
+                            "Right-click an app in Launchpad to hide it. Add apps that aren't in the Start menu (portable apps, scripts, shortcuts) here.",
+                        )];
+                        for (i, a) in state.added.iter().enumerate().take(30) {
+                            rows.push(Row::Named(format!("{} (added)", a.name), "Remove", Hit::LaunchpadRemoveAdded(i)));
+                        }
+                        for (i, h) in state.hidden.iter().enumerate().take(60) {
+                            rows.push(Row::Named(format!("{} (hidden)", h.name), "Show", Hit::LaunchpadUnhide(i)));
+                        }
+                        rows.push(Row::Buttons("", vec![("Add App\u{2026}", Hit::LaunchpadAddApp)]));
+                        rows
+                    },
+                },
+            ],
             Page::Dock => vec![
                 Group {
                     title: None,
@@ -1191,6 +1249,7 @@ impl SettingsWindow {
                             std::iter::once(("Add App…", Hit::AddApp))
                                 .chain((!cfg.dock.apps.iter().any(|a| a.path == FINDER_PATH)).then_some(("Add Finder", Hit::AddFinder)))
                                 .chain((!cfg.dock.apps.iter().any(|a| a.path == START_PATH)).then_some(("Add Start", Hit::AddStart)))
+                                .chain((!cfg.dock.apps.iter().any(|a| a.path == LAUNCHPAD_PATH)).then_some(("Add Launchpad", Hit::AddLaunchpad)))
                                 .collect(),
                         )))
                         .collect(),
@@ -1408,6 +1467,15 @@ impl SettingsWindow {
                 fixed(&[("Apple", "apple"), ("Windows", "windows")], sel)
             }
             Key::MbClock => fixed(&CLOCKS, CLOCKS.iter().position(|c| c.1 == cfg.menubar.clock_format)),
+            Key::LaunchpadDock | Key::LaunchpadSpotlight | Key::LaunchpadHotkeyOpens => {
+                use crate::config::LaunchStyle;
+                let style = match key {
+                    Key::LaunchpadDock => cfg.launchpad.dock,
+                    Key::LaunchpadSpotlight => cfg.launchpad.spotlight,
+                    _ => cfg.launchpad.hotkey_opens,
+                };
+                fixed(&[("Launchpad (Sequoia)", "sequoia"), ("Apps (Tahoe)", "tahoe")], Some((style == LaunchStyle::Tahoe) as usize))
+            }
             Key::SearchEngine => {
                 let mut labels: Vec<String> = web::ENGINES.iter().map(|e| e.1.to_string()).collect();
                 let mut values: Vec<String> = web::ENGINES.iter().map(|e| e.0.to_string()).collect();
@@ -1785,6 +1853,23 @@ impl SettingsWindow {
             Hit::AddExcludedFolder => Action::AddNoInject { folder: true },
             Hit::AddApp => Action::AddDockApp,
             Hit::AddStart => Action::TogglePin { path: START_PATH.into(), name: "Start".into(), pin: true },
+            Hit::AddLaunchpad => {
+                let pinned = cfg.dock.apps.iter().any(|a| a.path == LAUNCHPAD_PATH);
+                Action::TogglePin { path: LAUNCHPAD_PATH.into(), name: "Launchpad".into(), pin: !pinned }
+            }
+            Hit::LaunchpadUnhide(i) => match crate::launchpad::layout::State::load().hidden.get(i) {
+                Some(h) => Action::LaunchpadUnhide(h.target.clone()),
+                None => return SettingsEvent::None,
+            },
+            Hit::LaunchpadRemoveAdded(i) => match crate::launchpad::layout::State::load().added.get(i) {
+                Some(a) => Action::LaunchpadRemoveAdded(a.target.clone()),
+                None => return SettingsEvent::None,
+            },
+            Hit::LaunchpadAddApp => Action::LaunchpadAddApp,
+            Hit::ResetLaunchpad => {
+                crate::launchpad::layout::State::reset_layout();
+                return SettingsEvent::None;
+            }
             Hit::AddFinder => Action::TogglePin { path: FINDER_PATH.into(), name: "Finder".into(), pin: true },
             Hit::OpenConfig => Action::OpenConfig,
             Hit::OpenUpdate => Action::Open(
@@ -1827,9 +1912,13 @@ impl SettingsWindow {
                     let px = match (app.path.as_str(), app.icon.as_deref()) {
                         (FINDER_PATH, None) => icons.builtin(finder_icon::KEY, || finder_icon::render(gfx)),
                         (START_PATH, None) => icons.builtin(start_icon::KEY, || start_icon::render(gfx)),
+                        (LAUNCHPAD_PATH, None) => icons.builtin(launchpad_icon::KEY, || launchpad_icon::render(gfx)),
                         (path, custom) => icons.get(&gfx.wic, path, custom),
                     };
-                    let bmp = px.and_then(|px| px.to_bitmap(self.canvas.target()));
+                    // Fitted to the row's icon once: scaling a big custom icon (often
+                    // 1024 px) in high quality every frame of a scroll is costly.
+                    let rt = self.canvas.target();
+                    let bmp = px.and_then(|px| px.to_bitmap(rt)).and_then(|b| crate::gfx::fit_bitmap(rt, &b, ROW_ICON, ROW_ICON).or(Some(b)));
                     self.bitmaps.insert(key, bmp);
                 }
             }
@@ -1838,7 +1927,11 @@ impl SettingsWindow {
         if self.page == Page::Windows || searching {
             for e in &cfg.windows.no_inject {
                 if !self.bitmaps.contains_key(e) {
-                    let bmp = excluded_path(e).and_then(|p| icons.get(&gfx.wic, &p, None)).and_then(|px| px.to_bitmap(self.canvas.target()));
+                    let rt = self.canvas.target();
+                    let bmp = excluded_path(e)
+                        .and_then(|p| icons.get(&gfx.wic, &p, None))
+                        .and_then(|px| px.to_bitmap(rt))
+                        .and_then(|b| crate::gfx::fit_bitmap(rt, &b, ROW_ICON, ROW_ICON).or(Some(b)));
                     self.bitmaps.insert(e.clone(), bmp);
                 }
             }
@@ -1901,6 +1994,7 @@ impl SettingsWindow {
             login: self.login,
             fonts: &self.fonts,
             bitmaps: Some(&self.bitmaps),
+            scale: self.scale,
             editing: self.editing.as_ref(),
             recording: self.recording.as_ref(),
             motion: Some(motion),
@@ -2097,7 +2191,7 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 let key = app.icon.clone().unwrap_or_else(|| app.path.clone());
                 let icon = Rect::new(r.x + 12.0, r.cy() - 13.0, 26.0, 26.0);
                 if let Some(Some(bmp)) = ctx.bitmaps.and_then(|b| b.get(&key)) {
-                    p.bitmap(bmp, icon, 1.0);
+                    p.stamp(bmp, icon.x, icon.y, ctx.scale);
                 }
                 let name = app.name.clone().unwrap_or_else(|| app.path.clone());
                 p.text(&name, &regular, Rect::new(icon.right() + 10.0, r.y, r.w * 0.45, r.h), theme.text);
@@ -2114,7 +2208,7 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
             if let Some(entry) = cfg.windows.no_inject.get(*i) {
                 let icon = Rect::new(r.x + 12.0, r.cy() - 13.0, 26.0, 26.0);
                 if let Some(Some(bmp)) = ctx.bitmaps.and_then(|b| b.get(entry)) {
-                    p.bitmap(bmp, icon, 1.0);
+                    p.stamp(bmp, icon.x, icon.y, ctx.scale);
                 }
                 let (name, detail) = excluded_label(entry);
                 p.text(&name, &regular, Rect::new(icon.right() + 10.0, r.y, r.w * 0.45, r.h), theme.text);
@@ -2127,6 +2221,15 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 p.line(cx - 4.0, cy, cx + 4.0, cy, theme.text_secondary.mix(Color::WHITE, hot), 1.6);
                 hits.push((Rect::new(cx - 11.0, cy - 11.0, 22.0, 22.0), hit));
             }
+        }
+        Row::Named(label, text, hit) => {
+            let bw = p.gfx.measure(text, &button_font) + 24.0;
+            let b = Rect::new(right_edge - bw, r.cy() - 12.0, bw, 24.0);
+            p.text(label, &regular, Rect::new(label_r.x, label_r.y, b.x - 12.0 - label_r.x, label_r.h), theme.text);
+            p.fill_round(b, 6.0, control_bg.mix(selected_seg, ctx.hover_t(*hit)));
+            p.stroke_round(b.inset(0.25, 0.25), 6.0, card_border, 0.5);
+            p.text(text, &button_font, b, theme.text);
+            hits.push((b, *hit));
         }
         Row::Buttons(label, buttons) => {
             p.text(label, &regular, label_r, theme.text);
@@ -2295,6 +2398,22 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             p.fill_round(pill, pill.h / 2.0, Color::rgba(0, 0, 0, 1.0));
             p.stroke_round(pill, pill.h / 2.0, white.alpha(0.55), 1.0);
             p.fill_circle(pill.right() - pill.h * 0.7, pill.cy(), pill.h * 0.22, Color::rgba(48, 209, 88, 1.0));
+        }
+        Page::Launchpad => {
+            // A grid of coloured squares, like Launchpad's icon.
+            p.fill_round(r, 5.0, Color::rgba(72, 72, 74, 1.0));
+            const C: [(u8, u8, u8); 9] = [
+                (255, 94, 87), (255, 176, 46), (255, 214, 10),
+                (102, 222, 104), (70, 214, 214), (64, 160, 255),
+                (126, 112, 255), (222, 108, 255), (255, 106, 170),
+            ];
+            let (sq, gap) = (r.w * 0.17, r.w * 0.075);
+            let x0 = r.cx() - (3.0 * sq + 2.0 * gap) / 2.0;
+            let y0 = r.cy() - (3.0 * sq + 2.0 * gap) / 2.0;
+            for (i, (cr, cg, cb)) in C.iter().enumerate() {
+                let (c, row) = ((i % 3) as f32, (i / 3) as f32);
+                p.fill_round(Rect::new(x0 + c * (sq + gap), y0 + row * (sq + gap), sq, sq), sq * 0.3, Color::rgba(*cr, *cg, *cb, 1.0));
+            }
         }
         Page::Dock => {
             p.fill_round(r, 5.0, Color::rgba(28, 28, 30, 1.0));

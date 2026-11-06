@@ -5,10 +5,12 @@
 //! the same source WinUI's Acrylic uses) under a tint layer, both clipped to
 //! an antialiased rounded rectangle of any radius.
 //!
-//! Composition property changes can reach the screen frames after the window
-//! resizes, so the shape needs none when only its width changes (the Dock
-//! magnifying): fixed rounded ends either side of a middle that stretches with
-//! the window, the right end pinned to the window's right edge.
+//! DWM applies Composition property changes 50-260 ms late at times, while a
+//! window's own moves and resizes land on time. So the shape takes its size
+//! from the window and needs no Composition change when the window resizes
+//! (the Dock magnifying, Spotlight growing into a panel): nine parts, fixed
+//! rounded corners pinned to the window's corners, and edges and a middle that
+//! stretch with it. Only a new corner radius changes Composition.
 //!
 //! Liquid Glass adds two layers on top: a soft vertical sheen and a specular
 //! rim whose brightness sweeps around the edge, as if lit from the top-left.
@@ -73,6 +75,11 @@ pub fn shutdown() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// The UI thread's compositor (for surfaces that build their own visual trees).
+pub fn compositor() -> Option<Compositor> {
+    SHARED.with(|s| s.as_ref().map(|s| s.compositor.clone()))
 }
 
 fn init() -> Result<Shared> {
@@ -147,10 +154,15 @@ pub struct CompositionBackdrop {
     _target: DesktopWindowTarget,
     root: ContainerVisual,
     shape: ContainerVisual,
-    /// Rounded ends of a fixed size either side of a middle that stretches
-    /// with the window (see the module docs).
-    parts: [ContainerVisual; 3],
-    clips: [CompositionRoundedRectangleGeometry; 2],
+    /// Nine parts, row by row: rounded corners of a fixed size pinned to the
+    /// window's corners, edges and a middle that stretch (see the module docs).
+    parts: Vec<ContainerVisual>,
+    /// The corners' clips: top-left, top-right, bottom-left, bottom-right.
+    clips: [CompositionRoundedRectangleGeometry; 4],
+    /// The radius the parts are laid out for, and how far the shape runs past
+    /// the window's bottom (the Dock sliding off a screen with one below).
+    radius: Cell<Option<f32>>,
+    overflow: Cell<f32>,
     tint: CompositionColorBrush,
     glass: Option<Glass>,
     /// The pane's swap chain, through a nine-grid so a frame rendered at an
@@ -191,20 +203,26 @@ impl CompositionBackdrop {
             brushes.push(g.sheen.cast()?);
         }
 
-        // Width from the window (see `set_shape`).
+        // Its size from the window (see the module docs).
         let shape = compositor.CreateContainerVisual()?;
-        shape.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 0.0 })?;
+        shape.SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 1.0 })?;
         let children = shape.Children()?;
-        let [left, middle, right] = [(); 3].map(|_| compositor.CreateContainerVisual());
-        let parts = [left?, middle?, right?];
-        parts[1].SetRelativeSizeAdjustment(Vector2 { X: 1.0, Y: 0.0 })?;
-        parts[2].SetRelativeOffsetAdjustment(Vector3 { X: 1.0, Y: 0.0, Z: 0.0 })?;
+        let mut parts = Vec::with_capacity(9);
+        for row in 0..3 {
+            for col in 0..3 {
+                let part = compositor.CreateContainerVisual()?;
+                let rel = |i: usize, mid: f32, end: f32| if i == 1 { mid } else if i == 2 { end } else { 0.0 };
+                part.SetRelativeSizeAdjustment(Vector2 { X: rel(col, 1.0, 0.0), Y: rel(row, 1.0, 0.0) })?;
+                part.SetRelativeOffsetAdjustment(Vector3 { X: rel(col, 0.0, 1.0), Y: rel(row, 0.0, 1.0), Z: 0.0 })?;
+                parts.push(part);
+            }
+        }
         let rounded = |part: &ContainerVisual| -> Result<CompositionRoundedRectangleGeometry> {
             let geometry = compositor.CreateRoundedRectangleGeometry()?;
             part.SetClip(&compositor.CreateGeometricClipWithGeometry(&geometry)?)?;
             Ok(geometry)
         };
-        let clips = [rounded(&parts[0])?, rounded(&parts[2])?];
+        let clips = [rounded(&parts[0])?, rounded(&parts[2])?, rounded(&parts[6])?, rounded(&parts[8])?];
         let mut layers = Vec::new();
         for part in &parts {
             for brush in &brushes {
@@ -244,42 +262,65 @@ impl CompositionBackdrop {
         }
         root.Children()?.InsertAtTop(&shape)?;
 
-        Ok(Self { _target: target, root, shape, parts, clips, tint: tint_brush, glass, refraction, _layers: layers })
+        Ok(Self {
+            _target: target,
+            root,
+            shape,
+            parts,
+            clips,
+            radius: Cell::new(None),
+            overflow: Cell::new(0.0),
+            tint: tint_brush,
+            glass,
+            refraction,
+            _layers: layers,
+        })
     }
 
-    /// Position, size and corner radius in window-local physical pixels.
-    /// The shape spans the window's width whatever `w` says.
-    pub fn set_shape(&self, x: f32, y: f32, w: f32, h: f32, radius: f32) {
+    /// Size and corner radius in physical pixels. The shape fills the window
+    /// (its size comes from the window: see the module docs), running
+    /// `overflow` pixels past its bottom when the window is cut short.
+    pub fn set_shape(&self, w: f32, h: f32, radius: f32, overflow: f32) {
         let size = Vector2 { X: w.max(0.0), Y: h.max(0.0) };
-        let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
-        let corner = Vector2 { X: r, Y: r };
-        let _ = self.shape.SetOffset(Vector3 { X: x, Y: y, Z: 0.0 });
-        let _ = self.shape.SetSize(Vector2 { X: 0.0, Y: size.Y });
-        let [left, middle, right] = &self.parts;
-        let end = Vector2 { X: r, Y: size.Y };
-        let _ = left.SetSize(end);
-        let _ = middle.SetOffset(Vector3 { X: r, Y: 0.0, Z: 0.0 });
-        let _ = middle.SetSize(Vector2 { X: -2.0 * r, Y: size.Y });
-        let _ = right.SetOffset(Vector3 { X: -r, Y: 0.0, Z: 0.0 });
-        let _ = right.SetSize(end);
-        // Each end's clip is a whole rounded rect 2r wide, half of it past the end.
-        for (clip, dx) in self.clips.iter().zip([0.0, -r]) {
-            let _ = clip.SetOffset(Vector2 { X: dx, Y: 0.0 });
-            let _ = clip.SetSize(Vector2 { X: 2.0 * r, Y: size.Y });
-            let _ = clip.SetCornerRadius(corner);
+        let r = radius.min(w / 2.0).min(h / 2.0).max(0.0).round();
+        if self.overflow.get() != overflow {
+            self.overflow.set(overflow);
+            let _ = self.shape.SetSize(Vector2 { X: 0.0, Y: overflow });
+        }
+        if self.radius.get() != Some(r) {
+            self.radius.set(Some(r));
+            // Offsets and sizes on top of each part's window-relative ones.
+            let at = |i: usize| [0.0, r, -r][i];
+            let len = |i: usize| [r, -2.0 * r, r][i];
+            for (k, part) in self.parts.iter().enumerate() {
+                let (row, col) = (k / 3, k % 3);
+                let _ = part.SetOffset(Vector3 { X: at(col), Y: at(row), Z: 0.0 });
+                let _ = part.SetSize(Vector2 { X: len(col), Y: len(row) });
+            }
+            // Each corner's clip is a whole rounded rect 2r across, its other three quarters outside the part.
+            for (clip, (dx, dy)) in self.clips.iter().zip([(0.0, 0.0), (-r, 0.0), (0.0, -r), (-r, -r)]) {
+                let _ = clip.SetOffset(Vector2 { X: dx, Y: dy });
+                let _ = clip.SetSize(Vector2 { X: 2.0 * r, Y: 2.0 * r });
+                let _ = clip.SetCornerRadius(Vector2 { X: r, Y: r });
+            }
+            if let Some((_, nine)) = &self.refraction {
+                let _ = nine.SetLeftInset(r);
+                let _ = nine.SetRightInset(r);
+                let _ = nine.SetTopInset(r);
+                let _ = nine.SetBottomInset(r);
+            }
         }
         if let Some(g) = &self.glass {
             // Inset by half the stroke so the whole rim sits inside the clip.
             // Square shapes (the full-width menu bar) get no rim, like macOS.
+            // (A geometry: it can't follow the window, so it may lag a resize.)
             let h = RIM / 2.0;
-            let rim = if r > 0.0 { Vector2 { X: (size.X - RIM).max(0.0), Y: (size.Y - RIM).max(0.0) } } else { Vector2 { X: 0.0, Y: 0.0 } };
+            let rim = if r > 0.0 { Vector2 { X: (size.X - RIM).max(0.0), Y: (size.Y + overflow - RIM).max(0.0) } } else { Vector2 { X: 0.0, Y: 0.0 } };
             let _ = g.rim.SetOffset(Vector2 { X: h, Y: h });
             let _ = g.rim.SetSize(rim);
             let _ = g.rim.SetCornerRadius(Vector2 { X: (r - h).max(0.0), Y: (r - h).max(0.0) });
         }
-        if let Some((pane, nine)) = &self.refraction {
-            let _ = nine.SetLeftInset(r);
-            let _ = nine.SetRightInset(r);
+        if let Some((pane, _)) = &self.refraction {
             pane.set_shape(size.X, size.Y, r);
         }
     }

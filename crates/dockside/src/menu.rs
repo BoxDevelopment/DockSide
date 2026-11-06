@@ -53,6 +53,21 @@ pub enum Action {
     OpenFinder(Option<std::path::PathBuf>),
     /// Show or hide the Spotlight search panel.
     ToggleSpotlight,
+    /// Open (or close) Launchpad in the given look: Sequoia's full-screen
+    /// Launchpad, or Tahoe's Apps panel in Spotlight.
+    OpenLaunchpad(crate::config::LaunchStyle),
+    /// Take an app out of Launchpad (and Spotlight's Apps panel).
+    LaunchpadHide { name: String, target: String },
+    /// Bring a hidden app back; take out an added one; pick an app to add.
+    LaunchpadUnhide(String),
+    LaunchpadRemoveAdded(String),
+    LaunchpadAddApp,
+    /// Rename the open Launchpad's folder at this index on its page.
+    LaunchpadRenameFolder(usize),
+    /// Edit mode in the open Launchpad on (or off); with an app picked; add an app there.
+    LaunchpadEdit(bool),
+    LaunchpadSelect(String),
+    LaunchpadAddHere,
     /// A command for one Finder window (from its context menu).
     Finder { window: u32, cmd: crate::finder::FinderCmd },
     /// Move files to the Recycle Bin (dropped on the Dock's Trash).

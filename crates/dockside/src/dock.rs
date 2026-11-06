@@ -15,7 +15,7 @@ use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
 use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{load_shell_icon, IconStore, RECYCLE_BIN};
-use crate::gfx::{finder_icon, start_icon, Align, Gfx, Weight};
+use crate::gfx::{finder_icon, launchpad_icon, start_icon, Align, Gfx, Weight};
 use crate::icon_picker::{IconTarget, PICKER_PATH};
 use crate::onboarding::ONBOARDING_PATH;
 use crate::settings::SETTINGS_PATH;
@@ -39,6 +39,8 @@ const HIDE_DELAY: f32 = 0.3;
 const SPRING_DELAY: f32 = 0.7;
 /// A pinned item that opens the Start menu.
 pub const START_PATH: &str = "dockside:start";
+/// A pinned item that opens Launchpad (or Tahoe's Apps, as set).
+pub const LAUNCHPAD_PATH: &str = "dockside:launchpad";
 /// Icon-store keys for the Trash's shell icon, empty and full.
 const TRASH_EMPTY: &str = "dockside:trash-empty";
 const TRASH_FULL: &str = "dockside:trash-full";
@@ -115,7 +117,7 @@ impl Item {
             .or_else(|| {
                 lower.ends_with(".lnk").then(|| apps::resolve_lnk(&app.path)).flatten().map(|t| apps::exe_name(&t))
             });
-        let name = app.name.clone().or_else(|| (app.path == START_PATH).then(|| "Start".into())).unwrap_or_else(|| {
+        let name = app.name.clone().or_else(|| (app.path == START_PATH).then(|| "Start".into())).or_else(|| (app.path == LAUNCHPAD_PATH).then(|| "Launchpad".into())).unwrap_or_else(|| {
             Path::new(&app.path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         });
         Item {
@@ -333,6 +335,7 @@ fn icon_source(path: &str) -> String {
     match path {
         FINDER_PATH => finder_icon::KEY.to_string(),
         START_PATH => start_icon::KEY.to_string(),
+        LAUNCHPAD_PATH => launchpad_icon::KEY.to_string(),
         SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH => {
             std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
         }
@@ -342,7 +345,7 @@ fn icon_source(path: &str) -> String {
 
 /// Our drawn icons are already tiles.
 fn is_drawn_icon(key: &str) -> bool {
-    key == finder_icon::KEY || key == start_icon::KEY
+    key == finder_icon::KEY || key == start_icon::KEY || key == launchpad_icon::KEY
 }
 
 /// Names for DockSide's own windows, which show in the Dock like apps.
@@ -909,7 +912,7 @@ impl Dock {
             Kind::App if item.launch == FINDER_PATH => {
                 if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
             }
-            Kind::App if [START_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH].contains(&item.launch.as_str()) => FileDrop::None,
+            Kind::App if [START_PATH, LAUNCHPAD_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH].contains(&item.launch.as_str()) => FileDrop::None,
             Kind::App => FileDrop::Open,
         }
     }
@@ -1079,6 +1082,10 @@ impl Dock {
                     v.push(Entry::item("New Finder Window", Action::OpenFinder(None)));
                     v.push(Entry::Separator);
                 }
+                if item.launch == LAUNCHPAD_PATH {
+                    v.push(Entry::item("Launchpad Settings…", Action::OpenSettings(Some(crate::settings::Page::Launchpad))));
+                    v.push(Entry::Separator);
+                }
                 if pinnable(&item.launch) {
                     v.push(
                         Entry::item(
@@ -1128,6 +1135,7 @@ impl Dock {
             let px = match (key, item.custom_icon.as_deref()) {
                 (finder_icon::KEY, None) => icons.builtin(key, || finder_icon::render(gfx)),
                 (start_icon::KEY, None) => icons.builtin(key, || start_icon::render(gfx)),
+                (launchpad_icon::KEY, None) => icons.builtin(key, || launchpad_icon::render(gfx)),
                 // The shell's Recycle Bin icon follows its state: cache one per state.
                 (TRASH_EMPTY | TRASH_FULL, None) => icons.builtin(key, || load_shell_icon(RECYCLE_BIN)),
                 (TRASH_EMPTY | TRASH_FULL, custom) => icons.get(&gfx.wic, RECYCLE_BIN, custom),

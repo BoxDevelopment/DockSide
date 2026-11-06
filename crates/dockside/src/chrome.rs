@@ -336,7 +336,7 @@ impl SidebarBackdrop {
             let h = (r.h * scale).round() as i32;
             let key = [x, y, w, h, (radius * scale).round() as i32];
             if self.placed != Some(key) {
-                self.composition.set_shape(0.0, 0.0, w as f32, h as f32, key[4] as f32);
+                self.composition.set_shape(w as f32, h as f32, key[4] as f32, 0.0);
             }
             self.placed = Some(key);
             // Re-applied every time: the owner may have moved up in z-order.

@@ -15,6 +15,7 @@ mod gfx;
 mod icon_picker;
 mod island;
 mod keybind;
+mod launchpad;
 mod menu;
 mod menubar;
 mod net;

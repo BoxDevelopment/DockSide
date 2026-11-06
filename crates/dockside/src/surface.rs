@@ -112,7 +112,7 @@ impl Surface {
             accent::prepare(hwnd);
             match CompositionBackdrop::new(hwnd, tint, (kind == Backdrop::Glass).then_some(glass::Style::Bold), source) {
                 Ok(c) => {
-                    c.set_shape(0.0, 0.0, w as f32, h as f32, 0.0);
+                    c.set_shape(w as f32, h as f32, 0.0, 0.0);
                     composition = Some(c);
                     Some(hwnd)
                 }
@@ -202,7 +202,7 @@ impl Surface {
             (Some(bd), None) => {
                 unsafe { SetWindowPos(bd, None, rect.left, rect.top, w, h, SWP_NOACTIVATE | SWP_NOZORDER)? };
                 if let Some(c) = &self.composition {
-                    c.set_shape(0.0, 0.0, w as f32, h as f32, 0.0);
+                    c.set_shape(w as f32, h as f32, 0.0, 0.0);
                     c.refresh();
                 }
             }
@@ -284,12 +284,6 @@ impl Surface {
         let first = self.shape.is_none();
         self.shape = Some(key);
         let (w, h) = (key[2] - key[0], key[3] - key[1]);
-        match &self.composition {
-            Some(c) => c.set_shape(0.0, 0.0, w as f32, h as f32, key[4] as f32),
-            // Accent fallback can only get Windows 11's fixed 8px rounding.
-            None if first => accent::round_corners(bd),
-            None => {}
-        }
         // A shape sliding past the bottom edge (Dock auto-hide) is cut off by
         // the screen edge, not re-rounded. Only when a monitor sits below is the
         // window shortened to the surface: resizing it every frame of the slide
@@ -297,6 +291,13 @@ impl Surface {
         let below = RECT { left: key[0], top: self.rect.bottom, right: key[2], bottom: key[3] };
         let spills = key[3] > self.rect.bottom && unsafe { !MonitorFromRect(&below, MONITOR_DEFAULTTONULL).is_invalid() };
         let visible_h = if spills { (self.rect.bottom - key[1]).max(0) } else { h };
+        match &self.composition {
+            // The shape follows the window: resizing it below is all a new size needs.
+            Some(c) => c.set_shape(w as f32, visible_h as f32, key[4] as f32, (h - visible_h) as f32),
+            // Accent fallback can only get Windows 11's fixed 8px rounding.
+            None if first => accent::round_corners(bd),
+            None => {}
+        }
         unsafe {
             let _ = SetWindowPos(bd, None, key[0], key[1], w, visible_h, SWP_NOACTIVATE | SWP_NOZORDER);
         }

@@ -103,6 +103,23 @@ pub fn search(raw: &str, low_power: bool, dark: bool) -> Vec<Found> {
     out
 }
 
+/// Every command, in list order, for Spotlight's Actions view before anything's typed.
+pub fn all(low_power: bool, dark: bool) -> Vec<Found> {
+    COMMANDS
+        .iter()
+        .map(|&(title, _, glyph, command)| {
+            let (title, command) = match command {
+                Command::LowPowerMode(_) => {
+                    (format!("Turn Low Power Mode {}", if low_power { "Off" } else { "On" }), Command::LowPowerMode(!low_power))
+                }
+                Command::DarkMode(_) => (format!("Turn Dark Mode {}", if dark { "Off" } else { "On" }), Command::DarkMode(!dark)),
+                c => (title.to_string(), c),
+            };
+            Found { title, subtitle: "Command", glyph, command, score: 0 }
+        })
+        .collect()
+}
+
 /// "brightness 60", "brightness 60%", "volume 30", "vol 0".
 fn parse_level(q: &str) -> Option<Found> {
     let (word, rest) = q.split_once(' ')?;

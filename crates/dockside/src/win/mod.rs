@@ -190,6 +190,8 @@ pub fn class_name(hwnd: HWND) -> String {
 
 /// Spotlight panel lost focus: close it.
 pub const WM_APP_CLOSE_SPOTLIGHT: u32 = WM_APP + 11;
+/// Launchpad lost focus: close it.
+pub const WM_APP_CLOSE_LAUNCHPAD: u32 = WM_APP + 31;
 /// Spotlight's background index finished rebuilding.
 pub const WM_APP_INDEX_READY: u32 = WM_APP + 12;
 /// The media worker has a new Now Playing snapshot for the Dynamic Island.

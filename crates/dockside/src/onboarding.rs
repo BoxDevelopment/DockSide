@@ -606,6 +606,7 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             login: f.login,
             fonts: f.fonts,
             bitmaps: None,
+            scale: 1.0,
             editing: None,
             recording: f.recording,
             motion: f.motion,

@@ -120,6 +120,11 @@ impl IconLoader {
         None
     }
 
+    /// Whether `key` was asked for and hasn't arrived yet.
+    pub fn is_pending(&self, key: &str) -> bool {
+        self.pending.contains(key)
+    }
+
     pub fn get_entry(&mut self, entry: &Entry) -> Option<Rc<IconPixels>> {
         let (key, thumb) = Self::key_for(entry);
         self.get(&key, &entry.path, thumb, ICON_SIZE)

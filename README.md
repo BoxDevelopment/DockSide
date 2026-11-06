@@ -2,7 +2,7 @@
 
 # DockSide
 
-A fast, open-source macOS-style desktop shell for Windows 11, written in Rust.
+A fast, open-source (GPL-3.0) macOS-style desktop shell for Windows 11, written in Rust.
 Ai Assisted. Couldn't find a good alternative so I made my own.
 Feel free to contribute.
 
@@ -243,3 +243,9 @@ crates/dockside/src
 
 - Liquid Glass refraction (`[general] glass_refraction`) hides glass surfaces, and Finder windows with a glass sidebar, from screenshots and screen sharing; turn it off in Settings → Appearance to fall back to non-bending glass.
 - Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, DockSide falls back to a DWM accent with 8px corners.
+
+## License
+
+DockSide is free software, released under the [GNU General Public License v3.0](LICENSE).
+You can use, study, share and modify it. If you distribute DockSide or anything built from it,
+you must release the full source code under the same license.

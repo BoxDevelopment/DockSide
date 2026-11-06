@@ -3,6 +3,7 @@ name = "dockside-hook"
 description = "Loaded into other apps by DockSide: the genie window animations"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 
 [lib]

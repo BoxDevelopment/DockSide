@@ -52,6 +52,11 @@ fn main() {
         island::claude::status_line();
         return;
     }
+    // Now Playing's helper process (see island::media): DockSide starts it.
+    if std::env::args().any(|a| a == island::media::HELPER_ARG) {
+        island::media::helper_main();
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
     // `dockside activity start build --title Build …`: a Live Activity for the island.
     if args.get(1).is_some_and(|a| a == "activity") {

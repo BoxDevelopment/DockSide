@@ -192,6 +192,18 @@ impl MenuBar {
         })
     }
 
+    /// Where an item is on screen, in points.
+    pub fn screen_rect(&self, hit: Hit) -> Option<Rect> {
+        let (r, _) = self.hits.iter().find(|(_, h)| *h == hit)?;
+        let (s, k) = (self.monitor.scale, self.zoom());
+        Some(Rect::new(
+            self.monitor.rect.left as f32 / s + r.x * k,
+            self.monitor.rect.top as f32 / s,
+            r.w * k,
+            self.surface.height_pt(),
+        ))
+    }
+
     pub fn set_open(&mut self, hit: Option<Hit>) {
         if self.open != hit {
             self.open = hit;
@@ -208,12 +220,11 @@ impl MenuBar {
 
     pub fn status_action(hit: Hit, spotlight: bool) -> Option<Action> {
         const WIN_S: Shortcut = Shortcut::new("w", b'S' as u16, "S");
-        const WIN_A: Shortcut = Shortcut::new("w", b'A' as u16, "A");
         const WIN_N: Shortcut = Shortcut::new("w", b'N' as u16, "N");
+        // (Control Center and Wi-Fi open DockSide's Control Center; see the App.)
         match hit {
             Hit::Search if spotlight => Some(Action::ToggleSpotlight),
             Hit::Search => Some(Action::Keys(WIN_S)),
-            Hit::ControlCenter | Hit::Wifi => Some(Action::Keys(WIN_A)),
             Hit::Clock => Some(Action::Keys(WIN_N)),
             Hit::Battery => Some(Action::Open("ms-settings:batterysaver".into())),
             _ => None,

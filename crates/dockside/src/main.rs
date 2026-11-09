@@ -7,6 +7,7 @@ mod anim;
 mod app;
 mod chrome;
 mod config;
+mod controlcenter;
 mod dock;
 mod dock_drop;
 mod finder;

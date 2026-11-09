@@ -230,5 +230,7 @@ pub const WM_APP_DRAG_WATCH: u32 = WM_APP + 28;
 pub const WM_APP_SHELF_KEY: u32 = WM_APP + 29;
 /// One of our windows was cloaked or uncloaked (another virtual desktop came forward).
 pub const WM_APP_CLOAKED: u32 = WM_APP + 30;
+/// Control Center's worker has a new status.
+pub const WM_APP_CONTROL: u32 = WM_APP + 32;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

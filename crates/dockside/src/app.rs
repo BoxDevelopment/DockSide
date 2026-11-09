@@ -39,6 +39,7 @@ use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
 use crate::launchpad::{Launchpad, LaunchpadEvent, LAUNCHPAD_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
+use crate::controlcenter::{self, ControlCenter, ControlEvent};
 use crate::surface::Fading;
 use crate::theme::Theme;
 use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
@@ -61,6 +62,8 @@ static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Windows the menu mouse hook must not treat as "outside" clicks.
 static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
 static OPEN_SUBMENU_HWND: AtomicIsize = AtomicIsize::new(0);
+/// The open Control Center (outside clicks close it, like a menu).
+static CONTROL_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Every display's menu bar (clicks on any of them leave an open menu to the bar).
 static MENUBAR_HWNDS: [AtomicIsize; 8] = [const { AtomicIsize::new(0) }; 8];
 /// Whether the island's keyboard hook swallows volume keys (it shows its own HUD).
@@ -771,7 +774,7 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         // Close on any click except on the menu itself, or on the menu bar
         // (which switches between its menus on its own).
         let keep = root != 0
-            && [&OPEN_MENU_HWND, &OPEN_SUBMENU_HWND].into_iter().chain(&MENUBAR_HWNDS).any(|h| root == h.load(Ordering::Relaxed));
+            && [&OPEN_MENU_HWND, &OPEN_SUBMENU_HWND, &CONTROL_HWND].into_iter().chain(&MENUBAR_HWNDS).any(|h| root == h.load(Ordering::Relaxed));
         if apps::window_pid(target) != GetCurrentProcessId() || !keep {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_MENU);
         }
@@ -1017,6 +1020,8 @@ pub struct App {
     /// Finder windows whose folder changed on disk (reloaded on a short timer).
     finder_changed: Vec<u32>,
     spotlight: Option<Spotlight>,
+    /// The Control Center panel under the menu bar.
+    control: Option<ControlCenter>,
     /// Sequoia's full-screen Launchpad, and ones zooming away.
     launchpad: Option<Launchpad>,
     closing_launchpads: Vec<Launchpad>,
@@ -1168,6 +1173,7 @@ impl App {
             kinds: finder::fs::KindCache::default(),
             finder_changed: Vec::new(),
             spotlight: None,
+            control: None,
             launchpad: None,
             closing_launchpads: Vec::new(),
             launchpad_modal: false,
@@ -1200,6 +1206,8 @@ impl App {
     fn build(&mut self) {
         let started = Instant::now();
         crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
+        // Control Center stays open across a rebuild (Dark Mode switched from it), in the new look.
+        let reopen = self.control.as_ref().map(|c| c.page());
         self.close_menu();
         self.retire_island();
         self.retire_widgets();
@@ -1237,6 +1245,9 @@ impl App {
         self.register_hotkey();
         if self.index.lock().is_ok_and(|i| i.built.is_none()) {
             self.rebuild_index();
+        }
+        if let Some(page) = reopen {
+            self.open_control(page);
         }
         log!(
             "built surfaces in {:?} ({} display(s), scale {}, font {})",
@@ -1778,7 +1789,7 @@ impl App {
             still |= d.tick(dt);
         }
         if let Some(i) = &mut self.island {
-            i.hold_open = self.menu.is_some();
+            i.hold_open = self.menu.is_some() || self.control.is_some();
             still |= i.tick(dt);
         }
         for mb in &mut self.menubars {
@@ -1792,6 +1803,9 @@ impl App {
         }
         if let Some(s) = &mut self.spotlight {
             still |= s.tick(dt);
+        }
+        if let Some(c) = &mut self.control {
+            still |= c.tick(dt);
         }
         if let Some(l) = &mut self.launchpad {
             still |= l.tick(dt);
@@ -1935,6 +1949,7 @@ impl App {
             self.menu.as_ref().map(|m| &m.surface),
             self.submenu.as_ref().map(|(_, s)| &s.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
+            self.control.as_ref().map(|c| &c.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
         ];
         for s in bars.chain(surfaces.into_iter().flatten()) {
@@ -2137,6 +2152,9 @@ impl App {
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
         }
+        if let Some(c) = self.control.as_mut().filter(|c| c.dirty) {
+            c.render(&self.gfx, &self.theme);
+        }
         for l in self.launchpad.iter_mut().chain(&mut self.closing_launchpads).filter(|l| l.dirty) {
             l.render(&self.gfx, &self.theme, &mut self.loader);
         }
@@ -2155,6 +2173,7 @@ impl App {
             || self.menu.as_ref().is_some_and(|m| m.animating())
             || self.submenu.as_ref().is_some_and(|(_, s)| s.animating())
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
+            || self.control.as_ref().is_some_and(|c| c.animating())
             || self.launchpad.as_ref().is_some_and(|l| l.animating())
             || !self.closing_launchpads.is_empty()
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
@@ -2887,6 +2906,110 @@ impl App {
         }
     }
 
+    // --- Control Center ----------------------------------------------------
+
+    /// Opens Control Center from the menu bar's switches icon.
+    fn open_control(&mut self, page: controlcenter::Page) {
+        self.open_control_at(Hit::ControlCenter, page);
+    }
+
+    /// Opens Control Center under `hit` (the switches icon, or Wi-Fi) of the
+    /// menu bar `menu_opener` names, on `page`.
+    fn open_control_at(&mut self, hit: Hit, page: controlcenter::Page) {
+        self.close_menu();
+        let opener = self.menu_opener;
+        let Some(mb) = self.menubars.iter().find(|m| m.surface.content == opener).or(self.menubars.first()) else { return };
+        // Without that icon shown (Wi-Fi only, say), under the switches icon's spot.
+        let Some(anchor) = mb.screen_rect(hit).or_else(|| mb.screen_rect(Hit::ControlCenter)).or_else(|| mb.screen_rect(Hit::Clock)) else {
+            return;
+        };
+        let (bar, monitor) = (mb.surface.content, mb.monitor());
+        match ControlCenter::new(&self.gfx, &self.theme, &self.cfg, &monitor, anchor, page, self.msg_hwnd.0 as isize) {
+            Ok(mut c) => {
+                c.render(&self.gfx, &self.theme);
+                CONTROL_HWND.store(c.surface.content.0 as isize, Ordering::Relaxed);
+                self.control = Some(c);
+                self.menu_opener = bar;
+                if let Some(mb) = self.menubars.iter_mut().find(|m| m.surface.content == bar) {
+                    mb.set_open(Some(hit));
+                }
+                self.install_hooks();
+                self.animate();
+            }
+            Err(e) => log!("control center failed: {e}"),
+        }
+    }
+
+    fn close_control(&mut self) {
+        CONTROL_HWND.store(0, Ordering::Relaxed);
+        let Some(c) = self.control.take() else { return };
+        c.surface.set_click_through();
+        self.fading.push(Box::new(c));
+        self.animate();
+        self.remove_hooks();
+        self.reset_menu_openers();
+    }
+
+    fn control_event(&mut self, e: ControlEvent) {
+        match e {
+            ControlEvent::None => {}
+            ControlEvent::Close => self.close_control(),
+            // Stays open: the rebuild that follows reopens it in the new look.
+            ControlEvent::Run(a @ Action::SetDarkMode(_)) => push(a),
+            ControlEvent::Run(a) => {
+                self.close_control();
+                push(a);
+            }
+            ControlEvent::OpenMedia(id) => {
+                self.close_control();
+                push(open_media_app(&id));
+            }
+        }
+    }
+
+    fn on_control_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let c = self.control.as_mut()?;
+        let (x, y) = mouse_pt(lp, c.surface.scale);
+        let e = match msg {
+            WM_MOUSEMOVE => {
+                if !c.tracking {
+                    c.tracking = true;
+                    track_leave(hwnd);
+                }
+                c.on_move(x, y);
+                ControlEvent::None
+            }
+            WM_MOUSELEAVE => {
+                c.on_leave();
+                ControlEvent::None
+            }
+            // The shadow around the panel is outside it.
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN if !c.in_body(x, y) => ControlEvent::Close,
+            WM_LBUTTONDOWN => {
+                if c.on_down(x, y) {
+                    unsafe { SetCapture(hwnd) };
+                }
+                ControlEvent::None
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                c.on_up(x, y)
+            }
+            WM_RBUTTONDOWN => ControlEvent::None,
+            WM_RBUTTONUP => c.on_right(x, y),
+            WM_MOUSEWHEEL => {
+                c.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                ControlEvent::None
+            }
+            _ => return None,
+        };
+        self.control_event(e);
+        self.animate();
+        Some(LRESULT(0))
+    }
+
     // --- menus -------------------------------------------------------------
 
     fn open_menu(&mut self, entries: Vec<Entry>, placement: Placement, source: MenuSource) {
@@ -2942,6 +3065,7 @@ impl App {
     }
 
     fn close_menu(&mut self) {
+        self.close_control();
         self.close_submenu();
         OPEN_MENU_HWND.store(0, Ordering::Relaxed);
         let Some(m) = self.menu.take() else { return };
@@ -3089,6 +3213,12 @@ impl App {
     }
 
     fn on_menu_key(&mut self, vk: u16) {
+        if let Some(c) = &mut self.control {
+            let e = c.on_key(vk);
+            self.control_event(e);
+            self.animate();
+            return;
+        }
         // A submenu with a highlighted item has the keyboard; Left goes back.
         if let Some((_, sub)) = self.submenu.as_mut().filter(|(_, s)| s.has_hover()) {
             let (event, redraw) = sub.on_key(vk);
@@ -3309,6 +3439,11 @@ impl App {
                     self.timer(TIMER_FINDER, 200);
                 }
                 WM_APP_MENU_KEY => self.on_menu_key(wp.0 as u16),
+                win::WM_APP_CONTROL => {
+                    if let Some(c) = &mut self.control {
+                        c.on_status();
+                    }
+                }
                 // One worker feeds both.
                 WM_APP_MEDIA => {
                     if let Some(i) = &mut self.island {
@@ -3317,6 +3452,9 @@ impl App {
                     }
                     if let Some(w) = &mut self.widgets {
                         w.on_media();
+                    }
+                    if let Some(c) = &mut self.control {
+                        c.on_media();
                     }
                 }
                 WM_APP_ISLAND => {
@@ -3466,7 +3604,9 @@ impl App {
             return r;
         }
 
-        let result = if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
+        let result = if self.control.as_ref().is_some_and(|c| c.surface.content == hwnd) {
+            self.on_control_mouse(hwnd, msg, wp, lp)
+        } else if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
             self.on_menu_mouse(hwnd, msg, lp, false)
         } else if self.submenu.as_ref().is_some_and(|(_, s)| s.surface.content == hwnd) {
             self.on_menu_mouse(hwnd, msg, lp, true)
@@ -3690,6 +3830,15 @@ impl App {
             }
             WM_MOUSELEAVE => mb.set_pressed(None),
             WM_LBUTTONDOWN => match hit {
+                Some(h @ (Hit::ControlCenter | Hit::Wifi)) => {
+                    let page = if h == Hit::Wifi { controlcenter::Page::Wifi } else { controlcenter::Page::Main };
+                    let same = mb.open == Some(h);
+                    self.close_menu();
+                    if !same {
+                        self.menu_opener = hwnd;
+                        self.open_control_at(h, page);
+                    }
+                }
                 Some(h) if h.opens_menu() => {
                     if mb.open == Some(h) {
                         self.close_menu();

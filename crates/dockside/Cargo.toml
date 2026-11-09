@@ -28,6 +28,11 @@ features = [
     "implement",
     "ApplicationModel_Appointments",
     "Devices_Enumeration",
+    # Control Center: Wi-Fi / Bluetooth radios, network scans, Mobile Hotspot.
+    "Devices_Radios",
+    "Devices_WiFi",
+    "Networking_Connectivity",
+    "Networking_NetworkOperators",
     "Foundation_Collections",
     "Foundation_Numerics",
     "Graphics",

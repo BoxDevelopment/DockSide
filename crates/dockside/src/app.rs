@@ -2259,13 +2259,16 @@ impl App {
             }
             LaunchStyle::Sequoia => {
                 self.close_spotlight();
+                let t0 = Instant::now();
                 let lp = {
                     let Ok(idx) = self.index.lock() else { return };
                     Launchpad::new(&self.gfx, &Monitor::at_cursor(), &idx)
                 };
                 match lp {
                     Ok(mut l) => {
+                        let made = t0.elapsed();
                         l.render(&self.gfx, &self.theme, &mut self.loader);
+                        log!("launchpad: made in {:.1} ms, first frame drawn in {:.1} ms", made.as_secs_f32() * 1000.0, t0.elapsed().as_secs_f32() * 1000.0);
                         l.focus();
                         self.launchpad = Some(l);
                         self.timer(TIMER_LAUNCHPAD_BLINK, LAUNCHPAD_BLINK_MS);

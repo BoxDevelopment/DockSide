@@ -145,6 +145,9 @@ pub enum LaunchpadEvent {
 }
 
 /// The edit-mode toolbar's buttons, left to right: (label, width).
+/// A page dot's size, in points.
+const DOT: f32 = 8.0;
+
 const TOOLS: [(&str, f32); 5] = [("Add App\u{2026}", 96.0), ("Hide", 120.0), ("Select Page", 100.0), ("Hidden Apps\u{2026}", 118.0), ("Done", 72.0)];
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -201,6 +204,66 @@ struct Drag {
     origin: Option<(usize, usize)>,
     /// Over the Dock, which shows it in its gap instead (the page leaves its own gap be).
     over_dock: bool,
+    /// Its layer has been drawn (it only changes if its icon arrives late).
+    drawn: bool,
+}
+
+/// Room around an icon's cell in its sprite, for its edit-mode badge, its
+/// picked glow, and a label that runs long.
+const PAD: f32 = 16.0;
+
+/// The folder-to-be tile is drawn this much bigger than an icon, at its largest.
+const TILE: f32 = 1.2;
+
+/// A page: a sprite per icon, drawn once and moved by the compositor.
+struct PageVis {
+    visual: ContainerVisual,
+    slots: HashMap<u64, SlotVis>,
+    /// The (layout, live) generation laid out.
+    shows: (u64, u64),
+}
+
+struct SlotVis {
+    layer: Layer,
+    /// What it shows (see `slot_key`); 0 to draw it again.
+    key: u64,
+    /// An icon on it is still loading.
+    waiting: bool,
+    /// Where it was last put: (x, y, scale, shown).
+    at: Option<(f32, f32, f32, bool)>,
+}
+
+/// Everything an icon's sprite shows, hashed (never 0): its app or folder,
+/// pressed, and edit mode's badge.
+fn slot_key(slot: &Slot, pressed: bool, picked: Option<&std::collections::HashSet<String>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match slot {
+        Slot::App { target } => {
+            target.hash(&mut h);
+            picked.map(|p| p.contains(target)).hash(&mut h);
+        }
+        Slot::Folder { name, apps } => {
+            name.hash(&mut h);
+            apps.iter().take(9).for_each(|a| a.hash(&mut h));
+            picked.map(|p| !apps.is_empty() && apps.iter().all(|t| p.contains(t))).hash(&mut h);
+        }
+    }
+    pressed.hash(&mut h);
+    h.finish() | 1
+}
+
+/// What an open Launchpad cost, logged when it closes.
+struct Stats {
+    opened: Instant,
+    frames: u32,
+    renders: u32,
+    /// Icon sprites drawn (an icon and its label each).
+    icons: u32,
+    /// Other layers redrawn (search, toolbar, dots, results, folder, dragged icon).
+    others: u32,
+    render_us: u64,
+    max_us: u64,
 }
 
 struct Swipe {
@@ -251,9 +314,16 @@ pub struct Launchpad {
     pages_visual: ContainerVisual,
     bg: Layer,
     /// Each page's layer and the (layout, live) generation it shows.
-    page_layers: HashMap<usize, (Layer, (u64, u64))>,
+    /// The pages kept, by index.
+    page_layers: HashMap<usize, PageVis>,
+    /// The folder-to-be tile behind an icon a drag rests on.
+    tile: Layer,
     search_layer: Layer,
-    dots_layer: Layer,
+    /// One page dot, drawn once; each dot is a sprite showing it, so paging
+    /// only changes their opacity (no redrawing).
+    dot: Layer,
+    dots_visual: ContainerVisual,
+    dot_sprites: Vec<SpriteVisual>,
     results_layer: Layer,
     sel_layer: Layer,
     dim: SpriteVisual,
@@ -305,14 +375,21 @@ pub struct Launchpad {
     edit_fade: Spring,
     /// What `apply` last sent to the compositor.
     applied: std::cell::Cell<Option<[f32; 12]>>,
+    /// The search field, toolbar and dots need drawing.
     chrome_dirty: bool,
+    /// Just the search field (typing, its caret, its magnifier sliding).
+    search_dirty: bool,
     results_dirty: bool,
+    /// The results, or the open folder, show an icon that's still loading.
+    results_waiting: bool,
+    folder_waiting: bool,
     folder_dirty: bool,
     /// The layout changed and wants saving when Launchpad closes.
     changed: bool,
     pub dirty: bool,
     pub tracking: bool,
     shown: bool,
+    stats: Stats,
 }
 
 thread_local! {
@@ -436,9 +513,45 @@ struct Ink<'a> {
     /// Edit mode's picked apps (`None` outside edit mode).
     picked: Option<&'a std::collections::HashSet<String>>,
     accent: Color,
+    /// An icon drawn since this was last cleared is still loading: that
+    /// layer wants drawing again when icons arrive.
+    waiting: std::cell::Cell<bool>,
 }
 
 impl Ink<'_> {
+    /// An app icon `size` points across, noting one that's still loading.
+    fn icon(&self, p: &Painter, icons: &mut HashMap<(String, u32), Option<ID2D1Bitmap>>, loader: &mut IconLoader, target: &str, size: f32) -> Option<ID2D1Bitmap> {
+        let b = icon(p, loader, icons, target, size, self.scale);
+        if b.is_none() && !icons.contains_key(&(target.to_string(), (size * self.scale).round() as u32)) {
+            self.waiting.set(true);
+        }
+        b
+    }
+
+    /// A folder: a frosted tile with its first nine apps in a 3 × 3 grid.
+    fn folder(&self, p: &Painter, icons: &mut HashMap<(String, u32), Option<ID2D1Bitmap>>, loader: &mut IconLoader, apps: &[String], r: Rect) {
+        let r = r.inset(r.w * 0.04, r.w * 0.04);
+        p.fill_round(r, r.w * 0.24, Color::gray(255, 0.22));
+        p.stroke_round(r.inset(0.25, 0.25), r.w * 0.24, Color::gray(255, 0.28), 0.5);
+        let pad = r.w * 0.13;
+        let gap = r.w * 0.055;
+        let mini = (r.w - 2.0 * pad - 2.0 * gap) / 3.0;
+        for (i, t) in apps.iter().take(9).enumerate() {
+            let (c, row) = (i % 3, i / 3);
+            let mr = Rect::new(r.x + pad + c as f32 * (mini + gap), r.y + pad + row as f32 * (mini + gap), mini, mini);
+            if let Some(b) = self.icon(p, icons, loader, t, mini) {
+                p.stamp(&b, mr.x, mr.y, self.scale);
+            }
+        }
+    }
+
+    /// Runs `f` and says whether anything it drew is still loading.
+    fn waits(&self, f: impl FnOnce()) -> bool {
+        self.waiting.set(false);
+        f();
+        self.waiting.get()
+    }
+
     /// An app or folder with its icon at the top of `cell`; `pressed` darkens it.
     #[allow(clippy::too_many_arguments)]
     fn slot(&self, p: &Painter, icons: &mut HashMap<(String, u32), Option<ID2D1Bitmap>>, loader: &mut IconLoader, slot: &Slot, cell: Rect, label: bool, pressed: bool) {
@@ -446,7 +559,7 @@ impl Ink<'_> {
         let ir = m.icon_of(cell);
         let name = match slot {
             Slot::App { target } => {
-                match icon(p, loader, icons, target, m.icon, self.scale) {
+                match self.icon(p, icons, loader, target, m.icon) {
                     Some(b) => p.stamp(&b, ir.x, ir.y, self.scale),
                     // Still loading: a faint tile where it'll be.
                     None => p.fill_round(ir.inset(m.icon * 0.06, m.icon * 0.06), m.icon * 0.2, Color::gray(255, 0.1)),
@@ -454,7 +567,7 @@ impl Ink<'_> {
                 self.names.get(target).cloned().unwrap_or_default()
             }
             Slot::Folder { name, apps } => {
-                draw_folder(p, icons, loader, apps, ir, self.scale);
+                self.folder(p, icons, loader, apps, ir);
                 name.clone()
             }
         };
@@ -492,23 +605,6 @@ impl Ink<'_> {
     }
 }
 
-/// A folder: a frosted tile with its first nine apps in a 3 × 3 grid.
-fn draw_folder(p: &Painter, icons: &mut HashMap<(String, u32), Option<ID2D1Bitmap>>, loader: &mut IconLoader, apps: &[String], r: Rect, scale: f32) {
-    let r = r.inset(r.w * 0.04, r.w * 0.04);
-    p.fill_round(r, r.w * 0.24, Color::gray(255, 0.22));
-    p.stroke_round(r.inset(0.25, 0.25), r.w * 0.24, Color::gray(255, 0.28), 0.5);
-    let pad = r.w * 0.13;
-    let gap = r.w * 0.055;
-    let mini = (r.w - 2.0 * pad - 2.0 * gap) / 3.0;
-    for (i, t) in apps.iter().take(9).enumerate() {
-        let (c, row) = (i % 3, i / 3);
-        let mr = Rect::new(r.x + pad + c as f32 * (mini + gap), r.y + pad + row as f32 * (mini + gap), mini, mini);
-        if let Some(b) = icon(p, loader, icons, t, mini, scale) {
-            p.stamp(&b, mr.x, mr.y, scale);
-        }
-    }
-}
-
 impl Launchpad {
     pub fn new(gfx: &Gfx, monitor: &Monitor, index: &Index) -> Result<Self> {
         let gpu = comp::gpu(gfx)?;
@@ -534,7 +630,10 @@ impl Launchpad {
         let search_layer = Layer::new(&gpu, 320.0, 44.0, s)?;
         let tool_layer = Layer::new(&gpu, 640.0, 48.0, s)?;
         tool_layer.set_opacity(0.0);
-        let dots_layer = Layer::new(&gpu, w, 24.0, s)?;
+        let dot = Layer::new(&gpu, DOT, DOT, s)?;
+        let tile = Layer::new(&gpu, m.icon * TILE, m.icon * TILE, s)?;
+        tile.set_opacity(0.0);
+        let dots_visual = gpu.compositor.CreateContainerVisual()?;
         let hl = m.icon + 30.0;
         let sel_layer = Layer::new(&gpu, hl, hl, s)?;
         sel_layer.set_opacity(0.0);
@@ -548,11 +647,13 @@ impl Launchpad {
         kids.InsertAtTop(&dim)?;
         let c = content.Children()?;
         c.InsertAtTop(&pages_visual)?;
+        // Behind every page's icons.
+        pages_visual.Children()?.InsertAtBottom(&tile.visual)?;
         c.InsertAtTop(&results_layer.visual)?;
         c.InsertAtTop(&sel_layer.visual)?;
         c.InsertAtTop(&search_layer.visual)?;
         c.InsertAtTop(&tool_layer.visual)?;
-        c.InsertAtTop(&dots_layer.visual)?;
+        c.InsertAtTop(&dots_visual)?;
         root.SetOpacity(0.0)?;
         LAUNCHPAD_HWND.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
 
@@ -572,8 +673,11 @@ impl Launchpad {
             pages_visual,
             bg,
             page_layers: HashMap::new(),
+            tile,
             search_layer,
-            dots_layer,
+            dot,
+            dots_visual,
+            dot_sprites: Vec::new(),
             results_layer,
             sel_layer,
             dim,
@@ -614,14 +718,21 @@ impl Launchpad {
             tool_layer,
             edit_fade: Spring::new(0.0, 0.22, 1.0),
             chrome_dirty: true,
+            search_dirty: true,
             results_dirty: true,
+            results_waiting: false,
+            folder_waiting: false,
             folder_dirty: false,
             changed,
             dirty: true,
             tracking: false,
             shown: false,
+            stats: Stats { opened: Instant::now(), frames: 0, renders: 0, icons: 0, others: 0, render_us: 0, max_us: 0 },
         };
         lp.draw_bg(gfx, rect);
+        lp.dot.draw(gfx, |p| p.fill_circle(DOT / 2.0, DOT / 2.0, DOT / 2.0, Color::WHITE));
+        let ts = m.icon * TILE;
+        lp.tile.draw(gfx, |p| p.fill_round(Rect::new(0.0, 0.0, ts, ts), ts * 0.24, Color::gray(255, 0.3)));
         lp.sel_layer.draw(gfx, |p| p.fill_round(Rect::new(0.0, 0.0, hl, hl), 22.0, Color::gray(255, 0.17)));
         lp.appear.set(1.0);
         lp.apply();
@@ -679,6 +790,17 @@ impl Launchpad {
             return false;
         }
         self.commit_folder_name();
+        let st = &self.stats;
+        log!(
+            "launchpad: open {:.1}s, {} frames, {} renders ({} icons, {} other layers), render {:.1} ms total, {:.2} ms max",
+            st.opened.elapsed().as_secs_f32(),
+            st.frames,
+            st.renders,
+            st.icons,
+            st.others,
+            st.render_us as f32 / 1000.0,
+            st.max_us as f32 / 1000.0
+        );
         self.closing = true;
         self.appear.set(0.0);
         if self.changed {
@@ -716,18 +838,16 @@ impl Launchpad {
         let on = (self.blink.elapsed().as_millis() / 530) % 2 == 0;
         if on != self.caret_on {
             self.caret_on = on;
-            self.chrome_dirty = true;
+            self.search_dirty = true;
             self.dirty = true;
         }
         true
     }
 
     pub fn tick(&mut self, dt: f32) -> bool {
+        self.stats.frames += 1;
         let mut moving = self.appear.step(dt);
-        if self.offset.step(dt) {
-            moving = true;
-            self.chrome_dirty = true;
-        }
+        moving |= self.offset.step(dt);
         moving |= self.results_fade.step(dt);
         moving |= self.edit_fade.step(dt);
         // The folder-to-be's tile grows in (and away) rather than popping.
@@ -761,7 +881,7 @@ impl Launchpad {
         // The search field's magnifier slides aside as you type.
         if self.search_slide.step(dt) {
             moving = true;
-            self.chrome_dirty = true;
+            self.search_dirty = true;
         }
         moving |= self.sel.0.step(dt) | self.sel.1.step(dt) | self.sel.2.step(dt);
         if self.motion.tick(dt) {
@@ -796,9 +916,7 @@ impl Launchpad {
                     self.live += 1;
                 }
             }
-            if self.drag.as_ref().is_some_and(|d| d.over.is_some()) {
-                self.live += 1;
-            }
+            // (Resting on an icon redraws only as its folder tile grows: see `merge_grow`.)
             moving = true;
         }
         self.apply();
@@ -846,7 +964,12 @@ impl Launchpad {
         // Results settle in from a touch smaller; the pages draw back as they go.
         self.results_layer.set_scale(lerp(0.96, 1.0, r), self.w / 2.0, self.m.grid_h() / 2.0);
         let _ = self.pages_visual.SetScale(Vector3 { X: 1.0, Y: 1.0, Z: 1.0 });
-        self.dots_layer.set_opacity(1.0 - r);
+        let _ = self.dots_visual.SetOpacity(1.0 - r);
+        // A dot brightens as its page slides in.
+        for (i, d) in self.dot_sprites.iter().enumerate() {
+            let near = (1.0 - (self.offset.value - i as f32).abs()).clamp(0.0, 1.0);
+            let _ = d.SetOpacity(0.3 + 0.65 * near);
+        }
         // Edit mode: the toolbar fades in where the search field was.
         let e = self.edit_fade.value.clamp(0.0, 1.0);
         self.search_layer.set_opacity(1.0 - e);
@@ -893,7 +1016,7 @@ impl Launchpad {
         let q = self.query().trim().to_lowercase();
         self.results.clear();
         self.results_dirty = true;
-        self.chrome_dirty = true;
+        self.search_dirty = true;
         self.dirty = true;
         self.results_fade.set(if q.is_empty() { 0.0 } else { 1.0 });
         self.search_slide.set(if self.search.is_empty() { 0.0 } else { 1.0 });
@@ -943,7 +1066,6 @@ impl Launchpad {
         }
         self.page = page;
         self.offset.set(page as f32);
-        self.chrome_dirty = true;
         self.dirty = true;
     }
 
@@ -959,7 +1081,7 @@ impl Launchpad {
 
     fn dot_rects(&self) -> Vec<Rect> {
         let n = self.state.pages.len() + self.drag.is_some() as usize;
-        let (d, gap) = (8.0, 10.0);
+        let (d, gap) = (DOT, 10.0);
         let total = n as f32 * d + (n.saturating_sub(1)) as f32 * gap;
         let x0 = (self.w - total) / 2.0;
         (0..n).map(|i| Rect::new(x0 + i as f32 * (d + gap), self.dots_y(), d, d)).collect()
@@ -1223,7 +1345,6 @@ impl Launchpad {
                 o = max + (o - max) * 0.3;
             }
             self.offset.snap(o);
-            self.chrome_dirty = true;
             self.dirty = true;
             self.apply();
             return;
@@ -1280,7 +1401,7 @@ impl Launchpad {
         let _ = self.root.Children().map(|c| c.InsertAtTop(&layer.visual));
         let mut lift = Spring::new(1.0, 0.22, 0.7);
         lift.set(1.12);
-        self.drag = Some(Drag { slot, x, y, gx, gy, over: None, at: i, edge: None, dot: None, lift, layer, origin, over_dock: false });
+        self.drag = Some(Drag { slot, x, y, gx, gy, over: None, at: i, edge: None, dot: None, lift, layer, origin, over_dock: false, drawn: false });
         self.press = None;
         self.select(None);
         self.changed = true;
@@ -1639,7 +1760,8 @@ impl Launchpad {
         } else {
             self.picked.extend(targets.iter().cloned());
         }
-        self.gen += 1;
+        // Only this page (or its open folder) shows what was picked.
+        self.live += 1;
         self.folder_dirty = true;
         self.chrome_dirty = true;
         self.dirty = true;
@@ -1769,18 +1891,44 @@ impl Launchpad {
         self.dirty = true;
     }
 
+    /// Icons finished loading: only layers still showing a placeholder redraw
+    /// (icons for Finder and Spotlight arrive here too).
     pub fn icons_arrived(&mut self) {
-        self.gen += 1;
-        self.results_dirty = true;
-        self.folder_dirty = true;
-        self.dirty = true;
+        let mut any = false;
+        for pv in self.page_layers.values_mut() {
+            for sv in pv.slots.values_mut().filter(|sv| sv.waiting) {
+                sv.key = 0;
+                pv.shows = (u64::MAX, u64::MAX);
+                any = true;
+            }
+        }
+        if self.results_waiting {
+            self.results_dirty = true;
+            any = true;
+        }
+        if self.folder_waiting {
+            self.folder_dirty = true;
+            any = true;
+        }
+        any |= self.drag.as_ref().is_some_and(|d| !d.drawn);
+        self.dirty |= any;
     }
 
     // --- Drawing -----------------------------------------------------------
 
     /// Redraws the layers whose content changed. Movement needs no drawing (see `apply`).
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme, loader: &mut IconLoader) {
+        let t0 = Instant::now();
+        self.render_layers(gfx, theme, loader);
+        let us = t0.elapsed().as_micros() as u64;
+        self.stats.renders += 1;
+        self.stats.render_us += us;
+        self.stats.max_us = self.stats.max_us.max(us);
+    }
+
+    fn render_layers(&mut self, gfx: &Gfx, theme: &Theme, loader: &mut IconLoader) {
         self.dirty = false;
+        self.place_dots();
         let (m, s, w) = (self.m, self.scale, self.w);
         let ink = Ink {
             m,
@@ -1789,41 +1937,45 @@ impl Launchpad {
             names: &self.names,
             picked: self.editing.then_some(&self.picked),
             accent: theme.accent,
+            waiting: std::cell::Cell::new(false),
         };
         let pressed = self.press.as_ref().and_then(|p| p.hit);
         let merging = self.merging();
         let drag_over = self.drag.as_ref().and_then(|d| d.over.map(|o| o.0));
         let drag_at = self.drag.as_ref().map(|d| d.at);
 
-        // Pages next to the one in view: each drawn once, the current one again
-        // while a drag rearranges it (icons slide aside on springs).
+        // Pages next to the one in view. Each icon (with its label) is a sprite
+        // drawn once: sliding aside for a drag, landing and popping are the
+        // compositor moving and scaling it, and a press redraws just that icon.
         let last = self.state.pages.len().saturating_sub(1) + self.drag.is_some() as usize;
-        // Only the pages either side of this one are kept: a page is a
-        // screen-wide GPU surface (more than 10 MB on a big display).
+        // Only the pages either side of this one are kept (each holds a
+        // screen's worth of GPU surfaces).
         let (lo, hi) = (self.page.saturating_sub(1), (self.page + 1).min(last));
         let far: Vec<usize> = self.page_layers.keys().copied().filter(|&p| p < lo || p > hi).collect();
         for p in far {
-            if let Some((layer, _)) = self.page_layers.remove(&p) {
-                let _ = self.pages_visual.Children().map(|c| c.Remove(&layer.visual));
+            if let Some(pv) = self.page_layers.remove(&p) {
+                let _ = self.pages_visual.Children().map(|c| c.Remove(&pv.visual));
             }
         }
+        let mut tile: Option<(f32, f32)> = None;
+        let mut tile_seen = false;
         for pi in lo..=hi {
             let current = pi == self.page;
             let want = (self.gen, if current { self.live } else { 0 });
-            if self.page_layers.get(&pi).is_some_and(|(_, g)| *g == want) {
+            if self.page_layers.get(&pi).is_some_and(|pv| pv.shows == want) {
                 continue;
             }
             if !self.page_layers.contains_key(&pi) {
-                let Ok(layer) = Layer::new(&self.gpu, w, m.grid_h(), s) else { continue };
-                layer.set_offset(pi as f32 * w, 0.0);
-                let _ = self.pages_visual.Children().map(|c| c.InsertAtTop(&layer.visual));
-                self.page_layers.insert(pi, (layer, (0, 0)));
+                let Ok(visual) = self.gpu.compositor.CreateContainerVisual() else { continue };
+                let _ = visual.SetOffset(Vector3 { X: (pi as f32 * w * s).round(), Y: 0.0, Z: 0.0 });
+                let _ = self.pages_visual.Children().map(|c| c.InsertAtTop(&visual));
+                self.page_layers.insert(pi, PageVis { visual, slots: HashMap::new(), shows: (0, 0) });
             }
             let slots: Vec<Slot> = self.state.pages.get(pi).cloned().unwrap_or_default();
-            // Springs are only forgotten when the page they move is redrawn:
+            // Springs are only forgotten when the page they move is laid out:
             // other redraws (the search field, the dots) don't touch them, and
             // forgetting them there made icons snap instead of sliding.
-            if pi == self.page {
+            if current {
                 self.motion.sweep();
             }
             let cells: Vec<Rect> = slots
@@ -1854,79 +2006,112 @@ impl Launchpad {
                 .collect();
             if current {
                 self.landing = None;
+                tile_seen = true;
             }
             let grow = self.merge_grow.value.clamp(0.0, 1.2);
             let pop = self.pop.as_ref().map(|(id, s)| (*id, s.value));
             let icons = &mut self.icons;
-            let (layer, g) = self.page_layers.get_mut(&pi).unwrap();
-            *g = want;
+            let pv = self.page_layers.get_mut(&pi).unwrap();
+            pv.shows = want;
             // A full page with a gap opened: its last icon moves on to the next page.
             let shown = |i: usize| !(current && drag_at.is_some_and(|at| i >= at && i + 1 >= PER_PAGE));
-            layer.draw(gfx, |p| {
-                for (i, (slot, cell)) in slots.iter().zip(&cells).enumerate() {
-                    if !shown(i) {
-                        continue;
-                    }
-                    // The folder-to-be: a tile behind the icon being rested on.
-                    if current && (merging == Some(i) || (merging.is_none() && grow > 0.01 && drag_over == Some(i))) {
-                        let g = m.icon * lerp(-0.1, 0.1, grow);
-                        let ir = m.icon_of(*cell).inset(-g, -g);
-                        p.fill_round(ir, ir.w * 0.24, Color::gray(255, 0.3 * grow.min(1.0)));
-                    }
-                    let down = current && pressed == Some(Hit::Slot(i));
-                    match pop.filter(|(id, _)| current && *id == slot.id()) {
-                        Some((_, k)) => {
-                            let ir = m.icon_of(*cell);
-                            p.scaled_about(ir.cx(), ir.cy(), k, || ink.slot(p, icons, loader, slot, *cell, true, down));
-                        }
-                        None => ink.slot(p, icons, loader, slot, *cell, true, down),
-                    }
+            let mut ids = Vec::with_capacity(slots.len());
+            for (i, (slot, cell)) in slots.iter().zip(&cells).enumerate() {
+                let id = slot.id();
+                ids.push(id);
+                // The folder-to-be: a tile behind the icon being rested on.
+                if current && (merging == Some(i) || (merging.is_none() && grow > 0.01 && drag_over == Some(i))) {
+                    let ir = m.icon_of(*cell);
+                    tile = Some((ir.cx(), ir.cy()));
                 }
+                let down = current && pressed == Some(Hit::Slot(i));
+                let key = slot_key(slot, down, ink.picked);
+                let sv = match pv.slots.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let Ok(layer) = Layer::new(&self.gpu, m.pitch_x + 2.0 * PAD, m.pitch_y + 2.0 * PAD, s) else { continue };
+                        let _ = pv.visual.Children().map(|c| c.InsertAtTop(&layer.visual));
+                        e.insert(SlotVis { layer, key: 0, waiting: false, at: None })
+                    }
+                };
+                if sv.key != key {
+                    sv.key = key;
+                    self.stats.icons += 1;
+                    let local = Rect::new(PAD, PAD, m.pitch_x, m.pitch_y);
+                    sv.waiting = ink.waits(|| sv.layer.draw(gfx, |p| ink.slot(p, icons, loader, slot, local, true, down)));
+                }
+                let k = pop.filter(|(pid, _)| current && *pid == id).map_or(1.0, |(_, k)| k);
+                let place = (cell.x, cell.y, k, shown(i));
+                if sv.at != Some(place) {
+                    sv.at = Some(place);
+                    sv.layer.set_offset(cell.x - PAD, cell.y - PAD);
+                    // Pops about the icon's middle.
+                    sv.layer.set_scale(k, PAD + m.pitch_x / 2.0, PAD + m.icon / 2.0);
+                    let _ = sv.layer.visual.SetIsVisible(place.3);
+                }
+            }
+            // Gone from this page (moved, dragged away, hidden).
+            let kids = pv.visual.Children();
+            pv.slots.retain(|id, sv| {
+                let keep = ids.contains(id);
+                if !keep {
+                    let _ = kids.as_ref().map(|c| c.Remove(&sv.layer.visual));
+                }
+                keep
             });
+        }
+        // The folder tile grows in and out by scale and opacity alone.
+        if tile_seen {
+            match tile {
+                Some((cx, cy)) => {
+                    let grow = self.merge_grow.value.clamp(0.0, 1.2);
+                    let size = m.icon * TILE;
+                    self.tile.set_offset(self.page as f32 * w + cx - size / 2.0, cy - size / 2.0);
+                    self.tile.set_scale(lerp(0.8, 1.2, grow) / TILE, size / 2.0, size / 2.0);
+                    self.tile.set_opacity(grow.min(1.0));
+                }
+                None => self.tile.set_opacity(0.0),
+            }
         }
 
         if self.results_dirty {
             self.results_dirty = false;
+            self.stats.others += 1;
             let results = self.results.clone();
             let icons = &mut self.icons;
-            self.results_layer.draw(gfx, |p| {
-                for (i, t) in results.iter().enumerate() {
-                    let down = pressed == Some(Hit::Result(i));
-                    ink.slot(p, icons, loader, &Slot::App { target: t.clone() }, m.cell(i), true, down);
-                }
+            self.results_waiting = ink.waits(|| {
+                self.results_layer.draw(gfx, |p| {
+                    for (i, t) in results.iter().enumerate() {
+                        let down = pressed == Some(Hit::Result(i));
+                        ink.slot(p, icons, loader, &Slot::App { target: t.clone() }, m.cell(i), true, down);
+                    }
+                })
             });
         }
 
         if self.chrome_dirty {
             self.chrome_dirty = false;
+            self.stats.others += 3;
             self.draw_search(gfx, theme);
             self.draw_tools(gfx, theme);
-            let dots = self.dot_rects();
-            let (offset, show) = (self.offset.value, dots.len() > 1);
-            let y0 = self.dots_y() - 8.0;
-            self.dots_layer.set_offset(0.0, y0);
-            self.dots_layer.draw(gfx, |p| {
-                if !show {
-                    return;
-                }
-                for (i, d) in dots.iter().enumerate() {
-                    // A dot brightens as its page slides in.
-                    let near = (1.0 - (offset - i as f32).abs()).clamp(0.0, 1.0);
-                    p.fill_circle(d.cx(), d.cy() - y0, d.w / 2.0, Color::gray(255, 0.3 + 0.65 * near));
-                }
-            });
+        } else if self.search_dirty {
+            self.stats.others += 1;
+            self.draw_search(gfx, theme);
         }
+        self.search_dirty = false;
 
         // The open folder's sheet.
         let sheet = self.folder_sheet();
         let folder = self.folder.as_ref().map(|f| (f.page, f.index, f.editing.as_ref().map(|e| e.iter().collect::<String>())));
         if let (true, Some((sr, cols, gx, gy)), Some((fp, fi, editing))) = (self.folder_dirty, sheet, folder) {
             self.folder_dirty = false;
+            self.stats.others += 1;
             if let Some(Slot::Folder { name, apps }) = self.state.pages.get(fp).and_then(|p| p.get(fi)).cloned() {
                 let title_font = gfx.format(&theme.font, 30.0, Weight::Regular, Align::Center);
                 let icons = &mut self.icons;
                 if let Some(f) = self.folder.as_mut() {
                     f.layer.resize(sr.w, sr.h);
+                    ink.waiting.set(false);
                     f.layer.draw(gfx, |p| {
                         let r = Rect::new(0.0, 0.0, sr.w, sr.h);
                         p.fill_round(r, 36.0, Color::rgba(72, 76, 88, 0.64));
@@ -1949,18 +2134,23 @@ impl Launchpad {
                             ink.slot(p, icons, loader, &Slot::App { target: t.clone() }, cell, true, down);
                         }
                     });
+                    self.folder_waiting = ink.waiting.get();
                 }
             }
         }
 
         // The dragged icon, lifted under the pointer (one icon: cheap to redraw).
-        if let Some(slot) = self.drag.as_ref().map(|d| d.slot.clone()) {
+        if let Some(slot) = self.drag.as_ref().filter(|d| !d.drawn).map(|d| d.slot.clone()) {
+            self.stats.others += 1;
             let icons = &mut self.icons;
-            if let Some(d) = self.drag.as_ref() {
-                d.layer.draw(gfx, |p| {
-                    let cell = Rect::new(m.icon / 2.0 - m.pitch_x / 2.0, 0.0, m.pitch_x, m.pitch_y);
-                    ink.slot(p, icons, loader, &slot, cell, false, false);
+            if let Some(d) = self.drag.as_mut() {
+                let waiting = ink.waits(|| {
+                    d.layer.draw(gfx, |p| {
+                        let cell = Rect::new(m.icon / 2.0 - m.pitch_x / 2.0, 0.0, m.pitch_x, m.pitch_y);
+                        ink.slot(p, icons, loader, &slot, cell, false, false);
+                    })
                 });
+                d.drawn = !waiting;
             }
         }
 
@@ -1971,6 +2161,32 @@ impl Launchpad {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
         }
+    }
+
+    /// A sprite per page dot (none for a single page), when their number changes.
+    fn place_dots(&mut self) {
+        let dots = self.dot_rects();
+        let n = if dots.len() > 1 { dots.len() } else { 0 };
+        if n == self.dot_sprites.len() {
+            return;
+        }
+        let Ok(kids) = self.dots_visual.Children() else { return };
+        let _ = kids.RemoveAll();
+        self.dot_sprites.clear();
+        let brush = self.dot.visual.Brush();
+        let s = self.scale;
+        for d in dots.iter().take(n) {
+            let Ok(sprite) = self.gpu.compositor.CreateSpriteVisual() else { return };
+            if let Ok(b) = &brush {
+                let _ = sprite.SetBrush(b);
+            }
+            let _ = sprite.SetSize(Vector2 { X: (DOT * s).ceil(), Y: (DOT * s).ceil() });
+            let _ = sprite.SetOffset(Vector3 { X: (d.x * s).round(), Y: (d.y * s).round(), Z: 0.0 });
+            let _ = kids.InsertAtTop(&sprite);
+            self.dot_sprites.push(sprite);
+        }
+        // Their opacities are set with everything else that moves.
+        self.applied.set(None);
     }
 
     fn draw_tools(&self, gfx: &Gfx, theme: &Theme) {

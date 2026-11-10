@@ -20,6 +20,9 @@ pub struct Config {
     pub desktops: DesktopsCfg,
     pub widgets: WidgetsCfg,
     pub windows: WindowsCfg,
+    /// Which controls Control Center shows, by name (see `controlcenter::MODULES`).
+    #[serde(default)]
+    pub control_center: BTreeMap<String, bool>,
     #[serde(default)]
     pub app_names: BTreeMap<String, String>,
     /// Custom Dock icons by exe file name, for apps that aren't pinned.

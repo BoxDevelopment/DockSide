@@ -7,7 +7,7 @@
 //! zooming, folders opening and the selection gliding are the compositor
 //! moving, scaling and fading those layers, so they stay smooth at full screen.
 
-mod comp;
+pub(crate) mod comp;
 pub mod categories;
 pub mod layout;
 

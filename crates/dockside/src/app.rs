@@ -1022,6 +1022,8 @@ pub struct App {
     spotlight: Option<Spotlight>,
     /// The Control Center panel under the menu bar.
     control: Option<ControlCenter>,
+    /// A closed Control Center, fading away.
+    closing_control: Option<ControlCenter>,
     /// Sequoia's full-screen Launchpad, and ones zooming away.
     launchpad: Option<Launchpad>,
     closing_launchpads: Vec<Launchpad>,
@@ -1175,6 +1177,7 @@ impl App {
             finder_changed: Vec::new(),
             spotlight: None,
             control: None,
+            closing_control: None,
             launchpad: None,
             closing_launchpads: Vec::new(),
             launchpad_modal: false,
@@ -1808,6 +1811,18 @@ impl App {
         if let Some(c) = &mut self.control {
             still |= c.tick(dt);
         }
+        if let Some(c) = &mut self.closing_control {
+            c.tick(dt);
+            if c.closed() {
+                self.closing_control = None;
+                // Its GPU device goes too, unless Launchpad still uses it.
+                if self.control.is_none() && self.launchpad.is_none() && self.closing_launchpads.is_empty() {
+                    crate::launchpad::release();
+                }
+            } else {
+                still = true;
+            }
+        }
         if let Some(l) = &mut self.launchpad {
             still |= l.tick(dt);
         }
@@ -1950,11 +1965,13 @@ impl App {
             self.menu.as_ref().map(|m| &m.surface),
             self.submenu.as_ref().map(|(_, s)| &s.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
-            self.control.as_ref().map(|c| &c.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
         ];
         for s in bars.chain(surfaces.into_iter().flatten()) {
             s.raise();
+        }
+        if let Some(c) = &self.control {
+            c.raise();
         }
     }
 
@@ -2178,6 +2195,7 @@ impl App {
             || self.submenu.as_ref().is_some_and(|(_, s)| s.animating())
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
             || self.control.as_ref().is_some_and(|c| c.animating())
+            || self.closing_control.is_some()
             || self.launchpad.as_ref().is_some_and(|l| l.animating())
             || !self.closing_launchpads.is_empty()
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
@@ -2983,7 +3001,7 @@ impl App {
         match ControlCenter::new(&self.gfx, &self.theme, &self.cfg, &monitor, anchor, page, self.msg_hwnd.0 as isize) {
             Ok(mut c) => {
                 c.render(&self.gfx, &self.theme);
-                CONTROL_HWND.store(c.surface.content.0 as isize, Ordering::Relaxed);
+                CONTROL_HWND.store(c.hwnd.0 as isize, Ordering::Relaxed);
                 self.control = Some(c);
                 self.menu_opener = bar;
                 if let Some(mb) = self.menubars.iter_mut().find(|m| m.surface.content == bar) {
@@ -2998,9 +3016,9 @@ impl App {
 
     fn close_control(&mut self) {
         CONTROL_HWND.store(0, Ordering::Relaxed);
-        let Some(c) = self.control.take() else { return };
-        c.surface.set_click_through();
-        self.fading.push(Box::new(c));
+        let Some(mut c) = self.control.take() else { return };
+        c.close();
+        self.closing_control = Some(c);
         self.animate();
         self.remove_hooks();
         self.reset_menu_openers();
@@ -3025,14 +3043,14 @@ impl App {
 
     fn on_control_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let c = self.control.as_mut()?;
-        let (x, y) = mouse_pt(lp, c.surface.scale);
+        let (x, y) = mouse_pt(lp, c.scale);
         let e = match msg {
             WM_MOUSEMOVE => {
                 if !c.tracking {
                     c.tracking = true;
                     track_leave(hwnd);
                 }
-                c.on_move(x, y);
+                c.on_move(&self.gfx, x, y);
                 ControlEvent::None
             }
             WM_MOUSELEAVE => {
@@ -3660,7 +3678,7 @@ impl App {
             return r;
         }
 
-        let result = if self.control.as_ref().is_some_and(|c| c.surface.content == hwnd) {
+        let result = if self.control.as_ref().is_some_and(|c| c.hwnd == hwnd) {
             self.on_control_mouse(hwnd, msg, wp, lp)
         } else if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
             self.on_menu_mouse(hwnd, msg, lp, false)

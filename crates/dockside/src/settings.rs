@@ -51,6 +51,7 @@ pub enum Page {
     General,
     Appearance,
     MenuBar,
+    ControlCenter,
     Dock,
     Launchpad,
     Windows,
@@ -60,10 +61,11 @@ pub enum Page {
     Widgets,
 }
 
-const PAGES: [(Page, &str); 10] = [
+const PAGES: [(Page, &str); 11] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
+    (Page::ControlCenter, "Control Center"),
     (Page::Island, "Dynamic Island"),
     (Page::Dock, "Dock"),
     (Page::Launchpad, "Launchpad"),
@@ -230,6 +232,8 @@ pub(crate) enum Key {
     MbDisplays,
     /// An on/off setting in `[island]`, by name.
     Island(&'static str),
+    /// Whether Control Center shows a control (`[control_center]`), by name.
+    Control(&'static str),
     IslandIcs,
     IslandStyle,
     IslandFinish,
@@ -310,6 +314,7 @@ impl Key {
             Key::DockDisplays => ("dock", "displays"),
             Key::DockPerDisplay => ("dock", "per_display_apps"),
             Key::Island(name) => ("island", name),
+            Key::Control(name) => ("control_center", name),
             Key::IslandIcs => ("island", "calendar_ics"),
             Key::IslandStyle => ("island", "style"),
             Key::IslandFinish => ("island", "finish"),
@@ -1038,6 +1043,21 @@ impl SettingsWindow {
                     ],
                 },
             ],
+            Page::ControlCenter => {
+                use crate::controlcenter::{Section, MODULES};
+                let rows = |sec: Section| MODULES.iter().filter(|m| m.section == sec).map(|m| Row::Toggle(m.label, Key::Control(m.key))).collect();
+                vec![
+                    Group { title: Some("Modules"), rows: rows(Section::Modules) },
+                    Group { title: Some("Controls"), rows: rows(Section::Controls) },
+                    Group { title: Some("Windows Controls"), rows: rows(Section::Windows) },
+                    Group {
+                        title: None,
+                        rows: vec![Row::Note(
+                            "Controls fill Control Center's grid in this order, like macOS. Right-click Wi-Fi, Bluetooth, Focus, Display or Sound for more.",
+                        )],
+                    },
+                ]
+            }
             Page::Island => vec![
                 Group {
                     title: None,
@@ -1379,6 +1399,7 @@ impl SettingsWindow {
             Key::MbControlCenter => m.show_control_center,
             Key::MbTray => m.show_tray,
             Key::Island(name) => island_flag(&cfg.island, name),
+            Key::Control(name) => crate::controlcenter::shows(cfg, name),
             Key::DockEnabled => d.enabled,
             Key::DockPerDisplay => d.per_display_apps,
             Key::DockMag => d.magnification,
@@ -2394,6 +2415,18 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             let screen = r.inset(4.0, 5.0);
             p.stroke_round(screen, 1.5, white, 1.2);
             p.fill_rect(Rect::new(screen.x, screen.y, screen.w, 2.5), white);
+        }
+        Page::ControlCenter => {
+            // Two switches, like macOS's Control Center icon.
+            p.fill_round(r, 5.0, Color::rgba(142, 142, 147, 1.0));
+            let (w, h) = (r.w * 0.6, r.h * 0.2);
+            let x = r.cx() - w / 2.0;
+            for (i, y) in [r.y + r.h * 0.28, r.y + r.h * 0.52].into_iter().enumerate() {
+                let pill = Rect::new(x, y, w, h);
+                p.stroke_round(pill, h / 2.0, white, 1.2);
+                let kx = if i == 0 { pill.x + h / 2.0 } else { pill.right() - h / 2.0 };
+                p.fill_circle(kx, pill.cy(), h / 2.0 - 0.6, white);
+            }
         }
         Page::Island => {
             p.fill_round(r, 5.0, Color::rgba(28, 28, 30, 1.0));

@@ -88,6 +88,17 @@ pub struct Status {
     pub scan_failed: bool,
     pub devices: Option<Vec<Device>>,
     pub outputs: Option<Vec<Output>>,
+    /// The default output's (level 0-1, muted).
+    pub volume: Option<(f32, bool)>,
+}
+
+/// What the regular refresh reads.
+#[derive(Clone, PartialEq)]
+struct Reading {
+    toggles: HashMap<Toggle, bool>,
+    ssid: Option<String>,
+    brightness: Option<u8>,
+    volume: Option<(f32, bool)>,
 }
 
 pub enum Req {
@@ -128,13 +139,19 @@ impl Worker {
     }
 }
 
-/// What the worker keeps between requests.
+/// What the worker keeps between requests (made once: several are
+/// cross-process COM servers that are slow to start).
 #[derive(Default)]
 struct Ctx {
     radios: Vec<Radio>,
     adapter: Option<WiFiAdapter>,
     networks: HashMap<String, WiFiAvailableNetwork>,
     wmi: Option<IWbemServices>,
+    radio_manager: Option<Raw>,
+    /// The tethering manager for the current internet connection, and when it was found.
+    tethering: Option<(std::time::Instant, Option<NetworkOperatorTetheringManager>)>,
+    /// The last reading sent to the UI.
+    last: Option<Reading>,
 }
 
 fn run(rx: Receiver<Req>, shared: Arc<Mutex<Status>>, hwnd: isize, msg: u32) {
@@ -149,21 +166,28 @@ fn run(rx: Receiver<Req>, shared: Arc<Mutex<Status>>, hwnd: isize, msg: u32) {
         }
         crate::win::post(hwnd, msg);
     };
-    let refresh = |ctx: &mut Ctx| {
-        let (toggles, ssid, brightness) = read_all(ctx);
+    // Only news reaches the UI: an unchanged reading posts nothing (and draws nothing).
+    let refresh = |ctx: &mut Ctx, gen: u64, force: bool| {
+        let r = read_all(ctx);
+        if ctx.last.as_ref() == Some(&r) && !force {
+            return;
+        }
         publish(&mut |s| {
-            s.toggles = toggles.clone();
-            s.ssid = ssid.clone();
-            s.brightness = brightness;
+            s.toggles = r.toggles.clone();
+            s.ssid = r.ssid.clone();
+            s.brightness = r.brightness;
+            s.volume = r.volume;
+            s.gen = s.gen.max(gen);
         });
+        ctx.last = Some(r);
     };
-    refresh(&mut ctx);
+    refresh(&mut ctx, 0, false);
     loop {
         // While open, states changed elsewhere (a hotkey, Settings) show up within a couple of seconds.
         let first = match rx.recv_timeout(Duration::from_secs(2)) {
             Ok(r) => r,
             Err(RecvTimeoutError::Timeout) => {
-                refresh(&mut ctx);
+                refresh(&mut ctx, 0, false);
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -220,20 +244,14 @@ fn run(rx: Receiver<Req>, shared: Arc<Mutex<Status>>, hwnd: isize, msg: u32) {
             }
         }
         if changed {
-            let (toggles, ssid, brightness) = read_all(&mut ctx);
-            publish(&mut |s| {
-                s.toggles = toggles.clone();
-                s.ssid = ssid.clone();
-                s.brightness = brightness;
-                s.gen = s.gen.max(gen);
-            });
+            refresh(&mut ctx, gen, true);
         } else if gen > 0 {
             publish(&mut |s| s.gen = s.gen.max(gen));
         }
     }
 }
 
-fn read_all(ctx: &mut Ctx) -> (HashMap<Toggle, bool>, Option<String>, Option<u8>) {
+fn read_all(ctx: &mut Ctx) -> Reading {
     let mut t = HashMap::new();
     for r in &ctx.radios {
         let kind = r.Kind().ok();
@@ -248,7 +266,7 @@ fn read_all(ctx: &mut Ctx) -> (HashMap<Toggle, bool>, Option<String>, Option<u8>
             _ => {}
         }
     }
-    if let Some(on) = airplane_mode() {
+    if let Some(on) = airplane_mode(ctx) {
         t.insert(Toggle::Airplane, on);
     }
     t.insert(Toggle::EnergySaver, crate::win::controls::low_power_mode());
@@ -258,7 +276,7 @@ fn read_all(ctx: &mut Ctx) -> (HashMap<Toggle, bool>, Option<String>, Option<u8>
     if let Some(on) = night_light() {
         t.insert(Toggle::NightLight, on);
     }
-    if let Some(on) = hotspot() {
+    if let Some(on) = hotspot(ctx) {
         t.insert(Toggle::Hotspot, on);
     }
     if let Some(on) = nearby_sharing() {
@@ -271,7 +289,8 @@ fn read_all(ctx: &mut Ctx) -> (HashMap<Toggle, bool>, Option<String>, Option<u8>
     t.insert(Toggle::LiveCaptions, running[2]);
     t.insert(Toggle::ColorFilters, reg_dword(HKEY_CURRENT_USER, w!("Software\\Microsoft\\ColorFiltering"), w!("Active")) == Some(1));
     t.insert(Toggle::StickyKeys, sticky_keys());
-    (t, wifi_ssid(), brightness(ctx))
+    let brightness = brightness(ctx);
+    Reading { toggles: t, ssid: wifi_ssid(), brightness, volume: crate::island::sources::volume() }
 }
 
 fn set(ctx: &mut Ctx, t: Toggle, on: bool) {
@@ -286,7 +305,7 @@ fn set(ctx: &mut Ctx, t: Toggle, on: bool) {
         }
         Toggle::Focus => set_do_not_disturb(on),
         Toggle::NightLight => set_night_light(on),
-        Toggle::Hotspot => set_hotspot(on),
+        Toggle::Hotspot => set_hotspot(ctx, on),
         Toggle::Nearby => set_nearby_sharing(on),
         // Applied on the UI thread (it rebuilds every surface).
         Toggle::Dark => true,
@@ -478,12 +497,19 @@ fn create(clsid: &GUID, iid: &GUID, ctx: CLSCTX) -> Option<Raw> {
     }
 }
 
-fn airplane_mode() -> Option<bool> {
-    let rm = create(&CLSID_RADIO_MANAGEMENT, &IID_RADIO_MANAGER, CLSCTX_LOCAL_SERVER)?;
+fn airplane_mode(ctx: &mut Ctx) -> Option<bool> {
+    if ctx.radio_manager.is_none() {
+        ctx.radio_manager = create(&CLSID_RADIO_MANAGEMENT, &IID_RADIO_MANAGER, CLSCTX_LOCAL_SERVER);
+    }
+    let rm = ctx.radio_manager.as_ref()?;
     unsafe {
         let get: unsafe extern "system" fn(*mut c_void, *mut i32, *mut i32, *mut i32) -> windows::core::HRESULT = method(rm.0, 5);
         let (mut enabled, mut b, mut c) = (0, 0, 0);
-        get(rm.0, &mut enabled, &mut b, &mut c).ok().ok()?;
+        if get(rm.0, &mut enabled, &mut b, &mut c).is_err() {
+            // The service restarted: connect again next time.
+            ctx.radio_manager = None;
+            return None;
+        }
         // "Radios enabled" is the opposite of Airplane Mode.
         Some(enabled == 0)
     }
@@ -577,13 +603,20 @@ fn set_night_light(on: bool) -> bool {
 // Mobile Hotspot, Nearby Sharing
 // ---------------------------------------------------------------------------
 
-fn tethering() -> Option<NetworkOperatorTetheringManager> {
-    let profile = NetworkInformation::GetInternetConnectionProfile().ok()?;
-    NetworkOperatorTetheringManager::CreateFromConnectionProfile(&profile).ok()
+/// The tethering manager, looked up again every half minute (the internet connection can change).
+fn tethering(ctx: &mut Ctx) -> Option<NetworkOperatorTetheringManager> {
+    let fresh = ctx.tethering.as_ref().is_some_and(|(at, _)| at.elapsed() < Duration::from_secs(30));
+    if !fresh {
+        let m = NetworkInformation::GetInternetConnectionProfile()
+            .ok()
+            .and_then(|p| NetworkOperatorTetheringManager::CreateFromConnectionProfile(&p).ok());
+        ctx.tethering = Some((std::time::Instant::now(), m));
+    }
+    ctx.tethering.as_ref().and_then(|(_, m)| m.clone())
 }
 
-fn hotspot() -> Option<bool> {
-    let state = tethering()?.TetheringOperationalState().ok()?;
+fn hotspot(ctx: &mut Ctx) -> Option<bool> {
+    let state = tethering(ctx)?.TetheringOperationalState().ok()?;
     match state {
         TetheringOperationalState::On | TetheringOperationalState::InTransition => Some(true),
         TetheringOperationalState::Off => Some(false),
@@ -591,8 +624,8 @@ fn hotspot() -> Option<bool> {
     }
 }
 
-fn set_hotspot(on: bool) -> bool {
-    let Some(m) = tethering() else { return false };
+fn set_hotspot(ctx: &mut Ctx, on: bool) -> bool {
+    let Some(m) = tethering(ctx) else { return false };
     let r = if on { m.StartTetheringAsync() } else { m.StopTetheringAsync() }.and_then(|op| op.get());
     match r.and_then(|r| r.Status()) {
         Ok(s) if s == windows::Networking::NetworkOperators::TetheringOperationStatus::Success => true,
@@ -910,8 +943,9 @@ mod tests {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
         let mut ctx = Ctx { radios: radios(), ..Default::default() };
-        let (toggles, ssid, brightness) = read_all(&mut ctx);
-        let mut t: Vec<_> = toggles.into_iter().collect();
+        let r = read_all(&mut ctx);
+        let (ssid, brightness) = (r.ssid, r.brightness);
+        let mut t: Vec<_> = r.toggles.into_iter().collect();
         t.sort_by_key(|(k, _)| format!("{k:?}"));
         println!("toggles: {t:?}\nssid: {ssid:?}\nbrightness: {brightness:?}");
         let q = create(&CLSID_QUIET_HOURS, &IID_QUIET_HOURS_SETTINGS, CLSCTX_LOCAL_SERVER).expect("quiet hours");

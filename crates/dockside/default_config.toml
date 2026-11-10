@@ -73,6 +73,30 @@ reserve_space = true
 # displays without the focused window, like macOS), "main" only on the main one.
 displays = "all"
 
+[control_center]
+# The controls Control Center shows (Settings > Control Center).
+wifi = true
+bluetooth = true
+nearby_sharing = true
+now_playing = true
+focus = true
+project = true
+cast = true
+display = true
+sound = true
+dark_mode = true
+calculator = true
+timer = true
+screenshot = true
+airplane_mode = true
+energy_saver = true
+night_light = true
+hotspot = true
+live_captions = true
+accessibility = true
+keyboard = false
+vpn = false
+
 [dock]
 enabled = true
 tile_size = 48

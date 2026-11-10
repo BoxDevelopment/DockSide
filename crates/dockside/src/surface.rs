@@ -378,6 +378,10 @@ impl Surface {
     }
 
     /// Hide for fullscreen apps; `false` brings the surface back.
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
     pub fn set_hidden(&mut self, hidden: bool) {
         if self.hidden == hidden {
             return;

@@ -197,6 +197,10 @@ struct Drag {
     dot: Option<(usize, Instant)>,
     lift: Spring,
     layer: Layer,
+    /// Where it was taken from (page, index); `None` out of a folder.
+    origin: Option<(usize, usize)>,
+    /// Over the Dock, which shows it in its gap instead (the page leaves its own gap be).
+    over_dock: bool,
 }
 
 struct Swipe {
@@ -818,7 +822,7 @@ impl Launchpad {
             self.folder.as_ref().map_or(-1.0, |f| f.open.value),
             d.map_or(-1.0, |d| d.x),
             d.map_or(-1.0, |d| d.y),
-            d.map_or(-1.0, |d| d.lift.value),
+            d.map_or(-1.0, |d| d.lift.value + 10.0 * d.over_dock as u8 as f32),
             self.page as f32,
             self.searching() as u8 as f32 + 2.0 * self.edit_fade.value,
         ];
@@ -869,6 +873,7 @@ impl Launchpad {
         if let Some(d) = &self.drag {
             d.layer.set_offset(d.x - d.gx, d.y - d.gy);
             d.layer.set_scale(d.lift.value, d.gx, d.gy);
+            d.layer.set_opacity(if d.over_dock { 0.0 } else { 1.0 });
         }
     }
 
@@ -1197,7 +1202,10 @@ impl Launchpad {
         if let Some(d) = &mut self.drag {
             d.x = x;
             d.y = y;
-            self.update_drag();
+            // Over the Dock, the page keeps its gap: nothing turns or merges.
+            if !d.over_dock {
+                self.update_drag();
+            }
             self.apply();
             return;
         }
@@ -1242,6 +1250,7 @@ impl Launchpad {
     }
 
     fn start_drag(&mut self, i: usize, from_folder: bool, px: f32, py: f32, x: f32, y: f32) {
+        let origin = (!from_folder).then_some((self.page, i));
         let slot = if from_folder {
             let Some(f) = &self.folder else { return };
             let (fp, fi) = (f.page, f.index);
@@ -1271,7 +1280,7 @@ impl Launchpad {
         let _ = self.root.Children().map(|c| c.InsertAtTop(&layer.visual));
         let mut lift = Spring::new(1.0, 0.22, 0.7);
         lift.set(1.12);
-        self.drag = Some(Drag { slot, x, y, gx, gy, over: None, at: i, edge: None, dot: None, lift, layer });
+        self.drag = Some(Drag { slot, x, y, gx, gy, over: None, at: i, edge: None, dot: None, lift, layer, origin, over_dock: false });
         self.press = None;
         self.select(None);
         self.changed = true;
@@ -1326,6 +1335,45 @@ impl Launchpad {
                 self.live += 1;
             }
         }
+        self.dirty = true;
+    }
+
+    /// The app being dragged, as (name, target); not a folder.
+    pub fn dragged_app(&self) -> Option<(String, String)> {
+        match &self.drag.as_ref()?.slot {
+            Slot::App { target } => Some((self.name(target), target.clone())),
+            Slot::Folder { .. } => None,
+        }
+    }
+
+    /// The dragged app is over the Dock (or has left it): the Dock draws it
+    /// there, so the lifted icon here hides.
+    pub fn set_over_dock(&mut self, over: bool) {
+        let Some(d) = &mut self.drag else { return };
+        if d.over_dock == over {
+            return;
+        }
+        d.over_dock = over;
+        if over {
+            (d.over, d.edge, d.dot) = (None, None, None);
+        }
+        self.dirty = true;
+        self.apply();
+    }
+
+    /// The dragged app was let go over the Dock, which keeps it: here it goes
+    /// back where it came from (a folder's app stays where the page's gap is).
+    pub fn drop_on_dock(&mut self) {
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        }
+        let Some(d) = self.drag.take() else { return };
+        let _ = self.root.Children().map(|c| c.Remove(&d.layer.visual));
+        let (page, at) = d.origin.unwrap_or((self.page.min(self.state.pages.len()), d.at));
+        self.state.insert(page, at, d.slot);
+        self.state.tidy();
+        self.go_page(self.page.min(self.state.pages.len() - 1));
+        self.gen += 1;
         self.dirty = true;
     }
 

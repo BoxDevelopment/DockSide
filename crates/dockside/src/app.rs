@@ -1056,8 +1056,9 @@ pub struct App {
     explorer_tray: Option<HWND>,
     /// Edge the taskbar was last seen on, to notice it being moved while we run.
     taskbar_edge: Option<u32>,
-    /// The display (its rect) whose shell surfaces are hidden for a fullscreen app.
-    fullscreen_on: Option<RECT>,
+    /// The display (its rect) whose shell surfaces are hidden for a fullscreen app,
+    /// and whether that's Launchpad (the Dock stays up over it, like macOS's).
+    fullscreen_on: Option<(RECT, bool)>,
     /// Sources of a retired island / widgets, for their replacements to take over.
     island_handover: Option<crate::island::Handover>,
     widgets_handover: Option<crate::widgets::Handover>,
@@ -1966,16 +1967,19 @@ impl App {
         self.update_active_bar(fg);
         // Only that display's surfaces hide: a game on one screen leaves the others alone.
         let mon = if fg.is_invalid() { self.monitor } else { Monitor::of_window(fg) };
-        let on = apps::is_fullscreen_app(fg, mon.rect).then_some(mon.rect);
-        if on == self.fullscreen_on {
+        // Launchpad fills the screen too: the menu bar and island make way for it, the Dock doesn't.
+        let launchpad = self.launchpad.iter().chain(&self.closing_launchpads).any(|l| l.hwnd == fg);
+        let full = apps::is_fullscreen_app(fg, mon.rect).then_some((mon.rect, launchpad));
+        if full == self.fullscreen_on {
             return;
         }
-        self.fullscreen_on = on;
+        self.fullscreen_on = full;
+        let on = full.map(|f| f.0);
         for mb in &mut self.menubars {
             mb.surface.set_hidden(on == Some(mb.monitor().rect));
         }
         for d in &mut self.docks {
-            d.surface.set_hidden(on == Some(d.monitor().rect));
+            d.surface.set_hidden(on == Some(d.monitor().rect) && !launchpad);
         }
         if let Some(i) = &mut self.island {
             i.set_fullscreen(on == Some(i.monitor().rect));
@@ -2278,13 +2282,62 @@ impl App {
     fn close_launchpad(&mut self) -> bool {
         let Some(mut l) = self.launchpad.take() else { return false };
         l.close();
+        for d in &mut self.docks {
+            d.cancel_pin_drag();
+        }
         self.closing_launchpads.push(l);
         self.animate();
         true
     }
 
+    /// Carries the app being dragged in Launchpad over to the Dock under the
+    /// pointer, which opens a gap for it; returns whether it's over a Dock.
+    fn launchpad_drag_to_dock(&mut self) -> bool {
+        let app = self.launchpad.as_ref().and_then(|l| l.dragged_app()).map(|(name, path)| DockApp {
+            name: Some(name),
+            path,
+            args: None,
+            icon: None,
+            match_exe: None,
+        });
+        let mut pt = POINT::default();
+        let have_pt = unsafe { GetCursorPos(&mut pt) }.is_ok();
+        let mut over = false;
+        for d in &mut self.docks {
+            let r = d.monitor().rect;
+            let here = have_pt && pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
+            match &app {
+                Some(app) if here && !over && !d.surface.is_hidden() => over = d.on_pin_drag((pt.x, pt.y), app),
+                _ => d.cancel_pin_drag(),
+            }
+        }
+        if let Some(l) = &mut self.launchpad {
+            l.set_over_dock(over);
+        }
+        over
+    }
+
     fn on_launchpad_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+        let dragging = self.launchpad.as_ref().is_some_and(|l| l.dragged_app().is_some());
+        match msg {
+            WM_MOUSEMOVE if dragging => {
+                self.launchpad_drag_to_dock();
+            }
+            // Let go over the Dock: pinned there at its slot, and back in its place here.
+            WM_LBUTTONUP if dragging && self.launchpad_drag_to_dock() => {
+                let pin = self.docks.iter_mut().find_map(|d| d.drop_pin());
+                if let Some(l) = &mut self.launchpad {
+                    l.drop_on_dock();
+                }
+                if let Some(a) = pin {
+                    push(a);
+                }
+                self.animate();
+                return Some(LRESULT(0));
+            }
+            _ => {}
+        }
         let l = self.launchpad.as_mut()?;
         let (x, y) = mouse_pt(lp, l.scale);
         let event = match msg {

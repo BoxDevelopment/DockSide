@@ -86,6 +86,14 @@ struct Drag {
     out: bool,
 }
 
+/// An app dragged in from Launchpad (whose window has the pointer): it drives
+/// the Dock's own drag, so the gap opens and the drop lands as for a reorder.
+#[derive(Clone, Copy, Debug)]
+struct Incoming {
+    /// Its item was added for the drag (the app wasn't in the Dock yet).
+    added: bool,
+}
+
 struct Item {
     kind: Kind,
     name: String,
@@ -409,6 +417,7 @@ pub struct Dock {
     pressed: Option<usize>,
     press_at: (f32, f32),
     drag: Option<Drag>,
+    incoming: Option<Incoming>,
     file_hover: Option<FileHover>,
     /// Eased icon centers (screen points) by launch target, used while slots are moving.
     eased: HashMap<String, f32>,
@@ -468,6 +477,7 @@ impl Dock {
             pressed: None,
             press_at: (0.0, 0.0),
             drag: None,
+            incoming: None,
             file_hover: None,
             eased: HashMap::new(),
             ease_left: 0.0,
@@ -492,6 +502,7 @@ impl Dock {
         self.snapshot_positions();
         self.cfg.apps = apps.to_vec();
         self.drag = None;
+        self.incoming = None;
         self.pressed = None;
         self.menu_item = None;
 
@@ -966,6 +977,82 @@ impl Dock {
             }
         };
         (drop, action)
+    }
+
+    /// Whether an app dragged in at (x, y) would land in the Dock: over the
+    /// shelf or just above it (as high as a Dock icon dragged out stays in),
+    /// and not far past its ends.
+    fn takes_pin(&self, x: f32, y: f32) -> bool {
+        let lay = self.slots().lay;
+        let (t, shelf_top) = (self.metrics.tile, self.shelf_bottom() - self.metrics.shelf_h);
+        x >= lay.left - t && x <= lay.right + t && y >= shelf_top - t * 1.1
+    }
+
+    /// An app dragged from Launchpad is at `pt` (screen pixels). Over the Dock,
+    /// icons part at its drop slot, as when reordering; an app already in the
+    /// Dock moves from where it is. Returns whether letting go here pins it.
+    pub fn on_pin_drag(&mut self, pt: (i32, i32), app: &DockApp) -> bool {
+        let s = self.surface.scale;
+        let local = |d: &Self| ((pt.0 - d.surface.rect.left) as f32 / s, (pt.1 - d.surface.rect.top) as f32 / s);
+        let (x, y) = local(self);
+        if !self.takes_pin(x, y) {
+            self.cancel_pin_drag();
+            return false;
+        }
+        if self.incoming.is_none() {
+            if self.drag.is_some() {
+                return false; // the Dock's own drag (can't happen while Launchpad has the pointer)
+            }
+            // Icons glide apart from where they are now.
+            self.snapshot_positions();
+            let pinned = self.pinned_count();
+            let found = self.items[..pinned].iter().position(|i| i.launch.eq_ignore_ascii_case(&app.path));
+            let from = found.unwrap_or_else(|| {
+                self.items.insert(pinned, Item::pinned(app, &self.app_icons));
+                if let Err(e) = self.fit_window() {
+                    log!("dock resize failed: {e}");
+                }
+                pinned
+            });
+            self.incoming = Some(Incoming { added: found.is_none() });
+            self.pressed = None;
+            self.drag = Some(Drag { from, to: from, grab_dx: 0.0, x, y, out: false });
+        }
+        // The window may have grown for the new icon: place the pointer afresh.
+        let (x, y) = local(self);
+        self.on_move(x, y);
+        if self.drag.is_some_and(|d| d.out) {
+            self.cancel_pin_drag();
+            return false;
+        }
+        true
+    }
+
+    /// The Launchpad drag left the Dock (or ended elsewhere): the Dock closes up again.
+    pub fn cancel_pin_drag(&mut self) {
+        let Some(inc) = self.incoming.take() else { return };
+        if let Some(d) = self.drag.take() {
+            if inc.added {
+                self.items.remove(d.from);
+                if let Err(e) = self.fit_window() {
+                    log!("dock resize failed: {e}");
+                }
+            }
+        }
+        self.hovering = false;
+        self.ease_left = EASE_TIME;
+        self.dirty = true;
+    }
+
+    /// The Launchpad drag was let go over the Dock: the app is pinned at its
+    /// slot (saved like a reorder).
+    pub fn drop_pin(&mut self) -> Option<Action> {
+        self.incoming.take()?;
+        let d = self.drag?;
+        self.pressed = None;
+        let action = self.on_up(d.x, d.y);
+        self.hovering = false;
+        action
     }
 
     pub fn on_down(&mut self, x: f32, y: f32) {

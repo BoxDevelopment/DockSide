@@ -211,6 +211,7 @@ pub(crate) enum Key {
     Appearance,
     Font,
     GlassRefraction,
+    ScreenshotMode,
     FinderSidebar,
     FinderView,
     FinderHidden,
@@ -292,6 +293,7 @@ impl Key {
             Key::Appearance => ("general", "appearance"),
             Key::Font => ("general", "font"),
             Key::GlassRefraction => ("general", "glass_refraction"),
+            Key::ScreenshotMode => ("general", "screenshot_mode"),
             Key::FinderSidebar => ("finder", "sidebar"),
             Key::FinderView => ("finder", "view"),
             Key::FinderHidden => ("finder", "show_hidden"),
@@ -949,6 +951,15 @@ impl SettingsWindow {
                     ],
                 },
                 Group {
+                    title: Some("Screenshot Mode"),
+                    rows: vec![
+                        Row::Toggle("Hide personal info", Key::ScreenshotMode),
+                        Row::Note(
+                            "Your name, picture, location, weather, calendar, notifications, reminders, Wi-Fi and                              Bluetooth names and what's playing are swapped for demo data. Photo and Video widgets stay as they are.",
+                        ),
+                    ],
+                },
+                Group {
                     title: Some("Administrator Apps"),
                     rows: vec![Row::Buttons(
                         "Run as administrator (works with admin apps)",
@@ -1389,6 +1400,7 @@ impl SettingsWindow {
             Key::StartAtLogin => login,
             Key::HideTaskbar => g.hide_taskbar,
             Key::GlassRefraction => g.glass_refraction,
+            Key::ScreenshotMode => g.screenshot_mode,
             Key::FinderHidden => cfg.finder.show_hidden,
             Key::DesktopsAlt => cfg.desktops.alt_number,
             Key::DesktopsArrows => cfg.desktops.replace_windows_switcher,

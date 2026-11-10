@@ -1084,7 +1084,17 @@ impl Widgets {
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme) {
         let solid = self.cfg.backdrop == Backdrop::None;
+        // Screenshot Mode paints demo data in place of anything personal.
+        let private = crate::screenshot_mode::on().then(|| {
+            let fahrenheit = sources::fahrenheit(&self.cfg.temperature_unit);
+            let ids = self.widgets.iter().filter(|w| w.item.kind == WidgetKind::Notes).map(|w| w.item.id);
+            (demo_data(&self.data, fahrenheit), demo_store(ids))
+        });
         let Widgets { widgets, data, store, .. } = self;
+        let (data, store) = match &private {
+            Some((d, s)) => (d, s),
+            None => (&*data, &*store),
+        };
         for w in widgets.iter_mut().filter(|w| w.dirty) {
             w.dirty = false;
             if matches!(w.item.kind, WidgetKind::NowPlaying | WidgetKind::MusicWave) {
@@ -1129,12 +1139,15 @@ impl Widgets {
             let mut hits = Vec::new();
             w.motion.sweep();
             let error = w.live.as_ref().and_then(|l| l.feed.error());
+            // Demo notes, reminders and notifications can't be edited or opened:
+            // their clicks would land on the real ones.
+            let demo_only = private.is_some() && matches!(w.item.kind, WidgetKind::Notes | WidgetKind::Reminders | WidgetKind::Notifications);
             let ctx = views::Ctx {
                 theme,
                 data,
                 store,
                 item: &w.item,
-                edit: w.edit.as_ref(),
+                edit: w.edit.as_ref().filter(|_| !demo_only),
                 art: w.art.as_ref().map(|(_, b)| b),
                 hover: w.hover,
                 motion: Some(&w.motion),
@@ -1145,12 +1158,21 @@ impl Widgets {
             if let Err(e) = result {
                 log!("widget render failed: {e}");
             }
+            if demo_only {
+                hits.clear();
+            }
             w.hits = hits;
         }
     }
 
     /// Repaint everything (font or accent changed).
     pub fn invalidate(&mut self) {
+        // Typing stops when Screenshot Mode covers the note being written.
+        if crate::screenshot_mode::on() {
+            for i in 0..self.widgets.len() {
+                self.end_edit(i);
+            }
+        }
         for w in &mut self.widgets {
             w.dirty = true;
         }
@@ -1817,6 +1839,39 @@ impl Widgets {
     }
 }
 
+/// What the widgets show in Screenshot Mode: the live readings that say
+/// nothing about you (time, system load, battery, the music's progress) with
+/// everything personal swapped for demo data.
+fn demo_data(real: &Data, fahrenheit: bool) -> Data {
+    use crate::screenshot_mode as demo;
+    Data {
+        weather: demo::weather(fahrenheit, real.h24),
+        events: demo::events(),
+        devices: demo::devices(),
+        battery: real.battery,
+        sys: real.sys.clone(),
+        now: real.now.as_ref().map(demo::now_playing),
+        zones: demo::zones(),
+        first_weekday: real.first_weekday,
+        h24: real.h24,
+        bands: real.bands.clone(),
+        notes: demo::notes(),
+        user: Some(demo::user()),
+    }
+}
+
+/// Notes and reminders in Screenshot Mode (`notes`: the Notes widgets' ids).
+fn demo_store(notes: impl Iterator<Item = u32>) -> Store {
+    let mut s = Store::default();
+    for id in notes {
+        s.set_note(id, crate::screenshot_mode::NOTE.into());
+    }
+    for r in crate::screenshot_mode::REMINDERS {
+        s.add_reminder(r);
+    }
+    s
+}
+
 impl Drop for Widgets {
     fn drop(&mut self) {
         self.save_state();
@@ -1931,10 +1986,17 @@ mod tests {
             },
             user: Some(UserInfo { name: "Ollie Box".into(), first: "Ollie".into(), picture: None, pc: "OLLIE-LAPTOP".into() }),
         };
+        // DOCKSIDE_GALLERY_PRIVATE=1 paints what Screenshot Mode shows instead.
+        let private = std::env::var_os("DOCKSIDE_GALLERY_PRIVATE").is_some();
+        crate::screenshot_mode::set(private);
+        let data = if private { demo_data(&data, false) } else { data };
         let mut store = Store::default();
         store.set_note(1, "Groceries\nMilk, eggs, coffee beans\nPick up the dry cleaning before 6pm on Thursday.".into());
         for r in ["Call the dentist", "Renew passport", "Send invoice to Alex", "Water the plants", "Book train tickets"] {
             store.add_reminder(r);
+        }
+        if private {
+            store = demo_store(std::iter::once(1));
         }
         for dark in [false, true] {
             let mut cfg = crate::config::defaults();

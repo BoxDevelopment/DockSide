@@ -1087,6 +1087,7 @@ impl App {
             log!("config error, using defaults: {e:#}");
             config::defaults()
         });
+        crate::screenshot_mode::set(cfg.general.screenshot_mode);
         let theme = Theme::new(&cfg, &gfx);
         let watcher = config::watch(&cfg_path, msg_hwnd.0 as isize, WM_APP_RELOAD)
             .map_err(|e| log!("config watcher failed: {e}"))
@@ -1282,6 +1283,7 @@ impl App {
             || g0.glass_refraction != g1.glass_refraction
             || old.finder.sidebar != self.cfg.finder.sidebar;
         let general_changed = g0 != g1;
+        let private_changed = crate::screenshot_mode::set(g1.screenshot_mode);
         if rebuild {
             // Backdrop tints depend on light/dark, and glass on refraction; recreate everything.
             self.build();
@@ -1293,6 +1295,15 @@ impl App {
         }
         if rebuild {
             return;
+        }
+        if private_changed {
+            // Everything that shows personal details paints again (menu bars and widgets below).
+            if let Some(i) = &mut self.island {
+                i.dirty = true;
+            }
+            if let Some(c) = &mut self.control {
+                c.dirty = true;
+            }
         }
         if general_changed {
             // Font / accent / shortcut hints: same surfaces, new paint.
@@ -3031,6 +3042,7 @@ impl App {
             ControlEvent::Close => self.close_control(),
             // Stays open: the rebuild that follows reopens it in the new look.
             ControlEvent::Run(a @ Action::SetDarkMode(_)) => push(a),
+            ControlEvent::Run(a @ Action::SetConfig { key: "screenshot_mode", .. }) => push(a),
             ControlEvent::Run(a) => {
                 self.close_control();
                 push(a);

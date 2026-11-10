@@ -41,6 +41,8 @@ pub struct General {
     pub glass_refraction: bool,
     /// The Setup Assistant was finished or skipped (it opens on launch until then).
     pub onboarding_done: bool,
+    /// Personal details are swapped for demo data (see `screenshot_mode`).
+    pub screenshot_mode: bool,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]

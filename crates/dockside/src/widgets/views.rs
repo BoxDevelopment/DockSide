@@ -1338,11 +1338,45 @@ fn avatar(p: &Painter, c: &Ctx, cx: f32, cy: f32, d: f32, name: &str) {
         Some(b) => p.bitmap_round(b, r, d / 2.0, 1.0),
         None => {
             p.fill_round_gradient(r, d / 2.0, Color::rgba(166, 170, 180, 1.0), Color::rgba(132, 136, 146, 1.0));
-            text(p, c, &super::user::initials(name), d * 0.4, Weight::Bold, Align::Center, r, Color::WHITE);
+            if crate::screenshot_mode::on() {
+                silhouette(p, cx, cy, d);
+            } else {
+                text(p, c, &super::user::initials(name), d * 0.4, Weight::Bold, Align::Center, r, Color::WHITE);
+            }
         }
     }
     let rim = if c.theme.dark { Color::gray(255, 0.12) } else { Color::gray(0, 0.08) };
     p.stroke_circle(cx, cy, d / 2.0 - 0.25, rim, 0.5);
+}
+
+/// The generic account picture: a head and shoulders, cut off by the circle.
+fn silhouette(p: &Painter, cx: f32, cy: f32, d: f32) {
+    let ink = Color::gray(255, 0.92);
+    p.fill_circle(cx, cy - d * 0.1, d * 0.19, ink);
+    // Shoulders: a circle centred on the rim's bottom, where it meets the rim.
+    let (rad, s, a) = (d * 0.5, d * 0.36, d * 0.5);
+    let y = (rad * rad - s * s + a * a) / (2.0 * a);
+    let x = (rad * rad - y * y).max(0.0).sqrt();
+    let arc = |sink: &windows::Win32::Graphics::Direct2D::ID2D1GeometrySink, to: (f32, f32), radius: f32| unsafe {
+        use windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F;
+        use windows::Win32::Graphics::Direct2D::{D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_SWEEP_DIRECTION_CLOCKWISE};
+        sink.AddArc(&D2D1_ARC_SEGMENT {
+            point: pt(to.0, to.1),
+            size: D2D_SIZE_F { width: radius, height: radius },
+            rotationAngle: 0.0,
+            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+            arcSize: D2D1_ARC_SIZE_SMALL,
+        });
+    };
+    let g = p.gfx.path(|sink| unsafe {
+        sink.BeginFigure(pt(cx - x, cy + y), D2D1_FIGURE_BEGIN_FILLED);
+        arc(sink, (cx + x, cy + y), s);
+        arc(sink, (cx - x, cy + y), rad);
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = g {
+        p.fill_geometry(&g, ink);
+    }
 }
 
 /// Lock / Sign Out / Sleep. `room` = Some(width): pills with words from `x`

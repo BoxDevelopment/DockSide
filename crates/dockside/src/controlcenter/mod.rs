@@ -98,6 +98,7 @@ pub enum Module {
     Accessibility,
     Keyboard,
     Vpn,
+    ScreenshotMode,
     /// The Edit Controls pill (always there).
     Edit,
 }
@@ -127,7 +128,7 @@ const fn info(module: Module, key: &'static str, label: &'static str, section: S
 
 /// Every optional module, in grid order: each takes the first spot it fits,
 /// which lays the defaults out exactly like macOS.
-pub const MODULES: [ModuleInfo; 21] = [
+pub const MODULES: [ModuleInfo; 22] = [
     info(Module::Wifi, "wifi", "Wi-Fi", Section::Modules, 2, 1),
     info(Module::Media, "now_playing", "Now Playing", Section::Modules, 2, 2),
     info(Module::Bluetooth, "bluetooth", "Bluetooth", Section::Modules, 1, 1),
@@ -141,6 +142,7 @@ pub const MODULES: [ModuleInfo; 21] = [
     info(Module::Calculator, "calculator", "Calculator", Section::Controls, 1, 1),
     info(Module::Timer, "timer", "Timer", Section::Controls, 1, 1),
     info(Module::Screenshot, "screenshot", "Screenshot", Section::Controls, 1, 1),
+    info(Module::ScreenshotMode, "screenshot_mode", "Screenshot Mode", Section::Controls, 1, 1),
     info(Module::Airplane, "airplane_mode", "Airplane Mode", Section::Windows, 1, 1),
     info(Module::EnergySaver, "energy_saver", "Energy Saver", Section::Windows, 1, 1),
     info(Module::NightLight, "night_light", "Night Light", Section::Windows, 1, 1),
@@ -168,6 +170,7 @@ fn toggle_of(m: Module) -> Option<Toggle> {
         Module::Nearby => Toggle::Nearby,
         Module::Focus => Toggle::Focus,
         Module::Dark => Toggle::Dark,
+        Module::ScreenshotMode => Toggle::ScreenshotMode,
         Module::Airplane => Toggle::Airplane,
         Module::EnergySaver => Toggle::EnergySaver,
         Module::NightLight => Toggle::NightLight,
@@ -197,6 +200,8 @@ fn glyph_of(m: Module) -> char {
         Module::Accessibility => '\u{E776}',
         Module::Keyboard => '\u{E765}',
         Module::Vpn => '\u{E705}',
+        // Hide (an eye, struck through).
+        Module::ScreenshotMode => '\u{ED1A}',
         _ => ' ',
     }
 }
@@ -805,6 +810,9 @@ impl ControlCenter {
     }
 
     fn on(&self, t: Toggle) -> Option<bool> {
+        if t == Toggle::ScreenshotMode {
+            return Some(crate::screenshot_mode::on());
+        }
         self.local.get(&t).map(|(v, _)| *v).or_else(|| self.status.toggles.get(&t).copied())
     }
 
@@ -1046,9 +1054,11 @@ impl ControlCenter {
             Module::Wifi => {
                 self.on(Toggle::Wifi).hash(&mut h);
                 self.status.ssid.hash(&mut h);
+                crate::screenshot_mode::on().hash(&mut h);
             }
             Module::Focus => self.on(Toggle::Focus).hash(&mut h),
             Module::Media => {
+                crate::screenshot_mode::on().hash(&mut h);
                 if let Some(n) = &self.now {
                     n.title.hash(&mut h);
                     n.artist.hash(&mut h);
@@ -1061,6 +1071,9 @@ impl ControlCenter {
             _ => {
                 if let Some(t) = toggle_of(m) {
                     self.on(t).is_some().hash(&mut h);
+                    if t == Toggle::ScreenshotMode {
+                        self.on(t).hash(&mut h);
+                    }
                 }
             }
         }
@@ -1086,7 +1099,11 @@ impl ControlCenter {
                 let detail = match (m, self.on(t)) {
                     (Module::Wifi, None) => Some("Unavailable".to_string()),
                     (Module::Wifi, Some(false)) => Some("Off".to_string()),
-                    (Module::Wifi, Some(true)) => Some(self.status.ssid.clone().unwrap_or_else(|| "Not Connected".into())),
+                    (Module::Wifi, Some(true)) => Some(match &self.status.ssid {
+                        Some(_) if crate::screenshot_mode::on() => crate::screenshot_mode::SSID.to_string(),
+                        Some(s) => s.clone(),
+                        None => "Not Connected".into(),
+                    }),
                     (_, Some(true)) => Some("Do Not Disturb".to_string()),
                     _ => None,
                 };
@@ -1152,7 +1169,8 @@ impl ControlCenter {
         let title = p.gfx.format(&self.font, 13.0, Weight::SemiBold, Align::Leading);
         let sub = p.gfx.format(&self.font, 12.0, Weight::Regular, Align::Leading);
         let art = media_art_rect();
-        let now = self.now.as_ref().filter(|n| !n.title.is_empty());
+        let demo = self.now.as_ref().filter(|_| crate::screenshot_mode::on()).map(crate::screenshot_mode::now_playing);
+        let now = demo.as_ref().or(self.now.as_ref()).filter(|n| !n.title.is_empty());
         let bmp = now.and_then(|n| n.art.as_ref()).and_then(|a| IconPixels { width: a.size, height: a.size, data: a.data.clone() }.to_bitmap(p.rt));
         match bmp {
             Some(b) => p.bitmap_cover(&b, art, 10.0, 1.0),
@@ -1287,7 +1305,7 @@ impl ControlCenter {
                         v.push(Item::Note("Windows didn't let DockSide scan for networks.".into()));
                         if let Some(s) = &self.status.ssid {
                             v.push(Item::Section("Known Network"));
-                            v.push(Item::Note(s.clone()));
+                            v.push(Item::Note(if crate::screenshot_mode::on() { crate::screenshot_mode::SSID.into() } else { s.clone() }));
                         }
                     }
                     Some(list) if list.is_empty() => v.push(Item::Note("No networks found.".into())),
@@ -1346,6 +1364,7 @@ impl ControlCenter {
     }
 
     fn item_key(&self, it: &Item, h: &mut DefaultHasher) {
+        crate::screenshot_mode::on().hash(h);
         match it {
             Item::Section(s) => s.hash(h),
             Item::Note(s) => s.hash(h),
@@ -1416,11 +1435,13 @@ impl ControlCenter {
                     3 => '\u{E874}',
                     _ => '\u{E701}',
                 };
-                row(glyph, n.connected, &n.ssid, n.secure.then_some("Secured"), false);
+                let name = if crate::screenshot_mode::on() { crate::screenshot_mode::network_name(*i, n.connected) } else { n.ssid.clone() };
+                row(glyph, n.connected, &name, n.secure.then_some("Secured"), false);
             }
             Item::Device(i) => {
                 let Some(d) = self.status.devices.as_ref().and_then(|l| l.get(*i)) else { return };
-                row(device_glyph(&d.name), d.connected, &d.name, d.connected.then_some("Connected"), false);
+                let name = if crate::screenshot_mode::on() { crate::screenshot_mode::device_name(*i) } else { d.name.clone() };
+                row(device_glyph(&name), d.connected, &name, d.connected.then_some("Connected"), false);
             }
             Item::Output(i) => {
                 let Some(o) = self.status.outputs.as_ref().and_then(|l| l.get(*i)) else { return };
@@ -1751,6 +1772,11 @@ impl ControlCenter {
                 _ => "ms-settings:",
             });
         };
+        if t == Toggle::ScreenshotMode {
+            // Saved to the config; the App repaints everything (this panel too).
+            let value = crate::config::ConfigValue::Bool(!now);
+            return ControlEvent::Run(Action::SetConfig { table: "general", key: "screenshot_mode", value });
+        }
         if t == Toggle::Dark {
             // Every surface is rebuilt in the new appearance; the App reopens this panel.
             self.local.insert(t, (!now, u64::MAX));

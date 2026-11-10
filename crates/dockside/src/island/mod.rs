@@ -3045,11 +3045,25 @@ impl Island {
         let weather = self.wfeeds.as_ref().and_then(|f| f.weather.lock().ok().map(|w| w.clone()));
         let devices = self.wfeeds.as_ref().and_then(|f| f.devices.lock().ok().map(|d| d.clone())).unwrap_or_default();
         let tiles: Vec<(Tile, bool)> = self.tiles().into_iter().map(|t| (t, self.tile_ok(t, &self.drop_paths))).collect();
+        // Screenshot Mode: personal words swapped for demo ones, pictures left out.
+        use crate::screenshot_mode as demo;
+        let private = demo::on();
+        let (weather, devices) = if private {
+            (weather.map(|_| demo::weather(self.wcfg.fahrenheit, self.wcfg.h24)), demo::devices())
+        } else {
+            (weather, devices)
+        };
+        let demo_now = private.then(|| self.now.as_ref().map(demo::now_playing)).flatten();
+        let demo_notes = if private { demo::mask_notes(&self.notes) } else { Vec::new() };
+        let demo_events = if private { demo::mask_events(&self.events) } else { Vec::new() };
+        let demo_zones = if private { demo::zones() } else { Vec::new() };
+        let demo_discord = private.then(|| demo::discord(&self.discord));
+        let no_avatars = HashMap::new();
         let view = View {
             fonts: &fonts,
-            now: self.now.as_ref(),
-            art: self.art.as_ref().map(|(_, b)| b),
-            old_art: self.old_art.as_ref(),
+            now: if private { demo_now.as_ref() } else { self.now.as_ref() },
+            art: self.art.as_ref().map(|(_, b)| b).filter(|_| !private),
+            old_art: self.old_art.as_ref().filter(|_| !private),
             art_fade: self.art_fade.value.clamp(0.0, 1.0),
             art_shift: self.art_shift.value,
             wave_t: self.wave_t,
@@ -3072,7 +3086,7 @@ impl Island {
             preview_bmp: self.preview_bmp.as_ref().and_then(|(_, b)| b.as_ref()),
             live: &self.live,
             live_icons: &self.live_icons,
-            notes: &self.notes,
+            notes: if private { &demo_notes } else { &self.notes },
             note_icons: &self.note_icons,
             note_rows: &note_rows,
             note_open: self.note_open.is_some(),
@@ -3083,22 +3097,22 @@ impl Island {
             tiles: &tiles,
             drop_hot: self.drop_hot,
             drop_paths: &self.drop_paths,
-            events: &self.events,
+            events: if private { &demo_events } else { &self.events },
             downloads: &self.downloads,
             volume: self.volume,
             lyrics_row: self.lyrics_row(),
-            lyric: self.lyrics.as_ref().zip(self.lyric_line).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
-            lyric_prev: self.lyrics.as_ref().zip(self.lyric_prev).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
+            lyric: self.lyrics.as_ref().filter(|_| !private).zip(self.lyric_line).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
+            lyric_prev: self.lyrics.as_ref().filter(|_| !private).zip(self.lyric_prev).and_then(|((_, l), i)| l.get(i)).map(|(_, t)| t.as_str()),
             lyric_fade: self.lyric_fade.value,
             home_acts: &home_acts,
             weather: weather.as_ref(),
             devices: &devices,
             sys: &self.sys.stats,
-            zones: &self.wcfg.zones,
+            zones: if private { &demo_zones } else { &self.wcfg.zones },
             h24: self.wcfg.h24,
             battery: self.battery,
-            discord: &self.discord,
-            discord_avatars: &self.discord_avatars,
+            discord: demo_discord.as_ref().unwrap_or(&self.discord),
+            discord_avatars: if private { &no_avatars } else { &self.discord_avatars },
             mixer: &self.mixer,
             mixer_icons: &self.mixer_icons,
             alert_img: match self.shown {

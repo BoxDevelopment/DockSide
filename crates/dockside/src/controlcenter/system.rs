@@ -49,6 +49,8 @@ pub enum Toggle {
     ColorFilters,
     LiveCaptions,
     StickyKeys,
+    /// DockSide's own: personal details swapped for demo data.
+    ScreenshotMode,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -309,6 +311,8 @@ fn set(ctx: &mut Ctx, t: Toggle, on: bool) {
         Toggle::Nearby => set_nearby_sharing(on),
         // Applied on the UI thread (it rebuilds every surface).
         Toggle::Dark => true,
+        // Applied on the UI thread (it's a DockSide setting).
+        Toggle::ScreenshotMode => true,
         Toggle::Magnifier => {
             if on {
                 system::open("magnify.exe");

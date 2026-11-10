@@ -31,6 +31,8 @@ pub enum Hit {
     Clock,
     /// Every app's notification-area icon, in a menu.
     Tray,
+    /// Screenshot Mode is on (click to turn it off).
+    Private,
 }
 
 impl Hit {
@@ -227,6 +229,7 @@ impl MenuBar {
             Hit::Search => Some(Action::Keys(WIN_S)),
             Hit::Clock => Some(Action::Keys(WIN_N)),
             Hit::Battery => Some(Action::Open("ms-settings:batterysaver".into())),
+            Hit::Private => Some(Action::SetConfig { table: "general", key: "screenshot_mode", value: crate::config::ConfigValue::Bool(false) }),
             _ => None,
         }
     }
@@ -276,6 +279,10 @@ impl MenuBar {
         if self.cfg.show_tray {
             rx -= 30.0;
             hits.push((Rect::new(rx, 0.0, 30.0, h), Hit::Tray));
+        }
+        if crate::screenshot_mode::on() {
+            rx -= 30.0;
+            hits.push((Rect::new(rx, 0.0, 30.0, h), Hit::Private));
         }
         self.hits = hits;
     }
@@ -344,6 +351,7 @@ impl MenuBar {
                     Hit::Tray => draw_tray(p, r, c, tray_turn),
                     Hit::Search => draw_search(p, r, c),
                     Hit::Wifi => draw_wifi(p, r, c),
+                    Hit::Private => draw_private(p, r, c),
                     Hit::Battery => {
                         if let Some(b) = battery {
                             draw_battery(p, r, b, c);
@@ -491,6 +499,32 @@ fn draw_wifi(p: &Painter, r: Rect, c: Color) {
         p.stroke_geometry(&g, c, 1.9);
     }
     p.fill_circle(cx, cy - 0.6, 1.4, c);
+}
+
+/// Screenshot Mode's mark: an eye, struck through.
+fn draw_private(p: &Painter, r: Rect, c: Color) {
+    let (cx, cy) = (r.cx(), r.cy());
+    let (w, h) = (8.0_f32, 4.6_f32);
+    let geom = p.gfx.path(|s| unsafe {
+        // Two arcs meeting at the eye's corners.
+        s.BeginFigure(pt(cx - w, cy), D2D1_FIGURE_BEGIN_HOLLOW);
+        for (to, sweep) in [((cx + w), D2D1_SWEEP_DIRECTION_CLOCKWISE), ((cx - w), D2D1_SWEEP_DIRECTION_CLOCKWISE)] {
+            let rad = (w * w + h * h) / (2.0 * h);
+            s.AddArc(&D2D1_ARC_SEGMENT {
+                point: pt(to, cy),
+                size: D2D_SIZE_F { width: rad, height: rad },
+                rotationAngle: 0.0,
+                sweepDirection: sweep,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+        }
+        s.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = geom {
+        p.stroke_geometry(&g, c, 1.4);
+    }
+    p.fill_circle(cx, cy, 2.2, c);
+    p.line(cx - 6.5, cy + 6.5, cx + 6.5, cy - 6.5, c, 1.6);
 }
 
 fn draw_search(p: &Painter, r: Rect, c: Color) {

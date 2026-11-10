@@ -22,6 +22,10 @@ glass_refraction = true
 # Set once the Setup Assistant has been finished or skipped. Set it back to
 # false to see it on the next launch (or open it from System Settings > General).
 onboarding_done = false
+# Screenshot Mode: personal details (your name and picture, location, weather,
+# calendar, notifications, Wi-Fi and Bluetooth names, what's playing) are
+# swapped for demo data so screenshots are safe to share.
+screenshot_mode = false
 
 [windows]
 # How app windows minimize into their Dock icon: "genie" or "scale" like

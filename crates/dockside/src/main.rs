@@ -22,6 +22,7 @@ mod menubar;
 mod net;
 mod onboarding;
 mod settings;
+mod screenshot_mode;
 mod spotlight;
 mod surface;
 mod theme;

@@ -383,6 +383,7 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             hits.push((r, Hit::AlertBody));
         }
         Alert::Bluetooth { name, connected, battery } => {
+            let name = if crate::screenshot_mode::on() { "AirPods Pro" } else { name.as_str() };
             let big = r.h - 18.0;
             let ic = (r.x + 12.0 + big / 2.0, cy);
             p.fill_circle(ic.0, ic.1, big / 2.0, Color::gray(255, 0.12 * a));
@@ -412,6 +413,8 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             p.text(app, &f.alert_r, Rect::new(r.x + r.w * 0.45, r.y, r.w * 0.55 - right_inset, r.h), SECONDARY.alpha(a));
         }
         Alert::Note(n) => {
+            let masked = crate::screenshot_mode::on().then(|| crate::screenshot_mode::mask_note(n));
+            let n = masked.as_ref().unwrap_or(n);
             let is = 38.0;
             let icon = Rect::new(r.x + 16.0, cy - is / 2.0, is, is);
             match v.alert_img {

@@ -56,6 +56,8 @@ impl Item {
 /// than spelling out its path; `item` builds an `Item` for the few results shown.
 #[derive(Default)]
 pub struct Files {
+    /// Which build this is, so a `Narrow` from an older one isn't reused.
+    generation: u64,
     roots: Vec<String>,
     /// Every name followed by its lower-case form.
     text: String,
@@ -75,6 +77,15 @@ struct Entry {
 }
 
 const ROOT: u32 = u32::MAX;
+
+/// The names the last file search could match (see [`Files::top`]). Owned by
+/// the open Spotlight, so it's gone once Spotlight closes.
+#[derive(Default)]
+pub struct Narrow {
+    generation: u64,
+    q: String,
+    hits: Vec<u32>,
+}
 
 impl Files {
     pub fn len(&self) -> usize {
@@ -131,15 +142,64 @@ impl Files {
     }
 
     /// The `n` best matches for lower-case query `q`, best first (shorter names first among equals).
-    pub fn top(&self, q: &str, n: usize) -> Vec<(i32, Item)> {
-        let mut scored: Vec<(i32, u32)> = (0..self.entries.len() as u32)
-            .filter_map(|i| {
-                let e = &self.entries[i as usize];
-                score_name(self.lower(e), e.depth, q).map(|s| (s, i))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then(self.entries[a.1 as usize].name_len.cmp(&self.entries[b.1 as usize].name_len)));
-        scored.into_iter().take(n).map(|(s, i)| (s, self.item(i))).collect()
+    ///
+    /// Runs on the UI thread for every keystroke over a few hundred thousand
+    /// names, so it stays allocation-free per name: every way of matching needs
+    /// `q`'s letters in order, and that cheap byte scan rejects almost all.
+    ///
+    /// `narrow` remembers which names had the last query's letters in order:
+    /// typing one more letter only has to look at those.
+    pub fn top(&self, q: &str, n: usize, narrow: &mut Narrow) -> Vec<(i32, Item)> {
+        // Remembering more than this costs more than rescanning (one or two letters match most names).
+        const NARROW_MAX: usize = 32 * 1024;
+        if n == 0 {
+            return Vec::new();
+        }
+        // Best score, then shortest name, then index order (stable results).
+        let order = |a: &(i32, u16, u32), b: &(i32, u16, u32)| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2));
+        // Only the best `n` are kept: trimmed whenever the pile reaches a few times that.
+        let cap = (4 * n).max(64);
+        let mut scored: Vec<(i32, u16, u32)> = Vec::with_capacity(cap);
+        let mut kept: Option<Vec<u32>> = Some(Vec::new());
+        // The best a loose (fuzzy) match can score: once `n` results beat it, skip trying.
+        let fuzzy_best = 100 + 5 * (q.len() as i32) * (q.len() as i32);
+        let mut floor = i32::MIN;
+        let mut visit = |i: u32| {
+            let e = &self.entries[i as usize];
+            let lower = self.lower(e);
+            if !has_in_order(lower, q) {
+                return;
+            }
+            match &mut kept {
+                Some(k) if k.len() < NARROW_MAX => k.push(i),
+                Some(_) => kept = None,
+                None => {}
+            }
+            if let Some(s) = score_matched(lower, e.depth, q, floor <= fuzzy_best) {
+                scored.push((s, e.name_len, i));
+                if scored.len() >= cap {
+                    scored.select_nth_unstable_by(n - 1, order);
+                    scored.truncate(n);
+                    floor = scored[n - 1].0;
+                }
+            }
+        };
+        let reuse = narrow.generation == self.generation && !narrow.q.is_empty() && q.starts_with(narrow.q.as_str());
+        if reuse {
+            narrow.hits.iter().for_each(|&i| visit(i));
+        } else {
+            (0..self.entries.len() as u32).for_each(&mut visit);
+        }
+        *narrow = match kept {
+            Some(hits) => Narrow { generation: self.generation, q: q.to_string(), hits },
+            None => Narrow::default(),
+        };
+        if scored.len() > n {
+            scored.select_nth_unstable_by(n - 1, order);
+            scored.truncate(n);
+        }
+        scored.sort_unstable_by(order);
+        scored.into_iter().map(|(s, _, i)| (s, self.item(i))).collect()
     }
 }
 
@@ -169,7 +229,9 @@ pub fn rebuild(shared: Shared, roots: Vec<PathBuf>, notify: isize, msg: u32) {
         }
         let started = Instant::now();
         let apps = apps();
-        let mut files = Files { roots: roots.iter().map(|r| r.display().to_string()).collect(), ..Default::default() };
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        let mut files = Files { generation, roots: roots.iter().map(|r| r.display().to_string()).collect(), ..Default::default() };
         for (i, root) in roots.iter().enumerate() {
             walk(root, ROOT - i as u32, 0, &mut files);
         }
@@ -283,7 +345,49 @@ fn initials_start_with(lower: &str, q: &str) -> bool {
     next.is_none()
 }
 
+/// Whether `q`'s characters all appear in `name`, in order. Every kind of
+/// match below implies this, so it's the quick test that rules names out.
+fn has_in_order(name: &str, q: &str) -> bool {
+    if q.len() > name.len() {
+        return false;
+    }
+    if q.is_ascii() {
+        // ASCII bytes never occur inside a multi-byte UTF-8 sequence, so bytes will do.
+        let mut want = q.as_bytes().iter();
+        let Some(mut w) = want.next() else { return true };
+        for b in name.as_bytes() {
+            if b == w {
+                match want.next() {
+                    Some(n) => w = n,
+                    None => return true,
+                }
+            }
+        }
+        false
+    } else {
+        let mut want = q.chars();
+        let Some(mut w) = want.next() else { return true };
+        for c in name.chars() {
+            if c == w {
+                match want.next() {
+                    Some(n) => w = n,
+                    None => return true,
+                }
+            }
+        }
+        false
+    }
+}
+
 fn score_name(name: &str, depth: u16, q: &str) -> Option<i32> {
+    if !has_in_order(name, q) {
+        return None;
+    }
+    score_matched(name, depth, q, true)
+}
+
+/// `score_name` for a name already known to have `q`'s letters in order.
+fn score_matched(name: &str, depth: u16, q: &str, try_fuzzy: bool) -> Option<i32> {
     let base = if name == q {
         1000
     } else if name.starts_with(q) {
@@ -298,8 +402,10 @@ fn score_name(name: &str, depth: u16, q: &str) -> Option<i32> {
         } else {
             500 - (pos as i32).min(100)
         }
-    } else {
+    } else if try_fuzzy {
         fuzzy(name, q)?
+    } else {
+        return None;
     };
     Some(base - depth as i32 * 4)
 }
@@ -315,17 +421,30 @@ fn fuzzy(name: &str, q: &str) -> Option<i32> {
     if q.len() < 2 {
         return None;
     }
-    let name: Vec<char> = name.chars().collect();
     let mut qs = q.chars();
     let first = qs.next()?;
-    let start = (0..name.len()).find(|&i| name[i] == first && (i == 0 || !name[i - 1].is_alphanumeric()))?;
-    let mut pos = start + 1;
+    // The first query char, where it starts a word.
+    let mut prev_alnum = false;
+    let mut start = None;
+    for (i, c) in name.char_indices() {
+        if c == first && !prev_alnum {
+            start = Some(i + c.len_utf8());
+            break;
+        }
+        prev_alnum = c.is_alphanumeric();
+    }
+    let mut rest = name[start?..].chars();
     let mut score = 100;
     let mut run = 0;
     let mut total_skipped = 0;
     for qc in qs {
-        let next = (pos..name.len()).find(|&i| name[i] == qc)?;
-        let skipped = next - pos;
+        let mut skipped = 0usize;
+        loop {
+            if rest.next()? == qc {
+                break;
+            }
+            skipped += 1;
+        }
         total_skipped += skipped;
         if skipped == 0 {
             run += 1;
@@ -334,7 +453,6 @@ fn fuzzy(name: &str, q: &str) -> Option<i32> {
             run = 0;
             score -= skipped.min(10) as i32;
         }
-        pos = next + 1;
     }
     (total_skipped <= 3 * q.len()).then_some(score)
 }
@@ -367,9 +485,22 @@ mod tests {
         assert_eq!(f.path(other), r"D:\a.txt");
         let item = f.item(file);
         assert_eq!((item.name.as_str(), item.lower.as_str(), item.kind), ("Visual Notes.TXT", "visual notes.txt", Kind::File));
-        let top = f.top("vn", 5);
+        let top = f.top("vn", 5, &mut Narrow::default());
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].1.target, item.target);
+    }
+
+    #[test]
+    fn narrowing_matches_a_fresh_search() {
+        let mut f = Files { generation: 7, roots: vec![r"C:\r".into()], ..Default::default() };
+        for name in ["Document.docx", "docs", "Dog Photos", "random.txt", "do not open", "Old Docs Backup", "d", "Café menu.pdf"] {
+            f.push(name, ROOT, Kind::File, 0);
+        }
+        let targets = |v: Vec<(i32, Item)>| v.into_iter().map(|(s, i)| (s, i.target)).collect::<Vec<_>>();
+        let mut narrow = Narrow::default();
+        for q in ["d", "do", "doc", "docs", "do", "dog", "c", "ca", "caf", "café"] {
+            assert_eq!(targets(f.top(q, 3, &mut narrow)), targets(f.top(q, 3, &mut Narrow::default())), "{q}");
+        }
     }
 
     #[test]
@@ -379,5 +510,43 @@ mod tests {
         assert!(score(&app("Calculator"), "xyz").is_none());
         // Scattered letters across unrelated words don't count.
         assert!(score(&app("VLC media player - reset preferences and cache files"), "calc").is_none());
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn bench_real_index() {
+        let home = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap());
+        let roots: Vec<PathBuf> = ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos"].iter().map(|r| home.join(r)).collect();
+        let mut files = Files { roots: roots.iter().map(|r| r.display().to_string()).collect(), ..Default::default() };
+        for (i, root) in roots.iter().enumerate() {
+            walk(root, ROOT - i as u32, 0, &mut files);
+        }
+        println!("{} entries, text {} KB", files.len(), files.text.len() / 1024);
+        for q in ["d", "do", "doc", "docu", "document", "visual stu", "xq", "readme.md", "zzzz", "é"] {
+            let mut best = Duration::MAX;
+            let mut n = 0;
+            for _ in 0..20 {
+                let t = Instant::now();
+                n = files.top(q, 15, &mut Narrow::default()).len();
+                best = best.min(t.elapsed());
+            }
+            println!("{q:>12}: {best:?} best full search ({n} shown)");
+        }
+        // Typing a word letter by letter, narrowing as it goes.
+        let mut narrow = Narrow::default();
+        let word = "document";
+        for k in 1..=word.len() {
+            let q = &word[..k];
+            let t = Instant::now();
+            let got = files.top(q, 15, &mut narrow);
+            let took = t.elapsed();
+            let full = files.top(q, 15, &mut Narrow::default());
+            assert_eq!(got.iter().map(|g| &g.1.target).collect::<Vec<_>>(), full.iter().map(|g| &g.1.target).collect::<Vec<_>>());
+            println!("{q:>12}: {took:?} typed ({} candidates)", narrow.hits.len());
+        }
     }
 }

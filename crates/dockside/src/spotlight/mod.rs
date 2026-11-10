@@ -184,6 +184,8 @@ pub struct Spotlight {
     caret: usize,
     anchor: usize,
     rows: Vec<Row>,
+    /// What the last file search matched, so typing on narrows it.
+    narrow: index::Narrow,
     selected: usize,
     hits: Vec<(Rect, usize)>,
     bubble_hits: Vec<(Rect, usize)>,
@@ -311,6 +313,7 @@ impl Spotlight {
             caret: 0,
             anchor: 0,
             rows: Vec::new(),
+            narrow: index::Narrow::default(),
             selected: 0,
             hits: Vec::new(),
             bubble_hits: Vec::new(),
@@ -552,7 +555,7 @@ impl Spotlight {
             scored.into_iter().take(n).map(|(s, it)| (s, it.clone())).collect()
         };
         let mut apps = top_n(&index.apps, MAX_APPS + 1);
-        let mut files = index.files.top(&q, MAX_FILES + 1);
+        let mut files = index.files.top(&q, MAX_FILES + 1, &mut self.narrow);
 
         if let Some(lq) = latex::query(&raw) {
             for (code, symbol, _) in latex::search(lq, MAX_LATEX) {
@@ -650,7 +653,7 @@ impl Spotlight {
             }
             return;
         }
-        for (_, it) in index.files.top(q, 14) {
+        for (_, it) in index.files.top(q, 14, &mut self.narrow) {
             self.rows.push(item_row("Folders & Documents", &it));
         }
     }

@@ -1337,7 +1337,9 @@ pub fn tab_buttons(p: &Painter, pill: Rect, tabs: &[super::Panel], current: supe
             Panel::Notes => g::bell(p, x, y, 15.0, ink),
             _ => g::grid_fill(p, x, y, 13.5, ink),
         }
-        hits.push((t.inset(-GAP / 2.0, -(H - TAB_H) / 2.0), hit));
+        // Reaches up to the panel: a gap would read as leaving and fold it away at once.
+        let r = t.inset(-GAP / 2.0, 0.0);
+        hits.push((Rect::new(r.x, pill.bottom(), r.w, bar.bottom() - pill.bottom()), hit));
     }
 }
 

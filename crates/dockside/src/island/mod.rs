@@ -650,6 +650,10 @@ pub struct Island {
     expanded: Option<Panel>,
     /// A menu is open (the island's context menu): don't fold away under it.
     pub hold_open: bool,
+    /// After a tab click (screen space): the island's column down to the click.
+    /// The new page can be shorter and pull the tab bar out from under the
+    /// pointer, so it stays open while the pointer is in here.
+    tab_reach: Option<RECT>,
     drag_over: bool,
     /// When a file drag last left; it closes after `DRAG_LINGER` unless it comes back.
     drag_left: Option<Instant>,
@@ -836,6 +840,7 @@ impl Island {
             next_alert_id: 0,
             expanded: None,
             hold_open: false,
+            tab_reach: None,
             drag_over: false,
             drag_left: None,
             drop_paths: Vec::new(),
@@ -2232,6 +2237,10 @@ impl Island {
             self.inside = inside;
             self.hover_since = inside.then(Instant::now);
         }
+        // Back on the island once it has settled into the new page: normal hover again.
+        if inside && self.w.settled() && self.h.settled() {
+            self.tab_reach = None;
+        }
         let expanded = matches!(self.shown, Content::Panel(_));
         // A drag that wanders off the island keeps it open until it's let go.
         let held = inside || self.page_drag.is_some() || self.mix_drag.is_some();
@@ -2508,6 +2517,13 @@ impl Island {
                 let from = self.expanded.and_then(|e| tabs.iter().position(|t| *t == e));
                 let dir = if from.is_some_and(|f| f > i as usize) { -1 } else { 1 };
                 self.go_to(target, dir);
+                use windows::Win32::Foundation::POINT;
+                use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+                let mut pt = POINT::default();
+                if unsafe { GetCursorPos(&mut pt) }.is_ok() {
+                    let slack = (12.0 * self.monitor.scale) as i32;
+                    self.tab_reach = Some(RECT { bottom: pt.y + slack, ..self.surface.rect });
+                }
             }
             Hit::HomeAct(i) => match self.home_acts().get(i as usize).copied()? {
                 Persist::Download => return sources::downloads_dir().map(|d| IslandEvent::Run(Action::OpenFinder(Some(d)))),
@@ -2771,6 +2787,22 @@ impl Island {
         if self.hold_open && self.leave_at.is_some() {
             self.leave_at = Some(now);
         }
+        if let Some(r) = self.tab_reach {
+            use windows::Win32::Foundation::POINT;
+            use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+            let mut pt = POINT::default();
+            let held = unsafe { GetCursorPos(&mut pt) }.is_ok()
+                && (r.left..r.right).contains(&pt.x)
+                && (r.top..r.bottom).contains(&pt.y);
+            if held && matches!(self.shown, Content::Panel(_)) {
+                self.leave_at = None;
+            } else {
+                self.tab_reach = None;
+                if !self.inside && matches!(self.shown, Content::Panel(_)) {
+                    self.leave_at.get_or_insert(now);
+                }
+            }
+        }
         if self.drag_left.is_some_and(|t| now - t >= DRAG_LINGER) {
             self.end_drag();
             self.leave_at = matches!(self.shown, Content::Panel(_)).then_some(now);
@@ -2873,6 +2905,7 @@ impl Island {
         }
         let waiting = self.alert.is_some()
             || self.leave_at.is_some()
+            || self.tab_reach.is_some()
             || self.armed
             || self.drag_left.is_some()
             || self.art_swap.is_some()

@@ -122,6 +122,20 @@ fn blit(wic: &IWICImagingFactory, image: &IWICBitmapSource, natural: (i32, i32),
     unsafe { source.CopyPixels(&rect, (dst.0 * 4) as u32, &mut px[offset..]) }
 }
 
+thread_local! {
+    static STAMP: std::cell::Cell<Option<std::time::SystemTime>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the wallpaper changed since the last call. Spotlight and slideshows
+/// swap it without the `SPI_SETDESKWALLPAPER` broadcast, but Explorer rewrites
+/// its transcoded copy every time.
+pub fn moved() -> bool {
+    let path = std::path::PathBuf::from(std::env::var_os("APPDATA").unwrap_or_default()).join(r"Microsoft\Windows\Themes\TranscodedWallpaper");
+    let now = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let before = STAMP.with(|s| s.replace(now));
+    before.is_some() && before != now
+}
+
 struct Search {
     ignore: [u32; 2],
     live: bool,

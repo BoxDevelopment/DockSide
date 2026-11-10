@@ -269,6 +269,7 @@ pub(crate) enum Key {
     WinNoInject,
     SpotlightEnabled,
     SpotlightHotkey,
+    SpotlightBackdrop,
     LaunchpadDock,
     LaunchpadSpotlight,
     LaunchpadHotkey,
@@ -347,6 +348,7 @@ impl Key {
             Key::WinNoInject => ("windows", "no_inject"),
             Key::SpotlightEnabled => ("spotlight", "enabled"),
             Key::SpotlightHotkey => ("spotlight", "hotkey"),
+            Key::SpotlightBackdrop => ("spotlight", "backdrop"),
             Key::LaunchpadDock => ("launchpad", "dock"),
             Key::LaunchpadSpotlight => ("launchpad", "spotlight"),
             Key::LaunchpadHotkey => ("launchpad", "hotkey"),
@@ -959,6 +961,7 @@ impl SettingsWindow {
                         let mut rows = vec![
                             Row::Toggle("Spotlight search", Key::SpotlightEnabled),
                             Row::Keybind("Keyboard shortcut", Key::SpotlightHotkey),
+                            Row::Segmented("Background", Key::SpotlightBackdrop),
                         ];
                         if keybind::Hotkey::parse(&cfg.spotlight.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN)) {
                             rows.push(Row::Info("Start menu", "Double-tap Win".to_string()));
@@ -1475,6 +1478,7 @@ impl SettingsWindow {
                 }),
             ),
             Key::MbBackdrop => fixed(&MB_BACKDROPS, Some(backdrop(cfg.menubar.backdrop))),
+            Key::SpotlightBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.spotlight.backdrop.for_panels())).filter(|&i| i < BACKDROPS.len())),
             Key::DockBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.dock.backdrop)).filter(|&i| i < BACKDROPS.len())),
             Key::WidgetsBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.widgets.backdrop)).filter(|&i| i < BACKDROPS.len())),
             Key::WidgetsUnit => {

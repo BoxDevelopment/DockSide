@@ -176,6 +176,7 @@ pub fn run() -> anyhow::Result<()> {
 
     // Spotlight's Clipboard history.
     spotlight::clipboard::start(msg_hwnd);
+    win::wallpaper::watch(msg_hwnd, win::WM_APP_WALLPAPER);
 
     let app = App::new(msg_hwnd)?;
     for guid in [GUID_ENERGY_SAVER_STATUS, GUID_POWER_SAVING_STATUS] {
@@ -3513,6 +3514,8 @@ impl App {
                     self.timer(TIMER_FINDER, 200);
                 }
                 WM_APP_MENU_KEY => self.on_menu_key(wp.0 as u16),
+                // Explorer cross-fades to a new wallpaper; read it once that's settled.
+                win::WM_APP_WALLPAPER => self.timer(TIMER_WALLPAPER, 500),
                 win::WM_APP_CONTROL => {
                     if let Some(c) = &mut self.control {
                         c.on_status();

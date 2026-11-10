@@ -57,6 +57,7 @@ mod tests {
         SpotlightCfg {
             enabled: true,
             hotkey: "alt+space".into(),
+            backdrop: crate::config::Backdrop::Glass,
             search_engine: engine.into(),
             custom_search_url: custom.into(),
         }

@@ -52,6 +52,9 @@ const LOW_POWER_INTERVAL: Duration = Duration::from_millis(33);
 /// How often to look for windows that moved, opened or closed under glass
 /// without telling us (the foreground window's moves come right away).
 const POLL: Duration = Duration::from_millis(250);
+/// How often to check whether a live wallpaper app started or stopped (they
+/// don't announce it).
+const LIVE_POLL: Duration = Duration::from_secs(2);
 
 fn min_interval() -> Duration {
     if crate::win::controls::low_power_mode() { LOW_POWER_INTERVAL } else { MIN_INTERVAL }
@@ -217,6 +220,7 @@ thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(true) };
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
     static FAILED: Cell<bool> = const { Cell::new(false) };
+    static STATS: RefCell<Stats> = RefCell::new(Stats::new());
 }
 
 /// Whether new glass surfaces refract (`[general] glass_refraction`).
@@ -330,6 +334,12 @@ struct Engine {
     restack: bool,
     /// See `windows()`.
     windows: Option<(Vec<scene::Window>, Instant)>,
+    /// An app draws a live wallpaper (see `wallpaper::is_live`): panes that
+    /// would refract the wallpaper image refract the desktop window instead,
+    /// which holds the live wallpaper's frames.
+    live: bool,
+    /// Keeps `live` current.
+    live_poll: Option<DispatcherQueueTimer>,
 }
 
 /// Compiles one entry point of an HLSL source.
@@ -431,6 +441,8 @@ impl Engine {
             moved: None,
             restack: false,
             windows: None,
+            live: wallpaper::is_live(),
+            live_poll: None,
         })
     }
 
@@ -473,6 +485,54 @@ impl Engine {
         Ok(tex.unwrap())
     }
 
+    /// What a pane asking for `want` refracts: the wallpaper image only while
+    /// it's a still picture that loaded.
+    fn resolve(&mut self, want: Source, monitor: HMONITOR) -> Source {
+        match want {
+            Source::Wallpaper if self.live || self.wallpaper(monitor).is_none() => Source::Screen,
+            s => s,
+        }
+    }
+
+    fn start_live_poll(&mut self) {
+        if self.live_poll.is_none() {
+            self.live_poll = engine_timer(true, Engine::check_live);
+            if let Some(t) = &self.live_poll {
+                let _ = t.SetInterval(timespan(LIVE_POLL));
+                let _ = t.Start();
+            }
+        }
+    }
+
+    /// Notices a live wallpaper starting or stopping, and redraws every pane for it.
+    fn check_live(&mut self) {
+        let live = wallpaper::is_live();
+        if live != self.live {
+            log!("live wallpaper {}", if live { "started: glass refracts the desktop window" } else { "stopped" });
+            self.live = live;
+            self.resource_all();
+        }
+    }
+
+    /// Re-picks every pane's source and redraws it.
+    fn resource_all(&mut self) {
+        self.windows = None;
+        let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
+        for pane in panes {
+            let Ok(mut state) = pane.try_borrow_mut() else { continue };
+            let monitor = state.monitor;
+            state.source = self.resolve(state.want, monitor);
+            if state.source != Source::Screen {
+                state.layers.clear();
+            }
+            state.stale = true;
+            if let Err(e) = self.render(&mut state) {
+                log!("glass render failed: {e}");
+            }
+        }
+        self.prune();
+    }
+
     fn screen_panes(&mut self) -> Vec<Rc<RefCell<PaneState>>> {
         self.panes.retain(|p| p.strong_count() > 0);
         self.panes
@@ -488,6 +548,7 @@ impl Engine {
         let panes = self.screen_panes();
         let rect = panes.iter().find_map(|p| p.try_borrow().ok()?.layers.iter().find(|l| l.hwnd == hwnd).map(|l| l.rect));
         let Some(dirty) = self.scene.take(&self.device, &self.winrt, hwnd, rect) else { return };
+        count(|s| s.frames += 1);
         let mut any = false;
         for pane in &panes {
             let Ok(mut s) = pane.try_borrow_mut() else { continue };
@@ -541,7 +602,7 @@ impl Engine {
             let windows = self.windows();
             for pane in &panes {
                 let Ok(mut s) = pane.try_borrow_mut() else { continue };
-                if on_screen(s.hwnd) && (!s.shown || scene::layers(windows, &s.region) != s.layers) {
+                if on_screen(s.hwnd) && (!s.shown || layers_for(s.want, windows, &s.region, s.hwnd) != s.layers) {
                     s.stale = true;
                 }
             }
@@ -726,7 +787,7 @@ impl Engine {
 
         match pane.source {
             Source::Screen => {
-                let layers = scene::layers(self.windows(), &region);
+                let layers = layers_for(pane.want, self.windows(), &region, pane.hwnd);
                 self.scene.capture(&layers, &self.winrt, self.interval);
                 let rtv = &pane.src.as_ref().unwrap().2;
                 self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, &layers);
@@ -806,6 +867,7 @@ impl Engine {
         pane.drawn = Some(key);
         pane.presented = Some(Instant::now());
         pane.shown = true;
+        count(|s| s.renders += 1);
         Ok(())
     }
 }
@@ -817,7 +879,7 @@ pub fn shutdown() {
     // Nothing may start the engine again.
     FAILED.with(|f| f.set(true));
     let Some(mut engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
-    for t in [&engine.timer, &engine.poll, &engine.moved].into_iter().flatten() {
+    for t in [&engine.timer, &engine.poll, &engine.moved, &engine.live_poll].into_iter().flatten() {
         let _ = t.Stop();
     }
     engine.scene.close();
@@ -828,11 +890,80 @@ pub fn shutdown() {
 }
 
 /// Runs `f` on the engine if it's already running (never starts it).
+/// Where the glass engine's time goes, logged every 10 s while
+/// `%APPDATA%\DockSide\glass-stats` exists (create it, then restart).
+struct Stats {
+    on: bool,
+    since: Instant,
+    /// Engine calls, the time spent in them, and the slowest one.
+    calls: u32,
+    busy: Duration,
+    worst: Duration,
+    /// Captured frames taken, and panes presented.
+    frames: u32,
+    renders: u32,
+}
+
+impl Stats {
+    fn new() -> Self {
+        let on = crate::config::dir().join("glass-stats").exists();
+        Self { on, since: Instant::now(), calls: 0, busy: Duration::ZERO, worst: Duration::ZERO, frames: 0, renders: 0 }
+    }
+}
+
+/// What a screen pane draws behind it. One made for the wallpaper (it only
+/// sits over the desktop) refracts just the desktop window, holding a live
+/// wallpaper: windows passing over or under it never tint it.
+fn layers_for(want: Source, windows: &[scene::Window], region: &RECT, pane: HWND) -> Vec<Layer> {
+    match want {
+        Source::Wallpaper => scene::desktop(windows),
+        Source::Screen => scene::layers(windows, region, pane.0 as isize),
+    }
+}
+
+/// Times one engine call (see `Stats`).
+fn timed<R>(f: impl FnOnce() -> R) -> R {
+    if !STATS.with(|s| s.borrow().on) {
+        return f();
+    }
+    let start = Instant::now();
+    let r = f();
+    let took = start.elapsed();
+    STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.calls += 1;
+        s.busy += took;
+        s.worst = s.worst.max(took);
+        let span = s.since.elapsed();
+        if span >= Duration::from_secs(10) {
+            log!(
+                "glass stats: {:.1}% of a core, {} calls (worst {:.1} ms), {:.1} frames/s, {:.1} renders/s",
+                s.busy.as_secs_f64() / span.as_secs_f64() * 100.0,
+                s.calls,
+                s.worst.as_secs_f64() * 1000.0,
+                s.frames as f64 / span.as_secs_f64(),
+                s.renders as f64 / span.as_secs_f64()
+            );
+            *s = Stats::new();
+        }
+    });
+    r
+}
+
+fn count(f: impl FnOnce(&mut Stats)) {
+    STATS.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.on {
+            f(&mut s);
+        }
+    });
+}
+
 fn with_running(f: impl FnOnce(&mut Engine)) {
     ENGINE.with(|e| {
         if let Ok(mut e) = e.try_borrow_mut() {
             if let Some(engine) = e.as_mut() {
-                f(engine);
+                timed(|| f(engine));
             }
         }
     });
@@ -862,16 +993,8 @@ pub fn windows_changed() {
 pub fn wallpaper_changed() {
     with_running(|engine| {
         engine.wallpapers.clear();
-        let panes: Vec<_> = engine.panes.iter().filter_map(|p| p.upgrade()).collect();
-        for pane in panes {
-            let Ok(mut state) = pane.try_borrow_mut() else { continue };
-            if state.source == Source::Wallpaper {
-                state.stale = true;
-                if let Err(e) = engine.render(&mut state) {
-                    log!("glass render failed: {e}");
-                }
-            }
-        }
+        engine.live = wallpaper::is_live();
+        engine.resource_all();
     });
 }
 
@@ -891,7 +1014,8 @@ fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
                 }
             }
         }
-        Some(f(e.as_mut().unwrap()))
+        let engine = e.as_mut().unwrap();
+        Some(timed(|| f(engine)))
     })
 }
 
@@ -907,6 +1031,8 @@ struct PaneState {
     radius: f32,
     tint: Color,
     style: Style,
+    /// What it was made to refract, and what it does now (see `Engine::resolve`).
+    want: Source,
     source: Source,
     monitor: HMONITOR,
     /// A view of its back buffer, made once per resize.
@@ -951,14 +1077,12 @@ impl Pane {
         })?;
         let swapchain = swapchain.map_err(|e| log!("glass swap chain failed: {e}")).ok()?;
         let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-        let source = match source {
-            Source::Wallpaper if wallpaper::is_live() => {
-                log!("live wallpaper: glass refracts the screen instead");
-                Source::Screen
-            }
-            Source::Wallpaper if with_engine(|e| e.wallpaper(monitor).is_none()).unwrap_or(true) => Source::Screen,
-            s => s,
-        };
+        let want = source;
+        let source = with_engine(|e| {
+            e.start_live_poll();
+            e.resolve(want, monitor)
+        })
+        .unwrap_or(Source::Screen);
         let state = Rc::new(RefCell::new(PaneState {
             hwnd,
             swapchain: swapchain.clone(),
@@ -966,6 +1090,7 @@ impl Pane {
             radius: 0.0,
             tint,
             style,
+            want,
             source,
             monitor,
             rtv: None,

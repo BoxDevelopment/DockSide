@@ -16,6 +16,8 @@ pub mod taskbar;
 pub mod tray;
 pub mod versioned;
 pub mod wallpaper;
+#[cfg(test)]
+mod live_probe;
 
 use windows::core::{w, Error, Result, PCWSTR};
 use windows::Win32::Foundation::*;
@@ -232,5 +234,7 @@ pub const WM_APP_SHELF_KEY: u32 = WM_APP + 29;
 pub const WM_APP_CLOAKED: u32 = WM_APP + 30;
 /// Control Center's worker has a new status.
 pub const WM_APP_CONTROL: u32 = WM_APP + 32;
+/// The desktop wallpaper changed (from `wallpaper::watch`).
+pub const WM_APP_WALLPAPER: u32 = WM_APP + 33;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

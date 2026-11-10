@@ -64,8 +64,8 @@ pub enum Backdrop {
 }
 
 impl Backdrop {
-    /// The material for menus and Spotlight, which follow the menu bar's
-    /// setting but always need a body: a clear bar's panels are glass.
+    /// The material for menus (which follow the menu bar) and Spotlight, which
+    /// always need a body: "clear" panels are glass.
     pub fn for_panels(self) -> Backdrop {
         if self == Backdrop::Clear { Backdrop::Glass } else { self }
     }
@@ -236,6 +236,7 @@ pub struct DockCfg {
 pub struct SpotlightCfg {
     pub enabled: bool,
     pub hotkey: String,
+    pub backdrop: Backdrop,
     pub search_engine: String,
     pub custom_search_url: String,
 }

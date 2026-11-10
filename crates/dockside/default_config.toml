@@ -189,6 +189,8 @@ enabled = true
 # or one of those modifiers tapped on its own ("win", "ctrl"). With "win", double-tap Win for Start.
 # Set it in System Settings > General by clicking the shortcut and pressing the keys.
 hotkey = "alt+space"
+# The panel's material: "glass" (Liquid Glass), "acrylic", "blur" or "none".
+backdrop = "glass"
 # Engine for "Search the web" results: "google", "bing", "duckduckgo", "kagi", "brave" or "custom".
 search_engine = "google"
 # Used when search_engine = "custom". %s is replaced by the search text, e.g.

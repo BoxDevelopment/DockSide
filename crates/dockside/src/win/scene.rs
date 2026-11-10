@@ -93,6 +93,10 @@ pub struct Window {
     /// Hides what's behind it wherever it covers (no transparency to show through).
     opaque: bool,
     maximized: bool,
+    /// One of ours: never drawn, only marks where a pane sits in the stack.
+    ours: bool,
+    /// The desktop (Progman), which holds the wallpaper, live or not.
+    desktop: bool,
 }
 
 fn intersects(a: &RECT, b: &RECT) -> bool {
@@ -112,6 +116,7 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     let mut pid = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid == e.pid {
+        e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect: RECT::default() }, opaque: false, maximized: false, ours: true, desktop: false });
         return TRUE;
     }
     // Other virtual desktops, suspended Store apps, windows still opening.
@@ -129,11 +134,11 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     }
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let see_through = ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) != 0;
-    e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect }, opaque: !see_through, maximized: IsZoomed(hwnd).as_bool() });
+    e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect }, opaque: !see_through, maximized: IsZoomed(hwnd).as_bool(), ours: false, desktop: crate::win::class_name(hwnd) == "Progman" });
     TRUE
 }
 
-/// Every other app's window on screen, top-most first.
+/// Every other app's window on screen, top-most first, with markers for ours.
 pub fn windows() -> Vec<Window> {
     let mut e = Enum { pid: std::process::id(), out: Vec::new() };
     unsafe {
@@ -167,16 +172,27 @@ fn subtract(rects: &mut Vec<RECT>, cut: &RECT) {
     *rects = out;
 }
 
+/// Just the desktop window, for panes that only ever sit over the desktop
+/// (desktop widgets): they show the wallpaper and nothing else, whatever
+/// passes over or under them.
+pub fn desktop(windows: &[Window]) -> Vec<Layer> {
+    windows.iter().filter(|w| w.desktop).map(|w| w.layer).take(1).collect()
+}
+
 /// The windows that show in `region`, bottom-most first. Top-most first, each
 /// window that some still-uncovered part of the region shows is kept, and its
 /// opaque area covers that part for the windows below; a window only hidden
 /// by those above is skipped. (Maximized windows all overlap a pane at the top
 /// of the screen, but only the front one shows under it.)
-pub fn layers(windows: &[Window], region: &RECT) -> Vec<Layer> {
+///
+/// Only windows below `pane` count: one in front of it (the Alt+Tab switcher
+/// over a desktop widget) isn't behind the glass.
+pub fn layers(windows: &[Window], region: &RECT, pane: isize) -> Vec<Layer> {
+    let below = windows.iter().position(|w| w.ours && w.layer.hwnd == pane).map_or(0, |i| i + 1);
     let mut open = vec![*region];
     let mut out = Vec::new();
-    for w in windows {
-        if !open.iter().any(|r| intersects(r, &w.layer.rect)) {
+    for w in &windows[below..] {
+        if w.ours || !open.iter().any(|r| intersects(r, &w.layer.rect)) {
             continue;
         }
         out.push(w.layer);
@@ -209,6 +225,8 @@ struct Capture {
     /// from and the size of its content.
     frame: Option<(Direct3D11CaptureFrame, ID3D11ShaderResourceView, SizeInt32, (u32, u32))>,
     reports_dirty: bool,
+    /// The desktop window (see `pace`).
+    desktop: bool,
     /// Last needed by a pane.
     used: Instant,
 }
@@ -430,7 +448,7 @@ impl Scene {
     /// Re-paces every capture (battery saver turned on or off).
     pub fn set_interval(&self, interval: Duration) {
         for c in &self.captures {
-            let _ = c.session.SetMinUpdateInterval(timespan(interval));
+            let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop, interval)));
         }
     }
 
@@ -446,7 +464,17 @@ pub fn timespan(d: Duration) -> TimeSpan {
     TimeSpan { Duration: (d.as_nanos() / 100) as i64 }
 }
 
+/// How often a capture may send frames. The desktop window holds a live
+/// wallpaper's animation (Wallpaper Engine, Lively), redrawn in full every
+/// frame: glass follows it at up to 30 fps (15 in battery saver), smooth
+/// through the bend and frost, so a 60 fps wallpaper costs no more than a 30
+/// fps one. Every frame re-renders each pane over the desktop.
+fn pace(desktop: bool, interval: Duration) -> Duration {
+    if desktop { (interval * 2).max(Duration::from_millis(33)) } else { interval }
+}
+
 fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration) -> Result<Capture> {
+    let desktop = crate::win::class_name(HWND(hwnd as _)) == "Progman";
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(HWND(hwnd as _))? };
     let size = item.Size()?;
@@ -457,14 +485,14 @@ fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration) -> Result<Cap
     let _ = session.SetIsBorderRequired(false);
     // Windows 11 24H2+: Windows paces the frames and reports what changed, so
     // panes over a still part of a window skip the redraw.
-    let _ = session.SetMinUpdateInterval(timespan(interval));
+    let _ = session.SetMinUpdateInterval(timespan(pace(desktop, interval)));
     let reports_dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
     pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
         glass::on_window_frame(hwnd);
         Ok(())
     }))?;
     session.StartCapture()?;
-    Ok(Capture { hwnd, pool, session, _item: item, size, frame: None, reports_dirty, used: Instant::now() })
+    Ok(Capture { hwnd, pool, session, _item: item, size, frame: None, reports_dirty, desktop, used: Instant::now() })
 }
 
 #[cfg(test)]
@@ -472,7 +500,7 @@ mod tests {
     use super::*;
 
     fn win(id: isize, l: i32, t: i32, r: i32, b: i32, opaque: bool) -> Window {
-        Window { layer: Layer { hwnd: id, rect: RECT { left: l, top: t, right: r, bottom: b } }, opaque, maximized: false }
+        Window { layer: Layer { hwnd: id, rect: RECT { left: l, top: t, right: r, bottom: b } }, opaque, maximized: false, ours: false, desktop: false }
     }
 
     #[test]
@@ -491,7 +519,7 @@ mod tests {
             win(3, 0, 0, 400, 400, true),   // covers
             win(4, 0, 0, 500, 500, true),   // hidden under 3
         ];
-        let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 0).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![3, 2]);
     }
 
@@ -500,7 +528,7 @@ mod tests {
         let region = RECT { left: 100, top: 100, right: 200, bottom: 150 };
         // Covers, but layered; then one that covers only up to its rounded corners.
         let ws = [win(1, 0, 0, 400, 400, false), win(2, 95, 95, 205, 155, true), win(3, 0, 0, 400, 400, true)];
-        let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 0).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![3, 2, 1]);
     }
 
@@ -510,7 +538,20 @@ mod tests {
         let region = RECT { left: 1000, top: 0, right: 1500, bottom: 45 };
         let max = |id, opaque| Window { maximized: true, ..win(id, 0, 29, 2560, 1440, opaque) };
         let ws = [max(1, true), max(2, true), max(3, true), win(4, 0, 0, 2560, 1440, true)];
-        let got: Vec<isize> = layers(&ws, &region).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 0).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![4, 1]);
+    }
+
+    #[test]
+    fn ignores_windows_in_front_of_the_pane() {
+        // The Alt+Tab switcher (1) over a desktop widget (pane 9), above an app window (2).
+        let region = RECT { left: 100, top: 100, right: 200, bottom: 150 };
+        let pane = Window { ours: true, ..win(9, 0, 0, 0, 0, false) };
+        let ws = [win(1, 0, 0, 400, 400, true), pane, win(2, 90, 120, 300, 300, true)];
+        let got: Vec<isize> = layers(&ws, &region, 9).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![2]);
+        // A pane that isn't listed (hidden) sees everything.
+        let got: Vec<isize> = layers(&ws, &region, 5).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![1]);
     }
 }

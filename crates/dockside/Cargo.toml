@@ -64,6 +64,7 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_System_Variant",
     "Win32_System_Wmi",
+    "Win32_Storage_Xps",
     "Win32_System_WinRT",
     "Win32_System_WinRT_Composition",
     "Win32_System_WinRT_Direct3D11",

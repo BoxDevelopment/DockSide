@@ -4,10 +4,11 @@
 //! hide from capture and shows up in screenshots and recordings.
 
 use windows::core::{w, Result, HSTRING, PWSTR};
-use windows::Win32::Foundation::{BOOL, GENERIC_READ, HWND, LPARAM, RECT};
+use windows::Win32::Foundation::{BOOL, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, GENERIC_READ, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, CLSCTX_INPROC_SERVER};
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Registry::{RegEnumValueW, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, FindWindowExW, FindWindowW, GetWindowThreadProcessId, IsWindowVisible};
 
@@ -56,7 +57,13 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
 
     let wic: IWICImagingFactory = unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
     let image: IWICBitmapSource = unsafe {
-        let decoder = wic.CreateDecoderFromFilename(&HSTRING::from(path), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)?;
+        let open = |p: &str| wic.CreateDecoderFromFilename(&HSTRING::from(p), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand);
+        // The picture may since have been moved or deleted (or be one Windows
+        // Spotlight already cleaned up); Explorer keeps its own copy of what it shows.
+        let decoder = open(&path).or_else(|e| {
+            let copy = std::env::var("APPDATA").map(|a| format!("{a}\\Microsoft\\Windows\\Themes\\TranscodedWallpaper")).map_err(|_| e.clone())?;
+            open(&copy).map_err(|_| e)
+        })?;
         let converter = wic.CreateFormatConverter()?;
         converter.Initialize(&decoder.GetFrame(0)?, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)?;
         converter.into()
@@ -120,6 +127,57 @@ fn blit(wic: &IWICImagingFactory, image: &IWICBitmapSource, natural: (i32, i32),
     let rect = WICRect { X: x0 - at.0, Y: y0 - at.1, Width: x1 - x0, Height: y1 - y0 };
     let offset = ((y0 * dst.0 + x0) * 4) as usize;
     unsafe { source.CopyPixels(&rect, (dst.0 * 4) as u32, &mut px[offset..]) }
+}
+
+/// The registry values that say which picture the desktop shows (the path, its
+/// layout, and the per-monitor transcoded copies Explorer makes of it).
+fn signature(key: HKEY) -> Vec<u8> {
+    let mut sig = Vec::new();
+    let mut name = [0u16; 256];
+    let mut data = vec![0u8; 4096];
+    for i in 0.. {
+        let (mut n, mut len) = (name.len() as u32, data.len() as u32);
+        let r = unsafe { RegEnumValueW(key, i, PWSTR(name.as_mut_ptr()), &mut n, None, None, Some(data.as_mut_ptr()), Some(&mut len)) };
+        if r == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        // Too big for the buffer: its name still counts.
+        let len = if r.is_ok() { len as usize } else if r == ERROR_MORE_DATA { 0 } else { continue };
+        let name = String::from_utf16_lossy(&name[..n as usize]);
+        if name.starts_with("Wallpaper") || name.starts_with("TileWallpaper") || name.starts_with("TranscodedImageCache") {
+            sig.extend_from_slice(name.as_bytes());
+            sig.extend_from_slice(&data[..len.min(data.len())]);
+        }
+    }
+    sig
+}
+
+/// Posts `msg` to `hwnd` whenever the desktop wallpaper changes, however it
+/// was changed: Settings, a slideshow or Windows Spotlight moving on, or
+/// another app. (Not every one of them broadcasts `SPI_SETDESKWALLPAPER`.)
+pub fn watch(hwnd: HWND, msg: u32) {
+    let hwnd = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, w!("Control Panel\\Desktop"), 0, KEY_READ | KEY_NOTIFY, &mut key).is_err() {
+            log!("wallpaper watch unavailable");
+            return;
+        }
+        let Ok(event) = CreateEventW(None, false, false, None) else { return };
+        let mut last = signature(key);
+        loop {
+            if RegNotifyChangeKeyValue(key, false, REG_NOTIFY_CHANGE_LAST_SET, event, true).is_err() {
+                log!("wallpaper watch stopped");
+                return;
+            }
+            WaitForSingleObject(event, INFINITE);
+            let now = signature(key);
+            if now != last {
+                last = now;
+                crate::win::post(hwnd, msg);
+            }
+        }
+    });
 }
 
 struct Search {

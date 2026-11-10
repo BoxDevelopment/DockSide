@@ -243,6 +243,7 @@ crates/dockside/src
 
 - Liquid Glass refraction (`[general] glass_refraction`) hides glass surfaces, and Finder windows with a glass sidebar, from screenshots and screen sharing; turn it off in Settings → Appearance to fall back to non-bending glass.
 - Blurred backdrops need Windows 11 with **Transparency effects** turned on (Settings → Personalization → Colors). If Composition isn't available, DockSide falls back to a DWM accent with 8px corners.
+- Under a live wallpaper (Wallpaper Engine, Lively), Liquid Glass refracts the animated wallpaper through a capture of the desktop window. While the wallpaper app pauses (e.g. behind a maximized window), the glass holds its last frame.
 
 ## License
 

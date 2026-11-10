@@ -296,7 +296,7 @@ impl Spotlight {
         let left = mon.left + (mon.right - mon.left - w) / 2;
         let top = mon.top + ((mon.bottom - mon.top) as f32 * 0.17) as i32 - (SHADOW * s) as i32;
         let rect = RECT { left, top, right: left + w, bottom: top + h };
-        let kind = cfg.menubar.backdrop.for_panels();
+        let kind = cfg.spotlight.backdrop.for_panels();
         let surface = Surface::new(gfx, rect, s, kind, theme.menu_tint)?;
         SPOTLIGHT_HWND.store(surface.content.0 as isize, std::sync::atomic::Ordering::Relaxed);
         let low_power = Arc::new(OnceLock::new());

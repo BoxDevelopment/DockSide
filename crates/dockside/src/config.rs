@@ -20,6 +20,7 @@ pub struct Config {
     pub desktops: DesktopsCfg,
     pub widgets: WidgetsCfg,
     pub windows: WindowsCfg,
+    pub calendar: CalendarCfg,
     /// Which controls Control Center shows, by name (see `controlcenter::MODULES`).
     #[serde(default)]
     pub control_center: BTreeMap<String, bool>,
@@ -293,6 +294,16 @@ pub struct DesktopsCfg {
     pub replace_windows_switcher: bool,
     /// Show switches in the Dynamic Island.
     pub island: bool,
+}
+
+/// Calendar accounts (the accounts themselves live in `calendars.dat`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct CalendarCfg {
+    pub google_client_id: String,
+    pub google_client_secret: String,
+    pub microsoft_client_id: String,
+    /// "auto", "sunday" or "monday".
+    pub week_starts: String,
 }
 
 /// The Dynamic Island at the top center of the screen.

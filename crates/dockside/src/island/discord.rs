@@ -613,11 +613,11 @@ fn load_token() -> Option<Token> {
 }
 
 /// Encrypts to the current Windows user (DPAPI).
-fn protect(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn protect(data: &[u8]) -> Option<Vec<u8>> {
     dpapi(data, true)
 }
 
-fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
     dpapi(data, false)
 }
 

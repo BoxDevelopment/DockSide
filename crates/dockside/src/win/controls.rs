@@ -89,6 +89,21 @@ pub fn set_low_power_mode(on: bool) {
     }
 }
 
+/// The power mode slider's current position (Balanced when it can't be read).
+pub fn power_mode() -> crate::spotlight::commands::PowerMode {
+    use crate::spotlight::commands::PowerMode;
+    let overlay = powrprof(s!("PowerGetEffectiveOverlayScheme")).and_then(|f| {
+        let f: GetOverlay = unsafe { std::mem::transmute(f) };
+        let mut g = GUID::zeroed();
+        (unsafe { f(&mut g) } == 0).then_some(g)
+    });
+    match overlay {
+        Some(BEST_EFFICIENCY) => PowerMode::Efficiency,
+        Some(BEST_PERFORMANCE) => PowerMode::Performance,
+        _ => PowerMode::Balanced,
+    }
+}
+
 pub fn set_power_mode(mode: crate::spotlight::commands::PowerMode) {
     use crate::spotlight::commands::PowerMode;
     let guid = match mode {

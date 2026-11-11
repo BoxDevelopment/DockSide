@@ -59,9 +59,10 @@ pub enum Page {
     Desktops,
     Island,
     Widgets,
+    Calendars,
 }
 
-const PAGES: [(Page, &str); 11] = [
+const PAGES: [(Page, &str); 12] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
@@ -71,6 +72,7 @@ const PAGES: [(Page, &str); 11] = [
     (Page::Launchpad, "Launchpad"),
     (Page::Windows, "Windows"),
     (Page::Widgets, "Widgets"),
+    (Page::Calendars, "Calendars"),
     (Page::Finder, "Finder"),
     (Page::Desktops, "Desktops"),
 ];
@@ -116,6 +118,188 @@ fn discord_rows(cfg: &Config) -> Vec<Row> {
     rows
 }
 
+/// System Settings > Calendars: the accounts, or the setup adding one.
+fn calendar_groups() -> Vec<Group> {
+    use crate::calsync::{self, Method, Provider, Step};
+    let snap = calsync::snapshot();
+    let Some(setup) = snap.setup else {
+        let mut rows = Vec::new();
+        if snap.accounts.is_empty() {
+            rows.push(Row::Note(
+                "Add the calendars you use (iCloud, Google, Outlook, or any CalDAV server) and their events show in the menu bar \
+                 calendar (click the clock) and in the Dynamic Island. Setup explains the best way to connect each one.",
+            ));
+        }
+        rows.extend((0..snap.accounts.len()).map(Row::Account));
+        let mut buttons = vec![("Add Account\u{2026}", Hit::CalAdd)];
+        if !snap.accounts.is_empty() {
+            buttons.insert(0, ("Sync Now", Hit::CalSync));
+        }
+        rows.push(Row::Buttons("", buttons));
+        return vec![
+            Group { title: Some("Accounts"), rows },
+            Group { title: Some("Menu Bar Calendar"), rows: vec![Row::Segmented("Weeks start on", Key::CalWeekStart)] },
+        ];
+    };
+
+    let mut rows = Vec::new();
+    let title = match setup.step {
+        Step::Pick => {
+            rows.push(Row::Note(
+                "Where do your calendars live? Pick one and DockSide explains how it can connect before asking for anything. \
+                 You can add as many accounts as you like, one at a time.",
+            ));
+            rows.push(Row::Buttons(
+                "",
+                vec![
+                    ("Outlook / Microsoft 365", Hit::CalPick(Provider::Outlook)),
+                    ("Google", Hit::CalPick(Provider::Google)),
+                    ("iCloud", Hit::CalPick(Provider::ICloud)),
+                ],
+            ));
+            rows.push(Row::Buttons(
+                "",
+                vec![("Subscribe to a Link\u{2026}", Hit::CalPick(Provider::Link)), ("Other CalDAV Account\u{2026}", Hit::CalPick(Provider::CalDav))],
+            ));
+            rows.push(Row::Buttons("", vec![("Cancel", Hit::CalCancel)]));
+            "Add an Account"
+        }
+        Step::Explain(p) => {
+            let (signin, link, primary) = match p {
+                Provider::ICloud => (
+                    "App-specific password (recommended): Apple doesn't let other apps sign in with your Apple Account password, so you \
+                     make a separate one just for DockSide. Every calendar shows, changes arrive within minutes, and you can revoke it.",
+                    "Public link: share one calendar publicly from the Calendar app and paste its link. No password, but it's one calendar \
+                     per link, read-only, and anyone with the link can see it.",
+                    ("Use an App-Specific Password", Hit::CalMethod(Method::Password)),
+                ),
+                Provider::Google => (
+                    "Sign in with Google (recommended): every calendar, with changes within minutes. Google only lets registered apps \
+                     sign in, so you register DockSide as your own free app once. It takes about five minutes; steps are next.",
+                    "Secret address: paste a calendar's private iCal link from Google Calendar's settings. Nothing to register, but it's one \
+                     calendar per link, read-only, and Google can take several hours to show changes in it.",
+                    ("Sign In with Google", Hit::CalMethod(Method::SignIn)),
+                ),
+                _ => (
+                    "Sign in with Microsoft (recommended): Outlook.com, Hotmail and work or school (Microsoft 365) calendars, with changes \
+                     within minutes. You register DockSide as your own free app in Microsoft Entra once (about five minutes).",
+                    "Published link: publish a calendar from Outlook on the web and paste its ICS link. Nothing to register, but it's \
+                     read-only, one calendar per link, and changes can take hours. Work accounts may not allow publishing.",
+                    ("Sign In with Microsoft", Hit::CalMethod(Method::SignIn)),
+                ),
+            };
+            rows.push(Row::Note(signin));
+            rows.push(Row::Note(link));
+            rows.push(Row::Buttons("", vec![primary, ("Use a Link Instead", Hit::CalMethod(Method::Link)), ("Back", Hit::CalBack)]));
+            match p {
+                Provider::ICloud => "iCloud: Which Way to Connect?",
+                Provider::Google => "Google: Which Way to Connect?",
+                _ => "Outlook: Which Way to Connect?",
+            }
+        }
+        Step::SignIn(Provider::Google) => {
+            rows.push(Row::Note(
+                "1. Open Google Cloud and create a project (any name). Under APIs & Services \u{203A} Library, find the Google \
+                 Calendar API and click Enable.",
+            ));
+            rows.push(Row::Note(
+                "2. Under OAuth consent screen, choose External, enter an app name (DockSide) and your email, then under Audience \
+                 \u{203A} Test users add your own Google address.",
+            ));
+            rows.push(Row::Note(
+                "3. Under Credentials \u{203A} Create credentials \u{203A} OAuth client ID, choose Desktop app. Paste its Client ID and \
+                 secret below and click Sign In. Google warns the app isn't verified: it's your own, so continue.",
+            ));
+            rows.push(Row::Text("Client ID", Key::CalGoogleId, "\u{2026}.apps.googleusercontent.com"));
+            rows.push(Row::Text("Client Secret", Key::CalGoogleSecret, "GOCSPX-\u{2026}"));
+            "Sign In with Google"
+        }
+        Step::SignIn(_) => {
+            rows.push(Row::Note(
+                "1. Open Microsoft Entra \u{203A} App registrations \u{203A} New registration. Name it DockSide, and for supported \
+                 account types pick any organizational directory and personal Microsoft accounts.",
+            ));
+            rows.push(Row::Note(
+                "2. Under Redirect URI choose Public client/native (mobile & desktop), enter http://localhost and click Register.",
+            ));
+            rows.push(Row::Note(
+                "3. Under API permissions \u{203A} Add a permission \u{203A} Microsoft Graph \u{203A} Delegated, add Calendars.Read. \
+                 Paste the Application (client) ID from the Overview page below and click Sign In.",
+            ));
+            rows.push(Row::Text("Application ID", Key::CalMsId, "00000000-0000-0000-0000-000000000000"));
+            "Sign In with Microsoft"
+        }
+        Step::Password(Provider::ICloud) => {
+            rows.push(Row::Note(
+                "At account.apple.com, go to Sign-In and Security \u{203A} App-Specific Passwords, make one called DockSide, and \
+                 paste it below with your Apple Account email. (Two-factor authentication needs to be on.)",
+            ));
+            rows.push(Row::Text("Apple Account", Key::CalDraft(calsync::Field::User), "name@icloud.com"));
+            rows.push(Row::Text("App-Specific Password", Key::CalDraft(calsync::Field::Password), "xxxx-xxxx-xxxx-xxxx"));
+            "Connect iCloud"
+        }
+        Step::Password(_) => {
+            rows.push(Row::Note(
+                "Fastmail, Nextcloud, Yahoo, Zoho, mailbox.org and most calendar services speak CalDAV. Enter the server address \
+                 they give for calendar apps, with your user name and password (an app password if they offer one).",
+            ));
+            rows.push(Row::Text("Server", Key::CalDraft(calsync::Field::Server), "https://caldav.example.com"));
+            rows.push(Row::Text("User Name", Key::CalDraft(calsync::Field::User), "you@example.com"));
+            rows.push(Row::Text("Password", Key::CalDraft(calsync::Field::Password), "App password"));
+            "Add a CalDAV Account"
+        }
+        Step::Link(p) => {
+            rows.push(Row::Note(match p {
+                Provider::ICloud => {
+                    "In Calendar on your iPhone, iPad or Mac (or at icloud.com), open a calendar's info, turn on Public Calendar, and \
+                     share or copy its link (webcal://\u{2026}). Anyone with the link can see that calendar."
+                }
+                Provider::Google => {
+                    "In Google Calendar on the web: Settings \u{203A} choose the calendar on the left \u{203A} Integrate calendar \
+                     \u{203A} Secret address in iCal format. Keep it private: anyone with it can read the calendar."
+                }
+                Provider::Outlook => {
+                    "In Outlook on the web: Settings \u{203A} Calendar \u{203A} Shared calendars \u{203A} Publish a calendar. Choose \
+                     the calendar and Can view all details, click Publish, then copy the ICS link."
+                }
+                _ => {
+                    "Paste any calendar subscription link (.ics or webcal://): holidays, sports fixtures, school terms, or a calendar \
+                     someone shared with you. It's read-only and refreshes every few minutes."
+                }
+            }));
+            rows.push(Row::Text("Calendar Link", Key::CalDraft(calsync::Field::Link), "https://\u{2026}.ics or webcal://\u{2026}"));
+            "Subscribe to a Calendar"
+        }
+    };
+    if !matches!(setup.step, Step::Pick | Step::Explain(_)) {
+        if let Some((m, _)) = &setup.message {
+            rows.push(Row::Info("Status", m.clone()));
+        }
+        let mut buttons = Vec::new();
+        if setup.busy {
+            buttons.push(("Cancel", Hit::CalCancel));
+        } else {
+            buttons.push((
+                match setup.step {
+                    Step::SignIn(_) => "Sign In",
+                    Step::Link(_) => "Subscribe",
+                    _ => "Connect",
+                },
+                Hit::CalConnect,
+            ));
+            match setup.step {
+                Step::SignIn(Provider::Google) => buttons.push(("Open Google Cloud\u{2026}", Hit::CalOpen(0))),
+                Step::SignIn(_) => buttons.push(("Open Microsoft Entra\u{2026}", Hit::CalOpen(1))),
+                Step::Password(Provider::ICloud) => buttons.push(("Open account.apple.com\u{2026}", Hit::CalOpen(2))),
+                _ => {}
+            }
+            buttons.push(("Back", Hit::CalBack));
+        }
+        rows.push(Row::Buttons("", buttons));
+    }
+    vec![Group { title: Some(title), rows }]
+}
+
 /// The words a row is found by in search: its label and the choices it offers.
 fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
     match row {
@@ -127,6 +311,7 @@ fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
         Row::Named(l, b, _) => format!("{l} {b}"),
         Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
         Row::Excluded(i) => cfg.windows.no_inject.get(*i).map_or_else(String::new, |e| format!("Excluded {e}")),
+        Row::Account(i) => crate::calsync::snapshot().accounts.get(*i).map_or_else(String::new, |a| format!("{} {}", a.provider.label(), a.name)),
     }
 }
 
@@ -206,6 +391,13 @@ pub(crate) fn installed_fonts(gfx: &Gfx) -> Vec<String> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Key {
     StartAtLogin,
+    /// `[calendar]` settings.
+    CalGoogleId,
+    CalGoogleSecret,
+    CalMsId,
+    CalWeekStart,
+    /// Calendar setup: typed into the draft, not config.toml.
+    CalDraft(crate::calsync::Field),
     HideTaskbar,
     ShortcutStyle,
     Appearance,
@@ -288,6 +480,11 @@ impl Key {
     fn path(self) -> (&'static str, &'static str) {
         match self {
             Key::StartAtLogin => ("", ""),
+            Key::CalGoogleId => ("calendar", "google_client_id"),
+            Key::CalGoogleSecret => ("calendar", "google_client_secret"),
+            Key::CalMsId => ("calendar", "microsoft_client_id"),
+            Key::CalWeekStart => ("calendar", "week_starts"),
+            Key::CalDraft(_) => ("", ""),
             Key::HideTaskbar => ("general", "hide_taskbar"),
             Key::ShortcutStyle => ("general", "shortcut_style"),
             Key::Appearance => ("general", "appearance"),
@@ -411,6 +608,18 @@ pub(crate) enum Hit {
     NotificationSettings,
     LiveDemo,
     LiveDocs,
+    /// Calendars: add an account (setup's first step), pick a provider, pick
+    /// how it connects, go back, cancel, connect, open a provider's page,
+    /// remove an account, read every account again.
+    CalAdd,
+    CalPick(crate::calsync::Provider),
+    CalMethod(crate::calsync::Method),
+    CalBack,
+    CalCancel,
+    CalConnect,
+    CalOpen(u8),
+    CalRemove(u64),
+    CalSync,
 }
 
 /// Springs behind the controls: hover fades, switch knobs, segment pills.
@@ -449,17 +658,21 @@ pub(crate) enum Row {
     Keybind(&'static str, Key),
     /// A few lines of explanation (taller than other rows).
     Note(&'static str),
+    /// A calendar account (by index in `calsync::snapshot().accounts`), with Remove.
+    Account(usize),
 }
 
 /// A note row fits three lines of 12 pt text.
 const NOTE_H: f32 = 64.0;
+/// An account row: name over its status.
+const ACCOUNT_H: f32 = 52.0;
 
 impl Row {
     pub(crate) fn height(&self) -> f32 {
-        if matches!(self, Row::Note(_)) {
-            NOTE_H
-        } else {
-            ROW_H
+        match self {
+            Row::Note(_) => NOTE_H,
+            Row::Account(_) => ACCOUNT_H,
+            _ => ROW_H,
         }
     }
 }
@@ -1337,6 +1550,7 @@ impl SettingsWindow {
                     ],
                 },
             ],
+            Page::Calendars => calendar_groups(),
             Page::Widgets => {
                 use crate::widgets::{title, KINDS};
                 let add = |kinds: &[crate::config::WidgetKind]| {
@@ -1493,6 +1707,11 @@ impl SettingsWindow {
             Key::SpotlightBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.spotlight.backdrop.for_panels())).filter(|&i| i < BACKDROPS.len())),
             Key::DockBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.dock.backdrop)).filter(|&i| i < BACKDROPS.len())),
             Key::WidgetsBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.widgets.backdrop)).filter(|&i| i < BACKDROPS.len())),
+            Key::CalWeekStart => {
+                const STARTS: [(&str, &str); 3] = [("Automatic", "auto"), ("Sunday", "sunday"), ("Monday", "monday")];
+                let current = cfg.calendar.week_starts.to_lowercase();
+                fixed(&STARTS, Some(STARTS.iter().position(|u| u.1 == current).unwrap_or(0)))
+            }
             Key::WidgetsUnit => {
                 const UNITS: [(&str, &str); 3] = [("Automatic", "auto"), ("\u{B0}C", "c"), ("\u{B0}F", "f")];
                 let current = cfg.widgets.temperature_unit.to_lowercase();
@@ -1611,11 +1830,49 @@ impl SettingsWindow {
         }
     }
 
+    fn calendar_hit(&mut self, hit: Hit, cfg: &Config) {
+        use crate::calsync::{self, Method, Provider, Step};
+        self.editing = None;
+        match hit {
+            Hit::CalAdd => calsync::setup(Some(Step::Pick)),
+            Hit::CalPick(p) => calsync::setup(Some(match p {
+                Provider::CalDav => Step::Password(p),
+                Provider::Link => Step::Link(p),
+                _ => Step::Explain(p),
+            })),
+            Hit::CalMethod(m) => {
+                if let Some(Step::Explain(p)) = calsync::snapshot().setup.map(|s| s.step) {
+                    calsync::setup(Some(match m {
+                        Method::SignIn => Step::SignIn(p),
+                        Method::Password => Step::Password(p),
+                        Method::Link => Step::Link(p),
+                    }));
+                }
+            }
+            Hit::CalBack => calsync::setup_back(),
+            Hit::CalCancel => calsync::setup(None),
+            Hit::CalConnect => calsync::connect(&cfg.calendar),
+            Hit::CalRemove(id) => {
+                let name = calsync::snapshot().accounts.into_iter().find(|a| a.id == id).map(|a| a.name).unwrap_or_default();
+                let ask = format!("Remove {name} from DockSide? Its events stop showing, and DockSide forgets its sign-in.");
+                if crate::win::system::confirm("Remove Account", &ask) {
+                    calsync::remove(id);
+                }
+            }
+            Hit::CalSync => calsync::sync_now(),
+            _ => {}
+        }
+    }
+
     fn text_value(key: Key, cfg: &Config) -> String {
         match key {
             Key::CustomSearchUrl => cfg.spotlight.custom_search_url.clone(),
             Key::DockMacIconsKey => cfg.dock.macosicons_key.clone(),
             Key::IslandIcs => cfg.island.calendar_ics.clone(),
+            Key::CalGoogleId => cfg.calendar.google_client_id.clone(),
+            Key::CalGoogleSecret => cfg.calendar.google_client_secret.clone(),
+            Key::CalMsId => cfg.calendar.microsoft_client_id.clone(),
+            Key::CalDraft(f) => crate::calsync::draft(f),
             Key::DiscordId => cfg.island.discord_client_id.clone(),
             Key::DiscordSecret => cfg.island.discord_client_secret.clone(),
             Key::WidgetsLocation => cfg.widgets.location.clone(),
@@ -1640,6 +1897,10 @@ impl SettingsWindow {
         let key = ed.key;
         self.editing = None;
         self.dirty = true;
+        if let Key::CalDraft(f) = key {
+            crate::calsync::set_draft(f, text);
+            return SettingsEvent::None;
+        }
         if text == Self::text_value(key, cfg) {
             return SettingsEvent::None;
         }
@@ -1818,6 +2079,22 @@ impl SettingsWindow {
         if !matches!(hit, Some(Hit::Search | Hit::ClearSearch)) {
             self.search_focus = false;
         }
+        // Connecting while a calendar field is still being typed in: use what's typed.
+        if let (Some(ed), Some(Hit::CalConnect)) = (&self.editing, hit) {
+            let mut cal = cfg.calendar.clone();
+            let text = ed.field.string().trim().to_string();
+            match ed.key {
+                Key::CalGoogleId => cal.google_client_id = text,
+                Key::CalGoogleSecret => cal.google_client_secret = text,
+                Key::CalMsId => cal.microsoft_client_id = text,
+                _ => {}
+            }
+            let ev = self.commit(cfg);
+            if self.editing.is_none() {
+                crate::calsync::connect(&cal);
+            }
+            return ev;
+        }
         // Clicking anywhere outside the field being edited commits it.
         if let Some(ed) = &self.editing {
             if hit != Some(Hit::Field(ed.key)) {
@@ -1922,6 +2199,19 @@ impl SettingsWindow {
             Hit::ConnectClaude(on) => Action::ConnectClaude(on),
             Hit::ConnectDiscord(on) => Action::ConnectDiscord(on),
             Hit::DiscordPortal => Action::Open("https://discord.com/developers/applications".into()),
+            Hit::CalAdd | Hit::CalPick(_) | Hit::CalMethod(_) | Hit::CalBack | Hit::CalCancel | Hit::CalConnect | Hit::CalRemove(_) | Hit::CalSync => {
+                self.calendar_hit(hit, cfg);
+                self.dirty = true;
+                return SettingsEvent::None;
+            }
+            Hit::CalOpen(i) => Action::Open(
+                match i {
+                    0 => "https://console.cloud.google.com/apis/credentials",
+                    1 => "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade",
+                    _ => "https://account.apple.com/account/manage",
+                }
+                .into(),
+            ),
             Hit::AddWidget(kind) => Action::Widget(crate::widgets::WidgetCmd::Add(kind)),
             Hit::ResetWidgets => Action::Widget(crate::widgets::WidgetCmd::Reset),
             Hit::Slider(_) => return SettingsEvent::None,
@@ -2300,7 +2590,16 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
             let tr = Rect::new(f.x + 8.0, f.y, f.w - 16.0, f.h);
             match ed {
                 Some(e) => {
-                    let prefix = |n: usize| p.gfx.measure(&e.field.text[..n].iter().collect::<String>(), &regular);
+                    // Passwords show as dots, even while typing.
+                    let masked = *key == Key::CalDraft(crate::calsync::Field::Password);
+                    let shown = |n: usize| -> String {
+                        if masked {
+                            "\u{2022}".repeat(n)
+                        } else {
+                            e.field.text[..n].iter().collect()
+                        }
+                    };
+                    let prefix = |n: usize| p.gfx.measure(&shown(n), &regular);
                     let (a, b) = e.field.range();
                     if a != b {
                         let (x0, x1) = (prefix(a), prefix(b));
@@ -2309,7 +2608,7 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                         let cx = tr.x + prefix(a) + 0.5;
                         p.line(cx, f.y + 5.0, cx, f.bottom() - 5.0, theme.text, 1.0);
                     }
-                    p.text(&e.field.string(), &regular, tr, theme.text);
+                    p.text(&shown(e.field.text.len()), &regular, tr, theme.text);
                 }
                 None => {
                     let mut value = SettingsWindow::text_value(*key, cfg);
@@ -2318,7 +2617,10 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                         value = crate::island::calendar_links_summary(&value);
                     }
                     // So is an API key: show only its last few characters.
-                    if matches!(*key, Key::DockMacIconsKey | Key::DiscordSecret) && !value.is_empty() {
+                    if *key == Key::CalDraft(crate::calsync::Field::Password) && !value.is_empty() {
+                        value = "\u{2022}".repeat(value.chars().count());
+                    }
+                    if matches!(*key, Key::DockMacIconsKey | Key::DiscordSecret | Key::CalGoogleSecret) && !value.is_empty() {
                         let tail: String = value.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
                         value = format!("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022} {tail}");
                     }
@@ -2369,6 +2671,49 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
             p.text(label, &regular, label_r, theme.text);
             let vr = Rect::new(r.x + r.w * 0.3, r.y, r.w * 0.7 - 14.0, r.h);
             p.text(value, &right, vr, theme.text_secondary);
+        }
+        Row::Account(i) => {
+            use crate::calsync::{Method, Status};
+            let Some(a) = crate::calsync::snapshot().accounts.into_iter().nth(*i) else { return };
+            let badge = Rect::new(r.x + 12.0, r.cy() - 14.0, 28.0, 28.0);
+            let [cr, cg, cb] = a.provider.tint();
+            p.fill_round(badge, 7.0, Color::rgba(cr, cg, cb, 1.0));
+            let glyph = match a.method {
+                Method::Link => "\u{E71B}",
+                _ => "\u{E787}",
+            };
+            let gf = p.gfx.format("Segoe Fluent Icons", 14.0, Weight::Regular, Align::Center);
+            p.text(glyph, &gf, badge, Color::WHITE);
+            let name = if crate::screenshot_mode::on() { crate::screenshot_mode::NAME.to_string() } else { a.name.clone() };
+            let bw = p.gfx.measure("Remove", &button_font) + 24.0;
+            let b = Rect::new(right_edge - bw, r.cy() - 12.0, bw, 24.0);
+            let tx = badge.right() + 10.0;
+            let label = format!("{} \u{2014} {name}", a.provider.label());
+            p.text(&label, &regular, Rect::new(tx, r.y + 7.0, b.x - 12.0 - tx, 20.0), theme.text);
+            let (status, bad) = match &a.status {
+                Status::Syncing => ("Syncing\u{2026}".to_string(), false),
+                Status::Ok { calendars, .. } => {
+                    let names: Vec<&str> = calendars.iter().map(|c| c.name.as_str()).collect();
+                    let mut s = match names.len() {
+                        0 => "No calendars".to_string(),
+                        1 => names[0].to_string(),
+                        n => format!("{n} calendars: {}", names.join(", ")),
+                    };
+                    if a.method == Method::Link {
+                        s.push_str(" \u{00B7} read-only link");
+                    }
+                    (s, false)
+                }
+                Status::Failed(e) => (e.clone(), true),
+            };
+            let small = p.gfx.format(&theme.font, 11.0, Weight::Regular, Align::Leading);
+            let c = if bad { Color::rgba(255, 69, 58, 1.0) } else { theme.text_secondary };
+            p.text(&status, &small, Rect::new(tx, r.y + 26.0, b.x - 12.0 - tx, 18.0), c);
+            let hit = Hit::CalRemove(a.id);
+            p.fill_round(b, 6.0, control_bg.mix(selected_seg, ctx.hover_t(hit)));
+            p.stroke_round(b.inset(0.25, 0.25), 6.0, card_border, 0.5);
+            p.text("Remove", &button_font, b, theme.text);
+            hits.push((b, hit));
         }
         Row::Note(text) => {
             let block = p.gfx.format_block(&theme.font, 12.0, Weight::Regular, Align::Leading);
@@ -2488,6 +2833,15 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             let (w, h) = (r.w * 0.5, r.h * 0.36);
             p.stroke_round(Rect::new(r.cx() - w / 2.0 + 2.0, r.cy() - h / 2.0 - 2.0, w, h), 1.2, white.alpha(0.6), 1.1);
             p.fill_round(Rect::new(r.cx() - w / 2.0 - 1.5, r.cy() - h / 2.0 + 1.5, w, h), 1.2, white);
+        }
+        Page::Calendars => {
+            // A calendar page: red band, white body, today's date.
+            p.fill_round(r, 5.0, Color::WHITE);
+            p.stroke_round(r.inset(0.25, 0.25), 5.0, Color::gray(0, 0.15), 0.5);
+            p.clipped(Rect::new(r.x, r.y, r.w, r.h * 0.3), || p.fill_round(r, 5.0, Color::rgba(255, 59, 48, 1.0)));
+            let f = p.gfx.format("Segoe UI", r.h * 0.48, Weight::SemiBold, Align::Center);
+            let day = chrono::Local::now().format("%-d").to_string();
+            p.text(&day, &f, Rect::new(r.x, r.y + r.h * 0.26, r.w, r.h * 0.74), Color::gray(0, 0.86));
         }
         Page::Widgets => {
             p.fill_round(r, 5.0, Color::rgba(255, 149, 0, 1.0));

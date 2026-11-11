@@ -27,7 +27,7 @@ pub mod discord;
 mod encode;
 pub mod glyphs;
 mod holding;
-mod ics;
+pub mod ics;
 pub mod live;
 mod lyrics;
 pub mod media;

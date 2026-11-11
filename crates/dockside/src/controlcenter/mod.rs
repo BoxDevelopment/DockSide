@@ -247,21 +247,21 @@ pub enum ControlEvent {
 }
 
 /// Colours for the current appearance.
-struct Pal {
-    text: Color,
-    sub: Color,
-    tint: Color,
-    lit: Color,
-    on_bg: Color,
-    on_fg: Color,
-    chip: Color,
-    track: Color,
-    fill: Color,
-    sep: Color,
-    tip_bg: Color,
+pub(crate) struct Pal {
+    pub(crate) text: Color,
+    pub(crate) sub: Color,
+    pub(crate) tint: Color,
+    pub(crate) lit: Color,
+    pub(crate) on_bg: Color,
+    pub(crate) on_fg: Color,
+    pub(crate) chip: Color,
+    pub(crate) track: Color,
+    pub(crate) fill: Color,
+    pub(crate) sep: Color,
+    pub(crate) tip_bg: Color,
 }
 
-fn pal(theme: &Theme, solid: bool) -> Pal {
+pub(crate) fn pal(theme: &Theme, solid: bool) -> Pal {
     if theme.dark {
         Pal {
             text: Color::gray(255, 0.96),
@@ -293,21 +293,21 @@ fn pal(theme: &Theme, solid: bool) -> Pal {
     }
 }
 
-fn ui_color(c: Color) -> windows::UI::Color {
+pub(crate) fn ui_color(c: Color) -> windows::UI::Color {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     windows::UI::Color { A: b(c.a), R: b(c.r), G: b(c.g), B: b(c.b) }
 }
 
-fn v2(x: f32, y: f32) -> Vector2 {
+pub(crate) fn v2(x: f32, y: f32) -> Vector2 {
     Vector2 { X: x, Y: y }
 }
 
-fn v3(x: f32, y: f32) -> Vector3 {
+pub(crate) fn v3(x: f32, y: f32) -> Vector3 {
     Vector3 { X: x, Y: y, Z: 0.0 }
 }
 
 /// The shared brushes every piece of glass is made of.
-struct Brushes {
+pub(crate) struct Brushes {
     /// DWM's blur of what's behind the window (`None` for a solid look).
     backdrop: Option<CompositionBrush>,
     tint: CompositionColorBrush,
@@ -317,9 +317,43 @@ struct Brushes {
     fill: CompositionColorBrush,
 }
 
+/// The glass brushes for `kind` of backdrop (`None` = solid).
+pub(crate) fn brushes(c: &Compositor, kind: Backdrop, pal: &Pal, dark: bool) -> Result<Brushes> {
+    let solid = kind == Backdrop::None;
+    let white = |a: f32| Color::rgba(255, 255, 255, a);
+    let k = if dark { 0.55 } else { 1.0 };
+    let gradient = |from: Vector2, to: Vector2, stops: &[(f32, Color)]| -> Result<CompositionBrush> {
+        let g = c.CreateLinearGradientBrush()?;
+        g.SetStartPoint(from)?;
+        g.SetEndPoint(to)?;
+        let list = g.ColorStops()?;
+        for &(o, col) in stops {
+            list.Append(&c.CreateColorGradientStopWithOffsetAndColor(o, ui_color(col))?)?;
+        }
+        g.cast()
+    };
+    let tint = match kind {
+        Backdrop::Acrylic => pal.tint.alpha((pal.tint.a * 2.2).min(0.85)),
+        Backdrop::Blur => pal.tint.alpha(pal.tint.a * 1.4),
+        _ => pal.tint,
+    };
+    Ok(Brushes {
+        backdrop: if solid { None } else { Some(c.CreateHostBackdropBrush()?.cast()?) },
+        tint: c.CreateColorBrushWithColor(ui_color(tint))?,
+        sheen: gradient(v2(0.5, 0.0), v2(0.5, 1.0), &[(0.0, white(0.16 * k)), (0.5, white(0.02 * k)), (1.0, white(0.05 * k))])?,
+        rim: gradient(
+            v2(0.0, 0.0),
+            v2(1.0, 1.0),
+            &[(0.0, white(0.6 * k)), (0.35, white(0.16 * k)), (0.65, white(0.08 * k)), (1.0, white(0.38 * k))],
+        )?,
+        lit: c.CreateColorBrushWithColor(ui_color(pal.lit.alpha(1.0)))?,
+        fill: c.CreateColorBrushWithColor(ui_color(pal.fill))?,
+    })
+}
+
 /// One piece of glass: a clipped container with the glass layers inside.
-struct Glass {
-    vis: ContainerVisual,
+pub(crate) struct Glass {
+    pub(crate) vis: ContainerVisual,
     clip: CompositionRoundedRectangleGeometry,
     rim: CompositionRoundedRectangleGeometry,
     /// The hover highlight.
@@ -327,7 +361,7 @@ struct Glass {
 }
 
 impl Glass {
-    fn new(c: &Compositor, b: &Brushes, w: f32, h: f32, r: f32) -> Result<Self> {
+    pub(crate) fn new(c: &Compositor, b: &Brushes, w: f32, h: f32, r: f32) -> Result<Self> {
         let vis = c.CreateContainerVisual()?;
         let clip = c.CreateRoundedRectangleGeometry()?;
         vis.SetClip(&c.CreateGeometricClipWithGeometry(&clip)?)?;
@@ -360,7 +394,7 @@ impl Glass {
     }
 
     /// Size and corner radius, in pixels.
-    fn set_size(&self, w: f32, h: f32, r: f32) {
+    pub(crate) fn set_size(&self, w: f32, h: f32, r: f32) {
         let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
         let _ = self.vis.SetSize(v2(w, h));
         let _ = self.vis.SetCenterPoint(v3(w / 2.0, h / 2.0));
@@ -555,35 +589,7 @@ impl ControlCenter {
         root.Children()?.InsertAtTop(&grid)?;
 
         let pal = pal(theme, solid);
-        let white = |a: f32| Color::rgba(255, 255, 255, a);
-        let k = if theme.dark { 0.55 } else { 1.0 };
-        let gradient = |from: Vector2, to: Vector2, stops: &[(f32, Color)]| -> Result<CompositionBrush> {
-            let g = c.CreateLinearGradientBrush()?;
-            g.SetStartPoint(from)?;
-            g.SetEndPoint(to)?;
-            let list = g.ColorStops()?;
-            for &(o, col) in stops {
-                list.Append(&c.CreateColorGradientStopWithOffsetAndColor(o, ui_color(col))?)?;
-            }
-            g.cast()
-        };
-        let tint = match kind {
-            Backdrop::Acrylic => pal.tint.alpha((pal.tint.a * 2.2).min(0.85)),
-            Backdrop::Blur => pal.tint.alpha(pal.tint.a * 1.4),
-            _ => pal.tint,
-        };
-        let brushes = Brushes {
-            backdrop: if solid { None } else { Some(c.CreateHostBackdropBrush()?.cast()?) },
-            tint: c.CreateColorBrushWithColor(ui_color(tint))?,
-            sheen: gradient(v2(0.5, 0.0), v2(0.5, 1.0), &[(0.0, white(0.16 * k)), (0.5, white(0.02 * k)), (1.0, white(0.05 * k))])?,
-            rim: gradient(
-                v2(0.0, 0.0),
-                v2(1.0, 1.0),
-                &[(0.0, white(0.6 * k)), (0.35, white(0.16 * k)), (0.65, white(0.08 * k)), (1.0, white(0.38 * k))],
-            )?,
-            lit: c.CreateColorBrushWithColor(ui_color(pal.lit.alpha(1.0)))?,
-            fill: c.CreateColorBrushWithColor(ui_color(pal.fill))?,
-        };
+        let brushes = brushes(&c, kind, &pal, theme.dark)?;
 
         let mut tiles = Vec::new();
         let mut add = |m: Module, r: Rect, radius: f32, row: usize| -> Result<()> {
@@ -1981,7 +1987,7 @@ fn page_links(page: Page) -> &'static [(&'static str, &'static str)] {
 }
 
 /// A macOS switch.
-fn draw_switch(p: &Painter, pal: &Pal, on: Option<bool>, r: Rect, accent: Color) {
+pub(crate) fn draw_switch(p: &Painter, pal: &Pal, on: Option<bool>, r: Rect, accent: Color) {
     let k = if on == Some(true) { 1.0 } else { 0.0 };
     let bg = pal.track.mix(accent, k);
     let bg = if on.is_none() { bg.alpha(bg.a * 0.4) } else { bg };
@@ -1992,7 +1998,7 @@ fn draw_switch(p: &Painter, pal: &Pal, on: Option<bool>, r: Rect, accent: Color)
     p.fill_circle(cx, r.cy(), rad, Color::WHITE);
 }
 
-fn ease_out_back(t: f32, overshoot: f32) -> f32 {
+pub(crate) fn ease_out_back(t: f32, overshoot: f32) -> f32 {
     let c3 = overshoot + 1.0;
     1.0 + c3 * (t - 1.0).powi(3) + overshoot * (t - 1.0).powi(2)
 }

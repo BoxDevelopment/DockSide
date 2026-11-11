@@ -40,6 +40,7 @@ use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTIN
 use crate::launchpad::{Launchpad, LaunchpadEvent, LAUNCHPAD_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
 use crate::controlcenter::{self, ControlCenter, ControlEvent};
+use crate::dropdown::{self, DropEvent, Dropdown};
 use crate::surface::Fading;
 use crate::theme::Theme;
 use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
@@ -179,6 +180,9 @@ pub fn run() -> anyhow::Result<()> {
     win::wallpaper::watch(msg_hwnd, win::WM_APP_WALLPAPER);
 
     let app = App::new(msg_hwnd)?;
+    // Calendar accounts (menu bar calendar, island) and the Battery menu's charge history.
+    crate::calsync::start(msg_hwnd.0 as isize);
+    crate::win::power::start_history();
     for guid in [GUID_ENERGY_SAVER_STATUS, GUID_POWER_SAVING_STATUS] {
         if let Err(e) = unsafe { windows::Win32::System::Power::RegisterPowerSettingNotification(HANDLE(msg_hwnd.0), &guid, DEVICE_NOTIFY_WINDOW_HANDLE) } {
             log!("power notification failed: {e}");
@@ -1025,6 +1029,9 @@ pub struct App {
     control: Option<ControlCenter>,
     /// A closed Control Center, fading away.
     closing_control: Option<ControlCenter>,
+    /// The Battery or calendar menu under its menu bar item, and one fading away.
+    dropdown: Option<Dropdown>,
+    closing_dropdown: Option<Dropdown>,
     /// Sequoia's full-screen Launchpad, and ones zooming away.
     launchpad: Option<Launchpad>,
     closing_launchpads: Vec<Launchpad>,
@@ -1180,6 +1187,8 @@ impl App {
             spotlight: None,
             control: None,
             closing_control: None,
+            dropdown: None,
+            closing_dropdown: None,
             launchpad: None,
             closing_launchpads: Vec::new(),
             launchpad_modal: false,
@@ -1805,7 +1814,7 @@ impl App {
             still |= d.tick(dt);
         }
         if let Some(i) = &mut self.island {
-            i.hold_open = self.menu.is_some() || self.control.is_some();
+            i.hold_open = self.menu.is_some() || self.control.is_some() || self.dropdown.is_some();
             still |= i.tick(dt);
         }
         for mb in &mut self.menubars {
@@ -1823,12 +1832,26 @@ impl App {
         if let Some(c) = &mut self.control {
             still |= c.tick(dt);
         }
+        if let Some(d) = &mut self.dropdown {
+            still |= d.tick();
+        }
+        if let Some(d) = &mut self.closing_dropdown {
+            if d.closed() {
+                self.closing_dropdown = None;
+                if self.control.is_none() && self.closing_control.is_none() && self.launchpad.is_none() && self.closing_launchpads.is_empty() {
+                    crate::launchpad::release();
+                }
+            } else {
+                d.tick();
+                still = true;
+            }
+        }
         if let Some(c) = &mut self.closing_control {
             c.tick(dt);
             if c.closed() {
                 self.closing_control = None;
                 // Its GPU device goes too, unless Launchpad still uses it.
-                if self.control.is_none() && self.launchpad.is_none() && self.closing_launchpads.is_empty() {
+                if self.control.is_none() && self.dropdown.is_none() && self.closing_dropdown.is_none() && self.launchpad.is_none() && self.closing_launchpads.is_empty() {
                     crate::launchpad::release();
                 }
             } else {
@@ -1984,6 +2007,9 @@ impl App {
         }
         if let Some(c) = &self.control {
             c.raise();
+        }
+        if let Some(d) = &self.dropdown {
+            d.raise();
         }
     }
 
@@ -2188,6 +2214,9 @@ impl App {
         if let Some(c) = self.control.as_mut().filter(|c| c.dirty) {
             c.render(&self.gfx, &self.theme);
         }
+        if let Some(d) = self.dropdown.as_mut().filter(|d| d.dirty) {
+            d.render(&self.gfx);
+        }
         for l in self.launchpad.iter_mut().chain(&mut self.closing_launchpads).filter(|l| l.dirty) {
             l.render(&self.gfx, &self.theme, &mut self.loader);
         }
@@ -2208,6 +2237,8 @@ impl App {
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
             || self.control.as_ref().is_some_and(|c| c.animating())
             || self.closing_control.is_some()
+            || self.dropdown.as_ref().is_some_and(|d| d.animating())
+            || self.closing_dropdown.is_some()
             || self.launchpad.as_ref().is_some_and(|l| l.animating())
             || !self.closing_launchpads.is_empty()
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
@@ -3026,6 +3057,98 @@ impl App {
         }
     }
 
+    // --- Battery and calendar menus ------------------------------------------
+
+    /// Opens the menu for `hit` (Battery or the clock) under the menu bar `menu_opener` names.
+    fn open_dropdown(&mut self, hit: Hit) {
+        let kind = match hit {
+            Hit::Battery => dropdown::Kind::Battery,
+            Hit::Clock => dropdown::Kind::Calendar,
+            _ => return,
+        };
+        self.close_menu();
+        let opener = self.menu_opener;
+        let Some(mb) = self.menubars.iter().find(|m| m.surface.content == opener).or(self.menubars.first()) else { return };
+        let Some(anchor) = mb.screen_rect(hit) else { return };
+        let (bar, monitor) = (mb.surface.content, mb.monitor());
+        match Dropdown::new(&self.gfx, &self.theme, &self.cfg, &monitor, anchor, kind, self.msg_hwnd.0 as isize) {
+            Ok(mut d) => {
+                d.render(&self.gfx);
+                CONTROL_HWND.store(d.hwnd.0 as isize, Ordering::Relaxed);
+                self.dropdown = Some(d);
+                self.menu_opener = bar;
+                if let Some(mb) = self.menubars.iter_mut().find(|m| m.surface.content == bar) {
+                    mb.set_open(Some(hit));
+                }
+                self.install_hooks();
+                self.animate();
+            }
+            Err(e) => log!("menu bar dropdown failed: {e}"),
+        }
+    }
+
+    fn close_dropdown(&mut self) {
+        let Some(mut d) = self.dropdown.take() else { return };
+        CONTROL_HWND.store(0, Ordering::Relaxed);
+        d.close();
+        self.closing_dropdown = Some(d);
+        self.animate();
+        self.remove_hooks();
+        self.reset_menu_openers();
+    }
+
+    fn dropdown_event(&mut self, e: DropEvent) {
+        match e {
+            DropEvent::None => {}
+            DropEvent::Close => self.close_dropdown(),
+            DropEvent::Run(a) => {
+                self.close_dropdown();
+                push(a);
+            }
+        }
+    }
+
+    fn on_dropdown_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        let d = self.dropdown.as_mut()?;
+        let (x, y) = mouse_pt(lp, d.scale);
+        let e = match msg {
+            WM_MOUSEMOVE => {
+                if !d.tracking {
+                    d.tracking = true;
+                    track_leave(hwnd);
+                }
+                d.on_move(x, y);
+                DropEvent::None
+            }
+            WM_MOUSELEAVE => {
+                d.on_leave();
+                DropEvent::None
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN if !d.in_body(x, y) => DropEvent::Close,
+            WM_LBUTTONDOWN => {
+                d.on_down(x, y);
+                unsafe { SetCapture(hwnd) };
+                DropEvent::None
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                d.on_up(x, y)
+            }
+            WM_RBUTTONDOWN | WM_RBUTTONUP => DropEvent::None,
+            WM_MOUSEWHEEL => {
+                d.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                DropEvent::None
+            }
+            _ => return None,
+        };
+        self.dropdown_event(e);
+        self.flush();
+        self.animate();
+        Some(LRESULT(0))
+    }
+
     fn close_control(&mut self) {
         CONTROL_HWND.store(0, Ordering::Relaxed);
         let Some(mut c) = self.control.take() else { return };
@@ -3153,6 +3276,7 @@ impl App {
 
     fn close_menu(&mut self) {
         self.close_control();
+        self.close_dropdown();
         self.close_submenu();
         OPEN_MENU_HWND.store(0, Ordering::Relaxed);
         let Some(m) = self.menu.take() else { return };
@@ -3300,6 +3424,13 @@ impl App {
     }
 
     fn on_menu_key(&mut self, vk: u16) {
+        if let Some(d) = &mut self.dropdown {
+            let e = d.on_key(vk);
+            self.dropdown_event(e);
+            self.flush();
+            self.animate();
+            return;
+        }
         if let Some(c) = &mut self.control {
             let e = c.on_key(vk);
             self.control_event(e);
@@ -3533,6 +3664,15 @@ impl App {
                         c.on_status();
                     }
                 }
+                win::WM_APP_BATTERY | win::WM_APP_CALENDAR => {
+                    if let Some(d) = &mut self.dropdown {
+                        d.update();
+                    }
+                    if msg == win::WM_APP_CALENDAR {
+                        self.mark_settings_dirty();
+                    }
+                    self.flush();
+                }
                 // One worker feeds both.
                 WM_APP_MEDIA => {
                     if let Some(i) = &mut self.island {
@@ -3693,7 +3833,9 @@ impl App {
             return r;
         }
 
-        let result = if self.control.as_ref().is_some_and(|c| c.hwnd == hwnd) {
+        let result = if self.dropdown.as_ref().is_some_and(|d| d.hwnd == hwnd) {
+            self.on_dropdown_mouse(hwnd, msg, wp, lp)
+        } else if self.control.as_ref().is_some_and(|c| c.hwnd == hwnd) {
             self.on_control_mouse(hwnd, msg, wp, lp)
         } else if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
             self.on_menu_mouse(hwnd, msg, lp, false)
@@ -3919,6 +4061,14 @@ impl App {
             }
             WM_MOUSELEAVE => mb.set_pressed(None),
             WM_LBUTTONDOWN => match hit {
+                Some(h @ (Hit::Battery | Hit::Clock)) => {
+                    let same = mb.open == Some(h);
+                    self.close_menu();
+                    if !same {
+                        self.menu_opener = hwnd;
+                        self.open_dropdown(h);
+                    }
+                }
                 Some(h @ (Hit::ControlCenter | Hit::Wifi)) => {
                     let page = if h == Hit::Wifi { controlcenter::Page::Wifi } else { controlcenter::Page::Main };
                     let same = mb.open == Some(h);

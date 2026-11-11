@@ -5,6 +5,8 @@ mod log;
 
 mod anim;
 mod app;
+mod calsync;
+mod dropdown;
 mod chrome;
 mod config;
 mod controlcenter;

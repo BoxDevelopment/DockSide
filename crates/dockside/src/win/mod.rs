@@ -9,6 +9,7 @@ pub mod desktops;
 pub mod displays;
 pub mod elevation;
 pub mod glass;
+pub mod power;
 pub mod scene;
 pub mod startup;
 pub mod system;
@@ -236,5 +237,9 @@ pub const WM_APP_CLOAKED: u32 = WM_APP + 30;
 pub const WM_APP_CONTROL: u32 = WM_APP + 32;
 /// The desktop wallpaper changed (from `wallpaper::watch`).
 pub const WM_APP_WALLPAPER: u32 = WM_APP + 33;
+/// Calendar accounts synced or changed (see `calsync`).
+pub const WM_APP_CALENDAR: u32 = WM_APP + 34;
+/// The battery dropdown's worker has news.
+pub const WM_APP_BATTERY: u32 = WM_APP + 35;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

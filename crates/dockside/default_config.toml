@@ -339,6 +339,23 @@ screenshots = true
 download_alerts = true
 # (Virtual desktop switches: `island` under [desktops].)
 
+[calendar]
+# Calendar accounts are added in System Settings > Calendars (iCloud, Google,
+# Outlook, any CalDAV server, or a subscribed .ics link). Their sign-ins are
+# kept encrypted in calendars.dat next to this file, not here.
+#
+# Google and Microsoft only let registered apps sign in, so DockSide uses your
+# own (free) app registration. Settings walks you through making one.
+# Google Cloud: a "Desktop app" OAuth client, with the Google Calendar API on.
+google_client_id = ""
+google_client_secret = ""
+# Microsoft Entra: an app registration with the redirect URI http://localhost
+# (Mobile and desktop applications) and the Calendars.Read permission.
+microsoft_client_id = ""
+# The first day of the week in the menu bar calendar: "auto" (from Windows'
+# region settings), "sunday" or "monday".
+week_starts = "auto"
+
 [widgets]
 # Widgets on the desktop, below your windows. Drag them to move them (they snap
 # to each other and the screen edges); right-click one to resize or remove it.

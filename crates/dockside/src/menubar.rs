@@ -222,13 +222,11 @@ impl MenuBar {
 
     pub fn status_action(hit: Hit, spotlight: bool) -> Option<Action> {
         const WIN_S: Shortcut = Shortcut::new("w", b'S' as u16, "S");
-        const WIN_N: Shortcut = Shortcut::new("w", b'N' as u16, "N");
-        // (Control Center and Wi-Fi open DockSide's Control Center; see the App.)
+        // (Control Center and Wi-Fi open DockSide's Control Center, and Battery and
+        // the clock their own menus; see the App.)
         match hit {
             Hit::Search if spotlight => Some(Action::ToggleSpotlight),
             Hit::Search => Some(Action::Keys(WIN_S)),
-            Hit::Clock => Some(Action::Keys(WIN_N)),
-            Hit::Battery => Some(Action::Open("ms-settings:batterysaver".into())),
             Hit::Private => Some(Action::SetConfig { table: "general", key: "screenshot_mode", value: crate::config::ConfigValue::Bool(false) }),
             _ => None,
         }

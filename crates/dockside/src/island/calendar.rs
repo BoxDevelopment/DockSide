@@ -145,6 +145,8 @@ pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>, horizon: i64) {
             for text in feeds.iter().flatten() {
                 events.extend(super::ics::events_between(text, now - 3600, now + horizon));
             }
+            // Accounts added in Settings > Calendars.
+            events.extend(crate::calsync::timed_between(now - 3600, now + horizon));
             events.retain(|e| e.end > now);
             events.sort_by_key(|e| e.start);
             // The same meeting can arrive from both sources.
@@ -165,7 +167,21 @@ pub fn watch(inbox: Inbox, stop: Stop, urls: Vec<String>, horizon: i64) {
     }
 }
 
+/// Events in Windows' own calendar store between two Unix times, with whether
+/// each is all-day. (Opens the store each time: call from a worker thread.)
+pub fn windows_events(from: i64, to: i64) -> windows::core::Result<Vec<(CalEvent, bool)>> {
+    let store = AppointmentManager::RequestStoreAsync(AppointmentStoreAccessType::AllCalendarsReadOnly)?.get()?;
+    read(&store, from, to)
+}
+
 fn fetch(store: &windows::ApplicationModel::Appointments::AppointmentStore, horizon: i64) -> windows::core::Result<Vec<CalEvent>> {
+    let now = unix_now();
+    let mut out: Vec<CalEvent> = read(store, now - 3600, now + horizon)?.into_iter().filter(|(_, all_day)| !all_day).map(|(e, _)| e).collect();
+    out.retain(|e| e.end > now);
+    Ok(out)
+}
+
+fn read(store: &windows::ApplicationModel::Appointments::AppointmentStore, from: i64, to: i64) -> windows::core::Result<Vec<(CalEvent, bool)>> {
     let options = FindAppointmentsOptions::new()?;
     let props = options.FetchProperties()?;
     for p in [
@@ -178,30 +194,27 @@ fn fetch(store: &windows::ApplicationModel::Appointments::AppointmentStore, hori
     ] {
         props.Append(&p)?;
     }
-    options.SetMaxCount(200)?;
-    // From an hour ago (events in progress) to the horizon.
-    let start = DateTime { UniversalTime: EPOCH_DIFF + (unix_now() - 3600) * 10_000_000 };
-    let length = TimeSpan { Duration: (3600 + horizon) * 10_000_000 };
+    options.SetMaxCount(1000)?;
+    let start = DateTime { UniversalTime: EPOCH_DIFF + from * 10_000_000 };
+    let length = TimeSpan { Duration: (to - from).max(0) * 10_000_000 };
     let list = store.FindAppointmentsAsyncWithOptions(start, length, &options)?.get()?;
     let mut out = Vec::new();
     for a in list {
-        if a.AllDay().unwrap_or(false) || a.IsCanceledMeeting().unwrap_or(false) {
+        if a.IsCanceledMeeting().unwrap_or(false) {
             continue;
         }
+        let all_day = a.AllDay().unwrap_or(false);
         let s = (a.StartTime()?.UniversalTime - EPOCH_DIFF) / 10_000_000;
         let d = a.Duration()?.Duration / 10_000_000;
         let title = a.Subject().map(|h: HSTRING| h.to_string()).unwrap_or_default();
         if title.trim().is_empty() {
             continue;
         }
-        out.push(CalEvent {
-            title,
-            location: a.Location().map(|h| h.to_string()).unwrap_or_default(),
-            start: s,
-            end: s + d.max(0),
-        });
+        out.push((
+            CalEvent { title, location: a.Location().map(|h| h.to_string()).unwrap_or_default(), start: s, end: s + d.max(0) },
+            all_day,
+        ));
     }
-    out.sort_by_key(|e| e.start);
-    out.retain(|e| e.end > unix_now());
+    out.sort_by_key(|(e, _)| e.start);
     Ok(out)
 }

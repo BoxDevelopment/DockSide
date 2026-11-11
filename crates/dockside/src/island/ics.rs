@@ -37,21 +37,29 @@ struct VEvent {
     cancelled: bool,
 }
 
-/// Events overlapping `[from, to)` (Unix seconds), sorted by start.
+/// Timed events overlapping `[from, to)` (Unix seconds), sorted by start.
 pub fn events_between(text: &str, from: i64, to: i64) -> Vec<CalEvent> {
+    occurrences(text, from, to).into_iter().filter(|(_, all_day)| !all_day).map(|(e, _)| e).collect()
+}
+
+/// Every event overlapping `[from, to)`, with whether it's all-day (those run
+/// from local midnight to local midnight), sorted by start.
+pub fn occurrences(text: &str, from: i64, to: i64) -> Vec<(CalEvent, bool)> {
     let events = parse(text);
     // Moved / cancelled single occurrences replace the series' original slot.
     let overridden: HashSet<(String, i64)> =
         events.iter().filter_map(|e| e.recurrence_id.map(|r| (e.uid.clone(), r))).collect();
     let mut out = Vec::new();
     for e in &events {
-        if e.cancelled || e.all_day {
+        if e.cancelled {
             continue;
         }
         let Some((start, utc)) = e.start else { continue };
         let length = match (e.end, e.duration) {
             (Some((end, end_utc)), _) => to_unix(end, end_utc) - to_unix(start, utc),
             (None, Some(d)) => d,
+            // An all-day event without an end lasts the day.
+            _ if e.all_day => 86_400,
             _ => 0,
         }
         .max(0);
@@ -61,7 +69,7 @@ pub fn events_between(text: &str, from: i64, to: i64) -> Vec<CalEvent> {
         }
         let mut push = |s: i64| {
             if s < to && s + length.max(1) > from {
-                out.push(CalEvent { title: title.to_string(), location: e.location.clone(), start: s, end: s + length });
+                out.push((CalEvent { title: title.to_string(), location: e.location.clone(), start: s, end: s + length }, e.all_day));
             }
         };
         match (&e.rrule, e.recurrence_id) {
@@ -78,8 +86,8 @@ pub fn events_between(text: &str, from: i64, to: i64) -> Vec<CalEvent> {
             _ => push(to_unix(start, utc)),
         }
     }
-    out.sort_by_key(|e| e.start);
-    out.dedup_by(|a, b| a.start == b.start && a.title == b.title);
+    out.sort_by_key(|(e, _)| e.start);
+    out.dedup_by(|a, b| a.0.start == b.0.start && a.0.title == b.0.title);
     out
 }
 

@@ -185,7 +185,35 @@ pub fn open_start() {
 }
 
 /// Whether the Recycle Bin has anything in it, on any drive.
+/// Whether the Recycle Bin holds anything, as last seen. Asking Windows looks
+/// through the bin on every drive (slow with a big bin, or a slow drive), so
+/// a background thread asks every few seconds and this only reads its answer.
 pub fn trash_full() -> bool {
+    use std::sync::atomic::Ordering;
+    use std::sync::Once;
+    static WATCH: Once = Once::new();
+    WATCH.call_once(|| {
+        // The first answer right away: the Dock shows the Trash as it is from the start.
+        TRASH_FULL.store(query_trash_full(), Ordering::Relaxed);
+        let spawned = std::thread::Builder::new().name("trash watch".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            TRASH_FULL.store(query_trash_full(), Ordering::Relaxed);
+        });
+        if let Err(e) = spawned {
+            log!("trash watch didn't start: {e}");
+        }
+    });
+    TRASH_FULL.load(Ordering::Relaxed)
+}
+
+static TRASH_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Looks at the Recycle Bin again now (DockSide just emptied it or put files in).
+pub fn refresh_trash() {
+    TRASH_FULL.store(query_trash_full(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn query_trash_full() -> bool {
     use windows::Win32::UI::Shell::{SHQueryRecycleBinW, SHQUERYRBINFO};
     let mut info = SHQUERYRBINFO { cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };
     unsafe { SHQueryRecycleBinW(PCWSTR::null(), &mut info) }.is_ok() && info.i64NumItems > 0

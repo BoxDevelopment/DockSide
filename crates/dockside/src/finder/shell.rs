@@ -641,6 +641,7 @@ pub fn empty_recycle_bin(hwnd: HWND) {
     unsafe {
         let _ = SHEmptyRecycleBinW(hwnd, PCWSTR::null(), 0);
     }
+    crate::win::system::refresh_trash();
 }
 
 // --- details -------------------------------------------------------------------

@@ -711,6 +711,9 @@ pub struct Island {
     inside: bool,
     hover_since: Option<Instant>,
     leave_at: Option<Instant>,
+    /// Something moved on the last tick, so the next one should come at the
+    /// display's full rate (see `tick`).
+    pub smooth: bool,
     /// Until when a leave doesn't start the collapse countdown (a page button was just clicked).
     tab_grace: Option<Instant>,
     hot: Option<Hit>,
@@ -884,6 +887,7 @@ impl Island {
             inside: false,
             hover_since: None,
             leave_at: None,
+            smooth: false,
             tab_grace: None,
             hot: None,
             down: None,
@@ -2896,6 +2900,8 @@ impl Island {
             || self.drag_left.is_some()
             || self.art_swap.is_some()
             || (self.cfg.expand_on_hover && self.hover_since.is_some() && self.expanded.is_none());
+        // Springs need every display frame; periodic redraws and timers don't.
+        self.smooth = moving;
         moving || (visible && period.is_some()) || waiting
     }
 

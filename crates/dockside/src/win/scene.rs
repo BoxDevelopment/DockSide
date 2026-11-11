@@ -474,15 +474,16 @@ pub fn timespan(d: Duration) -> TimeSpan {
 
 /// How often a capture may send frames. The desktop window holds a live
 /// wallpaper's animation (Wallpaper Engine, Lively), redrawn in full every
-/// frame: glass follows it at up to 30 fps (15 in battery saver), smooth
-/// through the bend and frost, so a 60 fps wallpaper costs no more than a 30
-/// fps one. Every frame re-renders each pane over the desktop.
+/// frame: glass follows it at up to 20 fps (about 10 in battery saver). Bent
+/// and frosted, a wallpaper's slow drift reads as smoothly at 20 as at 60, and
+/// every frame re-renders each pane over the desktop (the Dock, the menu bar
+/// and every widget), so this rate is most of what a live wallpaper costs.
 ///
 /// A window only frosted panes show (window sidebars) is paced the same way:
-/// through that much blur 30 fps reads as smoothly as 60, and each frame is a
-/// copy of the whole window.
+/// through that much blur it reads as smoothly, and each frame is a copy of
+/// the whole window.
 fn pace(half: bool, interval: Duration) -> Duration {
-    if half { (interval * 2).max(Duration::from_millis(33)) } else { interval }
+    if half { (interval * 3).max(Duration::from_millis(50)) } else { interval }
 }
 
 fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration, frosted: bool) -> Result<Capture> {

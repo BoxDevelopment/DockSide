@@ -101,6 +101,9 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Console",
     "Win32_System_DataExchange",
+    # Stack samples of busy threads (cpu_watch).
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
     # Parent processes, to keep games started by anti-cheat launchers hook-free.
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Memory",

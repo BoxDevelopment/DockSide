@@ -22,6 +22,9 @@ use crate::win::post;
 const SLIDE: Duration = Duration::from_secs(30);
 /// Video frames shown per second, at most.
 const VIDEO_FPS: f64 = 30.0;
+/// The shortest time an animated GIF's frame stays up (about 30 a second):
+/// each one shown is a whole widget redrawn on the CPU.
+const GIF_MIN_FRAME: Duration = Duration::from_millis(33);
 /// Spectrum bands worked out (views draw fewer by pairing them).
 pub const BANDS: usize = 32;
 
@@ -268,7 +271,7 @@ fn show_picture(
         let frames = decoder.GetFrameCount().ok()?;
         let gif = decoder.GetContainerFormat().ok() == Some(GUID_ContainerFormatGif);
         if gif && frames > 1 {
-            return play_gif(wic, &decoder, frames, feed, hwnd, msg, until);
+            return play_gif(wic, &decoder, frames, px, feed, hwnd, msg, until);
         }
         let frame = decoder.GetFrame(0).ok()?;
         let source: IWICBitmapSource = upright(wic, &frame).unwrap_or_else(|| frame.cast().unwrap());
@@ -306,6 +309,38 @@ unsafe fn upright(wic: &IWICImagingFactory, frame: &IWICBitmapFrameDecode) -> Op
     rot.cast().ok()
 }
 
+/// A moving picture's frame (`data`, `w` x `h` premultiplied BGRA) cropped to
+/// the widget's shape and scaled to exactly `px`, its size in pixels: the
+/// widget then draws it one to one. Done here, on the player's own thread, once
+/// per frame, instead of being resampled on the UI thread (high-quality cubic,
+/// through a rounded mask, on the CPU) every time the widget redraws.
+unsafe fn fit(wic: &IWICImagingFactory, data: Vec<u8>, w: u32, h: u32, px: (u32, u32)) -> Frame {
+    let (pw, ph) = (px.0.max(1), px.1.max(1));
+    if (w, h) == (pw, ph) || w == 0 || h == 0 {
+        return Frame { w, h, data };
+    }
+    let fitted = (|| -> Option<Vec<u8>> {
+        let bmp = wic.CreateBitmapFromMemory(w, h, &GUID_WICPixelFormat32bppPBGRA, w * 4, &data).ok()?;
+        // The middle of the picture in the widget's shape (what "cover" shows).
+        let k = (pw as f64 / w as f64).max(ph as f64 / h as f64);
+        let (cw, ch) = (((pw as f64 / k).round() as u32).clamp(1, w), ((ph as f64 / k).round() as u32).clamp(1, h));
+        let clip = wic.CreateBitmapClipper().ok()?;
+        let rc = WICRect { X: ((w - cw) / 2) as i32, Y: ((h - ch) / 2) as i32, Width: cw as i32, Height: ch as i32 };
+        clip.Initialize(&bmp, &rc).ok()?;
+        let scaler = wic.CreateBitmapScaler().ok()?;
+        // Fant averages when shrinking; bilinear is plenty when growing a moving picture.
+        let mode = if k < 1.0 { WICBitmapInterpolationModeFant } else { WICBitmapInterpolationModeLinear };
+        scaler.Initialize(&clip, pw, ph, mode).ok()?;
+        let mut out = vec![0u8; (pw * ph * 4) as usize];
+        scaler.CopyPixels(std::ptr::null(), pw * 4, &mut out).ok()?;
+        Some(out)
+    })();
+    match fitted {
+        Some(out) => Frame { w: pw, h: ph, data: out },
+        None => Frame { w, h, data },
+    }
+}
+
 /// `src` as premultiplied BGRA.
 unsafe fn pbgra(wic: &IWICImagingFactory, src: &IWICBitmapSource, w: u32, h: u32) -> Option<Vec<u8>> {
     let conv = wic.CreateFormatConverter().ok()?;
@@ -327,6 +362,7 @@ unsafe fn play_gif(
     wic: &IWICImagingFactory,
     decoder: &IWICBitmapDecoder,
     frames: u32,
+    px: (u32, u32),
     feed: &Feed,
     hwnd: isize,
     msg: u32,
@@ -346,6 +382,9 @@ unsafe fn play_gif(
     let mut saved: Option<Vec<u8>> = None;
     // What the last frame asked to happen after it: (disposal, rect).
     let mut dispose: Option<(u16, (u32, u32, u32, u32))> = None;
+    // When a frame was last shown: faster GIFs keep their timing, but frames
+    // closer together than `GIF_MIN_FRAME` are composed and not shown.
+    let mut shown_at: Option<Instant> = None;
     loop {
         for i in 0..frames {
             let started = Instant::now();
@@ -366,7 +405,13 @@ unsafe fn play_gif(
             let reader = frame.GetMetadataQueryReader().ok();
             let get = |n: &str| reader.as_ref().and_then(|r| meta_u16(r, n));
             let (x, y) = (get("/imgdesc/Left").unwrap_or(0) as u32, get("/imgdesc/Top").unwrap_or(0) as u32);
-            let delay = get("/grctlext/Delay").unwrap_or(10).max(2) as u64 * 10;
+            // As browsers do: a delay of 0 or 1 hundredths (which many GIFs carry
+            // by mistake) means 100 ms, not "as fast as possible".
+            let delay = match get("/grctlext/Delay").unwrap_or(10) {
+                0 | 1 => 10,
+                d => d,
+            } as u64
+                * 10;
             let disposal = get("/grctlext/Disposal").unwrap_or(0);
             if disposal == 3 {
                 saved = Some(canvas.clone());
@@ -375,7 +420,13 @@ unsafe fn play_gif(
                 over(&mut canvas, cw, ch, &src, w, h, x, y);
             }
             dispose = Some((disposal, (x, y, w, h)));
-            feed.publish(Frame { w: cw, h: ch, data: canvas.clone() }, hwnd, msg);
+            // A frame that stays up long enough is always shown (the GIF rests
+            // on it); quick ones only once `GIF_MIN_FRAME` has passed.
+            let due = Duration::from_millis(delay) >= GIF_MIN_FRAME || shown_at.is_none_or(|t| t.elapsed() >= GIF_MIN_FRAME);
+            if due {
+                shown_at = Some(Instant::now());
+                feed.publish(fit(wic, canvas.clone(), cw, ch, px), hwnd, msg);
+            }
             let wait = Duration::from_millis(delay).saturating_sub(started.elapsed());
             if !feed.sleep(wait) {
                 return Some(());
@@ -522,6 +573,7 @@ unsafe fn video_loop(path: &Path, px: (u32, u32), feed: &Feed, hwnd: isize, msg:
     let size = cur.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
     let (w, h) = ((size >> 32) as u32, size as u32);
     log!("video widget: {}x{} -> {w}x{h} ({})", nw, nh, if gpu { "GPU" } else { "software" });
+    let wic = crate::island::media::wic();
 
     let step = Duration::from_secs_f64(1.0 / VIDEO_FPS);
     // When the clip's time 0 is (re-set at each loop and after a pause).
@@ -568,7 +620,11 @@ unsafe fn video_loop(path: &Path, px: (u32, u32), feed: &Feed, hwnd: isize, msg:
             continue;
         }
         if let Some(data) = sample_pixels(&sample, w, h) {
-            feed.publish(Frame { w, h, data }, hwnd, msg);
+            let frame = match &wic {
+                Some(wic) => fit(wic, data, w, h, px),
+                None => Frame { w, h, data },
+            };
+            feed.publish(frame, hwnd, msg);
             last_shown = Some(ts);
             frames += 1;
         }

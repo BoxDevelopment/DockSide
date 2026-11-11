@@ -1166,6 +1166,13 @@ fn artwork(p: &Painter, c: &Ctx, r: Rect, radius: f32) {
     }
 }
 
+/// Where Music Wave's bars go in a widget whose card is `r`: the only part
+/// that changes when the sound does, and so the only part redrawn then.
+pub fn wave_area(r: Rect, size: WidgetSize) -> Rect {
+    let top = if size == WidgetSize::Small { 70.0 } else { 84.0 };
+    Rect::new(r.x + PAD, r.y + top, r.w - 2.0 * PAD, r.h - top - PAD)
+}
+
 fn music_wave(p: &Painter, r: Rect, c: &Ctx) {
     let np = c.data.now.as_ref();
     let tint = np.and_then(|n| n.art.as_ref()).map_or(c.theme.accent, |a| a.tint);
@@ -1183,7 +1190,7 @@ fn music_wave(p: &Painter, r: Rect, c: &Ctx) {
             let w = r.right() - PAD - x;
             text(p, c, title, 13.0, Weight::Bold, Align::Leading, Rect::new(x, art.y, w, 20.0), c.theme.text);
             text(p, c, artist, 11.0, Weight::Regular, Align::Leading, Rect::new(x, art.y + 20.0, w, 18.0), c.theme.text_secondary);
-            wave_bars(p, Rect::new(r.x + PAD, r.y + 70.0, r.w - 2.0 * PAD, r.h - 70.0 - PAD), &c.data.bands, 14, color);
+            wave_bars(p, wave_area(r, c.item.size), &c.data.bands, 14, color);
         }
         _ => {
             let art = Rect::new(r.x + PAD, r.y + PAD, 56.0, 56.0);
@@ -1192,7 +1199,7 @@ fn music_wave(p: &Painter, r: Rect, c: &Ctx) {
             let w = r.right() - PAD - x;
             text(p, c, title, 15.0, Weight::Bold, Align::Leading, Rect::new(x, art.y + 6.0, w, 22.0), c.theme.text);
             text(p, c, artist, 13.0, Weight::Regular, Align::Leading, Rect::new(x, art.y + 28.0, w, 20.0), c.theme.text_secondary);
-            wave_bars(p, Rect::new(r.x + PAD, r.y + 84.0, r.w - 2.0 * PAD, r.h - 84.0 - PAD), &c.data.bands, 32, color);
+            wave_bars(p, wave_area(r, c.item.size), &c.data.bands, 32, color);
         }
     }
 }

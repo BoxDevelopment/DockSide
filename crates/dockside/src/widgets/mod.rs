@@ -339,6 +339,9 @@ struct Widget {
     item: WidgetItem,
     surface: Surface,
     dirty: bool,
+    /// Only Music Wave's bars changed: they alone are redrawn, unless `dirty`
+    /// asks for the whole card too.
+    bars_dirty: bool,
     hits: Vec<(Rect, Hit)>,
     hover: Option<Hit>,
     tracking: bool,
@@ -705,6 +708,7 @@ impl Widgets {
             item,
             surface,
             dirty: true,
+            bars_dirty: false,
             hits: Vec::new(),
             hover: None,
             tracking: false,
@@ -765,6 +769,13 @@ impl Widgets {
     fn mark(&mut self, kinds: &[WidgetKind]) {
         for w in self.widgets.iter_mut().filter(|w| kinds.contains(&w.item.kind)) {
             w.dirty = true;
+        }
+    }
+
+    /// Music Wave's levels moved: only its bars need drawing again.
+    fn mark_bands(&mut self) {
+        for w in self.widgets.iter_mut().filter(|w| w.item.kind == WidgetKind::MusicWave) {
+            w.bars_dirty = true;
         }
     }
 
@@ -946,10 +957,7 @@ impl Widgets {
             self.data.user = Some(u);
             changed.push(WidgetKind::User);
         }
-        if let Some(b) = src.bands.as_ref().and_then(|b| b.take()) {
-            self.data.bands = b;
-            changed.push(WidgetKind::MusicWave);
-        }
+        let bands = src.bands.as_ref().and_then(|b| b.take());
         if let Some(inbox) = &src.calendar {
             for s in inbox.drain() {
                 if let Signal::Calendar(events) = s {
@@ -971,6 +979,10 @@ impl Widgets {
             }
         }
         self.mark(&changed);
+        if let Some(b) = bands {
+            self.data.bands = b;
+            self.mark_bands();
+        }
     }
 
     pub fn on_media(&mut self) {
@@ -1095,8 +1107,10 @@ impl Widgets {
             Some((d, s)) => (d, s),
             None => (&*data, &*store),
         };
-        for w in widgets.iter_mut().filter(|w| w.dirty) {
+        for w in widgets.iter_mut().filter(|w| w.dirty || w.bars_dirty) {
+            let part = (!w.dirty).then(|| views::wave_area(w.body(), w.item.size));
             w.dirty = false;
+            w.bars_dirty = false;
             if matches!(w.item.kind, WidgetKind::NowPlaying | WidgetKind::MusicWave) {
                 let art = data.now.as_ref().and_then(|n| n.art.clone());
                 if art.as_ref().map(|a| a.id) != w.art.as_ref().map(|(id, _)| *id) {
@@ -1154,7 +1168,7 @@ impl Widgets {
                 pictures: &w.pictures,
                 error: error.as_deref(),
             };
-            let result = w.surface.render(gfx, |p| paint(p, body, &ctx, solid, &mut hits));
+            let result = w.surface.render_part(gfx, part, |p| paint(p, body, &ctx, solid, &mut hits));
             if let Err(e) = result {
                 log!("widget render failed: {e}");
             }
@@ -1179,7 +1193,7 @@ impl Widgets {
     }
 
     pub fn needs_render(&self) -> bool {
-        self.widgets.iter().any(|w| w.dirty)
+        self.widgets.iter().any(|w| w.dirty || w.bars_dirty)
     }
 
     // --- input -------------------------------------------------------------

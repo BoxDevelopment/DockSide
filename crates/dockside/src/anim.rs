@@ -29,15 +29,20 @@ pub fn motion_enabled() -> bool {
     MOTION.load(Ordering::Relaxed)
 }
 
+/// The frame clock's pace when nothing needs the display's full rate.
+pub const SLOW_FRAME: Duration = Duration::from_millis(33);
+
 pub struct FrameClock {
     active: Arc<AtomicBool>,
+    slow: Arc<AtomicBool>,
     thread: Thread,
 }
 
 impl FrameClock {
     pub fn new(target: isize) -> Self {
         let active = Arc::new(AtomicBool::new(false));
-        let flag = active.clone();
+        let slow = Arc::new(AtomicBool::new(false));
+        let (flag, slow_flag) = (active.clone(), slow.clone());
         let handle = std::thread::Builder::new()
             .name("frame-clock".into())
             .spawn(move || loop {
@@ -45,20 +50,32 @@ impl FrameClock {
                     std::thread::park();
                     continue;
                 }
-                let start = Instant::now();
-                unsafe {
-                    let _ = DwmFlush();
-                }
-                // DwmFlush returns immediately when nothing is composing (e.g. display off).
-                if start.elapsed() < Duration::from_millis(2) {
-                    std::thread::sleep(Duration::from_millis(16));
+                // Only redraws that run at 30 fps anyway (the island's waveform,
+                // a spinner) or a timer waiting to fire: no need to wake every
+                // display frame (120+ times a second on a fast screen).
+                if slow_flag.load(Ordering::Acquire) {
+                    std::thread::sleep(SLOW_FRAME);
+                } else {
+                    let start = Instant::now();
+                    unsafe {
+                        let _ = DwmFlush();
+                    }
+                    // DwmFlush returns immediately when nothing is composing (e.g. display off).
+                    if start.elapsed() < Duration::from_millis(2) {
+                        std::thread::sleep(Duration::from_millis(16));
+                    }
                 }
                 if !FRAME_PENDING.swap(true, Ordering::AcqRel) {
                     post(target, WM_APP_FRAME);
                 }
             })
             .expect("spawn frame clock");
-        Self { active, thread: handle.thread().clone() }
+        Self { active, slow, thread: handle.thread().clone() }
+    }
+
+    /// Ticks at `SLOW_FRAME` instead of every display frame while `on`.
+    pub fn set_slow(&self, on: bool) {
+        self.slow.store(on, Ordering::Release);
     }
 
     pub fn start(&self) {

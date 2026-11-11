@@ -659,17 +659,19 @@ impl Engine {
                 }
             }
         }
-        let mut rendered = false;
+        let mut rendered = 0;
+        let started = Instant::now();
         for pane in &panes {
             let Ok(mut s) = pane.try_borrow_mut() else { continue };
             if s.stale {
-                rendered = true;
+                rendered += 1;
                 if let Err(e) = self.render(&mut s) {
                     log!("glass render failed: {e}");
                 }
             }
         }
-        if rendered {
+        if rendered > 0 {
+            crate::cpu_watch::glass_render(rendered, started.elapsed());
             self.last = Some(Instant::now());
         }
         self.prune();
@@ -1083,6 +1085,7 @@ fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
 
 /// A captured window sent a new frame.
 pub(crate) fn on_window_frame(hwnd: isize) {
+    crate::cpu_watch::glass_frame();
     with_running(|engine| engine.window_frame(hwnd));
 }
 

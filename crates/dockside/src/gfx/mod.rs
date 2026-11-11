@@ -769,12 +769,24 @@ impl Painter<'_> {
             };
             let rr = D2D1_ROUNDED_RECT { rect: r.d2d(), radiusX: radius, radiusY: radius };
             let brush_props = D2D1_BRUSH_PROPERTIES { opacity, transform: m };
+            // Already the size it's drawn at (video and GIF frames are made so):
+            // copied pixel for pixel. Resampling with high-quality cubic on the
+            // CPU, every redraw, is what a moving picture widget cost most.
+            let (mut dx, mut dy) = (96.0f32, 96.0f32);
+            self.rt.GetDpi(&mut dx, &mut dy);
+            let px = bmp.GetPixelSize();
+            let one_to_one = ((size.width * sx * dx / 96.0) - px.width as f32).abs() <= 1.0
+                && ((size.height * sy * dy / 96.0) - px.height as f32).abs() <= 1.0;
             let brush: Option<ID2D1Brush> = match self.ctx {
                 Some(ctx) => {
                     let props = D2D1_BITMAP_BRUSH_PROPERTIES1 {
                         extendModeX: D2D1_EXTEND_MODE_CLAMP,
                         extendModeY: D2D1_EXTEND_MODE_CLAMP,
-                        interpolationMode: D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+                        interpolationMode: if one_to_one {
+                            D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                        } else {
+                            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
+                        },
                     };
                     ctx.CreateBitmapBrush(bmp, Some(&props), Some(&brush_props)).ok().and_then(|b| b.cast().ok())
                 }

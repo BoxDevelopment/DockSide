@@ -191,6 +191,7 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
     APP.with(|a| *a.borrow_mut() = Some(app));
+    crate::cpu_watch::start();
     with_app(|app| {
         app.build();
         if !app.cfg.general.onboarding_done {
@@ -502,6 +503,7 @@ fn execute(action: Action) {
         Action::Reveal(path) => system::reveal(&path),
         Action::TrashFiles(paths) => {
             finder::ops::delete(HWND::default(), &paths, true);
+            system::refresh_trash();
         }
         Action::TogglePin { path, name, pin } => {
             with_app(|app| app.toggle_pin(&path, &name, pin));
@@ -593,9 +595,12 @@ fn execute(action: Action) {
                 Err(e) => log!("could not update dock apps: {e:#}"),
             }
         }
-        Action::EmptyTrash => unsafe {
-            let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), 0);
-        },
+        Action::EmptyTrash => {
+            unsafe {
+                let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), 0);
+            }
+            system::refresh_trash();
+        }
         Action::Sleep => system::sleep(),
         Action::Restart => {
             if system::confirm("Restart", "Are you sure you want to restart your computer now?") {
@@ -743,6 +748,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     drain_actions();
     // Anything holding up the UI thread (a CPU spike, or a modal dialog) shows in the log.
     let took = started.elapsed();
+    crate::cpu_watch::ui_message(msg, wp.0, took);
     if took >= SLOW_MESSAGE {
         log!("slow: message {msg:#06x} (wparam {:#x}) took {took:?}", wp.0);
     }
@@ -1819,9 +1825,12 @@ impl App {
         for d in &mut self.docks {
             still |= d.tick(dt);
         }
+        // Whether only the island ticks, and only for slow redraws or timers.
+        let mut island_slow = false;
         if let Some(i) = &mut self.island {
             i.hold_open = self.menu.is_some() || self.control.is_some() || self.dropdown.is_some();
-            still |= i.tick(dt);
+            island_slow = i.tick(dt) && !i.smooth;
+            still |= i.smooth;
         }
         for mb in &mut self.menubars {
             still |= mb.animate(dt);
@@ -1911,7 +1920,9 @@ impl App {
             *a > 0.0
         });
         still |= !self.closing_windows.is_empty();
-        if !still {
+        // Nothing else moving: the island's slow redraws keep a slow clock.
+        self.clock.set_slow(!still && island_slow);
+        if !still && !island_slow {
             self.animating = false;
             self.clock.stop();
         }

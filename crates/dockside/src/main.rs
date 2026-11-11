@@ -10,6 +10,9 @@ mod dropdown;
 mod chrome;
 mod config;
 mod controlcenter;
+#[cfg(target_arch = "x86_64")]
+mod cpu_stacks;
+mod cpu_watch;
 mod dock;
 mod dock_drop;
 mod finder;

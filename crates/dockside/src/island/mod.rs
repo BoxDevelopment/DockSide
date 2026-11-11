@@ -298,6 +298,8 @@ pub enum Hit {
     DiscordLeave,
     /// A page button under the open island (index into its tabs).
     Tab(u8),
+    /// The gap between the open island and its page buttons: does nothing, but keeps the island open.
+    TabGap,
     /// A running activity on the home page.
     HomeAct(u8),
     TimerToggle,
@@ -2489,7 +2491,7 @@ impl Island {
                     self.remove_shelf(|i| i.path != p);
                 }
             }
-            Hit::ShelfTimer(_) => {}
+            Hit::ShelfTimer(_) | Hit::TabGap => {}
             Hit::ShelfClear => self.remove_shelf(|i| i.pinned),
             Hit::ShelfBody => {
                 self.selected.clear();

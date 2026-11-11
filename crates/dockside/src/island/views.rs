@@ -1324,6 +1324,10 @@ pub fn tab_buttons(p: &Painter, pill: Rect, tabs: &[super::Panel], current: supe
     let w = 2.0 * PAD + n * TAB_W + (n - 1.0) * GAP;
     let bar = Rect::new(pill.cx() - w / 2.0, pill.bottom() + 16.5, w, H);
     p.fill_round(bar, H / 2.0, Color::BLACK.alpha(a));
+    // The strip between the island and the bar (and the bar's own padding)
+    // still counts as over the island, so crossing it doesn't start a collapse.
+    hits.push((Rect::new(pill.x, pill.bottom(), pill.w, bar.y - pill.bottom()), Hit::TabGap));
+    hits.push((bar, Hit::TabGap));
     for (i, &tab) in tabs.iter().enumerate() {
         let t = Rect::new(bar.x + PAD + i as f32 * (TAB_W + GAP), bar.cy() - TAB_H / 2.0, TAB_W, TAB_H);
         let on = tab == current;

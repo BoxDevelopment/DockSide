@@ -340,6 +340,12 @@ fn nudge<A, B>(tx: &Sender<Cmd>) -> impl FnMut(&A, &B) -> Result<()> + Send + 's
     }
 }
 
+/// How long after a track change its artwork may still be replaced, how often
+/// it's re-read in that time, and how many reads at most.
+const ART_SETTLE: Duration = Duration::from_secs(20);
+const ART_RECHECK_GAP: Duration = Duration::from_millis(700);
+const ART_RECHECKS: u32 = 16;
+
 #[derive(Default)]
 struct Worker {
     subs: Vec<Sub>,
@@ -347,6 +353,9 @@ struct Worker {
     chosen: Option<String>,
     art_key: String,
     art_tries: u32,
+    /// When the track changed, and when its artwork was last read.
+    art_since: Option<Instant>,
+    art_checked: Option<Instant>,
     art: Option<Arc<Art>>,
     next_art_id: u64,
     wic: Option<IWICImagingFactory>,
@@ -644,15 +653,33 @@ impl Worker {
         let duration = ((end - start) as f64 / 1e7) as f32;
 
         let key = format!("{app_id}\n{title}\n{artist}\n{album}");
+        let now = Instant::now();
         if key != self.art_key {
             self.art_key = key;
             self.art_tries = 0;
             self.art = None;
+            self.art_since = Some(now);
+            self.art_checked = None;
         }
         // Apps often publish the title first and the artwork a moment later.
         if self.art.is_none() && self.art_tries < 4 {
             self.art_tries += 1;
             self.art = self.load_art(&props).map(Arc::new);
+            self.art_checked = Some(now);
+        } else if self.art.is_some()
+            && self.art_tries < ART_RECHECKS
+            && self.art_since.is_some_and(|t| now.duration_since(t) < ART_SETTLE)
+            && self.art_checked.is_none_or(|t| now.duration_since(t) >= ART_RECHECK_GAP)
+        {
+            // Browsers put their own logo up first and swap in the page's
+            // artwork once it has downloaded: keep looking for a while.
+            self.art_tries += 1;
+            self.art_checked = Some(now);
+            if let Some(new) = self.load_art(&props) {
+                if self.art.as_ref().is_none_or(|old| old.data != new.data) {
+                    self.art = Some(Arc::new(new));
+                }
+            }
         }
 
         Ok(NowPlaying {

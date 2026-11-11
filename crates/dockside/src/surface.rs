@@ -35,6 +35,8 @@ pub struct Surface {
     shape: Option<[i32; 5]>,
     shown: bool,
     hidden: bool,
+    /// Something has been drawn: the windows can go up as soon as they may.
+    drawn: bool,
     shadow: Option<Shadow>,
     /// Whole-surface fade (0..1), for appearing and disappearing.
     opacity: f32,
@@ -133,7 +135,7 @@ impl Surface {
         let content = create_window(ex | WS_EX_LAYERED, WS_POPUP, rect, backdrop.unwrap_or_default())?;
         accent::prepare(content);
         let canvas = Canvas::new(gfx, w, h, scale)?;
-        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0, applied: 1.0, solid_backdrop: false })
+        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, drawn: false, shadow: None, opacity: 1.0, applied: 1.0, solid_backdrop: false })
     }
 
     /// Casts a soft drop shadow under the backdrop shape. `strength` is the
@@ -351,6 +353,7 @@ impl Surface {
         self.canvas.draw_part(gfx, part, f)?;
         self.canvas.present_part(self.content, self.rect.left, self.rect.top, self.opacity, part)?;
         self.update_shadow(gfx);
+        self.drawn = true;
         if !self.shown && !self.hidden {
             self.shown = true;
             self.show_windows(true);
@@ -432,6 +435,12 @@ impl Surface {
         self.hidden = hidden;
         if self.shown {
             self.show_windows(!hidden);
+        } else if !hidden && self.drawn {
+            // Its first frame was drawn while it was hidden (a rebuild under a
+            // window that filled the screen for a moment): nothing else would
+            // show it until it next drew.
+            self.shown = true;
+            self.show_windows(true);
         }
     }
 

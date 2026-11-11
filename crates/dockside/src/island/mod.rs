@@ -101,6 +101,9 @@ const SLIDE: f32 = 42.0;
 const DRAG_LINGER: Duration = Duration::from_millis(150);
 /// The drop zone stays a moment after the button is let go, for the drop to arrive.
 const DISARM_DELAY: Duration = Duration::from_millis(300);
+/// After a page button is clicked, how long the pointer may sit outside the
+/// island (its buttons moved) before the collapse countdown starts.
+const TAB_GRACE: Duration = Duration::from_millis(1500);
 /// How far below the pill the drop zone reaches before a drag is over it.
 const CATCH_BELOW: f32 = 14.0;
 /// Room around the opened shelf the zone covers while a drag is over it.
@@ -708,6 +711,8 @@ pub struct Island {
     inside: bool,
     hover_since: Option<Instant>,
     leave_at: Option<Instant>,
+    /// Until when a leave doesn't start the collapse countdown (a page button was just clicked).
+    tab_grace: Option<Instant>,
     hot: Option<Hit>,
     down: Option<Hit>,
     down_at: (f32, f32),
@@ -879,6 +884,7 @@ impl Island {
             inside: false,
             hover_since: None,
             leave_at: None,
+            tab_grace: None,
             hot: None,
             down: None,
             down_at: (0.0, 0.0),
@@ -2237,7 +2243,7 @@ impl Island {
         let expanded = matches!(self.shown, Content::Panel(_));
         // A drag that wanders off the island keeps it open until it's let go.
         let held = inside || self.page_drag.is_some() || self.mix_drag.is_some();
-        self.leave_at = if held { None } else { self.leave_at.or_else(|| expanded.then(Instant::now)) };
+        self.leave_at = if held { None } else { self.leave_at.or_else(|| expanded.then(|| self.leave_from())) };
         self.drag_pages(x);
         if let Some((r, x0, _)) = self.note_drag {
             self.note_drag = Some((r, x0, x - x0));
@@ -2331,10 +2337,18 @@ impl Island {
         self.hover_since = None;
         self.hot = None;
         if matches!(self.shown, Content::Panel(_)) && self.scrub.is_none() && self.page_drag.is_none() {
-            self.leave_at.get_or_insert_with(Instant::now);
+            let from = self.leave_from();
+            self.leave_at.get_or_insert(from);
         }
         self.retarget();
         self.dirty = true;
+    }
+
+    /// When a leave that starts now counts from: now, or the end of the grace
+    /// after a page button was clicked.
+    fn leave_from(&self) -> Instant {
+        let now = Instant::now();
+        self.tab_grace.filter(|t| *t > now).unwrap_or(now)
     }
 
     pub fn on_down(&mut self, x: f32, y: f32) {
@@ -2510,6 +2524,9 @@ impl Island {
                 let from = self.expanded.and_then(|e| tabs.iter().position(|t| *t == e));
                 let dir = if from.is_some_and(|f| f > i as usize) { -1 } else { 1 };
                 self.go_to(target, dir);
+                // The new page may be a different height, which slides the
+                // buttons out from under the pointer: that's not leaving.
+                self.tab_grace = Some(Instant::now() + TAB_GRACE);
             }
             Hit::HomeAct(i) => match self.home_acts().get(i as usize).copied()? {
                 Persist::Download => return sources::downloads_dir().map(|d| IslandEvent::Run(Action::OpenFinder(Some(d)))),

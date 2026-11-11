@@ -106,6 +106,42 @@ fn cloak_flags(hwnd: HWND) -> u32 {
     }
 }
 
+/// The AppUserModelID a window gave itself (browsers do: "Brave", "Chrome.Profile 1"), if any.
+pub fn window_app_id(hwnd: HWND) -> Option<String> {
+    use windows::Win32::System::Com::{CoTaskMemFree, StructuredStorage::PropVariantToStringAlloc};
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow, PROPERTYKEY};
+    const PKEY_APP_USER_MODEL_ID: PROPERTYKEY =
+        PROPERTYKEY { fmtid: windows::core::GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
+    unsafe {
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(hwnd).ok()?;
+        let value = store.GetValue(&PKEY_APP_USER_MODEL_ID).ok()?;
+        let p = PropVariantToStringAlloc(&value).ok()?;
+        let id = p.to_string().ok();
+        CoTaskMemFree(Some(p.0 as *const c_void));
+        id.filter(|s| !s.is_empty())
+    }
+}
+
+/// The frontmost window of the app a media session (or notification) names:
+/// an exe name ("Spotify.exe") or an AppUserModelID ("Brave", "Company.App!Main").
+pub fn window_for_app_id(app_id: &str) -> Option<HWND> {
+    let id = app_id.to_lowercase();
+    let windows = list_windows();
+    let by_exe = || windows.iter().find(|w| w.exe_name() == id);
+    // A browser's windows carry its ID, plus the profile's for any but the first.
+    let by_id = || {
+        windows.iter().find(|w| {
+            window_app_id(w.hwnd).is_some_and(|a| {
+                let a = a.to_lowercase();
+                a == id || a.strip_prefix(id.as_str()).is_some_and(|rest| rest.starts_with('.'))
+            })
+        })
+    };
+    // "Brave" is brave.exe, "Chrome" chrome.exe.
+    let by_stem = || windows.iter().find(|w| w.exe_name().strip_suffix(".exe") == Some(id.as_str()));
+    by_exe().or_else(by_id).or_else(by_stem).map(|w| w.hwnd)
+}
+
 pub fn is_desktop(hwnd: HWND) -> bool {
     matches!(class_name(hwnd).as_str(), "Progman" | "WorkerW")
 }

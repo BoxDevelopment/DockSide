@@ -646,7 +646,8 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             p.text(page.text, &text_font, Rect::new(body.x + 60.0, body.y + 188.0, body.w - 120.0, 84.0), theme.text_secondary);
 
             // The page's settings, in a System Settings card.
-            let card = Rect::new(body.x + CARD_PAD, body.y + CARD_Y, body.w - 2.0 * CARD_PAD, settings::rows_height(&rows));
+            settings::measure_notes(gfx, theme, &rows, body.w - 2.0 * CARD_PAD);
+            let card =Rect::new(body.x + CARD_PAD, body.y + CARD_Y, body.w - 2.0 * CARD_PAD, settings::rows_height(&rows));
             let mut below = card.y;
             if !rows.is_empty() {
                 let mut controls = Vec::new();

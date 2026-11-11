@@ -956,6 +956,14 @@ impl Dock {
         (item.map_or(FileDrop::None, |i| self.file_drop_on(i, paths)), spring)
     }
 
+    /// Whether a drag at (x, y) is over the Dock: its shelf and icons, or the
+    /// bottom-edge strip while it's hidden.
+    pub fn takes_drag(&self, x: f32, y: f32) -> bool {
+        let lay = self.slots().lay;
+        let hidden = self.cfg.autohide && self.hide_t >= 0.999;
+        (!hidden && self.hit_rect(&lay).contains(x, y)) || (self.cfg.autohide && self.reveal_rect(&lay).contains(x, y))
+    }
+
     pub fn file_hovering(&self) -> bool {
         self.file_hover.is_some()
     }

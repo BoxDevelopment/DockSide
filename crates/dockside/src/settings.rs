@@ -308,6 +308,7 @@ fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
         }
         Row::Segmented(l, key) => format!("{l} {}", SettingsWindow::segments(fonts, *key, cfg).0.join(" ")),
         Row::Buttons(l, buttons) => buttons.iter().fold(l.to_string(), |s, (b, _)| s + " " + b),
+        Row::Tiles(buttons, _) => buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>().join(" "),
         Row::Named(l, b, _) => format!("{l} {b}"),
         Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
         Row::Excluded(i) => cfg.windows.no_inject.get(*i).map_or_else(String::new, |e| format!("Excluded {e}")),
@@ -649,6 +650,8 @@ pub(crate) enum Row {
     /// An entry of `[windows] no_inject`, with a remove button.
     Excluded(usize),
     Buttons(&'static str, Vec<(&'static str, Hit)>),
+    /// Buttons of one width in columns across the card (the count), filled from the left.
+    Tiles(Vec<(&'static str, Hit)>, usize),
     /// A label of its own (an app's name) with one button.
     Named(String, &'static str, Hit),
     Info(&'static str, String),
@@ -662,15 +665,42 @@ pub(crate) enum Row {
     Account(usize),
 }
 
-/// A note row fits three lines of 12 pt text.
-const NOTE_H: f32 = 64.0;
 /// An account row: name over its status.
 const ACCOUNT_H: f32 = 52.0;
+
+thread_local! {
+    /// How many lines each note wraps to (by its text's address), as last measured.
+    static NOTE_LINES: std::cell::RefCell<HashMap<usize, u8>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Measures the notes among `rows` in a card `card_w` wide, so each is as
+/// tall as its text. Call before laying the rows out.
+pub(crate) fn measure_notes(gfx: &Gfx, theme: &Theme, rows: &[Row], card_w: f32) {
+    use windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS;
+    for row in rows {
+        let Row::Note(text) = row else { continue };
+        let key = text.as_ptr() as usize;
+        if NOTE_LINES.with(|n| n.borrow().contains_key(&key)) {
+            continue;
+        }
+        let block = gfx.format_block(&theme.font, 12.0, Weight::Regular, Align::Leading);
+        let mut m = DWRITE_TEXT_METRICS::default();
+        let lines = match gfx.layout(text, &block, card_w - 28.0, 1000.0) {
+            Some(l) if unsafe { l.GetMetrics(&mut m) }.is_ok() => m.lineCount.clamp(1, 8) as u8,
+            _ => 3,
+        };
+        NOTE_LINES.with(|n| n.borrow_mut().insert(key, lines));
+    }
+}
 
 impl Row {
     pub(crate) fn height(&self) -> f32 {
         match self {
-            Row::Note(_) => NOTE_H,
+            // 12 pt lines with 8 pt above and below (three lines until measured).
+            Row::Note(text) => {
+                let lines = NOTE_LINES.with(|n| n.borrow().get(&(text.as_ptr() as usize)).copied()).unwrap_or(3);
+                16.0 + 16.0 * lines as f32
+            }
             Row::Account(_) => ACCOUNT_H,
             _ => ROW_H,
         }
@@ -1554,7 +1584,7 @@ impl SettingsWindow {
             Page::Widgets => {
                 use crate::widgets::{title, KINDS};
                 let add = |kinds: &[crate::config::WidgetKind]| {
-                    Row::Buttons("", kinds.iter().map(|&k| (title(k), Hit::AddWidget(k))).collect())
+                    Row::Tiles(kinds.iter().map(|&k| (title(k), Hit::AddWidget(k))).collect(), 3)
                 };
                 let count = cfg.widgets.items.len();
                 vec![
@@ -2279,6 +2309,9 @@ impl SettingsWindow {
         let content_w = body.w - SIDEBAR - 2.0 * CONTENT_PAD;
         let viewport = Self::viewport();
 
+        for g in &groups {
+            measure_notes(gfx, theme, &g.1, content_w);
+        }
         // Measure content height for scrolling.
         let content_h: f32 = groups
             .iter()
@@ -2574,6 +2607,19 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 p.text(text, &button_font, b, theme.text);
                 hits.push((b, *hit));
                 bx -= 8.0;
+            }
+        }
+        Row::Tiles(buttons, columns) => {
+            let gap = 8.0;
+            let n = (*columns).max(1) as f32;
+            let bw = (r.w - 28.0 - gap * (n - 1.0)) / n;
+            for (i, (text, hit)) in buttons.iter().enumerate() {
+                let b = Rect::new(r.x + 14.0 + i as f32 * (bw + gap), r.cy() - 12.0, bw, 24.0);
+                let bg = control_bg.mix(selected_seg, ctx.hover_t(*hit));
+                p.fill_round(b, 6.0, bg);
+                p.stroke_round(b.inset(0.25, 0.25), 6.0, card_border, 0.5);
+                p.text(text, &button_font, b, theme.text);
+                hits.push((b, *hit));
             }
         }
         Row::Text(label, key, placeholder) => {

@@ -106,6 +106,8 @@ const SPOTLIGHT_POLL_MS: u32 = 40;
 /// Launchpad is open: blinks its search caret.
 const TIMER_LAUNCHPAD_BLINK: usize = 17;
 const LAUNCHPAD_BLINK_MS: u32 = 265;
+/// A second look at the backdrop state after a power setting change.
+const TIMER_POWER: usize = 18;
 const DOCK_FOLLOW_MS: u32 = 100;
 const DOCK_FOLLOW_DWELL_MS: u64 = 300;
 /// Long enough for DWM to present a new surface's backdrop.
@@ -961,16 +963,14 @@ pub fn island_drag(phase: finder::dnd::Phase, paths: &[PathBuf]) -> bool {
     .unwrap_or(false)
 }
 
-/// Brings the app behind a media session forward: a running window of that exe,
-/// otherwise the app by its AppUserModelID (Store apps, browsers).
+/// Brings the app behind a media session forward: a window it already has
+/// open (launching a browser by its ID would open a new tab instead),
+/// otherwise the app by its AppUserModelID.
 fn open_media_app(app_id: &str) -> Action {
-    let exe = app_id.to_lowercase();
-    if exe.ends_with(".exe") {
-        if let Some(w) = apps::list_windows().into_iter().find(|w| w.exe_name() == exe) {
-            return Action::Activate(w.hwnd);
-        }
+    match apps::window_for_app_id(app_id) {
+        Some(hwnd) => Action::Activate(hwnd),
+        None => Action::Open(format!("shell:AppsFolder\\{app_id}")),
     }
-    Action::Open(format!("shell:AppsFolder\\{app_id}"))
 }
 
 fn dock_eq_except_apps(a: &config::DockCfg, b: &config::DockCfg) -> bool {
@@ -1046,6 +1046,8 @@ pub struct App {
     island_hook: Option<HHOOK>,
     /// Watches for drags while the island's shelf is on (its drop zone).
     drag_watch_hook: Option<HHOOK>,
+    /// Elevated Dock drag watch: where the held button was first seen, and whether it has moved since.
+    drag_watch_from: Option<(POINT, bool)>,
     /// Alt+number / Win+Ctrl+arrow desktop shortcuts.
     desktop_hook: Option<HHOOK>,
     /// Reports desktop switches made anywhere, for the island.
@@ -1198,6 +1200,7 @@ impl App {
             hooks: Vec::new(),
             island_hook: None,
             drag_watch_hook: None,
+            drag_watch_from: None,
             desktop_hook: None,
             desktop_watch: None,
             desktop_popup: None,
@@ -3509,8 +3512,11 @@ impl App {
                 WM_POWERBROADCAST => {
                     if wp.0 as u32 == PBT_POWERSETTINGCHANGE {
                         win::glass::power_changed();
-                        // Give DWM a moment to switch its effects first.
+                        log!("power: setting changed (transparency, low power) = {:?}, surfaces built for {:?}", backdrop_state(), self.backdrop_state);
+                        // Give DWM a moment to switch its effects first. Windows can
+                        // report the new state late, so look again a few seconds on.
                         self.timer(TIMER_THEME, 800);
+                        self.timer(TIMER_POWER, 4000);
                     }
                     return Some(LRESULT(1));
                 }
@@ -3552,7 +3558,7 @@ impl App {
                         TIMER_DRAG_WATCH => self.watch_drag(),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
-                        TIMER_THEME
+                        TIMER_THEME | TIMER_POWER
                             if crate::theme::wants_dark(&self.cfg) != self.theme.dark
                                 || backdrop_state() != self.backdrop_state =>
                         {
@@ -4264,15 +4270,29 @@ impl App {
         self.timer(TIMER_DRAG_WATCH, DRAG_WATCH_MS);
         let mut pt = POINT::default();
         let have_pt = unsafe { GetCursorPos(&mut pt) }.is_ok();
+        // A click or a press held still isn't a drag: the pointer has to travel
+        // with the button down first (apps take the capture for plain clicks too).
+        const TRAVEL: i32 = 8;
+        let travelled = if have_pt && system::mouse_button_down() {
+            let (from, moved) = self.drag_watch_from.get_or_insert((pt, false));
+            *moved |= (pt.x - from.x).abs() > TRAVEL || (pt.y - from.y).abs() > TRAVEL;
+            *moved
+        } else {
+            self.drag_watch_from = None;
+            false
+        };
         let mut animate = false;
         for d in &mut self.docks {
             let r = d.surface.rect;
-            let over = have_pt
+            let s = d.surface.scale;
+            // Only over the Dock itself (or a hidden Dock's edge strip), not the
+            // empty room around it in its window.
+            let over = travelled
                 && crate::dock_drop::foreign_drag(d.surface.content)
                 && (r.left..r.right).contains(&pt.x)
-                && (r.top..r.bottom).contains(&pt.y);
+                && (r.top..r.bottom).contains(&pt.y)
+                && (d.file_hovering() || d.takes_drag((pt.x - r.left) as f32 / s, (pt.y - r.top) as f32 / s));
             if over {
-                let s = d.surface.scale;
                 let (_, spring) = d.on_file_drag((pt.x - r.left) as f32 / s, (pt.y - r.top) as f32 / s, &[]);
                 if let Some(a) = spring {
                     push(a);

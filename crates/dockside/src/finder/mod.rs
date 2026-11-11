@@ -3431,7 +3431,15 @@ impl FinderWindow {
                         }
                         let current = key == Some(sort);
                         let font = if current { &small_bold } else { &small };
-                        p.text(label, font, Rect::new(r.x + 8.0, r.y, r.w - 24.0, r.h), theme.text_secondary);
+                        // Size's numbers sit at the right of their column; so does its heading.
+                        if cols[k].0 == Some(Col::Size) {
+                            let weight = if current { Weight::Bold } else { Weight::Regular };
+                            let trailing = p.gfx.format(&theme.font, 11.0, weight, Align::Trailing);
+                            let inset = if current { 26.0 } else { 14.0 };
+                            p.text(label, &trailing, Rect::new(r.x, r.y, r.w - inset, r.h), theme.text_secondary);
+                        } else {
+                            p.text(label, font, Rect::new(r.x + 8.0, r.y, r.w - 24.0, r.h), theme.text_secondary);
+                        }
                         if current {
                             let (cx, cy) = (r.right() - 14.0, r.cy());
                             let d = if ascending { -1.0 } else { 1.0 };
@@ -3446,7 +3454,8 @@ impl FinderWindow {
                 View::Gallery => {
                     // The selected item big, its name and details, and a strip of thumbnails below.
                     let strip = Rect::new(vr.x, vr.bottom() - STRIP_H, vr.w, STRIP_H);
-                    let stage = Rect::new(vr.x + 20.0, vr.y + 16.0, vr.w - 40.0, strip.y - vr.y - 60.0);
+                    // Room under the stage for the name and details (48 pt) and a margin above the strip.
+                    let stage = Rect::new(vr.x + 20.0, vr.y + 16.0, vr.w - 40.0, strip.y - vr.y - 76.0);
                     if let Some(e) = &focus_entry {
                         let key = IconLoader::large_key(e);
                         let big = match focus_bitmap.as_ref().filter(|(k, _)| *k == key) {

@@ -51,6 +51,11 @@ const BUBBLE: f32 = 50.0;
 const GAP: f32 = 8.0;
 /// The capsule's width with the bubbles out: the whole row stays `W` wide.
 const PILL_SHORT: f32 = W - 4.0 * (BUBBLE + GAP);
+/// How far (points) a bubble on its way out reaches to stay joined to the
+/// capsule and its neighbours; none once it's in place.
+const MELT: f32 = 14.0;
+/// Room past the capsule's end for a bubble springing a little too far.
+const OVERSHOOT: f32 = 12.0;
 /// How far the body's and a bubble's shadows reach past them.
 const BODY_REACH: f32 = 34.0;
 const BUBBLE_REACH: f32 = 24.0;
@@ -155,9 +160,19 @@ struct Shown {
     selected: usize,
 }
 
+/// A bubble out of the capsule this frame, when they share its glass.
+struct Blob {
+    index: usize,
+    rect: Rect,
+    p: f32,
+    hover: bool,
+    mode: Mode,
+}
+
 /// One glass bubble beside the capsule.
 struct Bubble {
-    surface: Surface,
+    /// Its own windows; None when it's drawn in the capsule's (`Spotlight::merged`).
+    surface: Option<Surface>,
     mode: Mode,
     /// 0 tucked in the capsule, 1 out in its place.
     p: Spring,
@@ -190,6 +205,10 @@ struct AppsView {
 
 pub struct Spotlight {
     pub surface: Surface,
+    /// The capsule and bubbles are one pane of refracting glass: the bubbles
+    /// bud off it like drops, and nothing but the picture changes as they
+    /// move. Without refraction each bubble is a surface of its own.
+    merged: bool,
     bubbles: Vec<Bubble>,
     kind: Backdrop,
     text: Vec<char>,
@@ -225,6 +244,10 @@ pub struct Spotlight {
     /// The panel's content fading in as it opens (the glass snaps to size) and
     /// out as it closes (the glass shrinking back to the capsule under it).
     fade: Spring,
+    /// The glass's height while the panel closes: it stays as tall as the
+    /// panel was and only the shape in it shrinks, so nothing is resized (a
+    /// pane this size takes ~2 ms a frame to resize) until it's done.
+    held: f32,
     /// See `Shown`; `rows_changed` says it's out of date.
     shown: Option<Shown>,
     rows_changed: bool,
@@ -317,6 +340,9 @@ impl Spotlight {
         let kind = cfg.spotlight.backdrop.for_panels();
         let surface = Surface::new(gfx, rect, s, kind, theme.menu_tint)?;
         SPOTLIGHT_HWND.store(surface.content.0 as isize, std::sync::atomic::Ordering::Relaxed);
+        let mut surface = surface;
+        // One pane of glass, which paints the body's tint and border itself.
+        let merged = surface.refracts() && surface.set_glass_coat(theme.menu_tint.alpha(0.28), theme.menu_border);
         let low_power = Arc::new(OnceLock::new());
         let slot = low_power.clone();
         std::thread::spawn(move || {
@@ -325,6 +351,7 @@ impl Spotlight {
         let now = cursor_pos();
         Ok(Self {
             surface,
+            merged,
             bubbles: Vec::new(),
             kind,
             text: Vec::new(),
@@ -349,6 +376,7 @@ impl Spotlight {
             revealed: false,
             grow: Spring::new(0.0, 0.3, 0.9),
             fade: Spring::new(1.0, 0.12, 1.0),
+            held: PILL_H,
             shown: None,
             rows_changed: true,
             app_glide: Glide::default(),
@@ -372,12 +400,12 @@ impl Spotlight {
     /// Whether `hwnd` is one of the windows behind Spotlight's glass (they're
     /// bigger than what shows: a click on one is a click outside).
     pub fn owns_backdrop(&self, hwnd: HWND) -> bool {
-        self.surface.backdrop == Some(hwnd) || self.bubbles.iter().any(|b| b.surface.backdrop == Some(hwnd))
+        self.surface.backdrop == Some(hwnd) || self.bubbles.iter().any(|b| b.surface.as_ref().is_some_and(|s| s.backdrop == Some(hwnd)))
     }
 
     /// The bubbles' windows, for routing their mouse messages.
     pub fn bubble_index(&self, hwnd: HWND) -> Option<usize> {
-        self.bubbles.iter().position(|b| b.surface.content == hwnd)
+        self.bubbles.iter().position(|b| b.surface.as_ref().is_some_and(|s| s.content == hwnd))
     }
 
     fn query(&self) -> String {
@@ -436,8 +464,8 @@ impl Spotlight {
 
     /// Hides the bubbles at once (Spotlight is closing: only the capsule fades).
     pub fn hide_bubbles(&mut self) {
-        for b in &mut self.bubbles {
-            b.surface.set_hidden(true);
+        for s in self.bubbles.iter_mut().filter_map(|b| b.surface.as_mut()) {
+            s.set_hidden(true);
         }
     }
 
@@ -469,20 +497,24 @@ impl Spotlight {
         let r = self.surface.rect;
         let rect = RECT { left: r.left, top: r.top, right: r.right, bottom: r.top + ((PILL_H + 2.0 * SHADOW) * s).round() as i32 };
         for mode in Mode::BUBBLES {
+            if self.merged {
+                self.bubbles.push(Bubble { surface: None, mode, p: Spring::new(0.0, 0.42, 0.72), hover: false, drawn: None });
+                continue;
+            }
             match Surface::new(gfx, rect, s, self.kind, theme.menu_tint) {
                 Ok(mut surface) => {
                     // The glass is there in full from a bubble's first frame to
                     // its last; what's drawn on it fades.
                     surface.keep_backdrop_solid();
                     surface.set_opacity(0.0);
-                    self.bubbles.push(Bubble { surface, mode, p: Spring::new(0.0, 0.42, 0.72), hover: false, drawn: None });
+                    self.bubbles.push(Bubble { surface: Some(surface), mode, p: Spring::new(0.0, 0.42, 0.72), hover: false, drawn: None });
                 }
                 Err(e) => log!("spotlight bubble failed: {e}"),
             }
         }
         // Above the capsule, so they always take their own clicks.
-        for b in &self.bubbles {
-            b.surface.raise();
+        for s in self.bubbles.iter().filter_map(|b| b.surface.as_ref()) {
+            s.raise();
         }
     }
 
@@ -918,6 +950,16 @@ impl Spotlight {
         if !self.revealed {
             self.show_bubbles(true);
         }
+        if self.merged {
+            let over = self.bubble_hits.iter().find(|(r, _)| r.contains(x, y)).map(|&(_, i)| i);
+            for (j, b) in self.bubbles.iter_mut().enumerate() {
+                let on = over == Some(j);
+                if b.hover != on {
+                    b.hover = on;
+                    self.dirty = true;
+                }
+            }
+        }
         if let Some(&(_, i)) = self.hits.iter().find(|(r, _)| r.contains(x, y)) {
             if i != self.selected {
                 self.selected = i;
@@ -932,7 +974,21 @@ impl Spotlight {
         }
     }
 
-    pub fn on_click(&mut self, x: f32, y: f32, ctrl: bool) -> SpotlightEvent {
+    /// The pointer left the panel: no bubble in it is under it any more.
+    pub fn on_leave(&mut self) {
+        if self.merged {
+            for b in &mut self.bubbles {
+                self.dirty |= std::mem::take(&mut b.hover);
+            }
+        }
+    }
+
+    pub fn on_click(&mut self, x: f32, y: f32, ctrl: bool, index: &Index) -> SpotlightEvent {
+        if self.merged {
+            if let Some(&(_, i)) = self.bubble_hits.iter().find(|(r, _)| r.contains(x, y)) {
+                return self.on_bubble_click(i, index);
+            }
+        }
         if self.view_hit.is_some_and(|r| r.contains(x, y)) {
             self.apps.list = !self.apps.list;
             self.apps.scroll_to = 0.0;
@@ -1086,7 +1142,28 @@ impl Spotlight {
         let height = PILL_H + self.grow.value.max(0.0);
         let body = Rect::new(SHADOW, SHADOW, width, height);
         let radius = RADIUS;
-        self.surface.set_backdrop_shape(body, radius);
+        // The bubbles out of the capsule, when they're part of its glass.
+        let anchor = Rect::new(SHADOW, SHADOW, W, PILL_H);
+        let blobs: Vec<Blob> = self
+            .bubbles
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| self.merged && b.p.value > 0.0)
+            .map(|(index, b)| Blob { index, rect: Self::bubble_rect(anchor, index, b.p.value), p: b.p.value, hover: b.hover, mode: b.mode })
+            .collect();
+        if self.merged {
+            let mut shapes = vec![(body, 0.0)];
+            shapes.extend(blobs.iter().map(|b| (b.rect, MELT * (1.0 - b.p).clamp(0.0, 1.0))));
+            if !closing {
+                self.held = height;
+            }
+            // As wide as the capsule at its longest whatever it is now: only
+            // the picture changes as the capsule shortens and the bubbles move.
+            self.surface.set_glass_shapes(Rect::new(SHADOW, SHADOW, W + OVERSHOOT, self.held.max(height)), radius, &shapes);
+        } else {
+            self.surface.set_backdrop_shape(body, radius);
+        }
+        let bubble_font = gfx.format("Segoe Fluent Icons", 18.0, Weight::Regular, Align::Center);
 
         let big = gfx.format(&theme.font, 20.0, Weight::Regular, Align::Leading);
         let title_font = gfx.format(&theme.font, 14.0, Weight::Regular, Align::Leading);
@@ -1161,6 +1238,7 @@ impl Spotlight {
         let fade = self.fade.value.clamp(0.0, 1.0);
 
         let mode = self.mode;
+        let merged = self.merged;
         let bitmaps = &mut self.bitmaps;
         let app_icons = &mut self.app_icons;
         let apps = &self.apps;
@@ -1171,13 +1249,29 @@ impl Spotlight {
         let mut view_hit = None;
         let names: HashMap<&str, &str> = if panel == Mode::Apps { apps.all.iter().map(|a| (a.1.as_str(), a.0.as_str())).collect() } else { HashMap::new() };
 
-        let part = self.painted.replace(body).map(|was| was.union(body).inset(-BODY_REACH, -BODY_REACH));
+        let extent = blobs.iter().fold(body, |e, b| e.union(b.rect));
+        let part = self.painted.replace(extent).map(|was| was.union(extent).inset(-BODY_REACH, -BODY_REACH));
         let r = self.surface.render_part(gfx, part, |p: &Painter| {
             // Shadow, then the tinted body over the glass.
             p.soft_shadow(body, radius, 12, 2.0, 0.035, 8.0, theme.shadow);
+            // The bubbles sharing the glass, under the capsule's body: one
+            // still tucked into it shows nothing until it's out.
+            for b in &blobs {
+                let (r, a) = (b.rect, (b.p * 1.7).clamp(0.0, 1.0));
+                p.soft_shadow(r, r.h / 2.0, 8, 2.0, 0.03 * a, 5.0, theme.shadow);
+                p.clear_round(r.inset(2.0, 2.0), r.h / 2.0 - 2.0);
+                // (Their tint and border are the glass's: see `set_glass_coat`.)
+                if b.hover {
+                    p.fill_round(r, r.h / 2.0, theme.text.alpha(0.08 * a));
+                }
+                let g = Rect::new(r.cx() - 12.0, r.cy() - 12.0, 24.0, 24.0);
+                p.faded(((b.p - 0.35) * 2.0).clamp(0.0, 1.0), || draw_mode_glyph(p, b.mode, g, theme.text, &bubble_font));
+            }
             p.clear_round(body.inset(3.0, 3.0), radius - 3.0);
-            p.fill_round(body, radius, if has_backdrop { theme.menu_tint.alpha(0.28) } else { theme.menu_tint.alpha(1.0) });
-            p.stroke_round(body.inset(0.25, 0.25), radius, theme.menu_border, 0.5);
+            if !merged {
+                p.fill_round(body, radius, if has_backdrop { theme.menu_tint.alpha(0.28) } else { theme.menu_tint.alpha(1.0) });
+                p.stroke_round(body.inset(0.25, 0.25), radius, theme.menu_border, 0.5);
+            }
 
             // The field: a magnifier (or the mode's glyph), the text, the caret.
             let gy = body.y + PILL_H / 2.0;
@@ -1386,6 +1480,10 @@ impl Spotlight {
         if ghost.is_some() {
             self.shown = ghost;
         }
+        if self.merged {
+            // A bubble takes clicks once it's mostly out (see `on_bubble_click`).
+            self.bubble_hits = blobs.iter().map(|b| (b.rect, b.index)).collect();
+        }
         if let Err(e) = r {
             log!("spotlight render failed: {e}");
         }
@@ -1463,18 +1561,22 @@ impl Spotlight {
 
     /// Draws and places the bubbles beside the capsule.
     fn render_bubbles(&mut self, gfx: &Gfx, theme: &Theme, body: Rect) {
+        if self.merged {
+            return;
+        }
         let glyph_font = gfx.format("Segoe Fluent Icons", 18.0, Weight::Regular, Align::Center);
         let anchor = Rect::new(SHADOW, SHADOW, W, PILL_H);
         let mut bubble_hits = Vec::new();
         for (i, b) in self.bubbles.iter_mut().enumerate() {
+            let Some(surface) = b.surface.as_mut() else { continue };
             let p = b.p.value;
             let alpha = (p * 1.7).clamp(0.0, 1.0);
-            b.surface.set_opacity(alpha);
+            surface.set_opacity(alpha);
             // Tucked away: hidden, so it doesn't catch clicks meant for the capsule.
             // Its glass doesn't fade, so on the way in it goes as soon as what's
             // on it has (not once the spring has rung out, a ring left on the capsule).
             let away = if b.p.target <= 0.0 { p <= 0.02 } else { p <= 0.0 };
-            b.surface.set_hidden(away);
+            surface.set_hidden(away);
             if away {
                 continue;
             }
@@ -1488,10 +1590,10 @@ impl Spotlight {
             // spans the whole capsule.
             let part = b.drawn.map(|(was, ..)| was.union(r).inset(-BUBBLE_REACH, -BUBBLE_REACH));
             b.drawn = Some((r, b.hover, glyph));
-            b.surface.set_backdrop_shape(r, BUBBLE / 2.0);
-            let has_backdrop = b.surface.backdrop.is_some();
+            surface.set_backdrop_shape(r, BUBBLE / 2.0);
+            let has_backdrop = surface.backdrop.is_some();
             let (mode, hover) = (b.mode, b.hover);
-            let res = b.surface.render_part(gfx, part, |pt: &Painter| {
+            let res = surface.render_part(gfx, part, |pt: &Painter| {
                 pt.soft_shadow(r, r.h / 2.0, 8, 2.0, 0.03, 5.0, theme.shadow);
                 pt.clear_round(r.inset(2.0, 2.0), r.h / 2.0 - 2.0);
                 pt.fill_round(r, r.h / 2.0, if has_backdrop { theme.menu_tint.alpha(0.28) } else { theme.menu_tint.alpha(1.0) });

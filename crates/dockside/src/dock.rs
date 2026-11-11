@@ -406,6 +406,8 @@ impl Slots {
 
 pub struct Dock {
     pub surface: Surface,
+    /// The columns last painted (see `render`).
+    painted: Option<Rect>,
     cfg: DockCfg,
     monitor: Monitor,
     metrics: Metrics,
@@ -466,6 +468,7 @@ impl Dock {
         }
         let mut dock = Self {
             surface,
+            painted: None,
             cfg: d.clone(),
             monitor,
             metrics,
@@ -1294,7 +1297,21 @@ impl Dock {
             }
         };
 
-        let r = self.surface.render(gfx, |p| {
+        // The window is wider than the Dock (room to magnify into): repaint
+        // only the columns it draws in, now and last time, at full height
+        // (icons bounce and labels sit above it).
+        let mut band = hit.union(shelf);
+        if autohide {
+            band = band.union(reveal);
+        }
+        let reach = label_w.max(m.max) + 8.0;
+        if let Some(d) = drag {
+            let cx = d.x - d.grab_dx;
+            band = band.union(Rect::new(cx - m.tile, 0.0, 2.0 * m.tile, 1.0));
+        }
+        let band = Rect::new(band.x - reach, 0.0, band.w + 2.0 * reach, self.surface.height_pt());
+        let part = self.painted.replace(band).map(|was| was.union(band));
+        let r = self.surface.render_part(gfx, part, |p| {
             if !fully_hidden {
                 p.fill_rect(hit, Color::HIT);
                 p.fill_round(shelf, m.radius, if has_backdrop { theme.dock_tint.alpha(0.0) } else { theme.dock_tint.alpha(1.0) });

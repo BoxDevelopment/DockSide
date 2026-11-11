@@ -97,7 +97,12 @@ cbuffer C : register(b0) {
     float frost;     // blur tap radius, px
     float strength;  // 1 = bold (Dock, menus); lower = subtle, frostier (sidebars)
     float lod;       // extra blur, in mip levels
-    float2 pad;
+    float count;     // shapes in the pane
+    float pad;
+    float4 shapes[5]; // x, y, w, h in pane px
+    float4 melt[5];   // x: how far (px) a shape reaches to merge with those before it
+    float4 coat;      // painted over the glass, straight alpha
+    float4 border;    // a hairline around its edge, straight alpha
 };
 
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -115,6 +120,25 @@ float sd(float2 p, float2 b, float r) {
     return length(max(q, 0)) + min(max(q.x, q.y), 0) - r;
 }
 
+// Distance to the pane's shapes (rounded to at least `minR`), as one body:
+// shapes that near each other flow together like drops (a smooth union).
+float field(float2 p, float minR) {
+    float d = 1e6;
+    [loop] for (int i = 0; i < (int)count; i++) {
+        float2 b = shapes[i].zw * 0.5;
+        float r = min(max(radius, minR), min(b.x, b.y));
+        float di = sd(p - shapes[i].xy - b, b, r);
+        float k = melt[i].x;
+        if (i > 0 && k > 0) {
+            float m = max(k - abs(d - di), 0) / k;
+            d = min(d, di) - m * m * k * 0.25;
+        } else {
+            d = min(d, di);
+        }
+    }
+    return d;
+}
+
 float3 tap(float2 px, float level) {
     float2 inv = 1.0 / texSize;
     return src.SampleLevel(smp, clamp(px * inv, 0.5 * inv, 1 - 0.5 * inv), level).rgb;
@@ -128,27 +152,29 @@ float3 frosted(float2 px, float lv, out float3 mid) {
     };
     mid = tap(px, 1.0 + lv);
     float3 c = mid * 2;
+    // The ring reaches at least three quarters of a texel of the level it
+    // reads: any closer and the taps all land in the same few texels, which
+    // shows that level's grid (blocky frost that shimmers as things move
+    // behind it) where the blur is strong.
+    float reach = max(frost, 0.75 * exp2(1.5 + lv));
     [unroll] for (int i = 0; i < 8; i++) {
-        c += tap(px + ring[i] * frost, 1.5 + lv);
+        c += tap(px + ring[i] * reach, 1.5 + lv);
     }
     return c / 10;
 }
 
 float4 ps(V i) : SV_Target {
-    float2 h = size * 0.5;
-    float2 p = i.uv * size - h;
-    float r = min(radius, min(h.x, h.y));
-    float d = sd(p, h, r);
+    float2 p = i.uv * size;
+    float d = field(p, 0);
     float alpha = saturate(0.5 - d);
     if (alpha <= 0) return 0;
 
     // The lens normal comes from the shape rounded to at least the bezel's
     // width, so it turns smoothly through tight corners instead of snapping
     // between the two edges along the diagonal.
-    float rn = min(max(r, bezel), min(h.x, h.y));
     float e = 0.5;
-    float2 n = float2(sd(p + float2(e, 0), h, rn) - sd(p - float2(e, 0), h, rn),
-                      sd(p + float2(0, e), h, rn) - sd(p - float2(0, e), h, rn));
+    float2 n = float2(field(p + float2(e, 0), bezel) - field(p - float2(e, 0), bezel),
+                      field(p + float2(0, e), bezel) - field(p - float2(0, e), bezel));
     n = n / max(length(n), 1e-4);
     float depth = -d;
 
@@ -158,7 +184,7 @@ float4 ps(V i) : SV_Target {
     float t = bezel > 0 ? saturate(depth / bezel) : 1;
     float u = 1 - t;
     float bend = refract * (1 - sqrt(saturate(1 - u * u)));
-    float2 q = p - n * bend + h + origin;
+    float2 q = p - n * bend + origin;
 
     // Toward the rim the bend outruns the pixels, so each one spans several
     // texels of what's behind; sample a mip that covers them, or moving
@@ -179,7 +205,13 @@ float4 ps(V i) : SV_Target {
     // Vibrancy, then the body of the glass.
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
     c = lerp(l.xxx, c, 1 + 0.4 * strength);
-    c = dark > 0.5 ? c * 0.86 : lerp(c, 1, 0.06);
+    // Adaptive, like macOS: dark glass dims further over bright content and
+    // light glass lifts over dark content, so what's written on it stays
+    // readable. Judged from the coarsest mip, so it eases across the pane
+    // instead of following every detail behind it.
+    float back = dot(tap(q, 4.0), float3(0.2126, 0.7152, 0.0722));
+    c = dark > 0.5 ? c * lerp(0.86, 0.5, smoothstep(0.55, 0.95, back))
+                   : lerp(c, 1, lerp(0.06, 0.45, 1 - smoothstep(0.05, 0.45, back)));
     c = lerp(c, tint.rgb, tint.a);
 
     if (bezel > 0) {
@@ -194,6 +226,10 @@ float4 ps(V i) : SV_Target {
         c += k * pow(1 - t, 3) * (0.05 + 0.18 * glint);
         c *= 1 - 0.08 * pow(1 - t, 2) * saturate(-facing);
     }
+    // What a surface would otherwise paint over its glass: here it follows
+    // the glass exactly, through every merge, and never a frame behind it.
+    c = lerp(saturate(c), coat.rgb, coat.a);
+    c = lerp(c, border.rgb, border.a * saturate(0.5 * scale - depth + 0.5));
     return float4(saturate(c) * alpha, alpha);
 }
 "#;
@@ -213,8 +249,16 @@ struct Constants {
     frost: f32,
     strength: f32,
     lod: f32,
-    pad: [f32; 2],
+    count: f32,
+    pad: f32,
+    shapes: [[f32; 4]; MAX_SHAPES],
+    melt: [[f32; 4]; MAX_SHAPES],
+    coat: [f32; 4],
+    border: [f32; 4],
 }
+
+/// The most shapes one pane can hold (see `Pane::set_shapes`).
+pub const MAX_SHAPES: usize = 5;
 
 thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(true) };
@@ -236,8 +280,10 @@ pub fn enabled() -> bool {
 struct Wallpaper {
     handle: HMONITOR,
     rect: RECT,
-    /// None when it couldn't be loaded (not retried until the wallpaper changes).
-    tex: Option<ID3D11Texture2D>,
+    /// With its mips, made once when it loads: every pane over the desktop
+    /// reads this one texture. None when it couldn't be loaded (not retried
+    /// until the wallpaper changes).
+    tex: Option<ID3D11ShaderResourceView>,
 }
 
 /// Whether `hwnd` shows any of itself: visible, not minimized, and not sized to
@@ -448,7 +494,7 @@ impl Engine {
 
     /// A monitor's wallpaper texture with its screen origin and size, loaded on
     /// first use and again when the monitor's bounds change.
-    fn wallpaper(&mut self, handle: HMONITOR) -> Option<(ID3D11Texture2D, (i32, i32), (i32, i32))> {
+    fn wallpaper(&mut self, handle: HMONITOR) -> Option<(ID3D11ShaderResourceView, (i32, i32), (i32, i32))> {
         let rect = monitor_rect(handle);
         let found = self.wallpapers.iter().position(|w| w.handle == handle && w.rect == rect);
         let i = match found {
@@ -464,25 +510,31 @@ impl Engine {
         Some((tex, (rect.left, rect.top), (rect.right - rect.left, rect.bottom - rect.top)))
     }
 
-    fn load_wallpaper(&self, rect: RECT) -> Result<ID3D11Texture2D> {
+    fn load_wallpaper(&self, rect: RECT) -> Result<ID3D11ShaderResourceView> {
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
         let pixels = wallpaper::render(rect)?;
+        // The mips are the frost: made here, once, not on every render.
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w as u32,
             Height: h as u32,
-            MipLevels: 1,
+            MipLevels: MIPS,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_IMMUTABLE,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
             CPUAccessFlags: 0,
-            MiscFlags: 0,
+            MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
         };
-        let init = D3D11_SUBRESOURCE_DATA { pSysMem: pixels.as_ptr() as _, SysMemPitch: (w * 4) as u32, SysMemSlicePitch: 0 };
-        let mut tex = None;
-        unsafe { self.device.CreateTexture2D(&desc, Some(&init), Some(&mut tex))? };
-        Ok(tex.unwrap())
+        let (mut tex, mut srv) = (None, None);
+        unsafe {
+            self.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
+            let tex = tex.as_ref().unwrap();
+            self.context.UpdateSubresource(tex, 0, None, pixels.as_ptr() as _, (w * 4) as u32, 0);
+            self.device.CreateShaderResourceView(tex, None, Some(&mut srv))?;
+            self.context.GenerateMips(srv.as_ref().unwrap());
+        }
+        Ok(srv.unwrap())
     }
 
     /// What a pane asking for `want` refracts: the wallpaper image only while
@@ -662,7 +714,7 @@ impl Engine {
         // Some slack: a surface animating at the refresh rate shouldn't be held back by jitter.
         let min = self.refresh.mul_f32(0.75);
         // Resized buffers show nothing until drawn into, so those can't wait.
-        let resized = pane.drawn.map_or(true, |k| k.1 != pane.size);
+        let resized = pane.drawn.as_ref().map_or(true, |k| k.1 != pane.size);
         if let Some(wait) = pane.presented.filter(|_| !resized).and_then(|t| min.checked_sub(t.elapsed())) {
             pane.moved = true;
             if self.moved.is_none() {
@@ -731,8 +783,10 @@ impl Engine {
         // A surface often moves and reshapes in separate calls within one
         // frame; once it's drawn for where it ends up, the other is a no-op.
         let t = pane.tint;
-        let key = (wr, pane.size, pane.radius.to_bits(), [t.r, t.g, t.b, t.a].map(f32::to_bits));
-        if !stale && pane.drawn == Some(key) {
+        let mut shape_bits: Vec<u32> = pane.shapes.iter().flat_map(|(r, k)| r.iter().chain(std::iter::once(k)).map(|v| v.to_bits())).collect();
+        shape_bits.extend([pane.coat, pane.border].iter().flat_map(|c| [c.r, c.g, c.b, c.a]).map(f32::to_bits));
+        let key = (wr, pane.size, pane.radius.to_bits(), [t.r, t.g, t.b, t.a].map(f32::to_bits), shape_bits);
+        if !stale && pane.drawn.as_ref() == Some(&key) {
             return Ok(());
         }
         let (w, h) = (pane.size.0 as i32, pane.size.1 as i32);
@@ -746,71 +800,68 @@ impl Engine {
         if need.right - need.left < 1 || need.bottom - need.top < 1 {
             return Ok(());
         }
-        // The texture is kept a size up from what's needed, so a pane that
-        // grows a little each frame (Dock magnification) doesn't reallocate it
-        // every frame. It holds more of the screen to fill it, slid back
-        // inside the monitor at its edges.
-        let need_size = ((need.right - need.left) as u32, (need.bottom - need.top) as u32);
-        let mon_size = ((m.right - m.left) as u32, (m.bottom - m.top) as u32);
-        let src_size = fit(pane.src.as_ref().map(|s| s.3), need_size, mon_size);
-        let left = need.left.min(m.right - src_size.0 as i32).max(m.left);
-        let top = need.top.min(m.bottom - src_size.1 as i32).max(m.top);
-        let region = RECT { left, top, right: left + src_size.0 as i32, bottom: top + src_size.1 as i32 };
-        if pane.src.as_ref().map(|s| s.3) != Some(src_size) {
-            let desc = D3D11_TEXTURE2D_DESC {
-                Width: src_size.0,
-                Height: src_size.1,
-                MipLevels: MIPS,
-                ArraySize: 1,
-                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-                CPUAccessFlags: 0,
-                MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
-            };
-            let (mut tex, mut srv, mut rtv) = (None, None, None);
-            unsafe {
-                self.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
-                let tex = tex.as_ref().unwrap();
-                self.device.CreateShaderResourceView(tex, None, Some(&mut srv))?;
-                // Mip 0 only: GenerateMips makes the rest for the frost.
-                let rdesc = D3D11_RENDER_TARGET_VIEW_DESC {
-                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
-                    Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 } },
-                };
-                self.device.CreateRenderTargetView(tex, Some(&rdesc), Some(&mut rtv))?;
-            }
-            pane.src = Some((tex.unwrap(), srv.unwrap(), rtv.unwrap(), src_size));
-        }
-
-        match pane.source {
+        let (srv, region, src_size) = match pane.source {
             Source::Screen => {
+                // The texture is kept a size up from what's needed, so a pane that
+                // grows a little each frame (Dock magnification) doesn't reallocate it
+                // every frame. It holds more of the screen to fill it, slid back
+                // inside the monitor at its edges.
+                let need_size = ((need.right - need.left) as u32, (need.bottom - need.top) as u32);
+                let mon_size = ((m.right - m.left) as u32, (m.bottom - m.top) as u32);
+                let src_size = fit(pane.src.as_ref().map(|s| s.3), need_size, mon_size);
+                let left = need.left.min(m.right - src_size.0 as i32).max(m.left);
+                let top = need.top.min(m.bottom - src_size.1 as i32).max(m.top);
+                let region = RECT { left, top, right: left + src_size.0 as i32, bottom: top + src_size.1 as i32 };
+                if pane.src.as_ref().map(|s| s.3) != Some(src_size) {
+                    let desc = D3D11_TEXTURE2D_DESC {
+                        Width: src_size.0,
+                        Height: src_size.1,
+                        MipLevels: MIPS,
+                        ArraySize: 1,
+                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Usage: D3D11_USAGE_DEFAULT,
+                        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                        CPUAccessFlags: 0,
+                        MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+                    };
+                    let (mut tex, mut srv, mut rtv) = (None, None, None);
+                    unsafe {
+                        self.device.CreateTexture2D(&desc, None, Some(&mut tex))?;
+                        let tex = tex.as_ref().unwrap();
+                        self.device.CreateShaderResourceView(tex, None, Some(&mut srv))?;
+                        // Mip 0 only: GenerateMips makes the rest for the frost.
+                        let rdesc = D3D11_RENDER_TARGET_VIEW_DESC {
+                            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+                            Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 { Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 } },
+                        };
+                        self.device.CreateRenderTargetView(tex, Some(&rdesc), Some(&mut rtv))?;
+                    }
+                    pane.src = Some((tex.unwrap(), srv.unwrap(), rtv.unwrap(), src_size));
+                }
+
                 let layers = layers_for(pane.want, self.windows(), &region, pane.hwnd);
-                self.scene.capture(&layers, &self.winrt, self.interval);
-                let rtv = &pane.src.as_ref().unwrap().2;
+                // Heavy frost hides motion: what's behind it needn't come as often.
+                self.scene.capture(&layers, &self.winrt, self.interval, pane.style == Style::Subtle);
+                let (_, srv, rtv, _) = pane.src.as_ref().unwrap();
                 self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, &layers);
                 pane.layers = layers;
                 self.start_poll();
+                // The frost reads its mips.
+                unsafe { self.context.GenerateMips(srv) };
+                (srv.clone(), region, src_size)
             }
             Source::Wallpaper => {
-                let Some((wall, origin, _)) = self.wallpaper(monitor) else { return Ok(()) };
-                // The wallpaper spans the monitor, which holds the region.
-                let bx = D3D11_BOX {
-                    left: (region.left - origin.0) as u32,
-                    top: (region.top - origin.1) as u32,
-                    front: 0,
-                    right: (region.right - origin.0) as u32,
-                    bottom: (region.bottom - origin.1) as u32,
-                    back: 1,
-                };
-                let tex = &pane.src.as_ref().unwrap().0;
-                unsafe { self.context.CopySubresourceRegion(tex, 0, 0, 0, 0, &wall, 0, Some(&bx)) };
+                // The monitor's one wallpaper texture, as it is: nothing to
+                // copy or blur for this pane, however often it moves.
+                let Some((srv, origin, size)) = self.wallpaper(monitor) else { return Ok(()) };
+                pane.src = None;
+                let region = RECT { left: origin.0, top: origin.1, right: origin.0 + size.0, bottom: origin.1 + size.1 };
+                (srv, region, (size.0 as u32, size.1 as u32))
             }
-        }
+        };
         pane.region = region;
-        let (_, srv, _, _) = pane.src.as_ref().unwrap();
 
         let dpi = unsafe { GetDpiForWindow(pane.hwnd) }.max(96) as f32;
         let scale = dpi / 96.0;
@@ -819,6 +870,13 @@ impl Engine {
         let bezel = if flat { 0.0 } else { (h.min(w) as f32 * 0.45).min(20.0 * scale).max(r * 0.6) };
         let tint = pane.tint;
         let subtle = pane.style == Style::Subtle;
+        // No shapes given: the pane is one, filling it.
+        let (mut shapes, mut melt) = ([[0.0; 4]; MAX_SHAPES], [[0.0; 4]; MAX_SHAPES]);
+        shapes[0] = [0.0, 0.0, w as f32, h as f32];
+        for (i, (r, k)) in pane.shapes.iter().enumerate() {
+            shapes[i] = *r;
+            melt[i][0] = *k;
+        }
         let consts = Constants {
             size: [w as f32, h as f32],
             origin: [(wr.left - region.left) as f32, (wr.top - region.top) as f32],
@@ -832,11 +890,15 @@ impl Engine {
             frost: if subtle { 5.0 } else { 2.5 } * scale,
             strength: if subtle { 0.25 } else { 1.0 },
             lod: if subtle { 1.5 } else { 0.0 },
-            pad: [0.0; 2],
+            count: pane.shapes.len().max(1) as f32,
+            pad: 0.0,
+            shapes,
+            melt,
+            coat: [pane.coat.r, pane.coat.g, pane.coat.b, pane.coat.a],
+            border: [pane.border.r, pane.border.g, pane.border.b, pane.border.a],
         };
 
         unsafe {
-            self.context.GenerateMips(srv);
             self.context.UpdateSubresource(&self.constants, 0, None, &consts as *const _ as _, 0, 0);
 
             // Flip model: buffer 0 is always the one to draw into next, so its view lasts.
@@ -1045,8 +1107,14 @@ struct PaneState {
     layers: Vec<Layer>,
     /// Something behind it changed since it last rendered.
     stale: bool,
-    /// What it was last drawn for: window rect, size, radius and tint.
-    drawn: Option<(RECT, (u32, u32), u32, [u32; 4])>,
+    /// What it was last drawn for: window rect, size, radius, tint and shapes.
+    drawn: Option<(RECT, (u32, u32), u32, [u32; 4], Vec<u32>)>,
+    /// The shapes in it (x, y, w, h in its pixels) and how far each reaches
+    /// to merge with those before it; empty for one shape filling the pane.
+    shapes: Vec<([f32; 4], f32)>,
+    /// A colour painted over the glass and a hairline around it (see `Pane::set_coat`).
+    coat: Color,
+    border: Color,
     /// When it last presented a frame.
     presented: Option<Instant>,
     /// Moved while too recently presented; renders on `Engine::moved`.
@@ -1099,6 +1167,9 @@ impl Pane {
             layers: Vec::new(),
             stale: false,
             drawn: None,
+            shapes: Vec::new(),
+            coat: Color::TRANSPARENT,
+            border: Color::TRANSPARENT,
             presented: None,
             moved: false,
             shown: false,
@@ -1128,9 +1199,37 @@ impl Pane {
         }
     }
 
+    /// Draws several shapes in the pane instead of one filling it, each
+    /// rounded like the pane: `(x, y, w, h)` in its pixels, and how far (px)
+    /// the shape reaches to flow together with those before it. Returns
+    /// whether they changed (the caller then renders).
+    pub fn set_shapes(&self, shapes: &[([f32; 4], f32)]) -> bool {
+        let mut s = self.0.borrow_mut();
+        let shapes = &shapes[..shapes.len().min(MAX_SHAPES)];
+        if s.shapes == shapes {
+            return false;
+        }
+        s.shapes = shapes.to_vec();
+        true
+    }
+
+    /// Has the glass paint `coat` over itself and a hairline `border` around
+    /// its edge, in place of the surface painting them on top: they then
+    /// follow the glass's own outline. Shows from the next render.
+    pub fn set_coat(&self, coat: Color, border: Color) {
+        let mut s = self.0.borrow_mut();
+        s.coat = coat;
+        s.border = border;
+    }
+
     pub fn set_tint(&self, tint: Color) {
         self.0.borrow_mut().tint = tint;
         self.render();
+    }
+
+    /// Whether it has drawn a frame yet.
+    pub fn shown(&self) -> bool {
+        self.0.try_borrow().is_ok_and(|s| s.shown)
     }
 
     /// Re-renders now (after the window moved or reshaped).

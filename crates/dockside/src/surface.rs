@@ -308,6 +308,38 @@ impl Surface {
         }
     }
 
+    /// Whether the backdrop is refracting glass, which can hold several shapes.
+    pub fn refracts(&self) -> bool {
+        self.composition.as_ref().is_some_and(|c| c.refracts())
+    }
+
+    /// Has refracting glass paint a tint over itself and a hairline around its
+    /// edge, so the surface needn't draw them on top (where they'd keep their
+    /// own outline while shapes in the glass merge). False without refraction:
+    /// the surface draws them as usual.
+    pub fn set_glass_coat(&mut self, coat: Color, border: Color) -> bool {
+        self.composition.as_ref().is_some_and(|c| c.set_coat(coat, border))
+    }
+
+    /// Like [`Self::set_backdrop_shape`] for refracting glass, with several
+    /// shapes inside `bounds` (all in surface-local points), each rounded to
+    /// `radius` and paired with how far (points) it reaches to flow together
+    /// with those before it. Shapes moving inside the bounds move no window.
+    pub fn set_glass_shapes(&mut self, bounds: Rect, radius: f32, shapes: &[(Rect, f32)]) {
+        let s = self.scale;
+        let px: Vec<([f32; 4], f32)> =
+            shapes.iter().map(|(r, k)| ([(r.x - bounds.x) * s, (r.y - bounds.y) * s, r.w * s, r.h * s], k * s)).collect();
+        let changed = self.composition.as_ref().is_some_and(|c| c.set_shapes(&px));
+        let before = self.shape;
+        self.set_backdrop_shape(bounds, radius);
+        // A new backdrop shape rendered them already.
+        if changed && before == self.shape {
+            if let Some(c) = &self.composition {
+                c.refresh();
+            }
+        }
+    }
+
     pub fn render(&mut self, gfx: &Gfx, f: impl FnOnce(&Painter)) -> Result<()> {
         self.render_part(gfx, None, f)
     }

@@ -227,6 +227,8 @@ struct Capture {
     reports_dirty: bool,
     /// The desktop window (see `pace`).
     desktop: bool,
+    /// Only frosted panes show it (see `pace`).
+    frosted: bool,
     /// Last needed by a pane.
     used: Instant,
 }
@@ -308,18 +310,24 @@ impl Scene {
         })
     }
 
-    /// Starts capturing any of `layers` not captured yet, and marks them all in use.
-    pub fn capture(&mut self, layers: &[Layer], winrt: &IDirect3DDevice, interval: Duration) {
+    /// Starts capturing any of `layers` not captured yet, and marks them all in
+    /// use. `frosted`: the pane asking blurs them heavily (see `pace`).
+    pub fn capture(&mut self, layers: &[Layer], winrt: &IDirect3DDevice, interval: Duration, frosted: bool) {
         let now = Instant::now();
         for l in layers {
             if let Some(c) = self.captures.iter_mut().find(|c| c.hwnd == l.hwnd) {
                 c.used = now;
+                // A clear pane shows it now: back to full pace.
+                if c.frosted && !frosted {
+                    c.frosted = false;
+                    let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop, interval)));
+                }
                 continue;
             }
             if self.failed.contains(&l.hwnd) {
                 continue;
             }
-            match start(l.hwnd, winrt, interval) {
+            match start(l.hwnd, winrt, interval, frosted) {
                 Ok(c) => self.captures.push(c),
                 Err(e) => {
                     log!("glass can't capture window {:#x}: {e}", l.hwnd);
@@ -448,7 +456,7 @@ impl Scene {
     /// Re-paces every capture (battery saver turned on or off).
     pub fn set_interval(&self, interval: Duration) {
         for c in &self.captures {
-            let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop, interval)));
+            let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop || c.frosted, interval)));
         }
     }
 
@@ -469,11 +477,15 @@ pub fn timespan(d: Duration) -> TimeSpan {
 /// frame: glass follows it at up to 30 fps (15 in battery saver), smooth
 /// through the bend and frost, so a 60 fps wallpaper costs no more than a 30
 /// fps one. Every frame re-renders each pane over the desktop.
-fn pace(desktop: bool, interval: Duration) -> Duration {
-    if desktop { (interval * 2).max(Duration::from_millis(33)) } else { interval }
+///
+/// A window only frosted panes show (window sidebars) is paced the same way:
+/// through that much blur 30 fps reads as smoothly as 60, and each frame is a
+/// copy of the whole window.
+fn pace(half: bool, interval: Duration) -> Duration {
+    if half { (interval * 2).max(Duration::from_millis(33)) } else { interval }
 }
 
-fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration) -> Result<Capture> {
+fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration, frosted: bool) -> Result<Capture> {
     let desktop = crate::win::class_name(HWND(hwnd as _)) == "Progman";
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(HWND(hwnd as _))? };
@@ -485,14 +497,14 @@ fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration) -> Result<Cap
     let _ = session.SetIsBorderRequired(false);
     // Windows 11 24H2+: Windows paces the frames and reports what changed, so
     // panes over a still part of a window skip the redraw.
-    let _ = session.SetMinUpdateInterval(timespan(pace(desktop, interval)));
+    let _ = session.SetMinUpdateInterval(timespan(pace(desktop || frosted, interval)));
     let reports_dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
     pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
         glass::on_window_frame(hwnd);
         Ok(())
     }))?;
     session.StartCapture()?;
-    Ok(Capture { hwnd, pool, session, _item: item, size, frame: None, reports_dirty, desktop, used: Instant::now() })
+    Ok(Capture { hwnd, pool, session, _item: item, size, frame: None, reports_dirty, desktop, frosted, used: Instant::now() })
 }
 
 #[cfg(test)]

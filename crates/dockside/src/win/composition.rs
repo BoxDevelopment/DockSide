@@ -15,8 +15,9 @@
 //! Liquid Glass adds two layers on top: a soft vertical sheen and a specular
 //! rim whose brightness sweeps around the edge, as if lit from the top-left.
 //! When refraction is available (see `glass`), a swap chain rendered by its
-//! shader covers all of that; the layers below stay as the fallback until the
-//! first frame arrives.
+//! shader covers all of that; the layers below stay as the fallback until its
+//! first frame arrives, then they're hidden: DWM would otherwise go on
+//! blurring what's behind the pane for layers no one can see.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -163,6 +164,8 @@ pub struct CompositionBackdrop {
     /// the window's bottom (the Dock sliding off a screen with one below).
     radius: Cell<Option<f32>>,
     overflow: Cell<f32>,
+    /// The layers under the refraction are hidden (see `hide_fallback`).
+    bare: Cell<bool>,
     tint: CompositionColorBrush,
     glass: Option<Glass>,
     /// The pane's swap chain, through a nine-grid so a frame rendered at an
@@ -270,6 +273,7 @@ impl CompositionBackdrop {
             clips,
             radius: Cell::new(None),
             overflow: Cell::new(0.0),
+            bare: Cell::new(false),
             tint: tint_brush,
             glass,
             refraction,
@@ -325,6 +329,37 @@ impl CompositionBackdrop {
         }
     }
 
+    /// Whether the glass refracts (see `glass`): then it can hold several shapes.
+    pub fn refracts(&self) -> bool {
+        self.refraction.is_some()
+    }
+
+    /// Several shapes in the glass, flowing together where they near each
+    /// other (see `Pane::set_shapes`); true when they changed. The blurred
+    /// layers under the refraction can only make the one rounded rect, so
+    /// they go at once.
+    pub fn set_shapes(&self, shapes: &[([f32; 4], f32)]) -> bool {
+        let Some((pane, _)) = &self.refraction else { return false };
+        self.hide_fallback();
+        pane.set_shapes(shapes)
+    }
+
+    /// Hides the blur, tint and sheen under the refraction, for good.
+    fn hide_fallback(&self) {
+        if !self.bare.replace(true) {
+            for part in &self.parts {
+                let _ = part.SetIsVisible(false);
+            }
+        }
+    }
+
+    /// See `Pane::set_coat`; false when the glass doesn't refract (the surface paints them itself).
+    pub fn set_coat(&self, coat: Color, border: Color) -> bool {
+        let Some((pane, _)) = &self.refraction else { return false };
+        pane.set_coat(coat, border);
+        true
+    }
+
     /// Fades the whole backdrop (blur, tint and glass) to `opacity`.
     pub fn set_opacity(&self, opacity: f32) {
         let _ = self.root.SetOpacity(opacity.clamp(0.0, 1.0));
@@ -341,6 +376,11 @@ impl CompositionBackdrop {
     pub fn refresh(&self) {
         if let Some((pane, _)) = &self.refraction {
             pane.render();
+            // Its frame covers the layers below from here on. (Hiding them is
+            // a Composition change, which lands no sooner than the frame.)
+            if pane.shown() {
+                self.hide_fallback();
+            }
         }
     }
 

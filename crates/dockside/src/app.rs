@@ -2173,9 +2173,14 @@ impl App {
 
     /// Renders what input changed, unless an animation is running: then the
     /// next frame (at most one refresh away) renders it. A fast mouse sends
-    /// moves far quicker than the display refreshes, and each one would
-    /// otherwise redraw whatever it touched, only for most never to be seen.
-    fn flush_input(&mut self) {
+    /// moves far quicker than the display refreshes (1000 a second from a
+    /// gaming mouse), and each one would otherwise redraw whatever it touched
+    /// (the whole magnifying Dock and its glass), only for most never to be
+    /// seen. So a pointer move never renders by itself: it asks for a frame.
+    fn flush_input(&mut self, msg: u32) {
+        if msg == WM_MOUSEMOVE && !self.animating {
+            self.animate();
+        }
         // Only while frames are really arriving: if the clock went quiet with an
         // animation still marked running, nothing would ever draw the input.
         if !self.animating || self.last_frame.elapsed() > std::time::Duration::from_millis(100) {
@@ -2645,9 +2650,10 @@ impl App {
             }
             WM_MOUSELEAVE => {
                 s.tracking = false;
+                s.on_leave();
                 SpotlightEvent::None
             }
-            WM_LBUTTONUP => s.on_click(x, y, down(VK_CONTROL)),
+            WM_LBUTTONUP => s.on_click(x, y, down(VK_CONTROL), &idx),
             WM_MOUSEWHEEL => {
                 s.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
                 SpotlightEvent::None
@@ -3791,46 +3797,46 @@ impl App {
 
         if self.settings.as_ref().is_some_and(|s| s.hwnd == hwnd) {
             let r = self.on_settings_message(hwnd, msg, wp, lp);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
         if self.onboarding.as_ref().is_some_and(|o| o.hwnd == hwnd) {
             let r = self.on_onboarding_message(hwnd, msg, wp, lp);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
         if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
             let r = self.on_spotlight_message(msg, wp, lp);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
         // The rest of the window behind Spotlight's glass: a click there is outside it.
         if self.spotlight.as_ref().is_some_and(|s| s.owns_backdrop(hwnd)) {
             if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
                 self.close_spotlight();
-                self.flush_input();
+                self.flush_input(msg);
                 return Some(LRESULT(0));
             }
             return None;
         }
         if let Some(i) = self.spotlight.as_ref().and_then(|s| s.bubble_index(hwnd)) {
             let r = self.on_bubble_message(i, hwnd, msg);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
         if self.launchpad.as_ref().is_some_and(|l| l.hwnd == hwnd) {
             let r = self.on_launchpad_message(msg, wp, lp);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
         if self.icon_picker.as_ref().is_some_and(|p| p.surface.content == hwnd) {
             let r = self.on_picker_message(msg, wp, lp);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
         if let Some(idx) = self.finders.iter().position(|f| f.hwnd == hwnd) {
             let r = self.on_finder_message(idx, hwnd, msg, wp, lp);
-            self.flush_input();
+            self.flush_input(msg);
             return r;
         }
 
@@ -3853,7 +3859,7 @@ impl App {
         } else {
             None
         };
-        self.flush_input();
+        self.flush_input(msg);
         result
     }
 

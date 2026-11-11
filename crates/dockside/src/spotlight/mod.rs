@@ -51,6 +51,9 @@ const BUBBLE: f32 = 50.0;
 const GAP: f32 = 8.0;
 /// The capsule's width with the bubbles out: the whole row stays `W` wide.
 const PILL_SHORT: f32 = W - 4.0 * (BUBBLE + GAP);
+/// How far the body's and a bubble's shadows reach past them.
+const BODY_REACH: f32 = 34.0;
+const BUBBLE_REACH: f32 = 24.0;
 const ROW_H: f32 = 40.0;
 const HEADER_H: f32 = 26.0;
 const MAX_APPS: usize = 5;
@@ -151,7 +154,8 @@ struct Bubble {
     /// 0 tucked in the capsule, 1 out in its place.
     p: Spring,
     hover: bool,
-    /// What was last drawn (its rect, hover and glyph fade), to skip redrawing a settled bubble.
+    /// What was last drawn (its rect, hover and glyph fade), to skip redrawing a
+    /// settled bubble and to repaint only where it was and is.
     drawn: Option<(Rect, bool, f32)>,
 }
 
@@ -219,6 +223,9 @@ pub struct Spotlight {
     app_hits: Vec<(Rect, usize)>,
     more_hits: Vec<(Rect, usize)>,
     view_hit: Option<Rect>,
+    /// The body as last drawn: a frame repaints only where it was and is, not
+    /// the whole window (which is sized for the tallest panel).
+    painted: Option<Rect>,
     clips: Vec<clipboard::Entry>,
     pub tracking: bool,
     pub dirty: bool,
@@ -336,6 +343,7 @@ impl Spotlight {
             app_hits: Vec::new(),
             more_hits: Vec::new(),
             view_hit: None,
+            painted: None,
             clips: Vec::new(),
             tracking: false,
             dirty: true,
@@ -416,8 +424,7 @@ impl Spotlight {
     /// Hides the bubbles at once (Spotlight is closing: only the capsule fades).
     pub fn hide_bubbles(&mut self) {
         for b in &mut self.bubbles {
-            b.surface.set_opacity(0.0);
-            b.surface.set_click_through();
+            b.surface.set_hidden(true);
         }
     }
 
@@ -434,6 +441,13 @@ impl Spotlight {
         Rect::new(cx - w / 2.0, body.y + PILL_H / 2.0 - BUBBLE / 2.0, w, BUBBLE)
     }
 
+    /// Makes the bubbles (hidden) ahead of their first showing: four windows
+    /// and their glass take long enough to make that the animation would
+    /// otherwise open on a dropped frame or two.
+    pub fn prepare_bubbles(&mut self, gfx: &Gfx, theme: &Theme) {
+        self.ensure_bubbles(gfx, theme);
+    }
+
     fn ensure_bubbles(&mut self, gfx: &Gfx, theme: &Theme) {
         if !self.bubbles.is_empty() {
             return;
@@ -444,6 +458,9 @@ impl Spotlight {
         for mode in Mode::BUBBLES {
             match Surface::new(gfx, rect, s, self.kind, theme.menu_tint) {
                 Ok(mut surface) => {
+                    // The glass is there in full from a bubble's first frame to
+                    // its last; what's drawn on it fades.
+                    surface.keep_backdrop_solid();
                     surface.set_opacity(0.0);
                     self.bubbles.push(Bubble { surface, mode, p: Spring::new(0.0, 0.42, 0.72), hover: false, drawn: None });
                 }
@@ -1119,7 +1136,8 @@ impl Spotlight {
         let mut view_hit = None;
         let names: HashMap<&str, &str> = if mode == Mode::Apps { apps.all.iter().map(|a| (a.1.as_str(), a.0.as_str())).collect() } else { HashMap::new() };
 
-        let r = self.surface.render(gfx, |p: &Painter| {
+        let part = self.painted.replace(body).map(|was| was.union(body).inset(-BODY_REACH, -BODY_REACH));
+        let r = self.surface.render_part(gfx, part, |p: &Painter| {
             // Shadow, then the tinted body over the glass.
             p.soft_shadow(body, radius, 12, 2.0, 0.035, 8.0, theme.shadow);
             p.clear_round(body.inset(3.0, 3.0), radius - 3.0);
@@ -1409,7 +1427,9 @@ impl Spotlight {
             let alpha = (p * 1.7).clamp(0.0, 1.0);
             b.surface.set_opacity(alpha);
             // Tucked away: hidden, so it doesn't catch clicks meant for the capsule.
-            let away = alpha <= 0.0 && b.p.settled();
+            // Its glass doesn't fade, so on the way in it goes as soon as what's
+            // on it has (not once the spring has rung out, a ring left on the capsule).
+            let away = if b.p.target <= 0.0 { p <= 0.02 } else { p <= 0.0 };
             b.surface.set_hidden(away);
             if away {
                 continue;
@@ -1420,11 +1440,14 @@ impl Spotlight {
                 bubble_hits.push((r, i));
                 continue;
             }
+            // Only where the bubble (and its shadow) was and is: its window
+            // spans the whole capsule.
+            let part = b.drawn.map(|(was, ..)| was.union(r).inset(-BUBBLE_REACH, -BUBBLE_REACH));
             b.drawn = Some((r, b.hover, glyph));
             b.surface.set_backdrop_shape(r, BUBBLE / 2.0);
             let has_backdrop = b.surface.backdrop.is_some();
             let (mode, hover) = (b.mode, b.hover);
-            let res = b.surface.render(gfx, |pt: &Painter| {
+            let res = b.surface.render_part(gfx, part, |pt: &Painter| {
                 pt.soft_shadow(r, r.h / 2.0, 8, 2.0, 0.03, 5.0, theme.shadow);
                 pt.clear_round(r.inset(2.0, 2.0), r.h / 2.0 - 2.0);
                 pt.fill_round(r, r.h / 2.0, if has_backdrop { theme.menu_tint.alpha(0.28) } else { theme.menu_tint.alpha(1.0) });

@@ -2277,6 +2277,7 @@ impl App {
     /// The pointer moved since Spotlight opened? Then the bubbles come out.
     fn poll_spotlight(&mut self) {
         let Some(s) = &mut self.spotlight else { return };
+        s.prepare_bubbles(&self.gfx, &self.theme);
         let (out, dirty) = (s.poll_cursor(), s.dirty);
         if !out {
             self.timer(TIMER_SPOTLIGHT_POLL, SPOTLIGHT_POLL_MS);

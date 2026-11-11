@@ -40,6 +40,8 @@ pub struct Surface {
     opacity: f32,
     /// The opacity last pushed to the windows (lags `opacity` by imperceptible steps).
     applied: f32,
+    /// The backdrop stays whole while the content fades (see `keep_backdrop_solid`).
+    solid_backdrop: bool,
 }
 
 /// Something built on a [`Surface`] that can fade away after it's closed.
@@ -131,7 +133,7 @@ impl Surface {
         let content = create_window(ex | WS_EX_LAYERED, WS_POPUP, rect, backdrop.unwrap_or_default())?;
         accent::prepare(content);
         let canvas = Canvas::new(gfx, w, h, scale)?;
-        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0, applied: 1.0 })
+        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, shadow: None, opacity: 1.0, applied: 1.0, solid_backdrop: false })
     }
 
     /// Casts a soft drop shadow under the backdrop shape. `strength` is the
@@ -328,6 +330,15 @@ impl Surface {
         self.opacity
     }
 
+    /// Leaves the backdrop out of `set_opacity`: only the content and shadow
+    /// fade, and the backdrop comes and goes with the windows (`set_hidden`).
+    /// A backdrop's opacity is a Composition property, which DWM can apply
+    /// 50-260 ms late: fading one in over a short animation shows the content
+    /// with no glass behind it until the animation is nearly over.
+    pub fn keep_backdrop_solid(&mut self) {
+        self.solid_backdrop = true;
+    }
+
     /// Fades the content, backdrop and shadow together, without redrawing.
     pub fn set_opacity(&mut self, opacity: f32) {
         let opacity = opacity.clamp(0.0, 1.0);
@@ -341,7 +352,7 @@ impl Surface {
             return;
         }
         self.applied = opacity;
-        if let Some(c) = &self.composition {
+        if let Some(c) = self.composition.as_ref().filter(|_| !self.solid_backdrop) {
             c.set_opacity(opacity);
         }
         if !self.shown {

@@ -55,6 +55,8 @@ impl IconPixels {
 #[derive(Default)]
 pub struct IconStore {
     cache: HashMap<String, Option<Rc<IconPixels>>>,
+    /// The longest side an image file is kept at (see `set_max_px`); 0 for `ICON_PX`.
+    max_px: u32,
 }
 
 impl IconStore {
@@ -64,8 +66,9 @@ impl IconStore {
         self.cache
             .entry(key)
             .or_insert_with(|| {
+                let max = if self.max_px == 0 { ICON_PX as u32 } else { self.max_px };
                 let px = match custom {
-                    Some(file) => load_image_file(wic, file).or_else(|| load_shell_icon(parse_name)),
+                    Some(file) => load_image_fit(wic, file, max).or_else(|| load_shell_icon(parse_name)),
                     None => load_shell_icon(parse_name),
                 };
                 if px.is_none() {
@@ -78,6 +81,18 @@ impl IconStore {
 }
 
 impl IconStore {
+    /// The biggest any icon is drawn, in pixels. Image files are kept no
+    /// bigger than that: an icon pack's 1024 px PNG is 4 MB decoded, and
+    /// again as each bitmap made from it, to be drawn 50-odd pixels wide.
+    pub fn set_max_px(&mut self, px: u32) {
+        let px = px.next_power_of_two().clamp(ICON_PX as u32, 1024);
+        // Bigger than before: what's cached was fitted too small.
+        if px > self.max_px.max(ICON_PX as u32) {
+            self.cache.clear();
+        }
+        self.max_px = px;
+    }
+
     /// An icon DockSide draws itself, made by `make` on first use.
     pub fn builtin(&mut self, key: &str, make: impl FnOnce() -> Option<IconPixels>) -> Option<Rc<IconPixels>> {
         self.cache.entry(key.to_string()).or_insert_with(|| make().map(Rc::new)).clone()
@@ -154,6 +169,11 @@ fn normalize_alpha(data: &mut [u8]) {
 }
 
 pub fn load_image_file(wic: &IWICImagingFactory, path: &str) -> Option<IconPixels> {
+    load_image_fit(wic, path, u32::MAX)
+}
+
+/// An image file's pixels, scaled down (never up) so neither side is over `max`.
+pub fn load_image_fit(wic: &IWICImagingFactory, path: &str, max: u32) -> Option<IconPixels> {
     unsafe {
         let decoder = wic
             .CreateDecoderFromFilename(&HSTRING::from(path), None, GENERIC_READ, WICDecodeMetadataCacheOnDemand)
@@ -177,6 +197,16 @@ pub fn load_image_file(wic: &IWICImagingFactory, path: &str) -> Option<IconPixel
             .ok()?;
         let (mut w, mut h) = (0, 0);
         converter.GetSize(&mut w, &mut h).ok()?;
+        if w.max(h) > max {
+            // Premultiplied already, so edges don't fringe as they're averaged.
+            let k = max as f32 / w.max(h) as f32;
+            let (sw, sh) = (((w as f32 * k).round() as u32).max(1), ((h as f32 * k).round() as u32).max(1));
+            let scaler = wic.CreateBitmapScaler().ok()?;
+            scaler.Initialize(&converter, sw, sh, WICBitmapInterpolationModeFant).ok()?;
+            let mut data = vec![0u8; (sw * sh * 4) as usize];
+            scaler.CopyPixels(std::ptr::null(), sw * 4, &mut data).ok()?;
+            return Some(IconPixels { width: sw, height: sh, data });
+        }
         let mut data = vec![0u8; (w * h * 4) as usize];
         converter.CopyPixels(std::ptr::null(), w * 4, &mut data).ok()?;
         Some(IconPixels { width: w, height: h, data })

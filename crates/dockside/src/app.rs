@@ -1445,6 +1445,9 @@ impl App {
         if !self.cfg.dock.enabled {
             return;
         }
+        // Icon files are kept only as big as the Dock ever draws one.
+        let scale = self.displays.iter().map(|d| d.monitor.scale).fold(self.monitor.scale, f32::max);
+        self.icons.set_max_px(crate::dock::icon_px(&self.cfg.dock, scale));
         for monitor in self.dock_monitors() {
             match Dock::new(&self.gfx, &self.theme, &self.cfg, monitor) {
                 Ok(mut d) => {

@@ -253,6 +253,11 @@ impl Metrics {
     }
 }
 
+/// The biggest a Dock icon is drawn on a display of `scale`, in pixels.
+pub fn icon_px(cfg: &DockCfg, scale: f32) -> u32 {
+    (Metrics::new(cfg).max * scale).ceil() as u32
+}
+
 /// Result of laying out a row of items for the current hover state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layout {

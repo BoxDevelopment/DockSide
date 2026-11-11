@@ -1261,6 +1261,7 @@ impl Spotlight {
                 p.soft_shadow(r, r.h / 2.0, 8, 2.0, 0.03 * a, 5.0, theme.shadow);
                 p.clear_round(r.inset(2.0, 2.0), r.h / 2.0 - 2.0);
                 // (Their tint and border are the glass's: see `set_glass_coat`.)
+                p.fill_round(r, r.h / 2.0, Color::HIT);
                 if b.hover {
                     p.fill_round(r, r.h / 2.0, theme.text.alpha(0.08 * a));
                 }
@@ -1268,7 +1269,12 @@ impl Spotlight {
                 p.faded(((b.p - 0.35) * 2.0).clamp(0.0, 1.0), || draw_mode_glyph(p, b.mode, g, theme.text, &bubble_font));
             }
             p.clear_round(body.inset(3.0, 3.0), radius - 3.0);
-            if !merged {
+            if merged {
+                // The glass paints the tint; this only keeps the body solid to
+                // the pointer. Left fully clear, the wheel and clicks between
+                // rows and icons would fall through to the window behind.
+                p.fill_round(body, radius, Color::HIT);
+            } else {
                 p.fill_round(body, radius, if has_backdrop { theme.menu_tint.alpha(0.28) } else { theme.menu_tint.alpha(1.0) });
                 p.stroke_round(body.inset(0.25, 0.25), radius, theme.menu_border, 0.5);
             }

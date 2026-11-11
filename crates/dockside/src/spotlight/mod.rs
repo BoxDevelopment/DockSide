@@ -147,6 +147,14 @@ pub enum SpotlightEvent {
     RunAll(Vec<Action>),
 }
 
+/// What the panel last showed, kept to draw while it closes: by then the
+/// rows and mode are already the new ones.
+struct Shown {
+    mode: Mode,
+    rows: Vec<Row>,
+    selected: usize,
+}
+
 /// One glass bubble beside the capsule.
 struct Bubble {
     surface: Surface,
@@ -214,9 +222,12 @@ pub struct Spotlight {
     revealed: bool,
     /// The panel's height below the capsule.
     grow: Spring,
-    /// The panel's content fading in as it opens (the glass snaps to size: a
-    /// backdrop resized every frame shows empty while DWM catches up).
+    /// The panel's content fading in as it opens (the glass snaps to size) and
+    /// out as it closes (the glass shrinking back to the capsule under it).
     fade: Spring,
+    /// See `Shown`; `rows_changed` says it's out of date.
+    shown: Option<Shown>,
+    rows_changed: bool,
     /// The Apps panel's selection, gliding like the list's.
     app_glide: Glide,
     apps: AppsView,
@@ -338,6 +349,8 @@ impl Spotlight {
             revealed: false,
             grow: Spring::new(0.0, 0.3, 0.9),
             fade: Spring::new(1.0, 0.12, 1.0),
+            shown: None,
+            rows_changed: true,
             app_glide: Glide::default(),
             apps: AppsView::default(),
             app_hits: Vec::new(),
@@ -544,6 +557,7 @@ impl Spotlight {
 
     /// Recomputes results for the current text and mode.
     pub fn search(&mut self, index: &Index) {
+        self.rows_changed = true;
         self.dirty = true;
         // New results: the selection appears on its row rather than sliding there.
         self.glide.reset();
@@ -1037,14 +1051,36 @@ impl Spotlight {
             self.ensure_bubbles(gfx, theme);
         }
         let below = if self.mode == Mode::Apps { APPS_H } else { self.list_height() };
-        // The glass takes its new size at once; what's in it fades in.
         if self.grow.target != below {
-            if self.grow.value <= 0.0 && below > 0.0 {
-                self.fade.snap(0.0);
+            if below <= 0.0 && self.grow.value > 0.0 && self.shown.is_some() {
+                // Going back to the capsule: the glass draws in while what it held fades.
+                self.grow.set(0.0);
+                self.fade.set(0.0);
+            } else {
+                // The glass takes its new size at once; what's in it fades in.
+                if self.grow.value <= 0.0 && below > 0.0 {
+                    self.fade.snap(0.0);
+                }
                 self.fade.set(1.0);
+                self.grow.snap(below);
             }
-            self.grow.snap(below);
         }
+        // Closing: what was there is drawn, not what's there now (nothing).
+        let closing = below <= 0.0 && self.grow.value > 0.0;
+        if !closing {
+            if below <= 0.0 {
+                self.shown = None;
+            } else if std::mem::take(&mut self.rows_changed) || self.shown.is_none() {
+                self.shown = Some(Shown { mode: self.mode, rows: self.rows.clone(), selected: self.selected });
+            } else if let Some(s) = &mut self.shown {
+                s.selected = self.selected;
+            }
+        }
+        let ghost = if closing { self.shown.take() } else { None };
+        let (panel, rows, selected) = match &ghost {
+            Some(g) => (g.mode, &g.rows[..], g.selected),
+            None => (self.mode, &self.rows[..], self.selected),
+        };
         let r = self.reveal.value;
         let width = lerp(W, PILL_SHORT, r);
         let height = PILL_H + self.grow.value.max(0.0);
@@ -1071,10 +1107,10 @@ impl Spotlight {
 
         // Where each row (and any section header above it) sits.
         let mut layout: Vec<(usize, Rect, bool)> = Vec::new();
-        if self.mode != Mode::Apps {
+        if panel != Mode::Apps {
             let mut y = body.y + PILL_H + 10.0;
             let mut last = "";
-            for (i, row) in self.rows.iter().enumerate() {
+            for (i, row) in rows.iter().enumerate() {
                 let header = row.section != last;
                 if y + ROW_H + if header { HEADER_H } else { 0.0 } > SHADOW + PILL_H + MAX_LIST {
                     break;
@@ -1087,14 +1123,14 @@ impl Spotlight {
                 y += ROW_H;
             }
         }
-        let target = layout.iter().find(|(i, ..)| *i == self.selected).map(|(_, r, _)| *r);
+        let target = layout.iter().find(|(i, ..)| *i == selected).map(|(_, r, _)| *r);
         let glide = self.glide.update(target);
 
         // The Apps panel: sections of icons (or a list), scrolled.
         let mut app_cells: Vec<(Rect, usize, f32)> = Vec::new();
         let mut headers: Vec<(Rect, &'static str, Option<(usize, bool)>)> = Vec::new();
         let mut shown: Vec<String> = Vec::new();
-        if self.mode == Mode::Apps {
+        if panel == Mode::Apps {
             self.layout_apps(body, &mut app_cells, &mut headers, &mut shown);
             let top = body.y + PILL_H + 8.0 - self.apps.scroll;
             self.apps.max_scroll = (Self::apps_extent(&app_cells, top) + 16.0 - APPS_H).max(0.0);
@@ -1121,11 +1157,10 @@ impl Spotlight {
         let app_target = app_cells.iter().find(|(_, i, _)| *i == self.apps.selected).map(|(c, _, _)| {
             if self.apps.list { *c } else { Rect::new(c.cx() - APP_ICON / 2.0, c.y + 6.0, APP_ICON, APP_ICON).inset(-7.0, -7.0) }
         });
-        let app_glide = if self.mode == Mode::Apps { self.app_glide.update(app_target) } else { None };
+        let app_glide = if panel == Mode::Apps { self.app_glide.update(app_target) } else { None };
         let fade = self.fade.value.clamp(0.0, 1.0);
 
         let mode = self.mode;
-        let rows = &self.rows;
         let bitmaps = &mut self.bitmaps;
         let app_icons = &mut self.app_icons;
         let apps = &self.apps;
@@ -1134,7 +1169,7 @@ impl Spotlight {
         let mut app_hits = Vec::new();
         let mut more_hits = Vec::new();
         let mut view_hit = None;
-        let names: HashMap<&str, &str> = if mode == Mode::Apps { apps.all.iter().map(|a| (a.1.as_str(), a.0.as_str())).collect() } else { HashMap::new() };
+        let names: HashMap<&str, &str> = if panel == Mode::Apps { apps.all.iter().map(|a| (a.1.as_str(), a.0.as_str())).collect() } else { HashMap::new() };
 
         let part = self.painted.replace(body).map(|was| was.union(body).inset(-BODY_REACH, -BODY_REACH));
         let r = self.surface.render_part(gfx, part, |p: &Painter| {
@@ -1186,7 +1221,7 @@ impl Spotlight {
             p.line(body.x + 14.0, body.y + PILL_H, body.right() - 14.0, body.y + PILL_H, theme.menu_separator, 1.0);
             let content = Rect::new(body.x, body.y + PILL_H + 1.0, body.w, body.h - PILL_H - 1.0);
 
-            if mode == Mode::Apps {
+            if panel == Mode::Apps {
                 p.clipped(content.inset(0.0, 2.0), || p.faded(fade, || {
                     if let Some((g, a)) = app_glide {
                         p.faded(a, || {
@@ -1338,10 +1373,19 @@ impl Spotlight {
                 }
             }));
         });
+        // Nothing in a closing panel takes clicks.
+        if closing {
+            hits.clear();
+            app_hits.clear();
+            more_hits.clear();
+        }
         self.hits = hits;
         self.app_hits = app_hits;
         self.more_hits = more_hits;
         self.view_hit = view_hit;
+        if ghost.is_some() {
+            self.shown = ghost;
+        }
         if let Err(e) = r {
             log!("spotlight render failed: {e}");
         }

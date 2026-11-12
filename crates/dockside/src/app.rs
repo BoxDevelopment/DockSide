@@ -4115,9 +4115,11 @@ impl App {
         match msg {
             WM_MOUSEMOVE => {
                 track_leave(hwnd);
-                // With a menu open, sliding across titles switches menus.
+                // With a menu open, sliding across titles switches menus. Panels
+                // (Control Center, Wi-Fi, Battery, the clock) don't take part:
+                // hovering away from one never opens something else.
                 if let (Some(open), Some(h)) = (mb.open, hit) {
-                    if h.opens_menu() && h != open {
+                    if open.opens_menu() && h.opens_menu() && h != open {
                         self.menu_opener = hwnd;
                         self.open_menubar_menu(h);
                     }

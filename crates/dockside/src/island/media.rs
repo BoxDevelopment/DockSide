@@ -340,11 +340,14 @@ fn nudge<A, B>(tx: &Sender<Cmd>) -> impl FnMut(&A, &B) -> Result<()> + Send + 's
     }
 }
 
-/// How long after a track change its artwork may still be replaced, how often
-/// it's re-read in that time, and how many reads at most.
+/// How long after a track change its artwork may still be replaced, and how
+/// often it's re-read in that time (on a timer, not only on change events:
+/// browsers swap the real thumbnail in without always saying so).
 const ART_SETTLE: Duration = Duration::from_secs(20);
-const ART_RECHECK_GAP: Duration = Duration::from_millis(700);
-const ART_RECHECKS: u32 = 16;
+const ART_RECHECK_GAP: Duration = Duration::from_millis(500);
+/// A track still without artwork after settling keeps being looked at, slowly, this long.
+const ART_MISSING_GAP: Duration = Duration::from_secs(3);
+const ART_GIVE_UP: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 struct Worker {
@@ -352,13 +355,22 @@ struct Worker {
     /// The session being shown, by app id.
     chosen: Option<String>,
     art_key: String,
-    art_tries: u32,
     /// When the track changed, and when its artwork was last read.
     art_since: Option<Instant>,
     art_checked: Option<Instant>,
     art: Option<Arc<Art>>,
+    /// Artwork this track showed and then replaced (a browser's logo put up
+    /// before the page's art, the last track's art): never gone back to.
+    art_replaced: Vec<u64>,
     next_art_id: u64,
     wic: Option<IWICImagingFactory>,
+}
+
+fn art_hash(data: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut h);
+    h.finish()
 }
 
 /// The helper's worker. Errs only when Now Playing can't start at all.
@@ -377,12 +389,24 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, out: &mut impl Write) -> Result<()> {
     let mut sent_art = None;
     let mut next = None;
     loop {
+        // A timed re-read of the artwork, not a change the app reported.
+        let mut timed = false;
         let cmd = match next.take() {
             Some(cmd) => cmd,
-            None => match rx.recv() {
-                Ok(cmd) => cmd,
-                Err(_) => break,
-            },
+            None => {
+                let got = match w.next_art_check() {
+                    Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                match got {
+                    Ok(cmd) => cmd,
+                    Err(RecvTimeoutError::Timeout) => {
+                        timed = true;
+                        Cmd::Refresh
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
         };
         if matches!(cmd, Cmd::Quit) {
             break;
@@ -402,6 +426,8 @@ fn run(rx: Receiver<Cmd>, tx: Sender<Cmd>, out: &mut impl Write) -> Result<()> {
             other => w.command(other).map(|_| None),
         };
         match r {
+            // Nothing new from a timed look: don't wake DockSide.
+            Ok(Some(snap)) if timed && snap.as_ref().and_then(|s| s.art.as_ref()).map(|a| a.id) == sent_art => {}
             Ok(Some(snap)) => {
                 // DockSide stopped listening: we're done.
                 if write_snapshot(out, snap.as_ref(), &mut sent_art).and_then(|_| out.flush()).is_err() {
@@ -578,9 +604,33 @@ fn is_playing(s: &Session) -> bool {
 }
 
 impl Worker {
+    /// Browsers make a session per tab, all under one app id: prefer the one playing.
     fn session(&self) -> Option<&Session> {
         let id = self.chosen.as_ref()?;
-        self.subs.iter().map(|s| &s.session).find(|s| app_id(s) == *id)
+        let mut same = self.subs.iter().map(|s| &s.session).filter(|s| app_id(s) == *id);
+        let first = same.next()?;
+        if is_playing(first) {
+            return Some(first);
+        }
+        same.find(|s| is_playing(s)).or(Some(first))
+    }
+
+    /// The gap between artwork reads now, or None when it's no longer looked for.
+    fn art_gap(&self, now: Instant) -> Option<Duration> {
+        let age = now.duration_since(self.art_since?);
+        if age < ART_SETTLE {
+            Some(ART_RECHECK_GAP)
+        } else if self.art.is_none() && age < ART_GIVE_UP {
+            Some(ART_MISSING_GAP)
+        } else {
+            None
+        }
+    }
+
+    /// When the artwork should next be re-read.
+    fn next_art_check(&self) -> Option<Instant> {
+        let gap = self.art_gap(Instant::now())?;
+        Some(self.art_checked.map_or_else(Instant::now, |t| t + gap))
     }
 
     fn command(&mut self, cmd: Cmd) -> Result<()> {
@@ -624,6 +674,7 @@ impl Worker {
         let Some(session) = self.session().cloned() else {
             self.art = None;
             self.art_key.clear();
+            self.art_since = None;
             return Ok(None);
         };
         self.snapshot(&session).map(Some)
@@ -656,27 +707,33 @@ impl Worker {
         let now = Instant::now();
         if key != self.art_key {
             self.art_key = key;
-            self.art_tries = 0;
-            self.art = None;
+            self.art_replaced.clear();
+            // The app may still hand out the last track's thumbnail for a moment.
+            if let Some(old) = self.art.take() {
+                self.art_replaced.push(art_hash(&old.data));
+            }
             self.art_since = Some(now);
             self.art_checked = None;
         }
-        // Apps often publish the title first and the artwork a moment later.
-        if self.art.is_none() && self.art_tries < 4 {
-            self.art_tries += 1;
-            self.art = self.load_art(&props).map(Arc::new);
-            self.art_checked = Some(now);
-        } else if self.art.is_some()
-            && self.art_tries < ART_RECHECKS
-            && self.art_since.is_some_and(|t| now.duration_since(t) < ART_SETTLE)
-            && self.art_checked.is_none_or(|t| now.duration_since(t) >= ART_RECHECK_GAP)
-        {
-            // Browsers put their own logo up first and swap in the page's
-            // artwork once it has downloaded: keep looking for a while.
-            self.art_tries += 1;
+        // Apps often publish the title first and the artwork a moment later, and
+        // browsers put their own logo up until the page's artwork has downloaded:
+        // keep re-reading it for a while, on a timer as well as on change events.
+        let due = self.art_gap(now).is_some_and(|gap| self.art_checked.is_none_or(|t| now.duration_since(t) >= gap));
+        if due {
             self.art_checked = Some(now);
             if let Some(new) = self.load_art(&props) {
-                if self.art.as_ref().is_none_or(|old| old.data != new.data) {
+                let h = art_hash(&new.data);
+                let same = self.art.as_ref().is_some_and(|old| old.data == new.data);
+                // Last track's art right after a change is shown only until
+                // something else turns up (same album: it never does, and stays).
+                let stale = self.art.is_none() && self.art_replaced.contains(&h);
+                if stale && now.duration_since(self.art_since.unwrap_or(now)) >= Duration::from_secs(2) {
+                    self.art_replaced.retain(|&r| r != h);
+                    self.art = Some(Arc::new(new));
+                } else if !same && !self.art_replaced.contains(&h) {
+                    if let Some(old) = self.art.take() {
+                        self.art_replaced.push(art_hash(&old.data));
+                    }
                     self.art = Some(Arc::new(new));
                 }
             }

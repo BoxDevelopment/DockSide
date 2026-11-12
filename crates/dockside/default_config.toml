@@ -228,6 +228,8 @@ sidebar_pins = []
 # All but "none" float the sidebar as a rounded pane, like macOS Tahoe; acrylic
 # and blur need Transparency effects on.
 sidebar = "glass"
+# Win+E opens a Finder window instead of File Explorer (while DockSide runs).
+replace_win_e = false
 
 [desktops]
 # Alt+1 ... Alt+9 switch to that virtual desktop (Windows' own desktops).

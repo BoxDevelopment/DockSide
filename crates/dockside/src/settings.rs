@@ -408,6 +408,7 @@ pub(crate) enum Key {
     FinderSidebar,
     FinderView,
     FinderHidden,
+    FinderWinE,
     DesktopsAlt,
     DesktopsArrows,
     DesktopsIsland,
@@ -495,6 +496,7 @@ impl Key {
             Key::FinderSidebar => ("finder", "sidebar"),
             Key::FinderView => ("finder", "view"),
             Key::FinderHidden => ("finder", "show_hidden"),
+            Key::FinderWinE => ("finder", "replace_win_e"),
             Key::DesktopsAlt => ("desktops", "alt_number"),
             Key::DesktopsArrows => ("desktops", "replace_windows_switcher"),
             Key::DesktopsIsland => ("desktops", "island"),
@@ -1577,6 +1579,7 @@ impl SettingsWindow {
                         Row::Segmented("Sidebar", Key::FinderSidebar),
                         Row::Segmented("New windows open in", Key::FinderView),
                         Row::Toggle("Show hidden files", Key::FinderHidden),
+                        Row::Toggle("Win+E opens Finder instead of File Explorer", Key::FinderWinE),
                     ],
                 },
             ],
@@ -1646,6 +1649,7 @@ impl SettingsWindow {
             Key::GlassRefraction => g.glass_refraction,
             Key::ScreenshotMode => g.screenshot_mode,
             Key::FinderHidden => cfg.finder.show_hidden,
+            Key::FinderWinE => cfg.finder.replace_win_e,
             Key::DesktopsAlt => cfg.desktops.alt_number,
             Key::DesktopsArrows => cfg.desktops.replace_windows_switcher,
             Key::DesktopsIsland => cfg.desktops.island,
@@ -2365,7 +2369,7 @@ impl SettingsWindow {
 
         let r = {
             let draw = |p: &Painter| p.scaled_about(zoom_x, zoom_y, zoom, || {
-                chrome::window(p, body, SIDEBAR, theme, &chrome::Palette::new(theme));
+                chrome::window(p, body, SIDEBAR, theme, &chrome::Palette::new(theme), chrome::RADIUS);
                 let group_hover = motion.fade(Anim::Lights, matches!(hover, Some(Hit::Close | Hit::Minimize)));
                 for (r, light) in chrome::traffic_lights(p, body, group_hover, false) {
                     hits.push((r, if light == chrome::Light::Close { Hit::Close } else { Hit::Minimize }));

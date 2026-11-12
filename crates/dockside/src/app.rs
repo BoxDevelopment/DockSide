@@ -72,6 +72,10 @@ static ISLAND_VOLUME_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Which desktop shortcuts the desktop key hook takes.
 static DESKTOP_ALT_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DESKTOP_ARROW_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Whether the same hook takes Win+E (opens Finder instead of File Explorer).
+static FINDER_WIN_E: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// E is held down after a swallowed Win+E (its repeats don't open more windows).
+static WIN_E_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Lives in the (large) Win32_UI_Controls feature; defined here instead.
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -485,7 +489,18 @@ fn execute(action: Action) {
         Action::Activate(h) => apps::activate(h),
         Action::Minimize(h) => apps::minimize(h),
         Action::MinimizeWindows(hwnds) => hwnds.into_iter().for_each(apps::minimize),
-        Action::Zoom(h) => apps::toggle_zoom(h),
+        // Finder's own Zoom also takes it out of full screen.
+        Action::Zoom(h) => {
+            let finder = with_app(|app| {
+                let f = app.finders.iter_mut().find(|f| f.hwnd == h)?;
+                f.toggle_zoom();
+                app.update_fullscreen();
+                Some(())
+            });
+            if finder.flatten().is_none() {
+                apps::toggle_zoom(h);
+            }
+        }
         Action::HideOthers(keep) => {
             let keep_pid = apps::effective_pid(keep);
             for w in apps::list_windows() {
@@ -728,6 +743,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCCALCSIZE if GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_THICKFRAME.0 != 0 => {
             return LRESULT(0)
         }
+        // Finder windows' minimum, maximized and full screen sizes (they resize
+        // themselves while App is borrowed, so App would never see these).
+        WM_GETMINMAXINFO | WM_WINDOWPOSCHANGING if let Some(r) = finder::frame_message(hwnd, msg, lp) => return r,
         // Desktop widgets stay on the desktop layer: nothing else may restack them
         // (clicking or typing into one would otherwise lift it over app windows).
         WM_WINDOWPOSCHANGING
@@ -890,8 +908,9 @@ unsafe extern "system" fn drag_watch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> 
 }
 
 /// Desktop shortcuts: Alt+1…9, and Win+Ctrl+←/→ in place of Windows' own (which
-/// shows a popup). Swallowed, with a masking key so releasing Alt / Win doesn't
-/// open an app's menu or Start.
+/// shows a popup); and Win+E opening Finder instead of File Explorer. Swallowed,
+/// with a masking key so releasing Alt / Win doesn't open an app's menu or Start.
+/// (Explorer owns Win+E, so RegisterHotKey can't take it.)
 unsafe extern "system" fn desktop_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     if code >= 0 {
@@ -903,6 +922,20 @@ unsafe extern "system" fn desktop_key_hook(code: i32, wp: WPARAM, lp: LPARAM) ->
             let (alt, ctrl, shift) = (held(VK_MENU), held(VK_CONTROL), held(VK_SHIFT));
             let win = held(VK_LWIN) || held(VK_RWIN);
             let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if vk == 0x45 && (WIN_E_HELD.load(Ordering::Relaxed) || (FINDER_WIN_E.load(Ordering::Relaxed) && win && !ctrl && !alt && !shift)) {
+                // Swallow the whole press (down, repeats and release), opening one window.
+                if down && !WIN_E_HELD.swap(true, Ordering::Relaxed) {
+                    let mask = |flags| INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: flags, ..Default::default() } },
+                    };
+                    SendInput(&[mask(KEYBD_EVENT_FLAGS(0)), mask(KEYEVENTF_KEYUP)], std::mem::size_of::<INPUT>() as i32);
+                    win::post_wp(MSG_HWND.load(Ordering::Relaxed), WM_APP_OPEN_SETTINGS, 1);
+                } else if !down {
+                    WIN_E_HELD.store(false, Ordering::Relaxed);
+                }
+                return LRESULT(1);
+            }
             let target = if DESKTOP_ALT_KEYS.load(Ordering::Relaxed) && alt && !ctrl && !shift && !win && (0x31..=0x39).contains(&vk) {
                 Some((vk - 0x30) as usize)
             } else if DESKTOP_ARROW_KEYS.load(Ordering::Relaxed) && win && ctrl && !alt && !shift && (vk == VK_LEFT.0 || vk == VK_RIGHT.0) {
@@ -1373,7 +1406,7 @@ impl App {
         if old.windows != self.cfg.windows {
             self.configure_genie();
         }
-        if old.desktops != self.cfg.desktops {
+        if old.desktops != self.cfg.desktops || old.finder.replace_win_e != self.cfg.finder.replace_win_e {
             self.setup_desktops();
         }
         if old.menubar != self.cfg.menubar {
@@ -1685,7 +1718,9 @@ impl App {
         let d = &self.cfg.desktops;
         DESKTOP_ALT_KEYS.store(d.alt_number, Ordering::Relaxed);
         DESKTOP_ARROW_KEYS.store(d.replace_windows_switcher, Ordering::Relaxed);
-        let want_hook = d.alt_number || d.replace_windows_switcher;
+        FINDER_WIN_E.store(self.cfg.finder.replace_win_e, Ordering::Relaxed);
+        let desktop_keys = d.alt_number || d.replace_windows_switcher;
+        let want_hook = desktop_keys || self.cfg.finder.replace_win_e;
         let keys = desktop_hotkeys();
         set_hotkeys(self.msg_hwnd, &keys[..9], d.alt_number);
         set_hotkeys(self.msg_hwnd, &keys[9..], d.replace_windows_switcher);
@@ -1708,7 +1743,7 @@ impl App {
             self.desktop_popup = win::desktops::hide_switch_popup();
         }
         // The watcher also moves focus after a switch, so run it whenever shortcuts are on.
-        if want_hook || d.island {
+        if desktop_keys || d.island {
             if self.desktop_watch.is_none() {
                 self.desktop_watch = win::desktops::watch(self.msg_hwnd.0 as isize, WM_APP_DESKTOP);
             }
@@ -2072,7 +2107,9 @@ impl App {
         let mon = if fg.is_invalid() { self.monitor } else { Monitor::of_window(fg) };
         // Launchpad fills the screen too: the menu bar and island make way for it, the Dock doesn't.
         let launchpad = self.launchpad.iter().chain(&self.closing_launchpads).any(|l| l.hwnd == fg);
-        let full = apps::is_fullscreen_app(fg, mon.rect).then_some((mon.rect, launchpad));
+        // Finder in full screen too (layered windows don't count as fullscreen apps).
+        let finder_full = self.finders.iter().any(|f| f.hwnd == fg && f.is_fullscreen());
+        let full = (finder_full || apps::is_fullscreen_app(fg, mon.rect)).then_some((mon.rect, launchpad));
         if full == self.fullscreen_on {
             return;
         }
@@ -2977,6 +3014,7 @@ impl App {
     fn on_finder_message(&mut self, idx: usize, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
         let f = &mut self.finders[idx];
+        let was_full = f.is_fullscreen();
         let scale = f.scale();
         let (x, y) = mouse_pt(lp, scale);
         let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
@@ -2990,12 +3028,6 @@ impl App {
                 let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
                 let hit = f.nc_hit((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
                 return Some(LRESULT(hit as isize));
-            }
-            WM_GETMINMAXINFO => {
-                let info = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
-                let (w, h) = f.min_track_size();
-                info.ptMinTrackSize = POINT { x: w, y: h };
-                return Some(LRESULT(0));
             }
             WM_WINDOWPOSCHANGED => {
                 f.sync_backdrop();
@@ -3056,13 +3088,22 @@ impl App {
             }
             WM_SYSCHAR => return Some(LRESULT(0)),
             WM_CLOSE => FinderEvent::Close,
+            // Full screen has no maximize or move (Win+↑, the window menu).
+            WM_SYSCOMMAND if f.is_fullscreen() && matches!((wp.0 & 0xFFF0) as u32, SC_MAXIMIZE | SC_MOVE | SC_SIZE) => {
+                return Some(LRESULT(0));
+            }
             _ => return None,
         };
         let id = f.id;
+        let full_changed = f.is_fullscreen() != was_full;
         let mut events = f.take_events();
         events.insert(0, event);
         for event in events {
             self.finder_event(id, event);
+        }
+        if full_changed {
+            // The menu bar and Dock make way (or come back).
+            self.update_fullscreen();
         }
         self.save_finder_prefs();
         Some(LRESULT(0))

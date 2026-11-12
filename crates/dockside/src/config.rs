@@ -283,6 +283,8 @@ pub struct FinderCfg {
     pub sidebar_pins: Vec<std::path::PathBuf>,
     /// Sidebar material. Anything but "none" floats it as a rounded pane, like macOS Tahoe.
     pub sidebar: Backdrop,
+    /// Win+E opens a Finder window instead of File Explorer.
+    pub replace_win_e: bool,
 }
 
 /// Virtual desktop shortcuts.

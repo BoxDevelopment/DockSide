@@ -167,21 +167,24 @@ pub fn shadow(p: &Painter, body: Rect, theme: &Theme) {
     p.soft_shadow(body, RADIUS, 14, 1.8, 0.035, 8.0, theme.shadow);
 }
 
-/// Shadow, body, sidebar split and hairline border.
-pub fn window(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette) {
-    shadow(p, body, theme);
+/// Shadow, body, sidebar split and hairline border. `radius` 0 is a full
+/// screen window: square corners and no shadow.
+pub fn window(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette, radius: f32) {
+    if radius > 0.0 {
+        shadow(p, body, theme);
+    }
     if pal.sidebar.a < 1.0 {
         // A see-through sidebar must not show the shadow under the body.
-        p.clear_round(body, RADIUS);
+        p.clear_round(body, radius);
     } else {
         p.clear_rect(body.inset(4.0, 4.0));
     }
-    p.fill_round(body, RADIUS, pal.sidebar);
+    p.fill_round(body, radius, pal.sidebar);
     let content = Rect::new(body.x + sidebar_w, body.y, body.w - sidebar_w, body.h);
-    p.fill_round(content, RADIUS, pal.content);
-    p.fill_rect(Rect::new(content.x, body.y, RADIUS, body.h), pal.content);
+    p.fill_round(content, radius, pal.content);
+    p.fill_rect(Rect::new(content.x, body.y, radius, body.h), pal.content);
     p.line(content.x, body.y, content.x, body.bottom(), pal.divider, 1.0);
-    p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
+    p.stroke_round(body.inset(0.25, 0.25), radius, theme.menu_border, 0.5);
 }
 
 /// Inset of the floating glass sidebar from the body's edges, and its corner radius.
@@ -195,14 +198,16 @@ pub fn sidebar_pane(body: Rect, sidebar_w: f32) -> Rect {
 
 /// Shadow and body with a see-through floating sidebar pane (macOS Tahoe):
 /// the window background runs edge to edge and the pane is cut out of it.
-pub fn window_floating(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette) {
-    shadow(p, body, theme);
+pub fn window_floating(p: &Painter, body: Rect, sidebar_w: f32, theme: &Theme, pal: &Palette, radius: f32) {
+    if radius > 0.0 {
+        shadow(p, body, theme);
+    }
     p.clear_rect(body.inset(4.0, 4.0));
-    p.fill_round(body, RADIUS, pal.content);
+    p.fill_round(body, radius, pal.content);
     let pane = sidebar_pane(body, sidebar_w);
     p.clear_round(pane, PANE_RADIUS);
     p.fill_round(pane, PANE_RADIUS, SidebarBackdrop::fill());
-    p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
+    p.stroke_round(body.inset(0.25, 0.25), radius, theme.menu_border, 0.5);
 }
 
 /// Draws close / minimize / zoom at the body's top-left. Glyphs fade in while

@@ -597,7 +597,8 @@ pub struct FinderWindow {
     flash: Option<(String, Instant)>,
     /// Events from commands (menus to open, windows to create), for the App to collect.
     outbox: Vec<FinderEvent>,
-    zoom_restore: Option<RECT>,
+    /// In full screen: where the window was before (restored on leaving).
+    fullscreen: Option<WINDOWPLACEMENT>,
     show_hidden: bool,
     /// One slot per tab, in order; the active tab's state lives in the fields above (its slot is `None`).
     tabs: Vec<Option<Tab>>,
@@ -660,6 +661,7 @@ impl FinderWindow {
             rect,
             HWND::default(),
         )?;
+        set_frame_state(hwnd, FRAME_NORMAL);
 
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if res.is_ok_and(|e| !e.kind.is_access()) {
@@ -733,7 +735,7 @@ impl FinderWindow {
             address_xs: Vec::new(),
             flash: None,
             outbox: Vec::new(),
-            zoom_restore: None,
+            fullscreen: None,
             show_hidden: prefs.show_hidden,
             tabs: vec![None],
             active_tab: 0,
@@ -1703,27 +1705,80 @@ impl FinderWindow {
 
     // --- window management -------------------------------------------------
 
+    /// The green button: a real Windows maximize (between the menu bar and Dock,
+    /// like any maximized app), the same state as double-clicking the title bar,
+    /// Win+↑, snapping to the top or the Dock's Zoom. In full screen it leaves
+    /// full screen instead.
     pub fn toggle_zoom(&mut self) {
+        if self.fullscreen.is_some() {
+            return self.toggle_fullscreen();
+        }
         unsafe {
-            let rc = match self.zoom_restore.take() {
-                Some(rc) => rc,
-                None => {
-                    let mut current = RECT::default();
-                    let _ = GetWindowRect(self.hwnd, &mut current);
-                    self.zoom_restore = Some(current);
-                    let mut work = RECT::default();
-                    let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut work as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
-                    let m = (SHADOW * self.scale).round() as i32;
-                    RECT { left: work.left - m, top: work.top - m + 4, right: work.right + m, bottom: work.bottom + m - 4 }
-                }
-            };
-            let _ = SetWindowPos(self.hwnd, None, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER);
+            let _ = ShowWindow(self.hwnd, if IsZoomed(self.hwnd).as_bool() { SW_RESTORE } else { SW_MAXIMIZE });
         }
         self.dirty = true;
     }
 
-    pub fn min_track_size(&self) -> (i32, i32) {
-        (((MIN_W + 2.0 * SHADOW) * self.scale) as i32, ((MIN_H + 2.0 * SHADOW) * self.scale) as i32)
+    pub fn is_zoomed(&self) -> bool {
+        unsafe { IsZoomed(self.hwnd).as_bool() }
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen.is_some()
+    }
+
+    /// F11, like a browser's: the window covers its whole display with square
+    /// corners, and the App hides that display's menu bar and Dock while it's in
+    /// front. Leaving puts it back where it was (maximized, if it was).
+    pub fn toggle_fullscreen(&mut self) {
+        unsafe {
+            match self.fullscreen.take() {
+                Some(placement) => {
+                    set_frame_state(self.hwnd, FRAME_NORMAL);
+                    mark_fullscreen(self.hwnd, false);
+                    let _ = SetWindowPlacement(self.hwnd, &placement);
+                }
+                None => {
+                    let mut placement = WINDOWPLACEMENT { length: std::mem::size_of::<WINDOWPLACEMENT>() as u32, ..Default::default() };
+                    let _ = GetWindowPlacement(self.hwnd, &mut placement);
+                    if IsZoomed(self.hwnd).as_bool() {
+                        let _ = ShowWindow(self.hwnd, SW_RESTORE);
+                    }
+                    let mut current = RECT::default();
+                    let _ = GetWindowRect(self.hwnd, &mut current);
+                    self.fullscreen = Some(placement);
+                    set_frame_state(self.hwnd, FRAME_FULL);
+                    let rc = Self::screen_rect(&current, true);
+                    let _ = SetWindowPos(self.hwnd, HWND_TOP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_SHOWWINDOW);
+                    mark_fullscreen(self.hwnd, true);
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Where the window goes, maximized (`full` false) or in full screen, on the
+    /// display holding `proposed`: the body fills that display's work area (or the
+    /// whole display) exactly, the shadow margin hanging outside it.
+    pub fn screen_rect(proposed: &RECT, full: bool) -> RECT {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        unsafe {
+            let hmon = MonitorFromRect(proposed, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let _ = GetMonitorInfoW(hmon, &mut mi);
+            let area = if full { mi.rcMonitor } else { mi.rcWork };
+            let m = (SHADOW * Monitor::from_handle(hmon).scale).round() as i32;
+            RECT { left: area.left - m, top: area.top - m, right: area.right + m, bottom: area.bottom + m }
+        }
+    }
+
+    /// Corner radius of the window body (square in full screen).
+    fn radius(&self) -> f32 {
+        if self.fullscreen.is_some() {
+            0.0
+        } else {
+            chrome::RADIUS
+        }
     }
 
     fn size_pt(&self) -> (f32, f32) {
@@ -1843,7 +1898,15 @@ impl FinderWindow {
         if !b.inset(-2.0, -2.0).contains(x, y) {
             return HTNOWHERE;
         }
-        let (l, r) = (x < b.x + EDGE, x > b.right() - EDGE);
+        // Full screen: nothing to drag or resize.
+        if self.fullscreen.is_some() {
+            return HTCLIENT;
+        }
+        // A maximized window has no resize edges (dragging the title bar restores it).
+        if self.is_zoomed() {
+            return if y < b.y + TOOLBAR && self.hit_at(x, y).is_none() { HTCAPTION } else { HTCLIENT };
+        }
+        let (l, r) =(x < b.x + EDGE, x > b.right() - EDGE);
         let (t, bt) = (y < b.y + EDGE, y > b.bottom() - EDGE);
         match (l, r, t, bt) {
             (true, _, true, _) => return HTTOPLEFT,
@@ -2478,7 +2541,7 @@ impl FinderWindow {
                 self.refresh_places();
                 self.reload(kinds);
             }
-            (F11, false, false) => self.toggle_zoom(),
+            (F11, false, false) => self.toggle_fullscreen(),
             (F10, false, false) if shift => return self.key_menu(),
             (APPS, ..) => return self.key_menu(),
             // ⌘⇧. on macOS: toggle hidden files.
@@ -2815,6 +2878,7 @@ impl FinderWindow {
 
         let (gfx, theme) = (ctx.gfx, ctx.theme);
         let mut pal = chrome::Palette::new(theme);
+        let radius = self.radius();
         if let Some(bd) = &mut self.backdrop {
             bd.set_theme(theme);
             pal.sidebar = SidebarBackdrop::fill();
@@ -3049,9 +3113,9 @@ impl FinderWindow {
             };
 
             if floating {
-                chrome::window_floating(p, body, SIDEBAR, theme, &pal);
+                chrome::window_floating(p, body, SIDEBAR, theme, &pal, radius);
             } else {
-                chrome::window(p, body, SIDEBAR, theme, &pal);
+                chrome::window(p, body, SIDEBAR, theme, &pal, radius);
             }
 
             // Sidebar: monochrome glyphs and rounded selection, inside the floating pane.
@@ -3725,7 +3789,7 @@ impl FinderWindow {
                 let style = QlStyle { theme, dark, title: &ql_title, mono: &mono, center: &center, preview_title: &preview_title };
                 // Quick Look zooms up out of the window and shrinks away when closed.
                 let t = ql_t.clamp(0.0, 1.0);
-                p.fill_round(body, chrome::RADIUS, Color::gray(0, 0.22 * t));
+                p.fill_round(body, radius, Color::gray(0, 0.22 * t));
                 let mut gone = Vec::new();
                 let ql_hits = if ql_live {
                     hits.push((body, Hit::QlBackdrop));
@@ -3765,6 +3829,81 @@ impl FinderWindow {
 }
 
 /// The group an entry falls in: an order rank and the heading.
+/// A window property marking Finder windows (and which are in full screen), so
+/// their sizing messages are handled even when they arrive while the App is busy
+/// (it is whenever the window resizes itself, e.g. from the green button).
+const FRAME_PROP: windows::core::PCWSTR = windows::core::w!("DockSide.FinderFrame");
+const FRAME_NORMAL: usize = 1;
+const FRAME_FULL: usize = 2;
+
+fn set_frame_state(hwnd: HWND, state: usize) {
+    unsafe {
+        let _ = SetPropW(hwnd, FRAME_PROP, windows::Win32::Foundation::HANDLE(state as _));
+    }
+}
+
+/// Sizing messages for Finder windows, from the window procedure before the App
+/// sees them: the minimum size, and the body filling the work area exactly when
+/// maximized (however it got there) or the whole display in full screen, the
+/// shadow margin hanging off the edges. Windows' own maximized rect would leave
+/// that margin as a gap all round.
+pub fn frame_message(hwnd: HWND, msg: u32, lp: windows::Win32::Foundation::LPARAM) -> Option<windows::Win32::Foundation::LRESULT> {
+    use windows::Win32::Foundation::{LRESULT, POINT};
+    let state = unsafe { GetPropW(hwnd, FRAME_PROP) }.0 as usize;
+    if state == 0 {
+        return None;
+    }
+    match msg {
+        WM_GETMINMAXINFO => {
+            let scale = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96) as f32 / 96.0;
+            let info = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
+            info.ptMinTrackSize = POINT { x: ((MIN_W + 2.0 * SHADOW) * scale) as i32, y: ((MIN_H + 2.0 * SHADOW) * scale) as i32 };
+            Some(LRESULT(0))
+        }
+        WM_WINDOWPOSCHANGING => {
+            let full = state == FRAME_FULL;
+            if !full && !unsafe { IsZoomed(hwnd).as_bool() } {
+                return None;
+            }
+            let pos = unsafe { &mut *(lp.0 as *mut WINDOWPOS) };
+            if pos.flags.contains(SWP_NOSIZE) && pos.flags.contains(SWP_NOMOVE) {
+                return None;
+            }
+            let mut rc = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(hwnd, &mut rc);
+            }
+            if !pos.flags.contains(SWP_NOMOVE) {
+                (rc.right, rc.bottom) = (pos.x + rc.right - rc.left, pos.y + rc.bottom - rc.top);
+                (rc.left, rc.top) = (pos.x, pos.y);
+            }
+            if !pos.flags.contains(SWP_NOSIZE) {
+                (rc.right, rc.bottom) = (rc.left + pos.cx, rc.top + pos.cy);
+            }
+            let r = FinderWindow::screen_rect(&rc, full);
+            (pos.x, pos.y, pos.cx, pos.cy) = (r.left, r.top, r.right - r.left, r.bottom - r.top);
+            pos.flags &= !(SWP_NOMOVE | SWP_NOSIZE);
+            // Not DefWindowProc: it would clamp the size back to the display's.
+            Some(LRESULT(0))
+        }
+        _ => None,
+    }
+}
+
+/// Tells the taskbar a window is full screen, so it gets out of the way while that
+/// window is in front (it only spots ordinary fullscreen windows on its own).
+fn mark_fullscreen(hwnd: HWND, on: bool) {
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
+    unsafe {
+        if let Ok(list) = CoCreateInstance::<_, ITaskbarList2>(&TaskbarList, None, CLSCTX_INPROC_SERVER) {
+            if list.HrInit().is_ok() {
+                let _ = list.MarkFullscreenWindow(hwnd, on);
+            }
+        }
+    }
+}
+
 fn group_key(group: Group, e: &FileEntry, kinds: &mut KindCache) -> (u32, String) {
     match group {
         Group::None => (0, String::new()),
@@ -3944,6 +4083,7 @@ impl Drop for FinderWindow {
         self.watcher = None;
         dnd::revoke(self.hwnd);
         unsafe {
+            let _ = RemovePropW(self.hwnd, FRAME_PROP);
             let _ = DestroyWindow(self.hwnd);
         }
     }

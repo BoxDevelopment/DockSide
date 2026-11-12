@@ -193,11 +193,12 @@ pub fn trash_full() -> bool {
     use std::sync::Once;
     static WATCH: Once = Once::new();
     WATCH.call_once(|| {
-        // The first answer right away: the Dock shows the Trash as it is from the start.
-        TRASH_FULL.store(query_trash_full(), Ordering::Relaxed);
+        // Even the first answer comes from the watch thread: at login the query
+        // takes seconds (it asks every drive while the shell is still starting),
+        // and the Dock picks the answer up on its next tick.
         let spawned = std::thread::Builder::new().name("trash watch".into()).spawn(|| loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
             TRASH_FULL.store(query_trash_full(), Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_secs(5));
         });
         if let Err(e) = spawned {
             log!("trash watch didn't start: {e}");

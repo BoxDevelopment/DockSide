@@ -295,26 +295,14 @@ impl Renderer {
             device: Mutex::new(Device(None)),
             cache: Mutex::new(SnapshotCache::default()),
         });
-        let (tx, rx) = std::sync::mpsc::channel();
         let for_thread = shared.clone();
+        // Not waited for: the thread makes its device (a second or more at login)
+        // while DockSide starts, and jobs queue up until it's ready.
         let thread = std::thread::Builder::new()
             .name("genie render".into())
-            .spawn(move || {
-                let Some(mut t) = RenderThread::new(for_thread) else {
-                    let _ = tx.send(false);
-                    return;
-                };
-                let _ = tx.send(true);
-                t.run();
-            })
+            .spawn(move || RenderThread::new(for_thread).run())
+            .map_err(|e| log!("genie: render thread: {e}"))
             .ok()?;
-        if !rx.recv().unwrap_or(false) {
-            let _ = thread.join();
-            unsafe {
-                let _ = CloseHandle(wake);
-            }
-            return None;
-        }
         Some(Renderer { shared, thread: Some(thread) })
     }
 
@@ -534,7 +522,7 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<Vec<u8>> {
 }
 
 impl RenderThread {
-    fn new(shared: Arc<Shared>) -> Option<Self> {
+    fn new(shared: Arc<Shared>) -> Self {
         unsafe {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -568,14 +556,17 @@ impl RenderThread {
             destroy_hook: HWINEVENTHOOK::default(),
         };
         if !t.create_device() {
+            // Made on this thread so DockSide's UI doesn't wait for it (seconds at
+            // login): a failure just finishes every job unanimated.
+            log!("genie: no render device; windows open and close without animations");
             t.destroy_device();
-            return None;
+            t.broken = true;
         }
         EVENT_SHARED.with(|s| *s.borrow_mut() = Some(shared));
         t.destroy_hook = unsafe {
             SetWinEventHook(EVENT_OBJECT_DESTROY, EVENT_OBJECT_DESTROY, None, Some(on_destroy), 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
         };
-        Some(t)
+        t
     }
 
     fn ms(&self, ticks: i64) -> f64 {

@@ -1,7 +1,7 @@
 //! The Dock: pinned + running apps, magnification, launch bounce, running
 //! indicators, tooltips, context menus, drag-to-reorder and auto-hide.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -14,7 +14,7 @@ use crate::anim::approach;
 use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
 use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
-use crate::gfx::icons::{load_shell_icon, IconStore, RECYCLE_BIN};
+use crate::gfx::icons::{IconStore, RECYCLE_BIN};
 use crate::gfx::{finder_icon, launchpad_icon, start_icon, Align, Gfx, Weight};
 use crate::icon_picker::{IconTarget, PICKER_PATH};
 use crate::onboarding::ONBOARDING_PATH;
@@ -42,6 +42,8 @@ pub const START_PATH: &str = "dockside:start";
 /// A pinned item that opens Launchpad (or Tahoe's Apps, as set).
 pub const LAUNCHPAD_PATH: &str = "dockside:launchpad";
 /// Icon-store keys for the Trash's shell icon, empty and full.
+/// Seconds an icon takes to fade in once it has loaded.
+const ICON_FADE: f32 = 0.25;
 const TRASH_EMPTY: &str = "dockside:trash-empty";
 const TRASH_FULL: &str = "dockside:trash-full";
 
@@ -418,6 +420,10 @@ pub struct Dock {
     metrics: Metrics,
     items: Vec<Item>,
     bitmaps: HashMap<String, Option<crate::gfx::ScaledBitmap>>,
+    /// Icons still loading (by bitmap key), and how far each one that has
+    /// arrived since has faded in (0 to 1).
+    waiting: HashSet<String>,
+    fade_in: HashMap<String, f32>,
     hover_t: f32,
     hovering: bool,
     mouse: (f32, f32),
@@ -447,12 +453,14 @@ pub struct Dock {
 impl Dock {
     pub fn new(gfx: &Gfx, theme: &Theme, cfg: &Config, monitor: Monitor) -> Result<Self> {
         let d = &cfg.dock;
+        let mut phases = crate::log::Phases::new();
         let mut items: Vec<Item> = d.apps.iter().filter(|a| pin_exists(a)).map(|a| Item::pinned(a, &cfg.app_icons)).collect();
         let trash_full = d.show_trash && crate::win::system::trash_full();
         if d.show_trash {
             items.push(Item::separator());
             items.push(Item::trash(d, trash_full));
         }
+        phases.mark("items");
 
         let metrics = Metrics::new(d);
         let placeholder = RECT { left: 0, top: 0, right: 1, bottom: 1 };
@@ -466,11 +474,13 @@ impl Dock {
                 log!("dock shadow failed: {e}");
             }
         }
+        phases.mark("surface");
         let on_desktop = apps::is_desktop(unsafe { GetForegroundWindow() });
         if reserved {
             let thickness = ((metrics.margin + metrics.shelf_h) * monitor.scale).round() as i32;
             appbar::register(surface.content, WM_APP_APPBAR, ABE_BOTTOM, monitor.rect, thickness);
         }
+        phases.mark("appbar");
         let mut dock = Self {
             surface,
             painted: None,
@@ -479,6 +489,8 @@ impl Dock {
             metrics,
             items,
             bitmaps: HashMap::new(),
+            waiting: HashSet::new(),
+            fade_in: HashMap::new(),
             hover_t: 0.0,
             hovering: false,
             mouse: (0.0, 0.0),
@@ -500,7 +512,10 @@ impl Dock {
             dirty: true,
         };
         dock.fit_window()?;
+        phases.mark("fit");
         crate::dock_drop::register(dock.surface.content);
+        phases.mark("drop target");
+        log!("dock: {}", phases.summary());
         Ok(dock)
     }
 
@@ -784,6 +799,15 @@ impl Dock {
     /// Advances animations; returns true while anything is still moving.
     pub fn tick(&mut self, dt: f32) -> bool {
         let mut animating = false;
+
+        if !self.fade_in.is_empty() {
+            for t in self.fade_in.values_mut() {
+                *t = (*t + dt / ICON_FADE).min(1.0);
+            }
+            self.fade_in.retain(|_, t| *t < 1.0);
+            animating = true;
+            self.dirty = true;
+        }
 
         let target = if self.hovering && self.cfg.magnification && self.drag.is_none() { 1.0 } else { 0.0 };
         if self.hover_t != target {
@@ -1235,17 +1259,26 @@ impl Dock {
                 continue;
             }
             let key = item.icon_key.as_str();
+            let bitmap_key = item.bitmap_key();
+            // Files and the shell load in the background (seconds at login);
+            // the Dock draws without them and fades each in as it arrives.
             let px = match (key, item.custom_icon.as_deref()) {
                 (finder_icon::KEY, None) => icons.builtin(key, || finder_icon::render(gfx)),
                 (start_icon::KEY, None) => icons.builtin(key, || start_icon::render(gfx)),
                 (launchpad_icon::KEY, None) => icons.builtin(key, || launchpad_icon::render(gfx)),
                 // The shell's Recycle Bin icon follows its state: cache one per state.
-                (TRASH_EMPTY | TRASH_FULL, None) => icons.builtin(key, || load_shell_icon(RECYCLE_BIN)),
-                (TRASH_EMPTY | TRASH_FULL, custom) => icons.get(&gfx.wic, RECYCLE_BIN, custom),
-                (_, custom) => icons.get(&gfx.wic, key, custom),
+                (TRASH_EMPTY | TRASH_FULL, custom) => icons.request(bitmap_key, RECYCLE_BIN, custom),
+                (_, custom) => icons.request(bitmap_key, key, custom),
             };
+            if px.is_none() && icons.is_pending(bitmap_key) {
+                self.waiting.insert(bitmap_key.to_string());
+                continue;
+            }
+            if self.waiting.remove(bitmap_key) {
+                self.fade_in.insert(bitmap_key.to_string(), 0.0);
+            }
             let bmp = px.and_then(|px| px.to_bitmap(self.surface.canvas.target())).map(crate::gfx::ScaledBitmap::new);
-            self.bitmaps.insert(item.bitmap_key().to_string(), bmp);
+            self.bitmaps.insert(bitmap_key.to_string(), bmp);
         }
 
         let slots = self.slots();
@@ -1283,12 +1316,16 @@ impl Dock {
         let fully_hidden = self.hide_t >= 0.999;
         let win_w = self.surface.width_pt();
         let (items, bitmaps, pressed, menu_item) = (&self.items, &self.bitmaps, self.pressed, self.menu_item);
+        let fade_in = &self.fade_in;
 
         let draw_icon = |p: &crate::gfx::Painter, item: &Item, rect: Rect, opacity: f32, darken: bool| {
-            let Some(Some(bmp)) = bitmaps.get(item.bitmap_key()) else {
+            // Not loaded yet: nothing, until it fades in.
+            let Some(bmp) = bitmaps.get(item.bitmap_key()) else { return };
+            let Some(bmp) = bmp else {
                 p.fill_round(rect.inset(rect.w * 0.08, rect.w * 0.08), rect.w * 0.2, theme.text_disabled);
                 return;
             };
+            let opacity = opacity * fade_in.get(item.bitmap_key()).map_or(1.0, |t| 1.0 - (1.0 - *t).powi(3));
             // Our drawn icons and most custom icons are already tiles; library logos aren't.
             let tiled = !is_drawn_icon(&item.icon_key) && item.custom_icon.as_deref().is_none_or(is_library_logo);
             let draw_rect = if squircle && tiled {

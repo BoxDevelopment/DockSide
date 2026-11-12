@@ -177,11 +177,14 @@ pub fn run() -> anyhow::Result<()> {
     // A relaunch and Claude Code's hooks run unelevated, even when we're not.
     win::elevation::allow_messages(msg_hwnd, &[WM_APP_PING, WM_APP_OPEN_SETTINGS, WM_COPYDATA]);
 
+    let mut phases = crate::log::Phases::new();
     // Spotlight's Clipboard history.
     spotlight::clipboard::start(msg_hwnd);
     win::wallpaper::watch(msg_hwnd, win::WM_APP_WALLPAPER);
+    phases.mark("clipboard+wallpaper");
 
     let app = App::new(msg_hwnd)?;
+    phases.mark("app");
     // Calendar accounts (menu bar calendar, island) and the Battery menu's charge history.
     crate::calsync::start(msg_hwnd.0 as isize);
     crate::win::power::start_history();
@@ -191,6 +194,8 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
     APP.with(|a| *a.borrow_mut() = Some(app));
+    phases.mark("calendar+power");
+    log!("startup: {}", phases.summary());
     crate::cpu_watch::start();
     with_app(|app| {
         app.build();
@@ -1092,8 +1097,10 @@ pub struct App {
 
 impl App {
     fn new(msg_hwnd: HWND) -> anyhow::Result<Self> {
+        let mut phases = crate::log::Phases::new();
         crate::anim::set_motion(system::animations_enabled());
         let gfx = Gfx::new()?;
+        phases.mark("gfx");
         let cfg_path = config::ensure_exists().unwrap_or_else(|e| {
             log!("could not create config: {e:#}");
             config::path()
@@ -1103,7 +1110,9 @@ impl App {
             config::defaults()
         });
         crate::screenshot_mode::set(cfg.general.screenshot_mode);
+        phases.mark("config");
         let theme = Theme::new(&cfg, &gfx);
+        phases.mark("theme");
         let watcher = config::watch(&cfg_path, msg_hwnd.0 as isize, WM_APP_RELOAD)
             .map_err(|e| log!("config watcher failed: {e}"))
             .ok();
@@ -1148,6 +1157,7 @@ impl App {
             }
         }
 
+        phases.mark("hooks");
         let genie = Genie::wanted(&cfg.windows).then(|| Genie::new(&cfg.windows, dock_icon)).flatten();
         let shell_hook = unsafe { RegisterWindowMessageW(w!("SHELLHOOK")) };
         unsafe {
@@ -1158,6 +1168,8 @@ impl App {
         // Explorer sends it, unelevated.
         win::elevation::allow_messages(msg_hwnd, &[shell_hook]);
 
+        phases.mark("genie");
+        log!("app: {}", phases.summary());
         Ok(Self {
             gfx,
             cfg,
@@ -1169,7 +1181,11 @@ impl App {
             clock: FrameClock::new(msg_hwnd.0 as isize),
             animating: false,
             last_frame: Instant::now(),
-            icons: IconStore::default(),
+            icons: {
+                let mut icons = IconStore::default();
+                icons.set_notify(msg_hwnd.0 as isize, win::WM_APP_DOCK_ICONS);
+                icons
+            },
             names: apps::AppNames::default(),
             displays: Vec::new(),
             menubars: Vec::new(),
@@ -1229,6 +1245,7 @@ impl App {
     /// (Re)creates every surface from the current config.
     fn build(&mut self) {
         let started = Instant::now();
+        let mut phases = crate::log::Phases::new();
         crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
         // Control Center stays open across a rebuild (Dark Mode switched from it), in the new look.
         let reopen = self.control.as_ref().map(|c| c.page());
@@ -1237,12 +1254,15 @@ impl App {
         self.retire_widgets();
         self.retire_dock();
         self.retire_menubar();
+        phases.mark("retire");
         self.theme = Theme::new(&self.cfg, &self.gfx);
         self.backdrop_state = backdrop_state();
         self.displays = displays::list();
         self.monitor = self.displays.first().map_or_else(Monitor::primary, |d| d.monitor);
+        phases.mark("theme");
 
         self.apply_taskbar();
+        phases.mark("taskbar");
         if self.cfg.menubar.enabled && self.cfg.menubar.show_tray {
             if let Err(e) = crate::win::tray::start() {
                 log!("tray host failed: {e}");
@@ -1250,8 +1270,11 @@ impl App {
         } else {
             crate::win::tray::stop();
         }
+        phases.mark("tray");
         self.create_menubars();
+        phases.mark("menu bar");
         self.create_docks(false);
+        phases.mark("dock");
         // Explorer releases the auto-hidden taskbar's work area after we've already
         // reserved ours; catch up even if no ABN_POSCHANGED arrives.
         self.taskbar_edge = taskbar::edge();
@@ -1259,26 +1282,34 @@ impl App {
         self.timer(TIMER_APPBAR, 1000);
         // After the menu bar, so it stacks above it.
         self.rebuild_island();
+        phases.mark("island");
         self.rebuild_widgets();
+        phases.mark("widgets");
         // The new surfaces start shown; hide them again if a fullscreen app is still up.
         self.fullscreen_on = None;
         self.update_fullscreen();
+        phases.mark("fullscreen");
         self.setup_desktops();
+        phases.mark("desktops");
         self.refresh_windows();
+        phases.mark("windows");
         self.flush();
+        phases.mark("flush");
         self.register_hotkey();
         if self.index.lock().is_ok_and(|i| i.built.is_none()) {
             self.rebuild_index();
         }
+        phases.mark("index");
         if let Some(page) = reopen {
             self.open_control(page);
         }
         log!(
-            "built surfaces in {:?} ({} display(s), scale {}, font {})",
+            "built surfaces in {:?} ({} display(s), scale {}, font {}): {}",
             started.elapsed(),
             self.displays.len(),
             self.monitor.scale,
-            self.theme.font
+            self.theme.font,
+            phases.summary()
         );
     }
 
@@ -3655,6 +3686,12 @@ impl App {
                 WM_APP_INDEX_READY => {
                     if let (Some(s), Ok(idx)) = (&mut self.spotlight, self.index.lock()) {
                         s.search(&idx);
+                    }
+                }
+                win::WM_APP_DOCK_ICONS => {
+                    if self.icons.drain() {
+                        self.docks.iter_mut().for_each(|d| d.dirty = true);
+                        self.animate();
                     }
                 }
                 WM_APP_ICONS => {

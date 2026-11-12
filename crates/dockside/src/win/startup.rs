@@ -10,6 +10,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ,
 };
@@ -175,21 +176,73 @@ pub fn refresh() {
 }
 
 /// Started by the login task, which fires as the user signs in: hold off until
-/// Explorer's taskbar exists, since DockSide hides it and hosts tray icons
-/// alongside it. Gives up after a while rather than never starting.
+/// Explorer says its shell is ready, since DockSide hides its taskbar, hosts
+/// tray icons alongside it and reserves screen edges. Doing that while Explorer
+/// is still starting holds the sign-in screen up for 30 s (its timeout), so
+/// the taskbar window merely existing isn't enough. Gives up after a while
+/// rather than never starting.
 pub fn wait_for_shell() {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenEventW, WaitForSingleObject, SYNCHRONIZATION_SYNCHRONIZE};
+
     if !std::env::args().any(|a| a == LOGIN) {
         return;
     }
     let start = std::time::Instant::now();
+    let limit = std::time::Duration::from_secs(60);
+    // Explorer sets it (and leaves it set) once the desktop is up; it may not
+    // exist yet this early.
+    loop {
+        let left = limit.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            log!("login: shell not ready after 60s, starting anyway");
+            return;
+        }
+        if let Ok(event) = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, w!("ShellReadyEvent")) } {
+            let ready = unsafe { WaitForSingleObject(event, left.as_millis() as u32) } == WAIT_OBJECT_0;
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            if ready {
+                break;
+            }
+            continue;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The event comes a second or two before the sign-in screen goes: until it
+    // has, the input desktop is Winlogon's (which we can't even open), and
+    // Explorer is still finishing up.
+    while !on_user_desktop() {
+        if start.elapsed() > limit {
+            log!("login: still on the sign-in screen after 60s, starting anyway");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // The taskbar too, which we hide (it's normally up well before this).
     while super::tray::explorer_tray().is_none() {
-        if start.elapsed() > std::time::Duration::from_secs(60) {
+        if start.elapsed() > limit {
             log!("login: no taskbar after 60s, starting anyway");
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    log!("login: taskbar up after {:?}", start.elapsed());
+    log!("login: shell ready after {:?}", start.elapsed());
+}
+
+/// Whether the input desktop is the user's own ("Default"), not the sign-in
+/// screen's.
+fn on_user_desktop() -> bool {
+    use windows::Win32::System::StationsAndDesktops::{CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, UOI_NAME};
+    unsafe {
+        let Ok(desk) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) else { return false };
+        let mut name = [0u16; 64];
+        let mut needed = 0u32;
+        let ok = GetUserObjectInformationW(HANDLE(desk.0), UOI_NAME, Some(name.as_mut_ptr() as *mut c_void), (name.len() * 2) as u32, Some(&mut needed)).is_ok();
+        let _ = CloseDesktop(desk);
+        ok && crate::win::from_wide(&name).eq_ignore_ascii_case("Default")
+    }
 }
 
 #[cfg(test)]

@@ -103,9 +103,11 @@ fn main() {
     win::startup::wait_for_shell();
 
     // "Run as administrator": hand off to the elevated task, releasing the lock first.
+    let hand_off = std::time::Instant::now();
     if win::elevation::should_hand_off() {
         release(&mutex);
         if win::elevation::run_task() {
+            log!("handed off to the admin task in {:?}", hand_off.elapsed());
             return;
         }
         log!("admin task didn't start: starting without admin rights");

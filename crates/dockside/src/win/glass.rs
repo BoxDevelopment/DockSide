@@ -281,9 +281,10 @@ struct Wallpaper {
     handle: HMONITOR,
     rect: RECT,
     /// With its mips, made once when it loads: every pane over the desktop
-    /// reads this one texture. None when it couldn't be loaded (not retried
-    /// until the wallpaper changes).
+    /// reads this one texture. None while it loads, and when it couldn't be
+    /// loaded (not retried until the wallpaper changes).
     tex: Option<ID3D11ShaderResourceView>,
+    loading: bool,
 }
 
 /// Whether `hwnd` shows any of itself: visible, not minimized, and not sized to
@@ -363,6 +364,9 @@ struct Engine {
     constants: ID3D11Buffer,
     scene: Scene,
     wallpapers: Vec<Wallpaper>,
+    /// Bumped when the wallpaper changes, so a load still on its way for the
+    /// old one is dropped.
+    wallpaper_gen: u64,
     panes: Vec<Weak<RefCell<PaneState>>>,
     /// Shortest time between renders (see `min_interval`).
     interval: Duration,
@@ -478,6 +482,7 @@ impl Engine {
             constants: constants.unwrap(),
             scene,
             wallpapers: Vec::new(),
+            wallpaper_gen: 0,
             panes: Vec::new(),
             interval: min_interval(),
             last: None,
@@ -493,26 +498,74 @@ impl Engine {
     }
 
     /// A monitor's wallpaper texture with its screen origin and size, loaded on
-    /// first use and again when the monitor's bounds change.
+    /// first use and again when the monitor's bounds change. None while it
+    /// loads: panes refract the screen until then.
     fn wallpaper(&mut self, handle: HMONITOR) -> Option<(ID3D11ShaderResourceView, (i32, i32), (i32, i32))> {
         let rect = monitor_rect(handle);
-        let found = self.wallpapers.iter().position(|w| w.handle == handle && w.rect == rect);
-        let i = match found {
-            Some(i) => i,
-            None => {
-                self.wallpapers.retain(|w| w.handle != handle);
-                let tex = self.load_wallpaper(rect).map_err(|e| log!("glass wallpaper failed: {e}")).ok();
-                self.wallpapers.push(Wallpaper { handle, rect, tex });
-                self.wallpapers.len() - 1
-            }
+        let Some(found) = self.wallpapers.iter().find(|w| w.handle == handle && w.rect == rect) else {
+            self.wallpapers.retain(|w| w.handle != handle);
+            self.wallpapers.push(Wallpaper { handle, rect, tex: None, loading: true });
+            self.load_wallpaper(handle, rect);
+            return None;
         };
-        let tex = self.wallpapers[i].tex.clone()?;
+        let tex = found.tex.clone()?;
         Some((tex, (rect.left, rect.top), (rect.right - rect.left, rect.bottom - rect.top)))
     }
 
-    fn load_wallpaper(&self, rect: RECT) -> Result<ID3D11ShaderResourceView> {
+    /// Renders the wallpaper's pixels on a thread of their own and hands them
+    /// back to this one. Off DockSide's UI thread because it asks Explorer
+    /// (out of process) and decodes the whole picture: seconds at login.
+    fn load_wallpaper(&self, handle: HMONITOR, rect: RECT) {
+        let queue = match DispatcherQueue::GetForCurrentThread() {
+            Ok(q) => q,
+            Err(e) => return log!("glass wallpaper failed: {e}"),
+        };
+        let (generation, monitor) = (self.wallpaper_gen, handle.0 as isize);
+        let spawned = std::thread::Builder::new().name("glass wallpaper".into()).spawn(move || {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            }
+            let started = Instant::now();
+            let mut pixels = Some(wallpaper::render(rect));
+            let took = started.elapsed();
+            if took > Duration::from_millis(200) {
+                log!("glass wallpaper: rendered in {took:?}");
+            }
+            let handler = windows::System::DispatcherQueueHandler::new(move || {
+                if let Some(px) = pixels.take() {
+                    with_running(|e| e.wallpaper_loaded(monitor, rect, generation, px));
+                }
+                Ok(())
+            });
+            if !queue.TryEnqueue(&handler).unwrap_or(false) {
+                log!("glass wallpaper: couldn't hand the picture back");
+            }
+        });
+        if let Err(e) = spawned {
+            log!("glass wallpaper thread: {e}");
+        }
+    }
+
+    /// A wallpaper's pixels arrived: made into its texture, and the panes that
+    /// want it switch from the screen to it.
+    fn wallpaper_loaded(&mut self, monitor: isize, rect: RECT, generation: u64, pixels: Result<Vec<u8>>) {
+        if generation != self.wallpaper_gen {
+            return;
+        }
+        let waiting = |w: &Wallpaper| w.handle.0 as isize == monitor && w.rect == rect && w.loading;
+        if !self.wallpapers.iter().any(waiting) {
+            return;
+        }
+        let tex = pixels.and_then(|px| self.upload_wallpaper(rect, &px)).map_err(|e| log!("glass wallpaper failed: {e}")).ok();
+        if let Some(w) = self.wallpapers.iter_mut().find(|w| waiting(w)) {
+            w.loading = false;
+            w.tex = tex;
+        }
+        self.resource_all();
+    }
+
+    fn upload_wallpaper(&self, rect: RECT, pixels: &[u8]) -> Result<ID3D11ShaderResourceView> {
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
-        let pixels = wallpaper::render(rect)?;
         // The mips are the frost: made here, once, not on every render.
         let desc = D3D11_TEXTURE2D_DESC {
             Width: w as u32,
@@ -1057,6 +1110,7 @@ pub fn windows_changed() {
 pub fn wallpaper_changed() {
     with_running(|engine| {
         engine.wallpapers.clear();
+        engine.wallpaper_gen += 1;
         engine.live = wallpaper::is_live();
         engine.resource_all();
     });

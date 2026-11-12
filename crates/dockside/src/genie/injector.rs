@@ -287,26 +287,28 @@ fn with_tracker(f: impl FnOnce(&mut Tracker)) {
     });
 }
 
-fn worker(path: PathBuf, rules: Rules, ready: mpsc::Sender<Option<u32>>) {
+fn worker(rules: Rules, ready: mpsc::Sender<Option<u32>>) {
     unsafe {
+        // A message queue before anyone posts to us, then DockSide's UI goes on:
+        // writing and loading the DLL can take seconds at login (antivirus scans
+        // it), and posts wait in the queue meanwhile.
+        let mut msg = MSG::default();
+        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+        let _ = ready.send(Some(GetCurrentThreadId()));
+        let path = match write_dll() {
+            Ok(p) => p,
+            Err(e) => return log!("genie: writing the hook DLL failed: {e}"),
+        };
         let dll = match LoadLibraryExW(&HSTRING::from(path.as_os_str()), None, LOAD_WITH_ALTERED_SEARCH_PATH) {
             Ok(d) => d,
-            Err(e) => {
-                log!("genie: loading {} failed: {e}", path.display());
-                let _ = ready.send(None);
-                return;
-            }
+            Err(e) => return log!("genie: loading {} failed: {e}", path.display()),
         };
         let procs = (GetProcAddress(dll, windows::core::PCSTR(CBT_PROC.as_ptr())), GetProcAddress(dll, windows::core::PCSTR(GETMSG_PROC.as_ptr())));
         let (Some(cbt_proc), Some(getmsg_proc)) = procs else {
             log!("genie: hook procedures not exported by {}", path.display());
             let _ = FreeLibrary(dll);
-            let _ = ready.send(None);
             return;
         };
-        // A message queue before anyone posts to us.
-        let mut msg = MSG::default();
-        let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
 
         TRACKER.with(|t| {
             *t.borrow_mut() = Some(Tracker {
@@ -326,8 +328,7 @@ fn worker(path: PathBuf, rules: Rules, ready: mpsc::Sender<Option<u32>>) {
         if event.is_invalid() {
             log!("genie: SetWinEventHook(EVENT_OBJECT_CREATE) failed");
         }
-        // DockSide's UI goes on; programs that are already running are vetted here.
-        let _ = ready.send(Some(GetCurrentThreadId()));
+        // Programs that are already running are vetted here.
         with_tracker(|t| t.scan());
         with_tracker(|t| log!("genie: hooked {} threads ({})", t.threads.values().filter(|e| e.cbt.is_some()).count(), path.display()));
 
@@ -376,11 +377,10 @@ pub struct Injector {
 
 impl Injector {
     pub fn start(rules: Rules) -> Option<Injector> {
-        let path = write_dll().map_err(|e| log!("genie: writing the hook DLL failed: {e}")).ok()?;
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("genie-injector".into())
-            .spawn(move || worker(path, rules, tx))
+            .spawn(move || worker(rules, tx))
             .map_err(|e| log!("genie: injector thread: {e}"))
             .ok()?;
         match rx.recv() {

@@ -40,6 +40,8 @@ pub const WM_APP_OPEN_SETTINGS: u32 = WM_APP + 8;
 pub const WM_APP_ICONS: u32 = WM_APP + 9;
 /// A Finder window's folder changed on disk (wParam = window id).
 pub const WM_APP_FINDER_CHANGED: u32 = WM_APP + 10;
+/// The Dock's background icon loads have results (see `IconStore::request`).
+pub const WM_APP_DOCK_ICONS: u32 = WM_APP + 36;
 
 /// Asks an already-running instance to show its settings window.
 pub fn signal_running_instance(finder: bool) -> bool {

@@ -1,11 +1,15 @@
-//! A macOS System Settings-style window: sidebar of pages, grouped cards of
-//! rows with toggles, segmented controls, sliders and accent swatches.
+//! A macOS Tahoe System Settings-style window: a floating sidebar of pages
+//! with search, and for each page a header (with a live preview where one
+//! helps) over grouped cards of rows: toggles, pickers that show each choice
+//! as a picture, segmented controls, sliders and accent swatches.
 //!
 //! Every control writes `config.toml` (via [`Action::SetConfig`]) and the
 //! change is applied immediately, so the file stays the single source of truth.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
+
+mod art;
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -37,10 +41,20 @@ pub static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Dock path for this window: it shows in the Dock like an app, and opens it when pinned.
 pub const SETTINGS_PATH: &str = "dockside:settings";
 
-const W: f32 = 780.0;
-const H: f32 = 560.0;
-const SIDEBAR: f32 = 210.0;
+const W: f32 = 860.0;
+const H: f32 = 640.0;
+const SIDEBAR: f32 = 226.0;
 const TITLE_H: f32 = 52.0;
+/// Sidebar page rows: their pitch, and the extra gap before each section.
+const PAGE_PITCH: f32 = 32.0;
+const SECTION_GAP: f32 = 12.0;
+/// A picker's thumbnails: size (at most this wide), spacing, and the caption under each.
+const PICK_W: f32 = 100.0;
+const PICK_H: f32 = 62.0;
+const PICK_GAP: f32 = 12.0;
+const PICK_CAPTION: f32 = 23.0;
+/// A page's live preview (see [`art::preview`]).
+const PREVIEW_H: f32 = 140.0;
 pub(crate) const ROW_H: f32 = 40.0;
 /// App icons in rows (pinned apps, excluded apps).
 const ROW_ICON: f32 = 26.0;
@@ -60,9 +74,10 @@ pub enum Page {
     Island,
     Widgets,
     Calendars,
+    Spotlight,
 }
 
-const PAGES: [(Page, &str); 12] = [
+const PAGES: [(Page, &str); 13] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
     (Page::MenuBar, "Menu Bar"),
@@ -70,12 +85,106 @@ const PAGES: [(Page, &str); 12] = [
     (Page::Island, "Dynamic Island"),
     (Page::Dock, "Dock"),
     (Page::Launchpad, "Launchpad"),
+    (Page::Spotlight, "Spotlight"),
     (Page::Windows, "Windows"),
+    (Page::Desktops, "Desktops"),
+    (Page::Finder, "Finder"),
     (Page::Widgets, "Widgets"),
     (Page::Calendars, "Calendars"),
-    (Page::Finder, "Finder"),
-    (Page::Desktops, "Desktops"),
 ];
+
+/// Where the sidebar's sections start (indices into `PAGES`): DockSide itself,
+/// the desktop's furniture, windows and files, then what's on the desktop.
+const SECTIONS: [usize; 3] = [2, 8, 11];
+
+/// The line under a page's title, saying what's there.
+fn page_blurb(page: Page) -> &'static str {
+    match page {
+        Page::General => "Start DockSide with Windows, hide the taskbar, and manage how DockSide runs.",
+        Page::Appearance => "Choose a light or dark look, an accent color and the font used across DockSide.",
+        Page::MenuBar => "Change the look of the bar across the top of the screen, and what it shows.",
+        Page::ControlCenter => "Choose the controls that Control Center shows.",
+        Page::Island => "Live activities, alerts and a shelf for files, in a pill at the top of the screen.",
+        Page::Dock => "Change the Dock's size, look and behavior, and choose the apps pinned to it.",
+        Page::Launchpad => "Choose the launcher that opens from the Dock, Spotlight and the keyboard.",
+        Page::Spotlight => "Find apps, files and answers from anywhere, and search the web.",
+        Page::Windows => "Choose how windows move when they minimize, open and close.",
+        Page::Desktops => "Switch between virtual desktops from the keyboard.",
+        Page::Finder => "Choose how Finder windows look and what they show.",
+        Page::Widgets => "Add widgets to the desktop and choose how they look.",
+        Page::Calendars => "Connect your calendars to see events in the menu bar and the Dynamic Island.",
+    }
+}
+
+/// The glyph (Segoe Fluent Icons) and tint of the badge before a switch's
+/// label, for the lists that are easier to scan with one.
+fn row_icon(key: Key) -> Option<(&'static str, Color)> {
+    const BLUE: Color = Color::rgba(0, 122, 255, 1.0);
+    const GREEN: Color = Color::rgba(52, 199, 89, 1.0);
+    const ORANGE: Color = Color::rgba(255, 149, 0, 1.0);
+    const RED: Color = Color::rgba(255, 59, 48, 1.0);
+    const PINK: Color = Color::rgba(255, 45, 85, 1.0);
+    const PURPLE: Color = Color::rgba(88, 86, 214, 1.0);
+    const TEAL: Color = Color::rgba(48, 176, 199, 1.0);
+    const GRAY: Color = Color::rgba(142, 142, 147, 1.0);
+    const DARK: Color = Color::rgba(58, 58, 60, 1.0);
+    Some(match key {
+        Key::MbBattery => ("\u{E83F}", GREEN),
+        Key::MbBatteryPct => ("%", GREEN),
+        Key::MbWifi => ("\u{E701}", BLUE),
+        Key::MbSearch => ("\u{E721}", GRAY),
+        Key::MbControlCenter => ("\u{E713}", GRAY),
+        Key::MbTray => ("\u{E712}", DARK),
+        Key::DesktopsIsland => ("\u{E7C4}", PURPLE),
+        Key::Island(name) => match name {
+            "now_playing" => ("\u{E768}", PINK),
+            "lyrics" => ("\u{EC4F}", PINK),
+            "timers" => ("\u{E916}", ORANGE),
+            "downloads" | "download_alerts" => ("\u{E896}", BLUE),
+            "calendar" => ("\u{E787}", RED),
+            "claude_code" => ("\u{E943}", ORANGE),
+            "live_activities" => ("\u{E9D9}", TEAL),
+            "shelf" => ("\u{E8B7}", BLUE),
+            "volume" => ("\u{E767}", PINK),
+            "brightness" => ("\u{E706}", ORANGE),
+            "charging" => ("\u{E945}", GREEN),
+            "low_battery" => ("\u{E851}", RED),
+            "caps_lock" => ("\u{E765}", GRAY),
+            "do_not_disturb" => ("\u{E708}", PURPLE),
+            "notifications" => ("\u{EA8F}", RED),
+            "bluetooth" => ("\u{E702}", BLUE),
+            "privacy_indicators" => ("\u{E720}", GREEN),
+            "screenshots" => ("\u{E722}", DARK),
+            _ => return None,
+        },
+        Key::Control(name) => match name {
+            "wifi" => ("\u{E701}", BLUE),
+            "now_playing" => ("\u{E768}", PINK),
+            "bluetooth" => ("\u{E702}", BLUE),
+            "nearby_sharing" => ("\u{E72D}", TEAL),
+            "focus" => ("\u{E708}", PURPLE),
+            "project" => ("\u{E7F4}", DARK),
+            "cast" => ("\u{EC15}", BLUE),
+            "display" => ("\u{E706}", ORANGE),
+            "sound" => ("\u{E767}", PINK),
+            "dark_mode" => ("\u{E793}", DARK),
+            "calculator" => ("\u{E8EF}", ORANGE),
+            "timer" => ("\u{E916}", ORANGE),
+            "screenshot" => ("\u{E722}", DARK),
+            "screenshot_mode" => ("\u{E7B3}", PURPLE),
+            "airplane_mode" => ("\u{E709}", ORANGE),
+            "energy_saver" => ("\u{E83F}", GREEN),
+            "night_light" => ("\u{E706}", ORANGE),
+            "hotspot" => ("\u{E704}", GREEN),
+            "live_captions" => ("\u{E7F0}", DARK),
+            "accessibility" => ("\u{E776}", BLUE),
+            "keyboard" => ("\u{E765}", GRAY),
+            "vpn" => ("\u{E705}", BLUE),
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
 
 /// macOS accent colors: blue, purple, pink, red, orange, yellow, green, graphite.
 const ACCENTS: [&str; 8] = ["#007AFF", "#A550A7", "#F74F9E", "#FF5257", "#F7821B", "#FFC600", "#62BA46", "#8C8C8C"];
@@ -306,9 +415,10 @@ fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
         Row::Toggle(l, _) | Row::Slider(l, _) | Row::Keybind(l, _) | Row::Text(l, _, _) | Row::Swatches(l) | Row::Info(l, _) | Row::Note(l) => {
             l.to_string()
         }
-        Row::Segmented(l, key) => format!("{l} {}", SettingsWindow::segments(fonts, *key, cfg).0.join(" ")),
+        Row::Segmented(l, key) | Row::Picker(l, key) => format!("{l} {}", SettingsWindow::segments(fonts, *key, cfg).0.join(" ")),
         Row::Buttons(l, buttons) => buttons.iter().fold(l.to_string(), |s, (b, _)| s + " " + b),
         Row::Tiles(buttons, _) => buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>().join(" "),
+        Row::Widgets(start) => gallery(*start).iter().map(|k| crate::widgets::title(*k)).collect::<Vec<_>>().join(" "),
         Row::Named(l, b, _) => format!("{l} {b}"),
         Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
         Row::Excluded(i) => cfg.windows.no_inject.get(*i).map_or_else(String::new, |e| format!("Excluded {e}")),
@@ -578,6 +688,11 @@ pub(crate) enum Hit {
     Close,
     Minimize,
     Page(Page),
+    /// The toolbar's back and forward buttons.
+    Back,
+    Forward,
+    /// A search result's heading: goes to its page.
+    Result(Page),
     /// The sidebar's search field, and its clear button.
     Search,
     ClearSearch,
@@ -635,6 +750,10 @@ pub(crate) enum Anim {
     SegX(Key),
     SegW(Key),
     Swatch(usize),
+    /// A picker thumbnail's selection ring.
+    Pick(Key, usize),
+    /// Parts of a page's live preview easing between states (see `art`).
+    Art(u8),
     Lights,
     /// Setup Assistant: progress dots (current, hovered) and footer buttons.
     Dot(usize),
@@ -648,6 +767,9 @@ const KNOB_FEEL: (f32, f32) = (0.2, 0.86);
 pub(crate) enum Row {
     Toggle(&'static str, Key),
     Segmented(&'static str, Key),
+    /// The same choice as a segmented control, each option drawn as a
+    /// thumbnail of what it does (see `art::thumb`).
+    Picker(&'static str, Key),
     Slider(&'static str, Key),
     Swatches(&'static str),
     App(usize),
@@ -655,7 +777,11 @@ pub(crate) enum Row {
     Excluded(usize),
     Buttons(&'static str, Vec<(&'static str, Hit)>),
     /// Buttons of one width in columns across the card (the count), filled from the left.
+    #[allow(dead_code)]
     Tiles(Vec<(&'static str, Hit)>, usize),
+    /// A row of the widget gallery: pictures of `WIDGETS_PER_ROW` kinds from
+    /// this index of `widgets::KINDS`, each adding its widget.
+    Widgets(usize),
     /// A label of its own (an app's name) with one button.
     Named(String, &'static str, Hit),
     Info(&'static str, String),
@@ -671,6 +797,17 @@ pub(crate) enum Row {
 
 /// An account row: name over its status.
 const ACCOUNT_H: f32 = 52.0;
+
+const WIDGETS_PER_ROW: usize = 5;
+/// A widget gallery tile, and the row holding it with its caption.
+const WIDGET_TILE: f32 = 62.0;
+const WIDGETS_H: f32 = 96.0;
+
+/// The widget kinds in the gallery row starting at `start`.
+fn gallery(start: usize) -> &'static [crate::config::WidgetKind] {
+    let kinds = &crate::widgets::KINDS;
+    &kinds[start.min(kinds.len())..(start + WIDGETS_PER_ROW).min(kinds.len())]
+}
 
 thread_local! {
     /// How many lines each note wraps to (by its text's address), as last measured.
@@ -697,6 +834,32 @@ pub(crate) fn measure_notes(gfx: &Gfx, theme: &Theme, rows: &[Row], card_w: f32)
     }
 }
 
+/// How many lines `text` wraps to in a box `w` wide (as first measured, by the text's address).
+fn block_lines(gfx: &Gfx, text: &'static str, format: &IDWriteTextFormat, w: f32) -> u8 {
+    use windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS;
+    let key = text.as_ptr() as usize;
+    if let Some(lines) = NOTE_LINES.with(|n| n.borrow().get(&key).copied()) {
+        return lines;
+    }
+    let mut m = DWRITE_TEXT_METRICS::default();
+    let lines = match gfx.layout(text, format, w, 1000.0) {
+        Some(l) if unsafe { l.GetMetrics(&mut m) }.is_ok() => m.lineCount.clamp(1, 8) as u8,
+        _ => 2,
+    };
+    NOTE_LINES.with(|n| n.borrow_mut().insert(key, lines));
+    lines
+}
+
+/// A picker thumbnail's caption: the choice's name, less what the picture already says.
+fn caption(key: Key, label: &str) -> String {
+    match key {
+        Key::ShortcutStyle => label.split("  ").next().unwrap_or(label).to_string(),
+        Key::LaunchpadDock | Key::LaunchpadSpotlight | Key::LaunchpadHotkeyOpens => label.split(" (").next().unwrap_or(label).to_string(),
+        Key::Font => label.replace(" Variable Text", ""),
+        _ => label.to_string(),
+    }
+}
+
 impl Row {
     pub(crate) fn height(&self) -> f32 {
         match self {
@@ -706,6 +869,8 @@ impl Row {
                 16.0 + 16.0 * lines as f32
             }
             Row::Account(_) => ACCOUNT_H,
+            Row::Widgets(_) => WIDGETS_H,
+            Row::Picker(label, _) => (if label.is_empty() { 12.0 } else { 36.0 }) + PICK_H + PICK_CAPTION + 9.0,
             _ => ROW_H,
         }
     }
@@ -719,6 +884,26 @@ pub(crate) fn rows_height(rows: &[Row]) -> f32 {
 struct Group {
     title: Option<&'static str>,
     rows: Vec<Row>,
+}
+
+/// A card in the content area: a page's group, or (searching) the rows of
+/// one that match, headed by where they are.
+struct Section {
+    /// Search results: the page they're on.
+    page: Option<Page>,
+    title: Option<String>,
+    rows: Vec<Row>,
+}
+
+impl Section {
+    /// Height of the heading above the card.
+    fn heading(&self) -> f32 {
+        match (&self.title, self.page) {
+            (None, _) => 0.0,
+            (Some(_), Some(_)) => 32.0,
+            (Some(_), None) => 26.0,
+        }
+    }
 }
 
 pub enum SettingsEvent {
@@ -840,6 +1025,8 @@ pub(crate) struct Style {
     right: IDWriteTextFormat,
     center: IDWriteTextFormat,
     button: IDWriteTextFormat,
+    caption_on: IDWriteTextFormat,
+    glyph: IDWriteTextFormat,
     pub card_bg: Color,
     pub card_border: Color,
     pub control_bg: Color,
@@ -856,6 +1043,8 @@ impl Style {
             right: gfx.format(&theme.font, 13.0, Weight::Regular, Align::Trailing),
             center: gfx.format(&theme.font, 12.0, Weight::Regular, Align::Center),
             button: gfx.format(&theme.font, 13.0, Weight::Regular, Align::Center),
+            caption_on: gfx.format(&theme.font, 12.0, Weight::SemiBold, Align::Center),
+            glyph: gfx.format("Segoe Fluent Icons", 12.0, Weight::Regular, Align::Center),
             card_bg: if dark { Color::rgba(44, 44, 46, 1.0) } else { Color::WHITE },
             card_border: if dark { Color::gray(255, 0.07) } else { Color::gray(0, 0.07) },
             control_bg: if dark { Color::gray(255, 0.1) } else { Color::gray(0, 0.06) },
@@ -883,6 +1072,8 @@ pub(crate) struct RowCtx<'a> {
     pub recording: Option<&'a Recording>,
     /// The window's springs; without them controls jump straight to their state.
     pub motion: Option<&'a Motion<Anim>>,
+    /// Badges before the switches that have one (see `row_icon`).
+    pub icons: bool,
 }
 
 impl RowCtx<'_> {
@@ -895,20 +1086,38 @@ impl RowCtx<'_> {
         let on = self.hover == Some(hit);
         self.motion.map_or(if on { 1.0 } else { 0.0 }, |m| m.fade(Anim::Hover(hit), on))
     }
+
+    /// A slider setting's value as it shows right now: mid-drag, just
+    /// released, or as saved.
+    fn live(&self, key: Key) -> f32 {
+        if let Some(s) = self.slider.filter(|s| s.key == key) {
+            return s.value();
+        }
+        match self.pending.filter(|p| p.0 == key) {
+            Some((_, v)) => v,
+            None => SettingsWindow::slider_spec(key, self.cfg).0,
+        }
+    }
 }
 
-/// A card holding `rows`, `ROW_H` each, with hairlines between them.
+const CARD_RADIUS: f32 = 12.0;
+
+/// A card holding `rows`, with hairlines between them.
 pub(crate) fn draw_card(p: &Painter, card: Rect, rows: &[Row], ctx: &RowCtx, hits: &mut Vec<(Rect, Hit)>) {
     let s = ctx.style;
-    p.fill_round(card, 10.0, s.card_bg);
-    p.stroke_round(card.inset(0.25, 0.25), 10.0, s.card_border, 0.5);
+    p.fill_round(card, CARD_RADIUS, s.card_bg);
+    p.stroke_round(card.inset(0.25, 0.25), CARD_RADIUS, s.card_border, 0.5);
+    // In a list of badged switches, the rows without a badge line up with the labels.
+    let badged = ctx.icons && rows.iter().any(|r| matches!(r, Row::Toggle(_, key) if row_icon(*key).is_some()));
+    let indent = if badged { 30.0 } else { 0.0 };
     let mut y = card.y;
     for (i, row) in rows.iter().enumerate() {
         let r = Rect::new(card.x, y, card.w, row.height());
-        if i > 0 {
-            p.line(r.x + 14.0, r.y, r.right() - 14.0, r.y, s.card_border, 1.0);
+        let in_gallery = matches!(row, Row::Widgets(_)) && i > 0 && matches!(rows[i - 1], Row::Widgets(_));
+        if i > 0 && !in_gallery {
+            p.line(r.x + 14.0 + indent, r.y, r.right() - 14.0, r.y, s.card_border, 1.0);
         }
-        draw_row(p, row, r, ctx, hits);
+        draw_row(p, row, r, indent, ctx, hits);
         y += r.h;
     }
 }
@@ -947,6 +1156,9 @@ pub struct SettingsWindow {
     canvas: Canvas,
     scale: f32,
     page: Page,
+    /// Pages visited before this one, and those gone back from (the toolbar's arrows).
+    back: Vec<Page>,
+    fwd: Vec<Page>,
     /// Smooth (eased) scrolling of the page content.
     scroll: Scroll,
     max_scroll: f32,
@@ -1003,6 +1215,8 @@ impl SettingsWindow {
             canvas: Canvas::new(gfx, w, h, s)?,
             scale: s,
             page,
+            back: Vec::new(),
+            fwd: Vec::new(),
             scroll: Scroll::default(),
             max_scroll: 0.0,
             hits: Vec::new(),
@@ -1047,7 +1261,9 @@ impl SettingsWindow {
         if self.scroll.tick(dt) {
             part = Some(Self::viewport());
         }
-        if self.side_glide.tick(dt) | self.sel_glide.tick(dt) {
+        // The step a glide comes to rest on still moved it: that needs its frame too.
+        let gliding = self.side_glide.moving() | self.sel_glide.moving();
+        if self.side_glide.tick(dt) | self.sel_glide.tick(dt) | gliding {
             let b = Self::body();
             let side = Rect::new(b.x, b.y, SIDEBAR, b.h);
             part = Some(part.map_or(side, |p| p.union(side)));
@@ -1077,10 +1293,39 @@ impl SettingsWindow {
 
     fn go_to(&mut self, page: Page) {
         if page != self.page {
+            self.back.push(self.page);
+            self.fwd.clear();
             self.page = page;
             self.scroll.jump(0.0);
         }
         self.dirty = true;
+    }
+
+    /// Back (or forward) through the pages visited, like a browser. Back
+    /// from search results returns to the page they were covering.
+    pub fn navigate(&mut self, back: bool) {
+        self.dirty = true;
+        if self.searching() {
+            if back {
+                self.search.clear();
+                self.search_focus = false;
+                self.scroll.jump(0.0);
+            }
+            return;
+        }
+        let (from, to) = if back { (&mut self.back, &mut self.fwd) } else { (&mut self.fwd, &mut self.back) };
+        if let Some(page) = from.pop() {
+            to.push(self.page);
+            self.page = page;
+            self.scroll.jump(0.0);
+        }
+    }
+
+    /// Where page `k` of `PAGES` sits in the sidebar.
+    fn page_row(k: usize) -> Rect {
+        let pane = chrome::sidebar_pane(Self::body(), SIDEBAR);
+        let gaps = SECTIONS.iter().filter(|&&s| s <= k).count() as f32;
+        Rect::new(pane.x + 8.0, pane.y + 82.0 + k as f32 * PAGE_PITCH + gaps * SECTION_GAP, pane.w - 16.0, 30.0)
     }
 
     pub fn scale(&self) -> f32 {
@@ -1123,12 +1368,16 @@ impl SettingsWindow {
 
     /// What the content area shows: the current page's groups, or while
     /// searching, the matching rows from every page under "Page › Group" headings.
-    fn sections(&self, cfg: &Config) -> Vec<(Option<String>, Vec<Row>)> {
+    fn sections(&self, cfg: &Config) -> Vec<Section> {
         let query = self.search.string();
         if query.trim().is_empty() {
-            return self.page_groups(self.page, cfg).into_iter().map(|g| (g.title.map(str::to_string), g.rows)).collect();
+            return self
+                .page_groups(self.page, cfg)
+                .into_iter()
+                .map(|g| Section { page: None, title: g.title.map(str::to_string), rows: g.rows })
+                .collect();
         }
-        self.search_results(&query, cfg).into_iter().map(|(_, title, rows)| (Some(title), rows)).collect()
+        self.search_results(&query, cfg).into_iter().map(|(page, title, rows)| Section { page: Some(page), title: Some(title), rows }).collect()
     }
 
     /// Rows matching every word of `query` (in the page name, group title or
@@ -1182,8 +1431,8 @@ impl SettingsWindow {
 
     /// The sidebar's search field.
     fn search_rect() -> Rect {
-        let b = Self::body();
-        Rect::new(b.x + 10.0, b.y + 44.0, SIDEBAR - 20.0, 28.0)
+        let pane = chrome::sidebar_pane(Self::body(), SIDEBAR);
+        Rect::new(pane.x + 10.0, pane.y + 38.0, pane.w - 20.0, 30.0)
     }
 
     fn page_groups(&self, page: Page, cfg: &Config) -> Vec<Group> {
@@ -1194,7 +1443,7 @@ impl SettingsWindow {
                     rows: vec![
                         Row::Toggle("Start DockSide at login", Key::StartAtLogin),
                         Row::Toggle("Hide the Windows taskbar", Key::HideTaskbar),
-                        Row::Segmented("Shortcut hints in menus", Key::ShortcutStyle),
+                        Row::Picker("Shortcut hints in menus", Key::ShortcutStyle),
                     ],
                 },
                 Group {
@@ -1212,24 +1461,6 @@ impl SettingsWindow {
                         "Run as administrator (works with admin apps)",
                         vec![(if self.admin { "Turn Off" } else { "Turn On…" }, Hit::RunAsAdmin)],
                     )],
-                },
-                Group {
-                    title: Some("Spotlight"),
-                    rows: {
-                        let mut rows = vec![
-                            Row::Toggle("Spotlight search", Key::SpotlightEnabled),
-                            Row::Keybind("Keyboard shortcut", Key::SpotlightHotkey),
-                            Row::Segmented("Background", Key::SpotlightBackdrop),
-                        ];
-                        if keybind::Hotkey::parse(&cfg.spotlight.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN)) {
-                            rows.push(Row::Info("Start menu", "Double-tap Win".to_string()));
-                        }
-                        rows.push(Row::Segmented("Web search", Key::SearchEngine));
-                        if cfg.spotlight.search_engine.eq_ignore_ascii_case("custom") {
-                            rows.push(Row::Text("Search URL", Key::CustomSearchUrl, "https://example.com/search?q=%s"));
-                        }
-                        rows
-                    },
                 },
                 Group {
                     title: Some("Setup Assistant"),
@@ -1254,15 +1485,32 @@ impl SettingsWindow {
                     },
                 },
             ],
-            Page::Appearance => vec![
+            Page::Spotlight => vec![
                 Group {
                     title: None,
-                    rows: vec![
-                        Row::Segmented("Appearance", Key::Appearance),
-                        Row::Swatches("Accent color"),
-                        Row::Segmented("Font", Key::Font),
-                    ],
+                    rows: {
+                        let mut rows = vec![Row::Toggle("Spotlight search", Key::SpotlightEnabled), Row::Keybind("Keyboard shortcut", Key::SpotlightHotkey)];
+                        if keybind::Hotkey::parse(&cfg.spotlight.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN)) {
+                            rows.push(Row::Info("Start menu", "Double-tap Win".to_string()));
+                        }
+                        rows
+                    },
                 },
+                Group { title: Some("Appearance"), rows: vec![Row::Picker("Background", Key::SpotlightBackdrop)] },
+                Group {
+                    title: Some("Web search"),
+                    rows: {
+                        let mut rows = vec![Row::Segmented("Search the web with", Key::SearchEngine)];
+                        if cfg.spotlight.search_engine.eq_ignore_ascii_case("custom") {
+                            rows.push(Row::Text("Search URL", Key::CustomSearchUrl, "https://example.com/search?q=%s"));
+                        }
+                        rows
+                    },
+                },
+            ],
+            Page::Appearance => vec![
+                Group { title: None, rows: vec![Row::Picker("", Key::Appearance)] },
+                Group { title: Some("Theme"), rows: vec![Row::Swatches("Accent color"), Row::Picker("Font", Key::Font)] },
                 Group {
                     title: Some("Liquid Glass"),
                     rows: vec![
@@ -1274,19 +1522,21 @@ impl SettingsWindow {
             Page::MenuBar => vec![
                 Group {
                     title: None,
+                    rows: vec![Row::Toggle("Show menu bar", Key::MbEnabled), Row::Toggle("Keep windows below the menu bar", Key::MbReserve)],
+                },
+                Group {
+                    title: Some("Appearance"),
                     rows: vec![
-                        Row::Toggle("Show menu bar", Key::MbEnabled),
-                        Row::Segmented("Background", Key::MbBackdrop),
+                        Row::Picker("Background", Key::MbBackdrop),
                         Row::Slider("Size", Key::MbHeight),
-                        Row::Segmented("Logo", Key::MbLogo),
+                        Row::Picker("Logo", Key::MbLogo),
                         Row::Segmented("Clock", Key::MbClock),
-                        Row::Toggle("Keep windows below the menu bar", Key::MbReserve),
                     ],
                 },
                 Group {
                     title: Some("Displays"),
                     rows: vec![
-                        Row::Segmented("Show menu bar on", Key::MbDisplays),
+                        Row::Picker("Show menu bar on", Key::MbDisplays),
                         Row::Note(
                             "With a menu bar on every display, the bars on displays without the active window are dimmed.",
                         ),
@@ -1322,22 +1572,26 @@ impl SettingsWindow {
             Page::Island => vec![
                 Group {
                     title: None,
+                    rows: vec![Row::Toggle("Show Dynamic Island", Key::Island("enabled")), Row::Toggle("Always show the island", Key::Island("always_show"))],
+                },
+                Group {
+                    title: Some("Appearance"),
                     rows: vec![
-                        Row::Toggle("Show Dynamic Island", Key::Island("enabled")),
-                        Row::Toggle("Always show the island", Key::Island("always_show")),
-                        Row::Toggle("Expand when hovered", Key::Island("expand_on_hover")),
+                        Row::Picker("Style", Key::IslandStyle),
+                        Row::Picker("Finish when open", Key::IslandFinish),
+                        Row::Slider("Vertical offset", Key::IslandOffset),
                     ]
                     .into_iter()
-                    .chain(cfg.island.expand_on_hover.then_some(Row::Segmented("Expand after", Key::IslandHoverDelay)))
-                    .chain([
-                        Row::Segmented("Fold away after", Key::IslandCollapseDelay),
-                        Row::Segmented("Style", Key::IslandStyle),
-                        Row::Segmented("Finish", Key::IslandFinish),
-                        Row::Slider("Vertical offset", Key::IslandOffset),
-                    ])
                     // Which display, once there's a choice.
                     .chain((crate::win::displays::current().len() > 1).then_some(Row::Segmented("Display", Key::IslandDisplay)))
                     .collect(),
+                },
+                Group {
+                    title: Some("Opening"),
+                    rows: std::iter::once(Row::Toggle("Expand when hovered", Key::Island("expand_on_hover")))
+                        .chain(cfg.island.expand_on_hover.then_some(Row::Segmented("Expand after", Key::IslandHoverDelay)))
+                        .chain([Row::Segmented("Fold away after", Key::IslandCollapseDelay)])
+                        .collect(),
                 },
                 Group {
                     title: Some("Activities"),
@@ -1442,12 +1696,15 @@ impl SettingsWindow {
             Page::Launchpad => vec![
                 Group {
                     title: None,
+                    rows: vec![
+                        Row::Picker("The Dock's Launchpad opens", Key::LaunchpadDock),
+                        Row::Segmented("Spotlight's Apps button opens", Key::LaunchpadSpotlight),
+                    ],
+                },
+                Group {
+                    title: None,
                     rows: {
-                        let mut rows = vec![
-                            Row::Segmented("The Dock's Launchpad opens", Key::LaunchpadDock),
-                            Row::Segmented("Spotlight's Apps button opens", Key::LaunchpadSpotlight),
-                            Row::Keybind("Keyboard shortcut", Key::LaunchpadHotkey),
-                        ];
+                        let mut rows = vec![Row::Keybind("Keyboard shortcut", Key::LaunchpadHotkey)];
                         if keybind::Hotkey::parse(&cfg.launchpad.hotkey) == Some(keybind::Hotkey::Tap(keybind::WIN)) {
                             rows.push(Row::Info("Start menu", "Double-tap Win".to_string()));
                         }
@@ -1481,31 +1738,38 @@ impl SettingsWindow {
             Page::Dock => vec![
                 Group {
                     title: None,
+                    rows: std::iter::once(Row::Toggle("Show Dock", Key::DockEnabled))
+                        .chain([Row::Toggle("Automatically hide and show the Dock", Key::DockAutohide)])
+                        // A refinement of auto-hide, so only offered while it's on.
+                        .chain(cfg.dock.autohide.then_some(Row::Toggle("Always show on the desktop", Key::DockShowOnDesktop)))
+                        .collect(),
+                },
+                Group {
+                    title: Some("Size"),
                     rows: vec![
-                        Row::Toggle("Show Dock", Key::DockEnabled),
                         Row::Slider("Size", Key::DockSize),
                         Row::Toggle("Magnification", Key::DockMag),
                         Row::Slider("Magnified size", Key::DockMagSize),
                         Row::Slider("Item spacing", Key::DockSpacing),
                         Row::Slider("Vertical offset", Key::DockOffset),
-                        Row::Toggle("Automatically hide and show the Dock", Key::DockAutohide),
-                    ]
-                    .into_iter()
-                    // A refinement of auto-hide, so only offered while it's on.
-                    .chain(cfg.dock.autohide.then_some(Row::Toggle("Always show on the desktop", Key::DockShowOnDesktop)))
-                    .chain([
-                        Row::Segmented("Icon style", Key::DockIconStyle),
-                        Row::Segmented("Background", Key::DockBackdrop),
+                    ],
+                },
+                Group {
+                    title: Some("Appearance"),
+                    rows: vec![
+                        Row::Picker("Icon style", Key::DockIconStyle),
+                        Row::Picker("Background", Key::DockBackdrop),
                         Row::Toggle("Shadow", Key::DockShadow),
                         Row::Toggle("Border", Key::DockBorder),
-                        Row::Toggle("Show running apps", Key::DockRunning),
-                        Row::Toggle("Show Trash", Key::DockTrash),
-                    ])
-                    .collect(),
+                    ],
+                },
+                Group {
+                    title: Some("In the Dock"),
+                    rows: vec![Row::Toggle("Show running apps", Key::DockRunning), Row::Toggle("Show Trash", Key::DockTrash)],
                 },
                 Group {
                     title: Some("Displays"),
-                    rows: std::iter::once(Row::Segmented("Show Dock on", Key::DockDisplays))
+                    rows: std::iter::once(Row::Picker("Show Dock on", Key::DockDisplays))
                         // Only with a Dock on each display.
                         .chain(
                             (cfg.dock.displays == DisplayMode::All)
@@ -1544,7 +1808,7 @@ impl SettingsWindow {
                 vec![
                     Group {
                         title: Some("Minimizing"),
-                        rows: std::iter::once(Row::Segmented("Minimize windows using", Key::MinimizeEffect))
+                        rows: std::iter::once(Row::Picker("Minimize windows using", Key::MinimizeEffect))
                             // Restoring plays the minimize backwards, so only with one of ours.
                             .chain(custom_min.then_some(Row::Toggle("Animate windows restoring from the Dock", Key::WinRestore)))
                             .collect(),
@@ -1552,11 +1816,11 @@ impl SettingsWindow {
                     Group {
                         title: Some("Opening and closing"),
                         rows: vec![
-                            Row::Segmented("Opening windows", Key::OpenEffect),
-                            Row::Segmented("Closing windows", Key::CloseEffect),
+                            Row::Picker("Opening windows", Key::OpenEffect),
+                            Row::Picker("Closing windows", Key::CloseEffect),
                         ],
                     },
-                    Group { title: None, rows: vec![Row::Segmented("Animation speed", Key::WinSpeed)] },
+                    Group { title: Some("Speed"), rows: vec![Row::Segmented("Animation speed", Key::WinSpeed)] },
                     Group {
                         title: Some("Excluded apps"),
                         rows: (0..cfg.windows.no_inject.len())
@@ -1577,9 +1841,11 @@ impl SettingsWindow {
             Page::Finder => vec![
                 Group {
                     title: None,
+                    rows: vec![Row::Picker("New windows open in", Key::FinderView), Row::Picker("Sidebar", Key::FinderSidebar)],
+                },
+                Group {
+                    title: Some("Files"),
                     rows: vec![
-                        Row::Segmented("Sidebar", Key::FinderSidebar),
-                        Row::Segmented("New windows open in", Key::FinderView),
                         Row::Toggle("Show hidden files", Key::FinderHidden),
                         Row::Toggle("Win+E opens Finder instead of File Explorer", Key::FinderWinE),
                         Row::Segmented("Windows menu items", Key::FinderShellItems),
@@ -1588,17 +1854,13 @@ impl SettingsWindow {
             ],
             Page::Calendars => calendar_groups(),
             Page::Widgets => {
-                use crate::widgets::{title, KINDS};
-                let add = |kinds: &[crate::config::WidgetKind]| {
-                    Row::Tiles(kinds.iter().map(|&k| (title(k), Hit::AddWidget(k))).collect(), 3)
-                };
                 let count = cfg.widgets.items.len();
                 vec![
                     Group {
                         title: None,
                         rows: vec![
                             Row::Toggle("Show widgets on the desktop", Key::WidgetsEnabled),
-                            Row::Segmented("Background", Key::WidgetsBackdrop),
+                            Row::Picker("Background", Key::WidgetsBackdrop),
                             Row::Info(
                                 "On the desktop",
                                 match count {
@@ -1611,14 +1873,11 @@ impl SettingsWindow {
                     },
                     Group {
                         title: Some("Add a widget"),
-                        rows: vec![
-                            add(&KINDS[..3]),
-                            add(&KINDS[3..6]),
-                            add(&KINDS[6..9]),
-                            add(&KINDS[9..12]),
-                            add(&KINDS[12..]),
-                            Row::Buttons("Start over with the default widgets", vec![("Reset Widgets…", Hit::ResetWidgets)]),
-                        ],
+                        rows: (0..crate::widgets::KINDS.len())
+                            .step_by(WIDGETS_PER_ROW)
+                            .map(Row::Widgets)
+                            .chain([Row::Buttons("Start over with the default widgets", vec![("Reset Widgets…", Hit::ResetWidgets)])])
+                            .collect(),
                     },
                     Group {
                         title: Some("Weather"),
@@ -2005,6 +2264,11 @@ impl SettingsWindow {
             } else {
                 return SettingsEvent::Close;
             }
+        } else if matches!(vk, 0x26 | 0x28) && !self.searching() {
+            // Up and Down walk the sidebar.
+            let k = PAGES.iter().position(|p| p.0 == self.page).unwrap_or(0);
+            let next = if vk == 0x26 { k.saturating_sub(1) } else { (k + 1).min(PAGES.len() - 1) };
+            self.go_to(PAGES[next].0);
         } else if self.search_focus {
             match self.search.on_key(vk, ctrl, shift) {
                 crate::finder::text::KeyResult::Edited => self.search_changed(),
@@ -2165,7 +2429,11 @@ impl SettingsWindow {
                 self.window.minimize();
                 return SettingsEvent::None;
             }
-            Hit::Page(p) => {
+            Hit::Back | Hit::Forward => {
+                self.navigate(hit == Hit::Back);
+                return SettingsEvent::None;
+            }
+            Hit::Page(p) | Hit::Result(p) => {
                 // Picking a page ends the search.
                 if !self.search.is_empty() {
                     self.search.clear();
@@ -2272,6 +2540,8 @@ impl SettingsWindow {
         let (regular, control_bg) = (&style.regular, style.control_bg);
         let title_font = gfx.format(&theme.font, 15.0, Weight::Bold, Align::Leading);
         let header_font = gfx.format(&theme.font, 12.0, Weight::Bold, Align::Leading);
+        let name_font = gfx.format(&theme.font, 17.0, Weight::Bold, Align::Leading);
+        let name_center = gfx.format(&theme.font, 20.0, Weight::Bold, Align::Center);
         let glyph_font = gfx.format("Segoe Fluent Icons", 12.0, Weight::Regular, Align::Center);
 
         let searching = self.searching();
@@ -2310,24 +2580,27 @@ impl SettingsWindow {
 
         let groups = self.sections(cfg);
         // While searching, pages with nothing matching dim in the sidebar.
-        let found: Vec<Page> = if searching {
-            self.search_results(&self.search.string(), cfg).into_iter().map(|r| r.0).collect()
-        } else {
-            vec![]
-        };
+        let found: Vec<Page> = groups.iter().filter_map(|s| s.page).collect();
         let body = Self::body();
+        let pane = chrome::sidebar_pane(body, SIDEBAR);
         let content_x = body.x + SIDEBAR + CONTENT_PAD;
         let content_w = body.w - SIDEBAR - 2.0 * CONTENT_PAD;
         let viewport = Self::viewport();
 
         for g in &groups {
-            measure_notes(gfx, theme, &g.1, content_w);
+            measure_notes(gfx, theme, &g.rows, content_w);
         }
+        // The page's header: its live preview or its icon, then its name and what it's for.
+        let blurb_font = gfx.format_block(&theme.font, 12.5, Weight::Regular, Align::Center);
+        let header = (!searching).then(|| {
+            let blurb = page_blurb(self.page);
+            let lines = block_lines(gfx, blurb, &blurb_font, content_w - 96.0);
+            let name_y = if art::has_preview(self.page) { 12.0 + PREVIEW_H + 14.0 } else { 20.0 + 56.0 + 10.0 };
+            (blurb, name_y, name_y + 30.0 + 17.0 * lines as f32 + 16.0)
+        });
         // Measure content height for scrolling.
-        let content_h: f32 = groups
-            .iter()
-            .map(|g| if g.0.is_some() { 26.0 } else { 0.0 } + rows_height(&g.1) + 20.0)
-            .sum::<f32>()
+        let content_h: f32 = groups.iter().map(|g| g.heading() + rows_height(&g.rows) + 20.0).sum::<f32>()
+            + header.map_or(0.0, |h| h.2 + 20.0)
             + 8.0;
         self.max_scroll = (content_h - viewport.h).max(0.0);
         self.scroll.clamp(self.max_scroll);
@@ -2346,16 +2619,19 @@ impl SettingsWindow {
         let mut hits: Vec<(Rect, Hit)> = Vec::new();
         let motion = &self.motion;
         let scroll = self.scroll.offset_px(self.scale);
-        let page_row = |k: usize| Rect::new(body.x + 10.0, body.y + TITLE_H + 32.0 + k as f32 * 32.0, SIDEBAR - 20.0, 30.0);
+        let page_row = Self::page_row;
         let side_target = match self.hover {
-            Some(Hit::Page(pg)) if pg != self.page => PAGES.iter().position(|(p, _)| *p == pg).map(page_row),
+            Some(Hit::Page(pg)) if pg != self.page || searching => PAGES.iter().position(|(p, _)| *p == pg).map(page_row),
             _ => None,
         };
         let side_glide = self.side_glide.update(side_target);
         // No page is selected while the content shows search results.
         let sel_glide = self.sel_glide.update(PAGES.iter().position(|(p, _)| *p == self.page).filter(|_| !searching).map(page_row));
         let (hover, page, slider, pending) = (self.hover, self.page, self.slider, self.pending);
-        let page_title = if searching { "Search Results" } else { PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("") };
+        let page_name = PAGES.iter().find(|p| p.0 == page).map(|p| p.1).unwrap_or("");
+        let page_title = if searching { "Search Results" } else { page_name };
+        // Back also leaves search results; forward has nowhere to go from them.
+        let (can_back, can_forward) = (searching || !self.back.is_empty(), !searching && !self.fwd.is_empty());
         let (search, search_focus) = (&self.search, self.search_focus);
         let query = search.string();
         let ctx = RowCtx {
@@ -2372,11 +2648,20 @@ impl SettingsWindow {
             editing: self.editing.as_ref(),
             recording: self.recording.as_ref(),
             motion: Some(motion),
+            icons: true,
         };
 
         let r = {
             let draw = |p: &Painter| p.scaled_about(zoom_x, zoom_y, zoom, || {
-                chrome::window(p, body, SIDEBAR, theme, &chrome::Palette::new(theme), chrome::RADIUS);
+                // The window, with the sidebar floating over it as a pane of its own (Tahoe).
+                let pal = chrome::Palette::new(theme);
+                chrome::shadow(p, body, theme);
+                p.clear_rect(body.inset(4.0, 4.0));
+                p.fill_round(body, chrome::RADIUS, pal.content);
+                p.soft_shadow(pane, chrome::PANE_RADIUS, 6, 1.4, 0.02, 2.0, theme.shadow);
+                p.fill_round(pane, chrome::PANE_RADIUS, pal.sidebar);
+                p.stroke_round(pane.inset(0.25, 0.25), chrome::PANE_RADIUS, pal.divider, 0.5);
+                p.stroke_round(body.inset(0.25, 0.25), chrome::RADIUS, theme.menu_border, 0.5);
                 let group_hover = motion.fade(Anim::Lights, matches!(hover, Some(Hit::Close | Hit::Minimize)));
                 for (r, light) in chrome::traffic_lights(p, body, group_hover, false) {
                     hits.push((r, if light == chrome::Light::Close { Hit::Close } else { Hit::Minimize }));
@@ -2386,14 +2671,23 @@ impl SettingsWindow {
                 // page to page. Names under the selection are redrawn white, clipped
                 // to it, so they turn exactly where the highlight is.
                 if let Some((g, a)) = side_glide {
-                    p.fill_round(g, 6.0, control_bg.alpha(control_bg.a * a));
+                    p.fill_round(g, 8.0, control_bg.alpha(control_bg.a * a));
                 }
-                let name_rect = |row: Rect| Rect::new(row.x + 34.0, row.y, row.w - 40.0, row.h);
+                let icon = |row: Rect, pg: Page| {
+                    p.transformed(row.x + 6.0, row.cy() - 11.0, 1.1, || draw_page_icon(p, pg, Rect::new(0.0, 0.0, 20.0, 20.0), &glyph_font))
+                };
+                let name_rect = |row: Rect| Rect::new(row.x + 37.0, row.y, row.w - 43.0, row.h);
+                // A hairline in the gap before each section.
+                for start in SECTIONS {
+                    let row = page_row(start);
+                    let y = row.y - (SECTION_GAP + PAGE_PITCH - row.h) / 2.0;
+                    p.fill_rect(Rect::new(row.x + 8.0, y - 0.5, row.w - 16.0, 1.0), pal.divider);
+                }
                 for (k, (pg, name)) in PAGES.into_iter().enumerate() {
                     let row = page_row(k);
                     let dim = if searching && !found.contains(&pg) { 0.35 } else { 1.0 };
                     p.faded(dim, || {
-                        draw_page_icon(p, pg, Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0), &glyph_font);
+                        icon(row, pg);
                         p.text(name, regular, name_rect(row), theme.text);
                     });
                     hits.push((row, Hit::Page(pg)));
@@ -2401,12 +2695,12 @@ impl SettingsWindow {
                 draw_search(p, Self::search_rect(), search, search_focus, &style, theme, &glyph_font, &mut hits);
                 if let Some((g, a)) = sel_glide {
                     p.faded(a, || {
-                        p.fill_round(g, 6.0, theme.accent);
+                        p.fill_round(g, 8.0, theme.accent);
                         p.clipped(g, || {
                             for (k, (pg, name)) in PAGES.into_iter().enumerate() {
                                 let row = page_row(k);
                                 if row.bottom() > g.y && row.y < g.bottom() {
-                                    draw_page_icon(p, pg, Rect::new(row.x + 6.0, row.cy() - 10.0, 20.0, 20.0), &glyph_font);
+                                    icon(row, pg);
                                     p.text(name, regular, name_rect(row), Color::WHITE);
                                 }
                             }
@@ -2414,19 +2708,80 @@ impl SettingsWindow {
                     });
                 }
 
-                // Toolbar title.
-                p.text(page_title, &title_font, Rect::new(content_x, body.y, content_w, TITLE_H), theme.text);
+                // Toolbar: back and forward sharing a capsule, then where you are.
+                let nav = Rect::new(content_x, body.y + 12.0, 60.0, 28.0);
+                p.fill_round(nav, 14.0, control_bg);
+                for (i, (hit, enabled)) in [(Hit::Back, can_back), (Hit::Forward, can_forward)].into_iter().enumerate() {
+                    let half = Rect::new(nav.x + i as f32 * 30.0, nav.y, 30.0, nav.h);
+                    let hot = if enabled { motion.fade(Anim::Hover(hit), hover == Some(hit)) } else { 0.0 };
+                    if hot > 0.0 {
+                        p.fill_round(half.inset(2.0, 2.0), 12.0, control_bg.alpha(control_bg.a * hot));
+                    }
+                    let c = if enabled { theme.text } else { theme.text_disabled };
+                    // A chevron pointing left (back) or right.
+                    let d = if i == 0 { -1.0 } else { 1.0 };
+                    let (tip, tail, cy) = (half.cx() - d * 0.5 + d * 2.75, half.cx() - d * 0.5 - d * 2.75, half.cy());
+                    p.line(tail, cy - 5.0, tip, cy, c, 1.7);
+                    p.line(tip, cy, tail, cy + 5.0, c, 1.7);
+                    if enabled {
+                        hits.push((half, hit));
+                    }
+                }
+                p.text(page_title, &title_font, Rect::new(nav.right() + 14.0, body.y, content_w - nav.w - 14.0, TITLE_H), theme.text);
 
                 // Scrolling content.
                 p.clipped(viewport, || {
                     let mut y = viewport.y + 8.0 - scroll;
-                    for (title, rows) in &groups {
-                        if let Some(t) = title {
-                            p.text(t, &header_font, Rect::new(content_x + 4.0, y, content_w, 26.0), theme.text_secondary);
-                            y += 26.0;
+                    let visible = |r: Rect| r.bottom() > viewport.y && r.y < viewport.bottom();
+                    let page_icon = |x: f32, y: f32, k: f32, pg: Page| {
+                        p.transformed(x, y, k, || draw_page_icon(p, pg, Rect::new(0.0, 0.0, 20.0, 20.0), &glyph_font))
+                    };
+                    if let Some((blurb, name_y, h)) = header {
+                        let card = Rect::new(content_x, y, content_w, h);
+                        if visible(card) {
+                            p.fill_round(card, CARD_RADIUS, style.card_bg);
+                            p.stroke_round(card.inset(0.25, 0.25), CARD_RADIUS, style.card_border, 0.5);
+                            let name = Rect::new(card.x, card.y + name_y, card.w, 26.0);
+                            if art::has_preview(page) {
+                                art::preview(p, page, Rect::new(card.x + 12.0, card.y + 12.0, card.w - 24.0, PREVIEW_H), &ctx);
+                                // Its icon and name side by side, centred as one.
+                                let tw = gfx.measure(page_name, &name_font);
+                                let x = card.cx() - (24.0 + 9.0 + tw) / 2.0;
+                                page_icon(x, name.y + 1.0, 1.2, page);
+                                p.text(page_name, &name_font, Rect::new(x + 33.0, name.y, tw + 4.0, name.h), theme.text);
+                            } else {
+                                page_icon(card.cx() - 28.0, card.y + 20.0, 2.8, page);
+                                p.text(page_name, &name_center, name, theme.text);
+                            }
+                            p.text(blurb, &blurb_font, Rect::new(card.x + 48.0, name.y + 30.0, card.w - 96.0, h - name_y - 30.0), theme.text_secondary);
                         }
-                        let card = Rect::new(content_x, y, content_w, rows_height(rows));
-                        draw_card(p, card, rows, &ctx, &mut hits);
+                        y += h + 20.0;
+                    }
+                    for s in &groups {
+                        if let Some(t) = &s.title {
+                            match s.page {
+                                // A search result's heading goes to its page.
+                                Some(pg) => {
+                                    let hit = Hit::Result(pg);
+                                    let hot = motion.fade(Anim::Hover(hit), hover == Some(hit));
+                                    let tw = gfx.measure(t, &header_font);
+                                    let line = Rect::new(content_x, y + 4.0, tw + 40.0, 24.0);
+                                    if hot > 0.0 {
+                                        p.fill_round(line, 7.0, control_bg.alpha(control_bg.a * hot));
+                                    }
+                                    page_icon(line.x + 5.0, line.y + 3.0, 0.9, pg);
+                                    p.text(t, &header_font, Rect::new(line.x + 29.0, line.y, tw + 6.0, line.h), theme.text_secondary.mix(theme.text, hot));
+                                    hits.push((line, hit));
+                                }
+                                None => p.text(t, &header_font, Rect::new(content_x + 4.0, y, content_w, 26.0), theme.text_secondary),
+                            }
+                        }
+                        y += s.heading();
+                        let card = Rect::new(content_x, y, content_w, rows_height(&s.rows));
+                        // Cards scrolled out of view aren't drawn (their pictures add up).
+                        if visible(card) {
+                            draw_card(p, card, &s.rows, &ctx, &mut hits);
+                        }
                         y += card.h + 20.0;
                     }
                     if searching && groups.is_empty() {
@@ -2436,14 +2791,28 @@ impl SettingsWindow {
                         p.text(&format!("No Results for \u{201C}{}\u{201D}", query.trim()), &centered, line, theme.text_secondary);
                         p.text("Check the spelling or try a different word.", &style.button, line.offset(0.0, 24.0), theme.text_disabled);
                     }
+                    // A hairline under the toolbar once the page has scrolled beneath it.
+                    let lift = (scroll / 12.0).clamp(0.0, 1.0);
+                    if lift > 0.0 {
+                        p.fill_rect(Rect::new(viewport.x + CONTENT_PAD, viewport.y, viewport.w - 2.0 * CONTENT_PAD, 1.0), pal.divider.alpha(pal.divider.a * lift));
+                    }
                 });
             });
             let part = self.part.take().filter(|_| zoom == 1.0 && window_alpha == 1.0).and_then(|r| self.canvas.part_px(r));
             self.drawn_part = part;
             self.canvas.draw_part(gfx, part, draw)
         };
-        // Content hits outside the viewport (scrolled away) must not be clickable.
-        hits.retain(|(r, h)| matches!(h, Hit::Close | Hit::Minimize | Hit::Page(_) | Hit::Search | Hit::ClearSearch) || (r.y >= viewport.y - 1.0 && r.bottom() <= viewport.bottom() + 1.0));
+        // Content only takes clicks where it shows: hits are cut to the viewport.
+        let hits = hits
+            .into_iter()
+            .filter_map(|(r, h)| {
+                if matches!(h, Hit::Close | Hit::Minimize | Hit::Page(_) | Hit::Back | Hit::Forward | Hit::Search | Hit::ClearSearch) {
+                    return Some((r, h));
+                }
+                let (top, bottom) = (r.y.max(viewport.y), r.bottom().min(viewport.bottom()));
+                (bottom > top).then(|| (Rect::new(r.x, top, r.w, bottom - top), h))
+            })
+            .collect();
         self.hits = hits;
 
         let presented = r.and_then(|_| self.canvas.present_part(self.hwnd, rc.left, rc.top, window_alpha, self.drawn_part));
@@ -2471,17 +2840,26 @@ impl Drop for SettingsWindow {
 }
 
 /// One row's label and control, drawn into `r`.
-fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect, Hit)>) {
+fn draw_row(p: &Painter, row: &Row, r: Rect, indent: f32, ctx: &RowCtx, hits: &mut Vec<(Rect, Hit)>) {
     let (theme, cfg, st) = (ctx.theme, ctx.cfg, ctx.style);
     let (regular, right, center, button_font) = (&st.regular, &st.right, &st.center, &st.button);
     let (card_border, control_bg, selected_seg, switch_off, field_bg) =
         (st.card_border, st.control_bg, st.selected_seg, st.switch_off, st.field_bg);
     let (slider, pending, login, fonts, editing) = (ctx.slider, ctx.pending, ctx.login, ctx.fonts, ctx.editing);
-    let label_r = Rect::new(r.x + 14.0, r.y, r.w * 0.5, r.h);
+    let label_r = Rect::new(r.x + 14.0 + indent, r.y, r.w * 0.5 - indent, r.h);
     let right_edge = r.right() - 14.0;
     match row {
         Row::Toggle(label, key) => {
-            p.text(label, &regular, Rect::new(label_r.x, r.y, r.w - 80.0, r.h), theme.text);
+            let mut x = label_r.x;
+            if let Some((glyph, tint)) = row_icon(*key).filter(|_| ctx.icons) {
+                let badge = Rect::new(r.x + 12.0, r.cy() - 11.0, 22.0, 22.0);
+                p.fill_round(badge, 6.0, tint);
+                // A glyph from the icon font, or a plain character.
+                let font = if glyph.is_ascii() { &st.caption_on } else { &st.glyph };
+                p.text(glyph, font, badge, Color::WHITE);
+                x = badge.right() + 10.0;
+            }
+            p.text(label, &regular, Rect::new(x, r.y, r.right() - 66.0 - x, r.h), theme.text);
             let on = SettingsWindow::toggle_on(login, *key, cfg);
             let t = ctx.anim(Anim::Knob(*key), if on { 1.0 } else { 0.0 }, KNOB_FEEL);
             let track = Rect::new(right_edge - 34.0, r.cy() - 10.0, 34.0, 20.0);
@@ -2519,6 +2897,40 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 p.text(l, &center, seg, theme.text);
                 hits.push((seg, Hit::Segment(*key, i)));
                 sx += w;
+            }
+        }
+        Row::Picker(label, key) => {
+            let (labels, values, sel) = SettingsWindow::segments(fonts, *key, cfg);
+            let mut top = r.y + 12.0;
+            if !label.is_empty() {
+                p.text(label, &regular, Rect::new(label_r.x, r.y + 6.0, r.w - 28.0, 26.0), theme.text);
+                top = r.y + 36.0;
+            }
+            let n = labels.len().max(1) as f32;
+            let tw = ((r.w - 28.0 - PICK_GAP * (n - 1.0)) / n).min(PICK_W);
+            for (i, (l, value)) in labels.iter().zip(&values).enumerate() {
+                let hit = Hit::Segment(*key, i);
+                let t = Rect::new(r.x + 14.0 + i as f32 * (tw + PICK_GAP), top, tw, PICK_H);
+                art::thumb(p, *key, value, t, theme);
+                p.stroke_round(t.inset(0.25, 0.25), art::THUMB_RADIUS, card_border, 0.5);
+                // The ring fades onto the chosen picture; a fainter one follows the pointer.
+                let on = ctx.anim(Anim::Pick(*key, i), if sel == Some(i) { 1.0 } else { 0.0 }, feel::SLIDE).clamp(0.0, 1.0);
+                let hot = ctx.hover_t(hit) * (1.0 - on);
+                let ring = t.inset(-3.0, -3.0);
+                if hot > 0.01 {
+                    p.stroke_round(ring, art::THUMB_RADIUS + 3.0, theme.text_disabled.alpha(theme.text_disabled.a * hot), 2.0);
+                }
+                if on > 0.01 {
+                    p.stroke_round(ring, art::THUMB_RADIUS + 3.0, theme.accent.alpha(on), 2.5);
+                }
+                let name = Rect::new(t.x - PICK_GAP / 2.0, t.bottom() + 5.0, tw + PICK_GAP, PICK_CAPTION - 5.0);
+                let text = caption(*key, l);
+                if sel == Some(i) {
+                    p.text(&text, &st.caption_on, name, theme.text);
+                } else {
+                    p.text(&text, &center, name, theme.text_secondary);
+                }
+                hits.push((Rect::new(t.x, t.y, tw, PICK_H + PICK_CAPTION), hit));
             }
         }
         Row::Slider(label, key) => {
@@ -2618,6 +3030,27 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
                 p.text(text, &button_font, b, theme.text);
                 hits.push((b, *hit));
                 bx -= 8.0;
+            }
+        }
+        Row::Widgets(start) => {
+            let gap = 10.0;
+            let n = WIDGETS_PER_ROW as f32;
+            let tw = (r.w - 28.0 - gap * (n - 1.0)) / n;
+            for (i, &kind) in gallery(*start).iter().enumerate() {
+                let hit = Hit::AddWidget(kind);
+                let hot = ctx.hover_t(hit);
+                let t = Rect::new(r.x + 14.0 + i as f32 * (tw + gap), r.y + 10.0, tw, WIDGET_TILE);
+                p.fill_round(t, 10.0, control_bg.alpha(control_bg.a * lerp(0.5, 1.0, hot)));
+                art::widget(p, kind, t, theme);
+                // Pointing at one shows what a click does: add it.
+                if hot > 0.01 {
+                    let (bx, by) = (t.right() - 12.0, t.y + 12.0);
+                    p.fill_circle(bx, by, 7.5, theme.accent.alpha(hot));
+                    p.line(bx - 3.2, by, bx + 3.2, by, Color::WHITE.alpha(hot), 1.5);
+                    p.line(bx, by - 3.2, bx, by + 3.2, Color::WHITE.alpha(hot), 1.5);
+                }
+                p.text(crate::widgets::title(kind), &center, Rect::new(t.x, t.bottom() + 3.0, tw, 18.0), theme.text_secondary.mix(theme.text, hot));
+                hits.push((Rect::new(t.x, t.y, tw, WIDGET_TILE + 22.0), hit));
             }
         }
         Row::Tiles(buttons, columns) => {
@@ -2783,13 +3216,13 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, ctx: &RowCtx, hits: &mut Vec<(Rect,
 /// button while it holds text.
 #[allow(clippy::too_many_arguments)]
 fn draw_search(p: &Painter, f: Rect, field: &TextField, focus: bool, st: &Style, theme: &Theme, glyph_font: &IDWriteTextFormat, hits: &mut Vec<(Rect, Hit)>) {
-    p.fill_round(f, 7.0, st.control_bg);
+    p.fill_round(f, f.h / 2.0, st.control_bg);
     if focus {
-        p.stroke_round(f.inset(-1.0, -1.0), 8.0, theme.accent.alpha(0.6), 3.0);
+        p.stroke_round(f.inset(-1.0, -1.0), f.h / 2.0 + 1.0, theme.accent.alpha(0.6), 3.0);
     }
-    p.text("\u{E721}", glyph_font, Rect::new(f.x + 4.0, f.y, 22.0, f.h), theme.text_secondary);
+    p.text("\u{E721}", glyph_font, Rect::new(f.x + 7.0, f.y, 22.0, f.h), theme.text_secondary);
     let clear = !field.is_empty();
-    let tr = Rect::new(f.x + 27.0, f.y, f.w - 27.0 - if clear { 26.0 } else { 8.0 }, f.h);
+    let tr = Rect::new(f.x + 31.0, f.y, f.w - 31.0 - if clear { 28.0 } else { 10.0 }, f.h);
     if field.is_empty() && !focus {
         p.text("Search", &st.regular, tr, theme.text_disabled);
     }
@@ -2807,7 +3240,7 @@ fn draw_search(p: &Painter, f: Rect, field: &TextField, focus: bool, st: &Style,
     p.clipped(tr, || p.text(&field.string(), &st.regular, tr, theme.text));
     hits.push((f, Hit::Search));
     if clear {
-        let (cx, cy) = (f.right() - 14.0, f.cy());
+        let (cx, cy) = (f.right() - 16.0, f.cy());
         p.fill_circle(cx, cy, 7.0, theme.text_secondary.alpha(0.55));
         p.line(cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5, Color::WHITE, 1.3);
         p.line(cx - 2.5, cy + 2.5, cx + 2.5, cy - 2.5, Color::WHITE, 1.3);
@@ -2908,6 +3341,12 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             tile(10.5, 4.0, 5.5, 5.5);
             tile(4.0, 10.5, 12.0, 5.5);
         }
+        Page::Spotlight => {
+            p.fill_round(r, 5.0, Color::rgba(175, 82, 222, 1.0));
+            let (cx, cy) = (r.cx() - 1.2, r.cy() - 1.2);
+            p.stroke_circle(cx, cy, 4.2, white, 1.5);
+            p.line(cx + 3.3, cy + 3.3, cx + 6.2, cy + 6.2, white, 1.7);
+        }
         Page::Finder => {
             // The two-tone Finder face.
             p.fill_round(r, 5.0, Color::rgba(30, 150, 255, 1.0));
@@ -2925,6 +3364,59 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
 #[cfg(test)]
 mod bench {
     use super::*;
+
+    /// Renders every page, light and dark, top to bottom, into the folder
+    /// named by `DOCKSIDE_SHOTS` (plus a search), for a look at the design.
+    #[test]
+    #[ignore]
+    fn shots() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc_(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        let Ok(dir) = std::env::var("DOCKSIDE_SHOTS") else { return };
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let _ = crate::win::register_class(Some(proc_));
+        let gfx = Gfx::new().unwrap();
+        let mut icons = IconStore::default();
+        for dark in [false, true] {
+            let mut cfg = crate::config::defaults();
+            cfg.general.appearance = if dark { Appearance::Dark } else { Appearance::Light };
+            let theme = Theme::new(&cfg, &gfx);
+            let mut s = SettingsWindow::new(&gfx, &Monitor::primary(), Page::General).unwrap();
+            s.shown = true;
+            let (w, h) = (((W + 2.0 * SHADOW) * s.scale).round() as u32, ((H + 2.0 * SHADOW) * s.scale).round() as u32);
+            let shot = |s: &mut SettingsWindow, icons: &mut IconStore, name: &str| {
+                for _ in 0..40 {
+                    s.tick(0.05);
+                }
+                s.dirty = true;
+                s.part = None;
+                s.render(&gfx, &theme, &cfg, icons);
+                let look = if dark { "dark" } else { "light" };
+                crate::gfx::write_png(&gfx, w, h, &s.canvas.pixels(), &format!("{dir}/{look}-{name}.png"));
+            };
+            for (page, name) in PAGES {
+                s.go_to(page);
+                s.render(&gfx, &theme, &cfg, &mut icons);
+                let mut at = 0.0;
+                for i in 0..6 {
+                    s.scroll.jump(at);
+                    shot(&mut s, &mut icons, &format!("{name}-{i}"));
+                    if at >= s.max_scroll {
+                        break;
+                    }
+                    at = (at + (H - TITLE_H) * 0.85).min(s.max_scroll);
+                }
+            }
+            s.search.insert("dock");
+            s.search_focus = true;
+            s.search_changed();
+            shot(&mut s, &mut icons, "search");
+        }
+    }
 
     #[test]
     #[ignore]

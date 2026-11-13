@@ -439,7 +439,7 @@ fn bez(sink: &ID2D1GeometrySink, c1: (f32, f32), c2: (f32, f32), end: (f32, f32)
 }
 
 /// A generic apple silhouette with a bite and leaf, in a 17x20 unit box.
-fn draw_apple(p: &Painter, r: Rect, c: Color) {
+pub(crate) fn draw_apple(p: &Painter, r: Rect, c: Color) {
     let geom = p.gfx.path(|s| unsafe {
         s.BeginFigure(pt(8.5, 5.2), D2D1_FIGURE_BEGIN_FILLED);
         bez(s, (9.6, 5.2), (11.0, 4.2), (13.0, 4.3));
@@ -469,7 +469,7 @@ fn draw_apple(p: &Painter, r: Rect, c: Color) {
     }
 }
 
-fn draw_windows_logo(p: &Painter, r: Rect, c: Color) {
+pub(crate) fn draw_windows_logo(p: &Painter, r: Rect, c: Color) {
     let (s, gap) = (6.0, 1.0);
     let (x0, y0) = (r.cx() - s - gap / 2.0, r.cy() - s - gap / 2.0);
     for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
@@ -477,7 +477,7 @@ fn draw_windows_logo(p: &Painter, r: Rect, c: Color) {
     }
 }
 
-fn draw_wifi(p: &Painter, r: Rect, c: Color) {
+pub(crate) fn draw_wifi(p: &Painter, r: Rect, c: Color) {
     let (cx, cy) = (r.cx(), r.cy() + 5.5);
     let geom = p.gfx.path(|s| unsafe {
         for radius in [4.2_f32, 7.6, 11.0] {
@@ -525,7 +525,7 @@ fn draw_private(p: &Painter, r: Rect, c: Color) {
     p.line(cx - 6.5, cy + 6.5, cx + 6.5, cy - 6.5, c, 1.6);
 }
 
-fn draw_search(p: &Painter, r: Rect, c: Color) {
+pub(crate) fn draw_search(p: &Painter, r: Rect, c: Color) {
     let (cx, cy) = (r.cx() - 1.2, r.cy() - 1.2);
     p.stroke_circle(cx, cy, 4.6, c, 1.6);
     p.line(cx + 3.4, cy + 3.4, cx + 6.6, cy + 6.6, c, 1.8);
@@ -533,7 +533,7 @@ fn draw_search(p: &Painter, r: Rect, c: Color) {
 
 /// The Windows "show hidden icons" chevron.
 /// The tray chevron: "^" at `turn` 0, rotated half a turn (through ">") to "v" at 1.
-fn draw_tray(p: &Painter, r: Rect, c: Color, turn: f32) {
+pub(crate) fn draw_tray(p: &Painter, r: Rect, c: Color, turn: f32) {
     let (cx, cy) = (r.cx(), r.cy() - 1.0);
     let (sin, cos) = (std::f32::consts::PI * turn).sin_cos();
     let at = |x: f32, y: f32| (cx + x * cos - y * sin, cy + x * sin + y * cos);
@@ -542,7 +542,7 @@ fn draw_tray(p: &Painter, r: Rect, c: Color, turn: f32) {
     p.line(apex.0, apex.1, rt.0, rt.1, c, 1.6);
 }
 
-fn draw_control_center(p: &Painter, r: Rect, c: Color) {
+pub(crate) fn draw_control_center(p: &Painter, r: Rect, c: Color) {
     let (cx, cy) = (r.cx(), r.cy());
     let pill = |y: f32, dot_left: bool| {
         let body = Rect::new(cx - 8.0, y - 3.25, 16.0, 6.5);
@@ -554,7 +554,7 @@ fn draw_control_center(p: &Painter, r: Rect, c: Color) {
     pill(cy + 4.0, true);
 }
 
-fn draw_battery(p: &Painter, r: Rect, b: Battery, c: Color) {
+pub(crate) fn draw_battery(p: &Painter, r: Rect, b: Battery, c: Color) {
     let (bw, bh) = (24.0, 11.5);
     let body = Rect::new(r.right() - 10.0 - bw, r.cy() - bh / 2.0, bw, bh);
     let dim = c.alpha(c.a * 0.4);

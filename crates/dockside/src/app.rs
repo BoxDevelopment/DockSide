@@ -4126,6 +4126,8 @@ impl App {
                 }
             }
             WM_MOUSEWHEEL => s.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32),
+            // The mouse's back and forward buttons walk the pages visited.
+            WM_XBUTTONUP => s.navigate((wp.0 >> 16) & 0xFFFF == 1),
             WM_KEYDOWN => {
                 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
                 let (ctrl, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };

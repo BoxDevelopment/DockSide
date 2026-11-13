@@ -3,6 +3,7 @@
 #[macro_use]
 mod log;
 
+mod about;
 mod anim;
 mod app;
 mod calsync;

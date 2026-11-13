@@ -18,6 +18,7 @@ use crate::gfx::icons::{IconStore, RECYCLE_BIN};
 use crate::gfx::{finder_icon, launchpad_icon, start_icon, Align, Gfx, Weight};
 use crate::icon_picker::{IconTarget, PICKER_PATH};
 use crate::onboarding::ONBOARDING_PATH;
+use crate::about::ABOUT_PATH;
 use crate::settings::SETTINGS_PATH;
 use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
@@ -351,7 +352,7 @@ fn icon_source(path: &str) -> String {
         FINDER_PATH => finder_icon::KEY.to_string(),
         START_PATH => start_icon::KEY.to_string(),
         LAUNCHPAD_PATH => launchpad_icon::KEY.to_string(),
-        SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH => {
+        SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH | ABOUT_PATH => {
             std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
         }
         _ => path.to_string(),
@@ -370,13 +371,14 @@ fn own_app_name(path: &str) -> Option<&'static str> {
         SETTINGS_PATH => Some("System Settings"),
         PICKER_PATH => Some("Icon Picker"),
         ONBOARDING_PATH => Some("Setup Assistant"),
+        ABOUT_PATH => Some(crate::about::TITLE),
         _ => None,
     }
 }
 
 /// The icon picker and Setup Assistant only exist while in use: nothing to keep in the Dock.
 fn pinnable(path: &str) -> bool {
-    path != PICKER_PATH && path != ONBOARDING_PATH
+    path != PICKER_PATH && path != ONBOARDING_PATH && path != ABOUT_PATH
 }
 
 /// Pinned files that no longer exist are skipped (URIs and shell ids always pass).
@@ -955,7 +957,7 @@ impl Dock {
             Kind::App if item.launch == FINDER_PATH => {
                 if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
             }
-            Kind::App if [START_PATH, LAUNCHPAD_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH].contains(&item.launch.as_str()) => FileDrop::None,
+            Kind::App if [START_PATH, LAUNCHPAD_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH, ABOUT_PATH].contains(&item.launch.as_str()) => FileDrop::None,
             Kind::App => FileDrop::Open,
         }
     }

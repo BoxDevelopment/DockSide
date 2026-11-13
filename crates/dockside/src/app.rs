@@ -36,6 +36,7 @@ use crate::menubar::{Hit, MenuBar};
 use crate::genie::Genie;
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
+use crate::about::{About, AboutEvent, ABOUT_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
 use crate::launchpad::{Launchpad, LaunchpadEvent, LAUNCHPAD_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
@@ -607,6 +608,9 @@ fn execute(action: Action) {
         Action::OpenOnboarding => {
             with_app(|app| app.open_onboarding());
         }
+        Action::OpenAbout => {
+            with_app(|app| app.open_about());
+        }
         Action::SetDockApps(list) => {
             match config::save_dock_apps(&config::path(), &list) {
                 Ok(()) => {
@@ -1056,6 +1060,7 @@ pub struct App {
     settings: Option<SettingsWindow>,
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
+    about: Option<About>,
     finders: Vec<FinderWindow>,
     /// Closed Finder windows, still fading out.
     closing_finders: Vec<FinderWindow>,
@@ -1233,6 +1238,7 @@ impl App {
             submenu: None,
             settings: None,
             onboarding: None,
+            about: None,
             finders: Vec::new(),
             closing_finders: Vec::new(),
             fading: Vec::new(),
@@ -1382,6 +1388,9 @@ impl App {
             // Everything that shows personal details paints again (menu bars and widgets below).
             if let Some(i) = &mut self.island {
                 i.dirty = true;
+            }
+            if let Some(a) = &mut self.about {
+                a.dirty = true;
             }
             if let Some(c) = &mut self.control {
                 c.dirty = true;
@@ -1778,6 +1787,32 @@ impl App {
         if let Some(o) = &mut self.onboarding {
             o.dirty = true;
         }
+        if let Some(a) = &mut self.about {
+            a.dirty = true;
+        }
+    }
+
+    fn open_about(&mut self) {
+        match &mut self.about {
+            Some(a) => a.show(),
+            None => match About::new(&self.gfx, &self.theme, &Monitor::at_cursor()) {
+                Ok(a) => {
+                    self.about = Some(a);
+                    self.animate();
+                }
+                Err(e) => log!("about window failed: {e}"),
+            },
+        }
+        self.refresh_windows();
+        self.flush();
+    }
+
+    fn close_about(&mut self) {
+        if let Some(a) = self.about.take() {
+            let hwnd = a.hwnd;
+            self.fade_out_window(Box::new(a), hwnd);
+            self.refresh_windows();
+        }
     }
 
     fn open_onboarding(&mut self) {
@@ -1960,6 +1995,9 @@ impl App {
         if let Some(o) = &mut self.onboarding {
             still |= o.tick(dt);
         }
+        if let Some(a) = &mut self.about {
+            still |= a.tick(dt);
+        }
         if let Some(w) = &mut self.widgets {
             still |= w.animate(dt);
         }
@@ -2136,7 +2174,8 @@ impl App {
         // Our Dock, menu bars and menus aren't windows to follow; Finder and Settings are.
         let surface = !shell && apps::window_pid(fg) == self.pid && !self.finders.iter().any(|f| f.hwnd == fg)
             && !self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
-            && !self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg);
+            && !self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
+            && !self.about.as_ref().is_some_and(|a| a.hwnd == fg);
         if surface {
             return;
         }
@@ -2175,7 +2214,9 @@ impl App {
         self.update_fullscreen();
         self.raise_surfaces();
         // Our own shell surfaces (Dock, menu bar, menus) leave the state as it was.
-        let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg) || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg);
+        let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
+            || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
+            || self.about.as_ref().is_some_and(|a| a.hwnd == fg);
         let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || ours {
             Some(false)
         } else if fg.is_invalid() || apps::window_pid(fg) == self.pid {
@@ -2213,6 +2254,12 @@ impl App {
         if self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg) {
             for mb in &mut self.menubars {
                 mb.set_app("Setup Assistant".into(), fg, None);
+            }
+            return;
+        }
+        if self.about.as_ref().is_some_and(|a| a.hwnd == fg) {
+            for mb in &mut self.menubars {
+                mb.set_app(crate::about::TITLE.into(), fg, None);
             }
             return;
         }
@@ -2295,6 +2342,9 @@ impl App {
         if let Some(o) = self.onboarding.as_mut().filter(|o| o.dirty) {
             o.render(&self.gfx, &self.theme, &self.cfg);
         }
+        if let Some(a) = self.about.as_mut().filter(|a| a.dirty) {
+            a.render(&self.gfx, &self.theme);
+        }
         if let Some(p) = self.icon_picker.as_mut().filter(|p| p.dirty) {
             p.render(&self.gfx, &self.theme);
         }
@@ -2334,6 +2384,7 @@ impl App {
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
             || self.settings.as_ref().is_some_and(|s| s.animating())
             || self.onboarding.as_ref().is_some_and(|o| o.animating())
+            || self.about.as_ref().is_some_and(|a| a.animating())
             || self.widgets.as_ref().is_some_and(|w| w.animating())
             || self.finders.iter().any(|f| f.animating())
             || !self.closing_finders.is_empty()
@@ -3007,6 +3058,7 @@ impl App {
         let mut v = self.finder_app_windows();
         v.extend(self.settings.as_ref().map(|s| window(s.hwnd, SETTINGS_PATH, "System Settings")));
         v.extend(self.onboarding.as_ref().map(|o| window(o.hwnd, ONBOARDING_PATH, "Setup Assistant")));
+        v.extend(self.about.as_ref().map(|a| window(a.hwnd, ABOUT_PATH, crate::about::TITLE)));
         v.extend(self.icon_picker.as_ref().map(|p| window(p.surface.content, PICKER_PATH, "Icon Picker")));
         v
     }
@@ -3908,6 +3960,11 @@ impl App {
             self.flush_input(msg);
             return r;
         }
+        if self.about.as_ref().is_some_and(|a| a.hwnd == hwnd) {
+            let r = self.on_about_message(hwnd, msg, wp, lp);
+            self.flush_input(msg);
+            return r;
+        }
         if self.spotlight.as_ref().is_some_and(|s| s.surface.content == hwnd) {
             let r = self.on_spotlight_message(msg, wp, lp);
             self.flush_input(msg);
@@ -4037,6 +4094,66 @@ impl App {
                 return None;
             }
             _ => return None,
+        }
+        Some(LRESULT(0))
+    }
+
+    fn on_about_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+        let a = self.about.as_mut()?;
+        let scale = a.scale();
+        let (x, y) = mouse_pt(lp, scale);
+        let event = match msg {
+            WM_NCHITTEST => {
+                // lParam is in screen coordinates here.
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let (lx, ly) = ((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
+                let hit = if a.is_caption(lx, ly) { HTCAPTION } else { HTCLIENT };
+                return Some(LRESULT(hit as isize));
+            }
+            WM_MOUSEMOVE => {
+                if !a.tracking {
+                    a.tracking = true;
+                    track_leave(hwnd);
+                }
+                a.on_move(x, y);
+                AboutEvent::None
+            }
+            WM_MOUSELEAVE => {
+                a.on_leave();
+                AboutEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                a.on_down(x, y);
+                unsafe { SetCapture(hwnd) };
+                AboutEvent::None
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                a.on_up(x, y)
+            }
+            WM_KEYDOWN => {
+                let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                a.on_key(wp.0 as u16, ctrl)
+            }
+            WM_CLOSE => AboutEvent::Close,
+            WM_SIZE => {
+                a.on_size();
+                return None;
+            }
+            _ => return None,
+        };
+        match event {
+            AboutEvent::None => {}
+            AboutEvent::Action(act) => push(act),
+            AboutEvent::Close => self.close_about(),
         }
         Some(LRESULT(0))
     }

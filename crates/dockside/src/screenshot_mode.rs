@@ -32,6 +32,9 @@ pub const FIRST: &str = "John";
 pub const PC: &str = "DESKTOP";
 pub const SSID: &str = "Home Network";
 pub const PLACE: &str = "Cupertino";
+/// About This PC: the serial number and the startup disk's name.
+pub const SERIAL: &str = "C02XK4ZJLVDQ";
+pub const DISK: &str = "Local Disk";
 
 /// The song playing, keeping the real track's progress and controls.
 pub fn now_playing(real: &NowPlaying) -> NowPlaying {

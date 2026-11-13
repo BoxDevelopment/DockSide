@@ -49,6 +49,8 @@ pub enum Action {
     OpenSettings(Option<crate::settings::Page>),
     /// Show the first-launch Setup Assistant again.
     OpenOnboarding,
+    /// The About This PC window.
+    OpenAbout,
     /// Open a Finder window (at a folder, or Home).
     OpenFinder(Option<std::path::PathBuf>),
     /// Show or hide the Spotlight search panel.
@@ -603,7 +605,7 @@ pub struct MenuCtx<'a> {
 
 pub fn apple_menu() -> Vec<Entry> {
     vec![
-        Entry::item("About This PC", Action::Open("ms-settings:about".into())),
+        Entry::item("About This PC", Action::OpenAbout),
         Entry::Separator,
         Entry::item("System Settings…", Action::Open("ms-settings:".into())),
         Entry::item("App Store…", Action::Open("ms-windows-store:".into())),

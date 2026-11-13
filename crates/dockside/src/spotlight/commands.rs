@@ -26,6 +26,7 @@ pub enum Command {
     ControlPanel,
     DockSideSettings,
     SetupAssistant,
+    AboutThisPc,
     QuitDockSide,
 }
 
@@ -69,6 +70,7 @@ const COMMANDS: &[(&str, &str, char, Command)] = &[
     ("Control Panel", "control panel", '\u{E80F}', Command::ControlPanel),
     ("DockSide Settings", "dockside settings preferences menu bar dock", '\u{E713}', Command::DockSideSettings),
     ("DockSide Setup Assistant", "setup assistant onboarding welcome tour getting started guide", '\u{E8FC}', Command::SetupAssistant),
+    ("About This PC", "about this pc mac computer system information specs specifications serial number model processor memory", '\u{E7F8}', Command::AboutThisPc),
     ("Quit DockSide", "quit dockside exit close stop", '\u{E8BB}', Command::QuitDockSide),
 ];
 

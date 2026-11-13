@@ -116,6 +116,14 @@ fn main() {
     config::migrate_legacy();
     log::init();
     std::thread::spawn(win::startup::refresh);
+    std::thread::spawn(|| {
+        let Ok(exe) = std::env::current_exe() else { return };
+        match island::claude::upgrade(&exe) {
+            Ok(true) => log!("claude: added the status line to settings.json"),
+            Ok(false) => {}
+            Err(e) => log!("claude: couldn't update settings.json: {e:#}"),
+        }
+    });
     std::panic::set_hook(Box::new(|info| {
         win::taskbar::restore();
         log::write(&format!("panic: {info}"));

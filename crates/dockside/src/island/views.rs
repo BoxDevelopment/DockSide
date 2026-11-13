@@ -878,8 +878,21 @@ fn ink(k: f32, a: f32) -> Color {
 /// Claude Code, open, laid out as Droppy's: a Progress page (the turn's steps
 /// and the latest tool call in detail) and a Usage page (how much of each plan
 /// is left), with a round button for each in the corner. Points are measured
-/// off Droppy's 549 × 231 panel.
+/// off a Droppy screenshot (549 × 231) and drawn scaled by [`CLAUDE_SCALE`].
 pub fn claude_panel(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
+    let k = CLAUDE_SCALE;
+    // Lay out at the measured size, then shrink it about the panel's corner.
+    let d = Rect::new(r.x, r.y, r.w / k, r.h / k);
+    let mut own = Vec::new();
+    p.transformed(r.x * (1.0 - k), r.y * (1.0 - k), k, || claude_layout(p, d, v, a, &mut own));
+    hits.extend(own.into_iter().map(|(h, hit)| (Rect::new(r.x + (h.x - r.x) * k, r.y + (h.y - r.y) * k, h.w * k, h.h * k), hit)));
+}
+
+/// How much smaller than the measured Droppy layout the Claude panel draws,
+/// to sit in line with the other panels.
+pub const CLAUDE_SCALE: f32 = 0.72;
+
+fn claude_layout(p: &Painter, r: Rect, v: &View, a: f32, hits: &mut Hits) {
     const SLIDE: f32 = 28.0;
     let f = v.fonts;
     let hy = r.y + 37.0;

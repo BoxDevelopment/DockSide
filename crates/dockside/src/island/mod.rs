@@ -86,7 +86,7 @@ const PANEL_RADIUS: f32 = 36.0;
 const NOTCH_COMPACT_RADIUS: f32 = 0.34;
 const NOTCH_PANEL_RADIUS: f32 = 22.0;
 /// The Claude panel's corners, as round as Droppy's.
-const CLAUDE_RADIUS: f32 = 45.0;
+const CLAUDE_RADIUS: f32 = 45.0 * views::CLAUDE_SCALE;
 /// Extra height at the bottom of a panel for its page dots.
 const DOTS_H: f32 = 16.0;
 /// Horizontal scroll needed for one page (a notch is 120), and the pause after
@@ -643,6 +643,8 @@ pub struct Island {
     /// Glides between the pages (0 Progress, 1 Usage) for the switch animation.
     claude_flip: Spring,
     codex: Option<claude::Limit>,
+    /// Claude's limit, from the desktop app or the status line (whichever is newer).
+    claude_limit: Option<claude::Limit>,
     codex_read: Option<Instant>,
 
     // Alerts.
@@ -839,6 +841,7 @@ impl Island {
             claude_view: 0,
             claude_flip: Spring::new(0.0, 0.34, 0.92),
             codex: None,
+            claude_limit: None,
             codex_read: None,
             alert: None,
             prev_alert: None,
@@ -1279,7 +1282,7 @@ impl Island {
                 Panel::Media => (372.0, 166.0 + if self.lyrics_row() { views::LYRICS_H } else { 0.0 }),
                 Panel::Discord => (372.0, 176.0),
                 Panel::Mixer => (372.0, 56.0 + views::MIX_ROW * (1 + self.mixer.len().min(views::MIX_ROWS)) as f32 + 8.0),
-                Panel::Claude => (549.0, 231.0),
+                Panel::Claude => (549.0 * views::CLAUDE_SCALE, 231.0 * views::CLAUDE_SCALE),
                 Panel::Timer => (340.0, 96.0),
                 Panel::Shelf if self.preview.is_some() && !self.drag_over => (420.0, 360.0),
                 Panel::Shelf => (if self.drag_over && !self.tiles().is_empty() { 460.0 } else { 420.0 }, 140.0),
@@ -1795,10 +1798,12 @@ impl Island {
         holding::discard(gone.into_iter().map(|i| i.path).collect());
     }
 
-    /// Re-reads Codex's limit from its logs (at most every few seconds unless `now`).
+    /// Re-reads Codex's limit from its logs, and Claude's from the desktop app
+    /// (at most every few seconds unless `now`).
     fn read_codex(&mut self, now: bool) {
         if now || self.codex_read.map_or(true, |t| t.elapsed() >= Duration::from_secs(15)) {
             self.codex = claude::codex_limit();
+            self.claude_limit = claude::claude_limit(self.claude.usage);
             self.codex_read = Some(Instant::now());
             self.dirty = true;
         }
@@ -1806,7 +1811,7 @@ impl Island {
 
     /// The Usage page's rings: each agent that has reported its limit.
     fn usage(&self) -> Vec<(claude::Agent, claude::Limit)> {
-        [(claude::Agent::Claude, self.claude.usage), (claude::Agent::Codex, self.codex)]
+        [(claude::Agent::Claude, self.claude_limit.or(self.claude.usage)), (claude::Agent::Codex, self.codex)]
             .into_iter()
             .filter_map(|(agent, l)| Some((agent, l?)))
             .collect()

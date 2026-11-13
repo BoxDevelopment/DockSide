@@ -698,6 +698,47 @@ fn usage_path() -> PathBuf {
     crate::config::dir().join("claude-usage.json")
 }
 
+/// The Claude desktop app's 5-hour usage, from the samples it saves each time
+/// it checks the plan's limits, with the sample's time (Unix seconds).
+pub fn desktop_limit() -> Option<(Limit, i64)> {
+    const NAME: &str = "plan-usage-history.json";
+    // The Store app keeps its data in Claude-Data\<package>; the installer's in Roaming\Claude.
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        if let Ok(rd) = std::fs::read_dir(PathBuf::from(local).join("Claude-Data")) {
+            files.extend(rd.flatten().map(|e| e.path().join(NAME)));
+        }
+    }
+    if let Some(roaming) = std::env::var_os("APPDATA") {
+        files.push(PathBuf::from(roaming).join("Claude").join(NAME));
+    }
+    files.iter().filter_map(|f| desktop_sample(&std::fs::read_to_string(f).ok()?)).max_by_key(|(_, t)| *t)
+}
+
+/// The newest sample in a `plan-usage-history.json`.
+fn desktop_sample(text: &str) -> Option<(Limit, i64)> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let last = v.get("samples")?.as_array()?.iter().filter(|s| s.pointer("/u/fh").is_some()).max_by_key(|s| s.get("t").and_then(Value::as_i64).unwrap_or(0))?;
+    let at = last.get("t")?.as_i64()? / 1000;
+    let used = last.pointer("/u/fh")?.as_f64()? as f32;
+    // The sample has no reset time, but the window resets within 5 hours of it.
+    Some((Limit { used, resets_at: Some(at + 5 * 3600) }, at))
+}
+
+/// Claude's limit: the desktop app's sample, or the status line's when that's newer.
+pub fn claude_limit(status: Option<Limit>) -> Option<Limit> {
+    let Some((app, at)) = desktop_limit() else { return status };
+    let status_at = std::fs::metadata(usage_path())
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64);
+    match status {
+        Some(s) if status_at.is_some_and(|t| t > at) => Some(s),
+        _ => Some(app),
+    }
+}
+
 /// Codex's 5-hour limit, from the newest of its session logs that reported one.
 pub fn codex_limit() -> Option<Limit> {
     let home = match std::env::var_os("CODEX_HOME") {
@@ -850,6 +891,24 @@ pub fn connect(exe: &Path) -> Result<bool> {
     Ok(status)
 }
 
+/// Brings an older connection up to date: hooks added before the status line
+/// existed get it now (unless you have your own), so the Usage page fills in.
+/// Returns whether settings.json was changed.
+pub fn upgrade(exe: &Path) -> Result<bool> {
+    let path = settings_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let mut settings = read_settings(&path)?;
+    let hooked = settings.get("hooks").and_then(Value::as_object).is_some_and(|h| h.values().filter_map(Value::as_array).flatten().any(is_ours));
+    if !hooked || settings.contains_key("statusLine") {
+        return Ok(false);
+    }
+    merge(&mut settings, exe)?;
+    write_settings(&path, &settings)?;
+    Ok(true)
+}
+
 pub fn disconnect() -> Result<()> {
     let path = settings_path();
     if !path.exists() {
@@ -924,6 +983,15 @@ mod tests {
         let card = c.current().unwrap().card.as_ref().unwrap();
         assert_eq!(card.status(), ("Lines".to_string(), Some("184".to_string())));
         assert_eq!(card.target, "C:/x/notes.md");
+    }
+
+    #[test]
+    fn usage_from_the_desktop_app() {
+        let text = r#"{"version":2,"samples":[{"t":1794547771841,"org":"a","u":{"fh":5,"sd":22}},{"t":1794546263366,"org":"a","u":{"fh":3,"sd":22}}]}"#;
+        let (l, at) = desktop_sample(text).unwrap();
+        assert_eq!(at, 1794547771);
+        assert_eq!(l.used, 5.0);
+        assert_eq!(l.resets_at, Some(1794547771 + 5 * 3600));
     }
 
     #[test]

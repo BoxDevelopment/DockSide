@@ -278,16 +278,16 @@ pub(crate) fn pal(theme: &Theme, solid: bool) -> Pal {
         }
     } else {
         Pal {
-            text: Color::gray(0, 0.86),
-            sub: Color::gray(0, 0.52),
-            tint: if solid { Color::rgba(246, 246, 248, 0.97) } else { Color::rgba(255, 255, 255, 0.38) },
-            lit: Color::gray(255, 0.3),
+            text: Color::rgba(18, 18, 22, 0.92),
+            sub: Color::rgba(28, 28, 34, 0.62),
+            tint: if solid { Color::rgba(246, 246, 248, 0.97) } else { Color::rgba(250, 250, 252, 0.52) },
+            lit: Color::gray(255, 0.45),
             on_bg: theme.accent,
             on_fg: Color::WHITE,
-            chip: Color::gray(0, 0.07),
-            track: Color::gray(0, 0.12),
+            chip: Color::gray(0, 0.08),
+            track: Color::gray(0, 0.14),
             fill: Color::WHITE,
-            sep: Color::gray(0, 0.1),
+            sep: Color::gray(0, 0.12),
             tip_bg: Color::rgba(250, 250, 252, 0.96),
         }
     }

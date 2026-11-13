@@ -203,16 +203,25 @@ float4 ps(V i) : SV_Target {
     }
 
     // Vibrancy, then the body of the glass.
+    // Light glass gets a gentler boost: saturated colour behind dark text is
+    // what makes it hard to read.
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
-    c = lerp(l.xxx, c, 1 + 0.4 * strength);
+    c = lerp(l.xxx, c, 1 + (dark > 0.5 ? 0.4 : 0.2) * strength);
     // Adaptive, like macOS: dark glass dims further over bright content and
     // light glass lifts over dark content, so what's written on it stays
     // readable. Judged from the coarsest mip, so it eases across the pane
     // instead of following every detail behind it.
     float back = dot(tap(q, 4.0), float3(0.2126, 0.7152, 0.0722));
     c = dark > 0.5 ? c * lerp(0.86, 0.5, smoothstep(0.55, 0.95, back))
-                   : lerp(c, 1, lerp(0.06, 0.45, 1 - smoothstep(0.05, 0.45, back)));
+                   : lerp(c, 1, lerp(0.2, 0.6, 1 - smoothstep(0.2, 0.85, back)));
     c = lerp(c, tint.rgb, tint.a);
+    if (dark < 0.5) {
+        // A floor under dark text: whatever's behind, light glass stays light
+        // enough to read on (a grey lift, so it keeps its colour). Subtle
+        // glass is mostly tint already and needs less.
+        float floorL = lerp(0.66, 0.74, strength);
+        c += max(floorL - dot(c, float3(0.2126, 0.7152, 0.0722)), 0);
+    }
 
     if (bezel > 0) {
         // Light from the top-left: a bright glint on the facing rim, a softer

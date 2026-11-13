@@ -321,7 +321,7 @@ impl MenuBar {
         // A clear bar takes its colours from the wallpaper, not the app theme.
         let (c, highlight) = match self.on_dark {
             Some(true) => (Color::gray(255, 0.96), Color::gray(255, 0.22)),
-            Some(false) => (Color::gray(0, 0.86), Color::gray(0, 0.10)),
+            Some(false) => (Color::rgba(18, 18, 22, 0.92), Color::gray(0, 0.10)),
             None => (theme.text, theme.menubar_highlight),
         };
         // A bar on a display without the focused window fades back, like macOS.

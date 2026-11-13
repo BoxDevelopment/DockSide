@@ -3754,6 +3754,11 @@ impl App {
                         self.animate();
                     }
                 }
+                // Quick Look's workers (only an open Quick Look listens).
+                win::WM_APP_QUICKLOOK => {
+                    self.finders.iter_mut().for_each(|f| f.on_quicklook());
+                    self.animate();
+                }
                 WM_APP_FINDER_CHANGED => {
                     let id = wp.0 as u32;
                     if !self.finder_changed.contains(&id) {

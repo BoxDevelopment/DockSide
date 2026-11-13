@@ -233,7 +233,7 @@ pub fn play_photo(path: PathBuf, px: (u32, u32), feed: SharedFeed, hwnd: isize, 
                 return;
             }
             let until = Instant::now() + SLIDE;
-            match show_picture(&wic, file, px, &feed, hwnd, msg, slideshow.then_some(until)) {
+            match show_picture(&wic, file, px, false, &feed, hwnd, msg, slideshow.then_some(until)) {
                 Some(()) => shown += 1,
                 None => log!("photo widget: couldn't show {}", file.display()),
             }
@@ -254,11 +254,26 @@ pub fn play_photo(path: PathBuf, px: (u32, u32), feed: SharedFeed, hwnd: isize, 
     });
 }
 
+/// Quick Look's picture: `file` fitted inside `px` (never enlarged), a GIF
+/// playing for as long as the feed runs. Fails the feed if WIC can't read it.
+pub fn play_fitted(file: PathBuf, px: (u32, u32), feed: SharedFeed, hwnd: isize, msg: u32) {
+    spawn("quick look picture", move || {
+        let Some(wic) = crate::island::media::wic() else { return feed.fail("Can't open this picture", hwnd, msg) };
+        // A still picture returns once shown; a GIF plays until stopped.
+        if show_picture(&wic, &file, px, true, &feed, hwnd, msg, None).is_none() {
+            feed.fail("Can't open this picture", hwnd, msg);
+        }
+    });
+}
+
 /// Shows one picture (a GIF plays until `until`, or for ever without one).
+/// `contain`: fitted inside `px` (Quick Look) rather than covering it (widgets).
+#[allow(clippy::too_many_arguments)]
 fn show_picture(
     wic: &IWICImagingFactory,
     file: &Path,
     px: (u32, u32),
+    contain: bool,
     feed: &Feed,
     hwnd: isize,
     msg: u32,
@@ -271,7 +286,7 @@ fn show_picture(
         let frames = decoder.GetFrameCount().ok()?;
         let gif = decoder.GetContainerFormat().ok() == Some(GUID_ContainerFormatGif);
         if gif && frames > 1 {
-            return play_gif(wic, &decoder, frames, px, feed, hwnd, msg, until);
+            return play_gif(wic, &decoder, frames, px, contain, feed, hwnd, msg, until);
         }
         let frame = decoder.GetFrame(0).ok()?;
         let source: IWICBitmapSource = upright(wic, &frame).unwrap_or_else(|| frame.cast().unwrap());
@@ -280,7 +295,8 @@ fn show_picture(
         if w == 0 || h == 0 {
             return None;
         }
-        let k = (px.0 as f64 / w as f64).max(px.1 as f64 / h as f64).min(1.0);
+        let (kw, kh) = (px.0 as f64 / w as f64, px.1 as f64 / h as f64);
+        let k = if contain { kw.min(kh) } else { kw.max(kh) }.min(1.0);
         let (ow, oh) = (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1));
         let scaler = wic.CreateBitmapScaler().ok()?;
         scaler.Initialize(&source, ow, oh, WICBitmapInterpolationModeHighQualityCubic).ok()?;
@@ -341,6 +357,12 @@ unsafe fn fit(wic: &IWICImagingFactory, data: Vec<u8>, w: u32, h: u32, px: (u32,
     }
 }
 
+/// `w` x `h` fitted inside `px`, never enlarged.
+fn contained(w: u32, h: u32, px: (u32, u32)) -> (u32, u32) {
+    let k = (px.0 as f64 / w as f64).min(px.1 as f64 / h as f64).min(1.0);
+    (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1))
+}
+
 /// `src` as premultiplied BGRA.
 unsafe fn pbgra(wic: &IWICImagingFactory, src: &IWICBitmapSource, w: u32, h: u32) -> Option<Vec<u8>> {
     let conv = wic.CreateFormatConverter().ok()?;
@@ -358,11 +380,13 @@ unsafe fn meta_u16(reader: &IWICMetadataQueryReader, name: &str) -> Option<u16> 
 
 /// Plays a GIF's frames onto a canvas of its logical screen size, honouring
 /// each frame's offset, delay and disposal.
+#[allow(clippy::too_many_arguments)]
 unsafe fn play_gif(
     wic: &IWICImagingFactory,
     decoder: &IWICBitmapDecoder,
     frames: u32,
     px: (u32, u32),
+    contain: bool,
     feed: &Feed,
     hwnd: isize,
     msg: u32,
@@ -425,6 +449,7 @@ unsafe fn play_gif(
             let due = Duration::from_millis(delay) >= GIF_MIN_FRAME || shown_at.is_none_or(|t| t.elapsed() >= GIF_MIN_FRAME);
             if due {
                 shown_at = Some(Instant::now());
+                let px = if contain { contained(cw, ch, px) } else { px };
                 feed.publish(fit(wic, canvas.clone(), cw, ch, px), hwnd, msg);
             }
             let wait = Duration::from_millis(delay).saturating_sub(started.elapsed());

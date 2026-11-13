@@ -7,8 +7,13 @@ pub mod dnd;
 pub mod fs;
 mod glyphs;
 pub mod loader;
+mod media;
 mod menus;
 pub mod ops;
+mod pdf;
+mod prevhost;
+mod quicklook;
+mod rich;
 pub mod search;
 pub mod shell;
 pub mod text;
@@ -20,22 +25,21 @@ use std::time::{Duration, Instant};
 use notify::{RecursiveMode, Watcher};
 use windows::core::{Result, HSTRING};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap, D2D1_DRAW_TEXT_OPTIONS_NONE};
-use windows::Win32::Graphics::DirectWrite::{
-    IDWriteTextFormat, DWRITE_HIT_TEST_METRICS, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_METRICS,
-};
+use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
+use windows::Win32::Graphics::DirectWrite::{IDWriteTextFormat, DWRITE_HIT_TEST_METRICS};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetCapture, GetDoubleClickTime, ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use self::fs::{Entry as FileEntry, KindCache, Place, PlaceKind, SortKey};
 use self::ops::DropOp;
 use self::loader::IconLoader;
+use self::quicklook::QuickLook;
 use self::text::{KeyResult, TextField};
 use crate::anim::{feel, lerp, Glide, Motion, Scroll, Spring};
 use crate::chrome::{self, Light, SidebarBackdrop, WindowAnim, SHADOW};
 use crate::config::FinderCfg;
 use crate::geom::{Color, Rect};
-use crate::gfx::{pt as gfx_pt, Align, Canvas, Gfx, Painter, Weight};
+use crate::gfx::{Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::{Action, Entry};
 use crate::theme::Theme;
 use crate::win::{self, Monitor};
@@ -406,6 +410,10 @@ enum Hit {
     QlPanel,
     QlClose,
     QlOpen,
+    /// Quick Look's video picture (a click plays / pauses), play button and scrubber.
+    QlMedia,
+    QlPlay,
+    QlScrub,
     Tab(usize),
     TabClose(usize),
     NewTab,
@@ -445,15 +453,6 @@ struct Band {
     /// Selection before the drag; Ctrl toggles against it, Shift adds to it.
     base: BTreeSet<usize>,
     toggle: bool,
-}
-
-/// Quick Look state: the previewed file's cached text and scroll.
-#[derive(Default)]
-struct QuickLook {
-    path: PathBuf,
-    text: Option<String>,
-    scroll: Scroll,
-    max_scroll: f32,
 }
 
 /// A background tab's folder state, swapped into the window's fields when it's selected.
@@ -954,13 +953,18 @@ impl FinderWindow {
     }
 
     fn begin_minimize(&mut self) {
+        if let Some(ql) = &mut self.quicklook {
+            ql.pause();
+        }
         self.window.minimize();
         self.dirty = true;
     }
 
     fn close_quicklook(&mut self) {
         let entry = self.ql_entry().cloned();
-        if let (Some(ql), Some(e)) = (self.quicklook.take(), entry) {
+        if let (Some(mut ql), Some(e)) = (self.quicklook.take(), entry) {
+            // Sound stops at once; the last picture zooms away.
+            ql.freeze();
             self.ql_closing = Some((ql, e));
             self.ql_t.set(0.0);
         }
@@ -1946,6 +1950,9 @@ impl FinderWindow {
                         | Hit::SearchClear
                         | Hit::QlClose
                         | Hit::QlOpen
+                        | Hit::QlMedia
+                        | Hit::QlPlay
+                        | Hit::QlScrub
                         | Hit::Tab(_)
                         | Hit::TabClose(_)
                         | Hit::NewTab
@@ -1963,6 +1970,11 @@ impl FinderWindow {
 
         if self.band.is_some() {
             self.update_band(x, y);
+        } else if self.pressed == Some(Hit::QlScrub) {
+            if let Some(ql) = &mut self.quicklook {
+                ql.scrub_to(x, false);
+                self.dirty = true;
+            }
         } else if self.pressed == Some(Hit::Search) {
             // Drag-select inside the search field.
             let i = self.search_index(x);
@@ -2177,6 +2189,14 @@ impl FinderWindow {
                 }
             }
             Some(Hit::QlBackdrop) => self.close_quicklook(),
+            Some(Hit::QlScrub) => {
+                if let Some(ql) = &mut self.quicklook {
+                    ql.scrub_to(x, true);
+                }
+                unsafe {
+                    SetCapture(self.hwnd);
+                }
+            }
             // Tabs switch on press, like macOS.
             Some(Hit::Tab(i)) => self.select_tab(i, kinds),
             _ => {}
@@ -2277,6 +2297,16 @@ impl FinderWindow {
             }
             Hit::NewTab => self.new_tab(fs::home(), kinds),
             Hit::QlClose => self.close_quicklook(),
+            Hit::QlPlay | Hit::QlMedia => {
+                if let Some(ql) = &mut self.quicklook {
+                    ql.toggle_play();
+                }
+            }
+            Hit::QlScrub => {
+                if let Some(ql) = &mut self.quicklook {
+                    ql.scrub_to(x, true);
+                }
+            }
             Hit::QlOpen => {
                 if let Some(e) = self.ql_entry().cloned() {
                     self.quicklook = None;
@@ -2844,8 +2874,26 @@ impl FinderWindow {
             return;
         };
         if let Some(ql) = self.quicklook.as_mut().filter(|ql| ql.path != e.path) {
-            *ql = QuickLook { path: e.path.clone(), text: fs::text_preview(&e), scroll: Scroll::default(), max_scroll: 0.0 };
+            *ql = QuickLook::new(&e);
+            ql.start(self.notify);
         }
+    }
+
+    /// Quick Look's workers have news (a frame, a page, a player state). With
+    /// Quick Look settled, only its content area is repainted.
+    pub fn on_quicklook(&mut self) {
+        let Some(ql) = self.quicklook.as_mut() else { return };
+        if !ql.poll() {
+            return;
+        }
+        if let Some(area) = ql.area.filter(|_| self.ql_t.settled()) {
+            if !self.dirty || self.part.is_some() {
+                self.part = Some(self.part.map_or(area, |p| p.union(area)));
+            }
+        } else {
+            self.part = None;
+        }
+        self.dirty = true;
     }
 
     fn preview_entry(&self) -> Option<&FileEntry> {
@@ -2910,6 +2958,8 @@ impl FinderWindow {
         let preview_title = gfx.format(&theme.font, 15.0, Weight::Bold, Align::Center);
         let ql_title = gfx.format(&theme.font, 13.0, Weight::Bold, Align::Center);
         let mono = gfx.format_wrapped("Consolas", 12.0);
+        let ql_time = gfx.format(&theme.font, 11.0, Weight::Regular, Align::Center);
+        let (ql_scale, ql_notify, ql_owner) = (self.scale, self.notify, self.hwnd.0 as isize);
 
         // Layout and scroll metrics for the current view (the gallery's strip scrolls sideways).
         let n = self.entries.len();
@@ -3786,7 +3836,18 @@ impl FinderWindow {
                 if let Some(m) = e.modified {
                     info += &format!("  ·  Modified {}", fs::format_date(m));
                 }
-                let style = QlStyle { theme, dark, title: &ql_title, mono: &mono, center: &center, preview_title: &preview_title };
+                let style = QlStyle {
+                    theme,
+                    dark,
+                    title: &ql_title,
+                    mono: &mono,
+                    center: &center,
+                    preview_title: &preview_title,
+                    time: &ql_time,
+                    scale: ql_scale,
+                    notify: ql_notify,
+                    owner: ql_owner,
+                };
                 // Quick Look zooms up out of the window and shrinks away when closed.
                 let t = ql_t.clamp(0.0, 1.0);
                 p.fill_round(body, radius, Color::gray(0, 0.22 * t));
@@ -3821,6 +3882,12 @@ impl FinderWindow {
         }
         self.hits = hits;
         self.search_xs = search_xs;
+        // A preview handler's window sits over Quick Look once it has zoomed up.
+        let still = ql_live && self.ql_t.settled() && self.ql_t.value >= 0.999 && zoom == 1.0 && window_alpha == 1.0;
+        if let Some(ql) = &mut self.quicklook {
+            let at = ql.area.filter(|_| still).and_then(|a| self.canvas.part_px(a.inset(1.0, 1.0)));
+            ql.place_host(at);
+        }
         self.address_xs = address_xs;
         if let Err(e) = drawn.and_then(|_| self.canvas.present_part(self.hwnd, rc.left, rc.top, window_alpha, part)) {
             log!("finder render failed: {e}");
@@ -3989,10 +4056,16 @@ struct QlStyle<'a> {
     mono: &'a IDWriteTextFormat,
     center: &'a IDWriteTextFormat,
     preview_title: &'a IDWriteTextFormat,
+    /// Times beside the scrubber.
+    time: &'a IDWriteTextFormat,
+    /// Device pixels per point, the window (for workers' messages) and its handle.
+    scale: f32,
+    notify: isize,
+    owner: isize,
 }
 
-/// Quick Look: a large preview panel floating over the window. Text files show
-/// their contents, images and videos a big thumbnail, everything else a big icon.
+/// Quick Look: a large preview panel floating over the window, its title bar,
+/// and the preview (see [`quicklook`]).
 #[allow(clippy::too_many_arguments)]
 fn quick_look(
     p: &Painter,
@@ -4038,44 +4111,7 @@ fn quick_look(
     p.line(panel.x, bar.bottom(), panel.right(), bar.bottom(), Color::gray(ink, 0.1), 1.0);
 
     let area = Rect::new(panel.x + 20.0, bar.bottom() + 16.0, panel.w - 40.0, panel.bottom() - bar.bottom() - 32.0);
-    if let Some(text) = &ql.text {
-        p.fill_round(area, 6.0, if s.dark { Color::rgba(30, 30, 30, 1.0) } else { Color::WHITE });
-        let inner = area.inset(14.0, 12.0);
-        let Some(layout) = p.gfx.layout(text, s.mono, inner.w, 1_000_000.0) else { return };
-        let mut m = DWRITE_TEXT_METRICS::default();
-        unsafe {
-            let _ = layout.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-            let _ = layout.GetMetrics(&mut m);
-        }
-        ql.max_scroll = (m.height - inner.h).max(0.0);
-        ql.scroll.clamp(ql.max_scroll);
-        p.clipped(inner, || unsafe {
-            if let Ok(brush) = p.rt.CreateSolidColorBrush(&theme.text.d2d(), None) {
-                p.rt.DrawTextLayout(gfx_pt(inner.x, inner.y - ql.scroll.offset()), &layout, &brush, D2D1_DRAW_TEXT_OPTIONS_NONE);
-            }
-        });
-        return;
-    }
-    ql.max_scroll = 0.0;
-    let thumbnail = IconLoader::key_for(e).1;
-    let Some(b) = image else { return };
-    let size = unsafe { b.GetSize() };
-    let (bw, bh) = (size.width.max(1.0), size.height.max(1.0));
-    if thumbnail {
-        // Fit the preview, never upscaling it.
-        let k = (area.w / bw).min(area.h / bh).min(1.0);
-        let (iw, ih) = (bw * k, bh * k);
-        p.bitmap(&b, Rect::new(area.cx() - iw / 2.0, area.cy() - ih / 2.0, iw, ih), 1.0);
-    } else {
-        // Big icon with the name and details under it.
-        let side = 192.0_f32.min(area.h - 90.0).max(48.0);
-        let top = area.cy() - (side + 70.0) / 2.0;
-        let k = (side / bw).min(side / bh);
-        let (iw, ih) = (bw * k, bh * k);
-        p.bitmap(&b, Rect::new(area.cx() - iw / 2.0, top + side - ih, iw, ih), 1.0);
-        p.text(&e.name, s.preview_title, Rect::new(area.x, top + side + 16.0, area.w, 24.0), theme.text);
-        p.text(info, s.center, Rect::new(area.x, top + side + 42.0, area.w, 20.0), theme.text_secondary);
-    }
+    quicklook::draw(p, area, ql, e, image, info, s, hover, hits);
 }
 
 impl Drop for FinderWindow {
@@ -4262,6 +4298,144 @@ mod bench {
         f.rename = None;
         snap(&mut f, &mut ctx, "10-scratch");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// A 64 x 64 GIF of `frames` frames (each a different colour), for Quick Look.
+    fn test_gif(frames: usize) -> Vec<u8> {
+        let mut g = b"GIF89a".to_vec();
+        g.extend([64, 0, 64, 0, 0xF1, 0, 0]); // 4-colour global table
+        g.extend([255, 0, 0, 0, 160, 0, 0, 0, 255, 255, 255, 0]);
+        g.extend(b"\x21\xFF\x0BNETSCAPE2.0\x03\x01\x00\x00\x00");
+        for i in 0..frames {
+            g.extend([0x21, 0xF9, 4, 0, 20, 0, 0, 0]); // 200 ms
+            g.extend([0x2C, 0, 0, 0, 0, 64, 0, 64, 0, 0, 2]);
+            // Every pixel preceded by a clear code keeps codes 3 bits wide.
+            let (mut bits, mut n, mut data) = (0u32, 0u32, Vec::new());
+            let mut put = |code: u32, bits: &mut u32, n: &mut u32, data: &mut Vec<u8>| {
+                *bits |= code << *n;
+                *n += 3;
+                while *n >= 8 {
+                    data.push(*bits as u8);
+                    *bits >>= 8;
+                    *n -= 8;
+                }
+            };
+            for y in 0..64u32 {
+                for x in 0..64u32 {
+                    put(4, &mut bits, &mut n, &mut data);
+                    put(((x / 16 + y / 16 + i as u32) % 4) as u32, &mut bits, &mut n, &mut data);
+                }
+            }
+            put(5, &mut bits, &mut n, &mut data);
+            if n > 0 {
+                data.push(bits as u8);
+            }
+            for chunk in data.chunks(255) {
+                g.push(chunk.len() as u8);
+                g.extend(chunk);
+            }
+            g.push(0);
+        }
+        g.push(0x3B);
+        g
+    }
+
+    /// Quick Look on each kind of file it previews, saving a PNG of each to
+    /// `TOUR_DIR`. Files come from `QL_FILES` (`;`-separated) plus generated
+    /// ones (a GIF, Markdown, code, an unknown text type).
+    /// `cargo test quicklook_tour -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn quicklook_tour() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc_(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        dnd::ensure_ole();
+        let _ = crate::win::register_class(Some(proc_));
+        let out = PathBuf::from(std::env::var("TOUR_DIR").unwrap_or_else(|_| std::env::temp_dir().display().to_string()));
+        let dir = std::env::temp_dir().join("dockside-ql-tour");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a-anim.gif"), test_gif(4)).unwrap();
+        std::fs::write(
+            dir.join("b-notes.md"),
+            "# Quick Look\n\nSome **bold**, *italic*, `code` and a [link](https://example.com).\n\n## A list\n\n- one\n- two\n  - nested\n- [x] done\n\n> A quote that goes on for a while so it wraps onto a second line in the panel.\n\n```rust\nfn main() {\n    let x = 42; // answer\n    println!(\"{x}\");\n}\n```\n\n---\n\n1. first\n2. second\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("c-code.rs"), include_str!("quicklook.rs")).unwrap();
+        std::fs::write(dir.join("d-data.json"), "{\n  \"name\": \"DockSide\",\n  \"version\": 3,\n  \"ok\": true,\n  \"list\": [1, 2, null]\n}\n").unwrap();
+        std::fs::write(dir.join("e-notes.weird"), "Plain text in a file type nobody knows.\nIt still previews.\n").unwrap();
+        let mut n = 0;
+        for f in std::env::var("QL_FILES").unwrap_or_default().split(';').filter(|s| !s.is_empty()) {
+            let p = PathBuf::from(f);
+            let name = format!("z{n}-{}", p.file_name().unwrap().to_string_lossy());
+            n += 1;
+            std::fs::copy(&p, dir.join(name)).unwrap();
+        }
+
+        let gfx = Gfx::new().unwrap();
+        let cfg = crate::config::defaults();
+        let theme = Theme::new(&cfg, &gfx);
+        let mut loader = IconLoader::new(0, 0);
+        let mut kinds = KindCache::default();
+        let prefs = FinderCfg { view: View::List, show_hidden: false, ..cfg.finder.clone() };
+        let mut ctx = Ctx { gfx: &gfx, theme: &theme, loader: &mut loader, kinds: &mut kinds };
+        let mut f = FinderWindow::new(&mut ctx, &Monitor::primary(), 1, dir.clone(), 0, 0, 0, &prefs).unwrap();
+        for _ in 0..50 {
+            f.poll_async(ctx.kinds);
+            if f.pending.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let names: Vec<String> = f.entries.iter().map(|e| e.name.clone()).collect();
+        for (i, name) in names.iter().enumerate() {
+            f.selected = [i].into();
+            f.cursor = Some(i);
+            f.quicklook = None;
+            f.toggle_quicklook();
+            let started = Instant::now();
+            let mut frames = 0;
+            let (mut full, mut parts) = (0, 0);
+            while started.elapsed() < Duration::from_millis(2500) {
+                std::thread::sleep(Duration::from_millis(30));
+                ctx.loader.drain();
+                f.on_quicklook();
+                f.tick(0.03);
+                if f.dirty {
+                    if f.part.is_some() {
+                        parts += 1;
+                    } else {
+                        full += 1;
+                    }
+                    f.render(&mut ctx);
+                    frames += 1;
+                }
+            }
+            let what = match &f.quicklook.as_ref().unwrap().content {
+                quicklook::Content::Text { .. } => "text",
+                quicklook::Content::Picture { failed, .. } => {
+                    if *failed {
+                        "picture (failed)"
+                    } else {
+                        "picture"
+                    }
+                }
+                quicklook::Content::Media { .. } => "media",
+                quicklook::Content::Pdf { .. } => "pdf",
+                quicklook::Content::Handler { .. } => "preview handler",
+                quicklook::Content::Fallback => "fallback",
+            };
+            println!("{name}: {what}, {frames} frames ({full} full, {parts} partial)");
+            let px = f.canvas.pixels();
+            crate::gfx::write_png(ctx.gfx, f.canvas.width as u32, f.canvas.height as u32, &px, &out.join(format!("ql-{i:02}.png")).to_string_lossy());
+            f.close_quicklook();
+            f.quicklook = None;
+            f.ql_closing = None;
+        }
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On-screen frame rate while scrolling a big folder every frame.

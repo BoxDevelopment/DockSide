@@ -452,29 +452,12 @@ pub fn same_volume(a: &Path, b: &Path) -> bool {
 }
 
 /// Extensions Quick Look shows as plain text.
-const TEXT_EXT: &[&str] = &[
+pub(crate) const TEXT_EXT: &[&str] = &[
     "txt", "md", "markdown", "log", "csv", "tsv", "json", "jsonc", "toml", "yaml", "yml", "ini", "cfg", "conf", "xml",
     "html", "htm", "css", "scss", "js", "mjs", "cjs", "ts", "tsx", "jsx", "rs", "py", "rb", "go", "java", "kt", "swift",
     "c", "h", "cc", "cpp", "hpp", "cs", "lua", "sh", "bash", "zsh", "ps1", "psm1", "bat", "cmd", "sql", "gitignore",
     "gitattributes", "editorconfig", "env", "lock", "properties", "gradle", "cmake", "mk", "srt", "reg", "nfo",
 ];
-
-/// The start of a text file for Quick Look (None for folders and binary / unknown types).
-pub fn text_preview(e: &Entry) -> Option<String> {
-    use std::io::Read;
-    const MAX: u64 = 32 * 1024;
-    let named = matches!(e.name.to_lowercase().as_str(), "makefile" | "dockerfile" | "license" | "readme");
-    if e.is_dir || !(TEXT_EXT.contains(&e.ext.as_str()) || named) {
-        return None;
-    }
-    let mut buf = Vec::new();
-    std::fs::File::open(&e.path).ok()?.take(MAX).read_to_end(&mut buf).ok()?;
-    if buf.contains(&0) {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&buf);
-    Some(text.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\t', "    "))
-}
 
 pub fn open_terminal(dir: &Path) {
     use std::os::windows::process::CommandExt;

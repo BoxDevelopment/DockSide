@@ -243,5 +243,7 @@ pub const WM_APP_WALLPAPER: u32 = WM_APP + 33;
 pub const WM_APP_CALENDAR: u32 = WM_APP + 34;
 /// The battery dropdown's worker has news.
 pub const WM_APP_BATTERY: u32 = WM_APP + 35;
+/// A Finder Quick Look worker has news (a video frame, a picture, a PDF page, a player state).
+pub const WM_APP_QUICKLOOK: u32 = WM_APP + 37;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

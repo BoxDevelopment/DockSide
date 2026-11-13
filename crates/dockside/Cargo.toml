@@ -28,6 +28,8 @@ features = [
     "implement",
     "ApplicationModel_Appointments",
     "Devices_Enumeration",
+    # Quick Look: PDF pages.
+    "Data_Pdf",
     # Control Center: Wi-Fi / Bluetooth radios, network scans, Mobile Hotspot.
     "Devices_Radios",
     "Devices_WiFi",

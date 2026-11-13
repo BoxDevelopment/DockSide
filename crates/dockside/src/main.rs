@@ -67,6 +67,13 @@ fn main() {
         return;
     }
     let args: Vec<String> = std::env::args().collect();
+    // Finder's unelevated helper for apps' context menu items (see finder::xcmd::remote).
+    if let Some(i) = args.iter().position(|a| a == finder::xcmd::remote::ARG) {
+        if let Some(pipe) = args.get(i + 1) {
+            finder::xcmd::remote::helper_main(pipe);
+        }
+        finder::xcmd::remote::quit();
+    }
     // `dockside activity start build --title Build …`: a Live Activity for the island.
     if args.get(1).is_some_and(|a| a == "activity") {
         std::process::exit(island::live::cli(&args[2..]));

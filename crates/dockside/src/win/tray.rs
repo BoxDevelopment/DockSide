@@ -584,7 +584,7 @@ fn record(data: &[u8], explorer_ok: Option<bool>) {
 }
 
 /// Renders an icon into premultiplied BGRA at `size` px.
-fn icon_pixels(icon: HICON, size: i32) -> Option<IconPixels> {
+pub(crate) fn icon_pixels(icon: HICON, size: i32) -> Option<IconPixels> {
     use windows::Win32::Graphics::Gdi::*;
     unsafe {
         let bmi = BITMAPINFO {

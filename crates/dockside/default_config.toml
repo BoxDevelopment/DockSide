@@ -230,6 +230,10 @@ sidebar_pins = []
 sidebar = "glass"
 # Win+E opens a Finder window instead of File Explorer (while DockSide runs).
 replace_win_e = false
+# Where the right-click menu shows Windows' and apps' own items (WinRAR, 7-Zip,
+# "Open in Terminal", Send to, ...): "submenu" (under More Options) or "inline"
+# (at the bottom of the menu, leaving out the ones Finder's own items cover).
+shell_items = "submenu"
 
 [desktops]
 # Alt+1 ... Alt+9 switch to that virtual desktop (Windows' own desktops).

@@ -263,6 +263,50 @@ pub struct PopupMenu {
     aim: Option<(f32, f32, f32)>,
     /// The last pointer position, in surface points.
     last: (f32, f32),
+    /// How far the items are scrolled up (menus taller than the screen), and the most they can be.
+    scroll: f32,
+    max_scroll: f32,
+    /// Resting on a scroll arrow: points per second it scrolls (negative: up).
+    auto: f32,
+}
+
+/// The work area a menu must stay inside, in screen points.
+#[derive(Clone, Copy, Debug)]
+struct Bounds {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+/// The gap kept between a menu and the edges of the work area.
+const EDGE: f32 = 4.0;
+/// Height of a scroll arrow strip.
+const ARROW_H: f32 = 18.0;
+/// How fast resting on a scroll arrow scrolls, in points per second.
+const ARROW_SPEED: f32 = 360.0;
+
+/// Where a menu body `w` x `h` goes (its top-left, in screen points). A context
+/// menu (`context`) opens right of and below the pointer, flipping left or up
+/// where it would run off the screen, like macOS; anything still too big slides
+/// back inside.
+fn place(placement: Placement, w: f32, h: f32, area: Bounds, context: bool) -> (f32, f32) {
+    let fit = |pos: f32, size: f32, lo: f32, hi: f32| pos.min(hi - size).max(lo);
+    match placement {
+        Placement::Below { x, y } => {
+            let x = if context && x + w > area.right && x - w >= area.left { x - w } else { x };
+            let flipped = context && y + h > area.bottom && y - h >= area.top;
+            // Never pushed down from where it was asked to open (a menu bar menu sits on the bar).
+            let top = area.top.min(y);
+            (fit(x, w, area.left, area.right), fit(if flipped { y - h } else { y }, h, top, area.bottom))
+        }
+        // Never pushed up from where it was asked to end (a Dock menu sits on the Dock).
+        Placement::Above { cx, bottom } => (fit(cx - w / 2.0, w, area.left, area.right), fit(bottom - h, h, area.top, area.bottom.max(bottom))),
+        Placement::Beside { left, right, top } => {
+            let x = if right + w <= area.right || left - w < area.left { right } else { left - w };
+            (fit(x, w, area.left, area.right), fit(top, h, area.top.min(top), area.bottom))
+        }
+    }
 }
 
 /// Menus open instantly; once closed they fade out (see the App's frame loop).
@@ -299,23 +343,21 @@ impl PopupMenu {
             short_w = short_w.max(CHEVRON);
         }
         let width = (22.0 + label_w + if short_w > 0.0 { 32.0 + short_w } else { 0.0 } + 18.0).clamp(160.0, 420.0);
-        let height = PAD_Y * 2.0
+        let content_h = PAD_Y * 2.0
             + entries.iter().map(|e| if matches!(e, Entry::Separator) { SEP_H } else { ITEM_H }).sum::<f32>();
 
-        // Body position in screen points, clamped to the monitor.
+        // Body position in screen points, kept inside the monitor's work area (the
+        // taskbar and app bars stay uncovered). A menu taller than that scrolls.
         let s = monitor.scale;
-        let mon_l = monitor.rect.left as f32 / s;
-        let mon_r = monitor.rect.right as f32 / s;
-        let (mut x, y) = match placement {
-            Placement::Below { x, y } => (x, y),
-            Placement::Above { cx, bottom } => (cx - width / 2.0, bottom - height),
-            Placement::Beside { left, right, top } => {
-                let x = if right + width <= mon_r - 4.0 { right } else { left - width };
-                let (mon_t, mon_b) = (monitor.rect.top as f32 / s, monitor.rect.bottom as f32 / s);
-                (x, top.min(mon_b - height - 4.0).max(mon_t))
-            }
+        let work = monitor.work_area();
+        let area = Bounds {
+            left: work.left as f32 / s + EDGE,
+            top: work.top as f32 / s + EDGE,
+            right: work.right as f32 / s - EDGE,
+            bottom: work.bottom as f32 / s - EDGE,
         };
-        x = x.clamp(mon_l + 4.0, (mon_r - width - 4.0).max(mon_l));
+        let height = content_h.min((area.bottom - area.top).max(ITEM_H * 3.0 + PAD_Y * 2.0));
+        let (x, y) = place(placement, width, height, area, source == MenuSource::Window);
 
         let rect = RECT {
             left: ((x - SHADOW) * s).round() as i32,
@@ -348,7 +390,55 @@ impl PopupMenu {
             icons: Vec::new(),
             aim: None,
             last: (0.0, 0.0),
+            scroll: 0.0,
+            max_scroll: (content_h - height).max(0.0),
+            auto: 0.0,
         })
+    }
+
+    /// Item `i`'s rect as shown (scrolled), in surface points.
+    fn shown(&self, i: usize) -> Rect {
+        self.rects[i].offset(0.0, -self.scroll)
+    }
+
+    /// The scroll arrows' strips, when they're showing (only in a menu too tall for the screen).
+    fn arrow_up(&self) -> Option<Rect> {
+        (self.scroll > 0.5).then(|| Rect::new(self.body.x, self.body.y, self.body.w, ARROW_H))
+    }
+
+    fn arrow_down(&self) -> Option<Rect> {
+        (self.scroll < self.max_scroll - 0.5).then(|| Rect::new(self.body.x, self.body.bottom() - ARROW_H, self.body.w, ARROW_H))
+    }
+
+    /// Scrolls by `dy` points; true when it moved.
+    fn scroll_by(&mut self, dy: f32) -> bool {
+        let to = (self.scroll + dy).clamp(0.0, self.max_scroll);
+        let moved = (to - self.scroll).abs() > 0.01;
+        self.scroll = to;
+        if moved {
+            // What's under the pointer now.
+            self.hovered = self.index_at(self.last.0, self.last.1);
+        }
+        moved
+    }
+
+    /// The mouse wheel over the menu (tall menus only); true when it scrolled.
+    pub fn on_wheel(&mut self, delta: i32) -> bool {
+        self.max_scroll > 0.0 && self.scroll_by(-delta as f32 / 120.0 * ITEM_H * 3.0)
+    }
+
+    /// Scrolls item `i` into view (keyboard moves).
+    fn reveal(&mut self, i: usize) {
+        if self.max_scroll <= 0.0 {
+            return;
+        }
+        let r = self.shown(i);
+        let (top, bottom) = (self.body.y + ARROW_H, self.body.bottom() - ARROW_H);
+        if r.y < top {
+            self.scroll_by(r.y - top);
+        } else if r.bottom() > bottom {
+            self.scroll_by(r.bottom() - bottom);
+        }
     }
 
     /// Top-left of the surface, in screen points.
@@ -379,7 +469,7 @@ impl PopupMenu {
             return None;
         }
         let (ox, oy) = self.origin();
-        let placement = Placement::Beside { left: ox + self.body.x, right: ox + self.body.right(), top: oy + self.rects[i].y - PAD_Y };
+        let placement = Placement::Beside { left: ox + self.body.x, right: ox + self.body.right(), top: oy + self.shown(i).y - PAD_Y };
         Some((item.submenu.clone(), placement))
     }
 
@@ -398,13 +488,17 @@ impl PopupMenu {
         self.on_key(0x28).1
     }
 
-    /// Advances the highlight; returns true while it's moving (redraw then).
+    /// Advances the highlight (and a scroll arrow being rested on); returns true while either moves (redraw then).
     pub fn tick(&mut self, dt: f32) -> bool {
-        self.glide.tick(dt)
+        let scrolled = self.auto != 0.0 && self.scroll_by(self.auto * dt.min(0.05));
+        if self.auto != 0.0 && !scrolled {
+            self.auto = 0.0;
+        }
+        self.glide.tick(dt) | scrolled
     }
 
     pub fn animating(&self) -> bool {
-        self.glide.moving()
+        self.glide.moving() || self.auto != 0.0
     }
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme) {
@@ -422,9 +516,13 @@ impl PopupMenu {
                 })
                 .collect();
         }
-        let target = self.hovered.map(|i| self.rects[i].inset(5.0, 0.0));
+        let target = self.hovered.map(|i| self.shown(i).inset(5.0, 0.0));
         let glide = self.glide.update(target);
-        let (body, entries, rects, mac, icons) = (self.body, &self.entries, &self.rects, self.mac, &self.icons);
+        let (up, down) = (self.arrow_up(), self.arrow_down());
+        let rects: Vec<Rect> = (0..self.rects.len()).map(|i| self.shown(i)).collect();
+        let (body, entries, rects, mac, icons) = (self.body, &self.entries, &rects, self.mac, &self.icons);
+        // Items show between the scroll arrows (when there are any).
+        let items_clip = Rect::new(body.x, body.y + up.map_or(0.0, |r| r.h), body.w, body.h - up.map_or(0.0, |r| r.h) - down.map_or(0.0, |r| r.h));
 
         // One item, in its plain colours or (`lit`) white for under the highlight.
         let draw_item = |p: &crate::gfx::Painter, i: usize, lit: bool| {
@@ -468,28 +566,41 @@ impl PopupMenu {
             p.fill_round(body, RADIUS, if has_backdrop { theme.menu_tint.alpha(0.35) } else { theme.menu_tint.alpha(1.0) });
             p.stroke_round(body.inset(0.25, 0.25), RADIUS, theme.menu_border, 0.5);
 
-            for (i, (e, r)) in entries.iter().zip(rects).enumerate() {
-                match e {
-                    Entry::Separator => {
-                        let y = r.cy();
-                        p.line(r.x + 10.0, y, r.right() - 10.0, y, theme.menu_separator, 1.0);
+            p.clipped(items_clip, || {
+                for (i, (e, r)) in entries.iter().zip(rects).enumerate() {
+                    if r.bottom() < items_clip.y || r.y > items_clip.bottom() {
+                        continue;
                     }
-                    Entry::Item(_) => draw_item(p, i, false),
-                }
-            }
-            // The highlight glides over the items; whatever it covers is redrawn
-            // white, clipped to it, so text turns exactly where the highlight is.
-            if let Some((g, a)) = glide {
-                p.faded(a, || {
-                    p.fill_round(g, 4.0, theme.accent);
-                    p.clipped(g, || {
-                        for (i, r) in rects.iter().enumerate() {
-                            if r.bottom() > g.y && r.y < g.bottom() {
-                                draw_item(p, i, true);
-                            }
+                    match e {
+                        Entry::Separator => {
+                            let y = r.cy();
+                            p.line(r.x + 10.0, y, r.right() - 10.0, y, theme.menu_separator, 1.0);
                         }
+                        Entry::Item(_) => draw_item(p, i, false),
+                    }
+                }
+                // The highlight glides over the items; whatever it covers is redrawn
+                // white, clipped to it, so text turns exactly where the highlight is.
+                if let Some((g, a)) = glide {
+                    p.faded(a, || {
+                        p.fill_round(g, 4.0, theme.accent);
+                        p.clipped(g, || {
+                            for (i, r) in rects.iter().enumerate() {
+                                if r.bottom() > g.y && r.y < g.bottom() {
+                                    draw_item(p, i, true);
+                                }
+                            }
+                        });
                     });
-                });
+                }
+            });
+            // Scroll arrows: small chevrons pointing where there's more, as on macOS.
+            for (r, dir) in [(up, -1.0f32), (down, 1.0)] {
+                if let Some(r) = r {
+                    let (cx, cy, h) = (r.cx(), r.cy(), 3.5);
+                    p.line(cx - h * 1.4, cy - h * dir * 0.5, cx, cy + h * dir * 0.5, theme.text, 1.5);
+                    p.line(cx, cy + h * dir * 0.5, cx + h * 1.4, cy - h * dir * 0.5, theme.text, 1.5);
+                }
             }
         });
         if let Err(e) = r {
@@ -503,12 +614,21 @@ impl PopupMenu {
     }
 
     fn index_at(&self, x: f32, y: f32) -> Option<usize> {
-        self.rects.iter().position(|r| r.contains(x, y)).filter(|&i| self.entries[i].enabled())
+        if !self.body.contains(x, y) || [self.arrow_up(), self.arrow_down()].into_iter().flatten().any(|r| r.contains(x, y)) {
+            return None;
+        }
+        (0..self.rects.len()).find(|&i| self.shown(i).contains(x, y)).filter(|&i| self.entries[i].enabled())
     }
 
     /// Returns true when the highlight changed.
     pub fn on_move(&mut self, x: f32, y: f32) -> bool {
         let from = std::mem::replace(&mut self.last, (x, y));
+        // Resting on a scroll arrow scrolls that way (see `tick`).
+        self.auto = match (self.arrow_up(), self.arrow_down()) {
+            (Some(r), _) if r.contains(x, y) => -ARROW_SPEED,
+            (_, Some(r)) if r.contains(x, y) => ARROW_SPEED,
+            _ => 0.0,
+        };
         // Heading for the open submenu across other items: they don't take the highlight.
         if let Some((edge, top, bottom)) = self.aim {
             if self.hovered.is_some() && toward(from, (x, y), edge, top, bottom) {
@@ -522,6 +642,7 @@ impl PopupMenu {
     }
 
     pub fn on_leave(&mut self) -> bool {
+        self.auto = 0.0;
         // The open submenu's item stays highlighted while the pointer is in the submenu.
         if self.aim.is_some() {
             return false;
@@ -568,6 +689,7 @@ impl PopupMenu {
                     i = (i + dir).rem_euclid(n);
                     if self.entries[i as usize].enabled() {
                         self.hovered = Some(i as usize);
+                        self.reveal(i as usize);
                         return (MenuEvent::None, true);
                     }
                 }
@@ -702,5 +824,52 @@ pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
             Entry::keys("Search", Shortcut::new("w", ch(b'S'), "S")),
         ],
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AREA: Bounds = Bounds { left: 4.0, top: 34.0, right: 1916.0, bottom: 1036.0 };
+
+    #[test]
+    fn context_menus_open_down_and_right_where_they_fit() {
+        assert_eq!(place(Placement::Below { x: 500.0, y: 300.0 }, 200.0, 400.0, AREA, true), (500.0, 300.0));
+    }
+
+    #[test]
+    fn context_menus_flip_up_near_the_bottom() {
+        // 400 tall at y = 900 would end at 1300: it opens upward, ending at the pointer.
+        assert_eq!(place(Placement::Below { x: 500.0, y: 900.0 }, 200.0, 400.0, AREA, true), (500.0, 500.0));
+    }
+
+    #[test]
+    fn context_menus_flip_left_near_the_right_edge() {
+        assert_eq!(place(Placement::Below { x: 1850.0, y: 300.0 }, 200.0, 100.0, AREA, true), (1650.0, 300.0));
+    }
+
+    #[test]
+    fn menus_that_fit_neither_way_slide_inside() {
+        // 900 tall at y = 500: no room below (ends 1400) or above (starts -400): pinned to the bottom.
+        assert_eq!(place(Placement::Below { x: 500.0, y: 500.0 }, 200.0, 900.0, AREA, true), (500.0, 136.0));
+    }
+
+    #[test]
+    fn menu_bar_menus_stay_on_the_bar() {
+        // A menu bar menu opens right under the bar even where that's above the work area's edge.
+        assert_eq!(place(Placement::Below { x: 10.0, y: 30.0 }, 200.0, 300.0, AREA, false), (10.0, 30.0));
+    }
+
+    #[test]
+    fn dock_menus_stay_on_the_dock() {
+        let (_, y) = place(Placement::Above { cx: 960.0, bottom: 1040.0 }, 200.0, 300.0, AREA, false);
+        assert_eq!(y, 740.0);
+    }
+
+    #[test]
+    fn submenus_open_left_without_room_and_shift_up_near_the_bottom() {
+        let (x, y) = place(Placement::Beside { left: 1700.0, right: 1900.0, top: 900.0 }, 200.0, 300.0, AREA, true);
+        assert_eq!((x, y), (1500.0, 736.0));
     }
 }

@@ -17,6 +17,7 @@ mod rich;
 pub mod search;
 pub mod shell;
 pub mod text;
+pub mod xcmd;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -604,6 +605,8 @@ pub struct FinderWindow {
     active_tab: usize,
     /// Blurred backdrop behind the translucent sidebar, when vibrancy is on and available.
     backdrop: Option<SidebarBackdrop>,
+    /// Where the context menu puts the shell's items ([finder] shell_items).
+    pub shell_items: crate::config::ShellItems,
     /// The view pill, search field, tab bar and scrollbar springs. Anything
     /// following direct input (scrolling, hovering, selecting) stays instant.
     motion: Motion<Anim>,
@@ -647,6 +650,8 @@ impl FinderWindow {
         changed_msg: u32,
         prefs: &FinderCfg,
     ) -> Result<Self> {
+        // Have the shell's context menu items ready by the first right-click.
+        shell::warm_menus();
         let s = monitor.scale;
         let (w, h) = (((W + 2.0 * SHADOW) * s).round() as i32, ((H + 2.0 * SHADOW) * s).round() as i32);
         let mon = monitor.rect;
@@ -739,6 +744,7 @@ impl FinderWindow {
             tabs: vec![None],
             active_tab: 0,
             backdrop: Self::new_backdrop(prefs, ctx.theme),
+            shell_items: prefs.shell_items,
             motion: Motion::default(),
             window: WindowAnim::opening(),
             side_glide: Glide::default(),
@@ -3454,18 +3460,21 @@ impl FinderWindow {
                         p.faded(dim(sel, e), || draw_icon(p, bmp, icon_r));
                         let label = Rect::new(cell.x + 4.0, icon_r.bottom() + 6.0, cell.w - 8.0, 32.0);
                         let name = e.label(show_ext);
+                        // Only the icon and the name's text take clicks: the gaps around them are the folder's.
+                        let full_w = p.gfx.measure(name, &label_font);
+                        let (text_w, lines) = (full_w.min(label.w), if full_w > label.w { 2.0 } else { 1.0 });
+                        let text_r = Rect::new(label.cx() - text_w / 2.0 - 4.0, label.y - 1.0, text_w + 8.0, lines * 15.5 + 2.0);
+                        hits.extend(intersect(icon_r.inset(-6.0, -5.0), vr).map(|r| (r, Hit::Item(i))));
+                        hits.extend(intersect(text_r, vr).map(|r| (r, Hit::Item(i))));
                         match rename.as_ref().filter(|r| r.target == e.path) {
                             Some(ren) => draw_field(p, Rect::new(cell.x + 2.0, label.y, cell.w - 4.0, 20.0), ren),
                             None => {
                                 if sel {
-                                    let tw = p.gfx.measure(name, &label_font).min(label.w);
-                                    let lines = if p.gfx.measure(name, &label_font) > label.w { 2.0 } else { 1.0 };
-                                    p.fill_round(Rect::new(label.cx() - tw / 2.0 - 4.0, label.y - 1.0, tw + 8.0, lines * 15.5 + 2.0), 4.0, sel_bg);
+                                    p.fill_round(text_r, 4.0, sel_bg);
                                 }
                                 p.text(name, &label_font, label, if sel { sel_text } else { theme.text });
                             }
                         }
-                        hits.extend(intersect(Rect::new(cell.x + 4.0, cell.y, cell.w - 8.0, cell.h - 4.0), vr).map(|r| (r, Hit::Item(i))));
                     }
                 }
                 View::List => {
@@ -3532,7 +3541,18 @@ impl FinderWindow {
                                     p.text(&text, &regular, Rect::new(cx + 8.0, r.y, cw - 12.0, r.h), sc);
                                 }
                             }
-                            hits.extend(intersect(r, rows_clip).map(|r| (r, Hit::Item(i))));
+                            // The icon, the name's text and the other columns take clicks; the
+                            // blank part of the Name column beside it is the folder's, as in Finder.
+                            let text_w = if rename.as_ref().is_some_and(|ren| ren.target == e.path) {
+                                name_r.w
+                            } else {
+                                p.gfx.measure(e.label(show_ext), &regular).min(name_r.w)
+                            };
+                            let name_hit = Rect::new(r.x, r.y, (name_r.x - r.x) + text_w + 8.0, r.h);
+                            let rest_x = cols.get(1).map_or(r.right(), |c| c.3);
+                            for hr in [name_hit, Rect::new(rest_x, r.y, r.right() - rest_x, r.h)] {
+                                hits.extend(intersect(hr, rows_clip).map(|h| (h, Hit::Item(i))));
+                            }
                         }
                     });
                     // Header (drawn last so rows scroll under it).
@@ -4128,6 +4148,103 @@ impl Drop for FinderWindow {
 #[cfg(test)]
 mod bench {
     use super::*;
+
+    /// A hidden Finder window in a scratch folder: which points are items and
+    /// which are the folder's blank space, and the context menus in both
+    /// `shell_items` modes.
+    /// `cargo test --profile fast context_menus -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn context_menus() {
+        use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+        unsafe extern "system" fn proc_(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            DefWindowProcW(h, m, w, l)
+        }
+        dnd::ensure_ole();
+        let _ = crate::win::register_class(Some(proc_));
+        let dir = std::env::temp_dir().join("dockside-menu-test");
+        let _ = std::fs::create_dir_all(&dir);
+        for n in ["a long file name for the list view.txt", "b.txt", "c.png"] {
+            let _ = std::fs::write(dir.join(n), "x");
+        }
+        let gfx = Gfx::new().unwrap();
+        let cfg = crate::config::defaults();
+        let theme = Theme::new(&cfg, &gfx);
+        let mut loader = IconLoader::new(0, 0);
+        let mut kinds = KindCache::default();
+        let mut ctx = Ctx { gfx: &gfx, theme: &theme, loader: &mut loader, kinds: &mut kinds };
+        let walk_menu = |name: &str, ev: FinderEvent| {
+            fn walk(v: &[Entry], depth: usize) {
+                for e in v {
+                    match e {
+                        Entry::Separator => println!("{}--", "  ".repeat(depth)),
+                        Entry::Item(i) => {
+                            println!("{}{}", "  ".repeat(depth), i.label);
+                            if depth < 2 {
+                                walk(&i.submenu, depth + 1);
+                            }
+                        }
+                    }
+                }
+            }
+            println!("== {name}");
+            match ev {
+                FinderEvent::Menu(v, ..) => walk(&v, 1),
+                _ => println!("  (no menu)"),
+            }
+        };
+        std::thread::sleep(Duration::from_secs(2));
+        for view in [View::List, View::Icons] {
+            let prefs = FinderCfg { view, show_hidden: false, ..cfg.finder.clone() };
+            let mut f = FinderWindow::new(&mut ctx, &Monitor::primary(), 1, dir.clone(), 0, 0, 0, &prefs).unwrap();
+            for _ in 0..40 {
+                f.poll_async(ctx.kinds);
+                f.dirty = true;
+                f.render(&mut ctx);
+                if f.pending.is_none() && f.entries.len() >= 3 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let i = f.entries.iter().position(|e| e.name.starts_with("a long")).unwrap();
+            let r = f.layout.cells[i].offset(0.0, -f.scroll.offset());
+            let ib = f.entries.iter().position(|e| e.name == "b.txt").unwrap();
+            let rb = f.layout.cells[ib].offset(0.0, -f.scroll.offset());
+            let vr = f.view_rect();
+            let probes: Vec<(&str, f32, f32, bool)> = match view {
+                View::List => vec![
+                    ("icon", r.x + 14.0, r.cy(), true),
+                    ("name text", r.x + 60.0, r.cy(), true),
+                    ("blank beside a short name", rb.x + 120.0, rb.cy(), false),
+                    ("below the last row", vr.x + 100.0, vr.bottom() - 10.0, false),
+                ],
+                _ => vec![
+                    ("icon", r.cx(), r.y + 6.0 + f.icon_size / 2.0, true),
+                    ("cell corner", r.x + 6.0, r.y + 4.0, false),
+                    ("below the last row", vr.x + 100.0, vr.bottom() - 10.0, false),
+                ],
+            };
+            for (what, x, y, item) in probes {
+                let hit = f.hit_at(x, y);
+                println!("{view:?} {what}: {hit:?}");
+                assert_eq!(matches!(hit, Some(Hit::Item(_))), item, "{view:?} {what}");
+            }
+            if view == View::List {
+                f.selected = [i].into();
+                let (bx, by) = (rb.x + 120.0, rb.cy());
+                for mode in [crate::config::ShellItems::Submenu, crate::config::ShellItems::Inline] {
+                    f.shell_items = mode;
+                    f.selected = [i].into();
+                    walk_menu(&format!("item menu, {mode:?}"), f.on_right_click(r.x + 60.0, r.cy(), false, ctx.kinds));
+                    walk_menu(&format!("blank beside a name, {mode:?}"), f.on_right_click(bx, by, false, ctx.kinds));
+                    assert!(f.selected.is_empty(), "a right-click on blank space deselects");
+                }
+            }
+            unsafe {
+                let _ = DestroyWindow(f.hwnd);
+            }
+        }
+    }
 
     /// Drives a Finder window through places, views, menus, search and file
     /// operations, saving a PNG of each step to `TOUR_DIR`.

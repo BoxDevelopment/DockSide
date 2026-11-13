@@ -2,14 +2,37 @@
 //! (Open With, Run as administrator, Copy as path, Share, ...) and the
 //! shell's own menu, extensions included, under "More Options".
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use windows::Win32::Foundation::RECT;
+use windows::Win32::UI::Shell::IContextMenu;
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
 use super::fs::{Entry as FileEntry, KindCache, PlaceKind, SortKey};
-use super::{ops, shell, Col, FinderCmd, FinderEvent, FinderWindow, Group, Hit, Pane, View};
+use super::{ops, shell, xcmd, Col, FinderCmd, FinderEvent, FinderWindow, Group, Hit, Pane, View};
+use crate::config::ShellItems;
 use crate::menu::{Action, Entry};
+
+/// Shell verbs Finder's own item menu already has (Open, Cut, Copy, Move to Trash,
+/// Get Info, Rename, Make Shortcut, Copy as Path, Share, Run as Administrator, Put Back).
+const ITEM_VERBS: &[&str] = &[
+    "open", "opennewwindow", "opennewtab", "cut", "copy", "delete", "properties", "rename", "link", "copyaspath",
+    "Windows.ModernShare", "runas", "undelete",
+];
+/// Shell submenus it already has.
+const ITEM_MENUS: &[&str] = &["Open with"];
+/// The same for a folder's background menu (Paste, Paste Shortcut, Undo, Get Info; View, Sort By, Group By, New).
+const BACKGROUND_VERBS: &[&str] = &["paste", "pastelink", "properties", "undo", "redo", "refresh"];
+const BACKGROUND_MENUS: &[&str] = &["View", "Sort by", "Group by", "New"];
+
+/// An item's label (not a separator's).
+fn label(e: &Entry) -> Option<&str> {
+    match e {
+        Entry::Item(i) => Some(&i.label),
+        Entry::Separator => None,
+    }
+}
 use crate::win::system::Shortcut;
 
 const DEL: u16 = 0x2E;
@@ -32,11 +55,55 @@ impl FinderWindow {
         Action::Finder { window: self.id, cmd: c }
     }
 
-    /// The shell's own menu for items (or a folder's background), under "More Options".
-    fn more_options(&self, cm: Option<windows::Win32::UI::Shell::IContextMenu>, extended: bool) -> Option<shell::Filled> {
+    /// The shell's own menu for items (or a folder's background): the classic
+    /// menu's items, plus the verbs apps add to Windows 11's new menu (WinRAR,
+    /// 7-Zip, "Open in Terminal", PowerToys), which the classic one leaves out.
+    fn more_options(&self, cm: Option<IContextMenu>, extended: bool, paths: &[PathBuf], target: xcmd::Target) -> Option<shell::Filled> {
         let id = self.id;
         let action = move |n: u32| Action::Finder { window: id, cmd: FinderCmd::ShellCommand(n) };
-        cm.map(|cm| shell::menu_entries(cm, extended, &action)).filter(|f| !f.entries.is_empty())
+        let mut filled = cm.map(|cm| shell::menu_entries(cm, extended, &action)).unwrap_or_default();
+        let packaged = xcmd::entries(paths, target, &action);
+        if !packaged.is_empty() {
+            // Once Windows has loaded them itself, the classic menu has some of the same: keep one.
+            let names: HashSet<String> = packaged.iter().filter_map(|e| label(e).map(str::to_lowercase)).collect();
+            filled.entries.retain(|e| label(e).is_none_or(|l| !names.contains(&l.to_lowercase())));
+            // After the classic menu's first group (its Open verbs), where Explorer puts them.
+            let at = filled.entries.iter().position(|e| matches!(e, Entry::Separator)).unwrap_or(filled.entries.len());
+            let tail = filled.entries.split_off(at);
+            filled.entries.push(Entry::Separator);
+            filled.entries.extend(packaged);
+            filled.entries.push(Entry::Separator);
+            filled.entries.extend(tail);
+            filled.entries = tidy(std::mem::take(&mut filled.entries));
+        }
+        Some(filled).filter(|f| !f.entries.is_empty())
+    }
+
+    /// Adds the shell's items to the end of a menu: under "More Options", or
+    /// (`[finder] shell_items = "inline"`) right in it, without the ones whose
+    /// verbs (or submenus, by name) Finder's own items already cover.
+    fn add_shell_items(&self, v: &mut Vec<Entry>, more: Option<shell::Filled>, covered_verbs: &[&str], covered_menus: &[&str]) {
+        let Some(m) = more else { return };
+        v.push(Entry::Separator);
+        match self.shell_items {
+            ShellItems::Submenu => v.push(Entry::submenu("More Options", m.entries)),
+            ShellItems::Inline => {
+                let ids: HashSet<u32> =
+                    m.verbs.iter().filter(|(verb, _)| covered_verbs.iter().any(|c| c.eq_ignore_ascii_case(verb))).map(|(_, id)| *id).collect();
+                let keep = |e: &Entry| match e {
+                    Entry::Separator => true,
+                    Entry::Item(i) => {
+                        let shell_id = match &i.action {
+                            Some(Action::Finder { cmd: FinderCmd::ShellCommand(n), .. }) => Some(*n),
+                            _ => None,
+                        };
+                        !shell_id.is_some_and(|n| ids.contains(&n))
+                            && !(i.action.is_none() && covered_menus.iter().any(|c| c.eq_ignore_ascii_case(&i.label)))
+                    }
+                };
+                v.extend(m.entries.into_iter().filter(keep));
+            }
+        }
     }
 
     pub fn on_right_click(&mut self, x: f32, y: f32, shift: bool, kinds: &mut KindCache) -> FinderEvent {
@@ -61,6 +128,11 @@ impl FinderWindow {
                 self.columns.truncate(c + 1);
                 self.columns[c].selected = None;
                 self.active_col = c;
+            }
+            // Right-clicking the folder's blank space deselects, like Finder.
+            Some(Hit::Content) if self.view != View::Columns => {
+                self.selected.clear();
+                self.anchor = None;
             }
             _ => {}
         }
@@ -104,7 +176,8 @@ impl FinderWindow {
         let one = sel.len() == 1;
         let in_trash = first.deleted.is_some() || self.cwd.as_os_str().eq_ignore_ascii_case(shell::RECYCLE_BIN);
         let fs = sel.iter().all(|e| e.fs);
-        let more = self.more_options(shell::item_menu(&paths), shift);
+        let kinds: Vec<(bool, String)> = sel.iter().map(|e| (e.is_dir, e.ext.clone())).collect();
+        let more = self.more_options(shell::item_menu(&paths), shift, &paths, xcmd::Target::Items(kinds));
         let mut v = vec![Entry::item("Open", self.cmd(Open(first.path.clone())))];
         if first.is_dir && one {
             v.push(Entry::item("Open in New Tab", self.cmd(OpenTab(first.path.clone()))));
@@ -185,10 +258,7 @@ impl FinderWindow {
         if fs {
             v.push(Entry::item("Show in File Explorer", self.cmd(Reveal(first.path.clone()))));
         }
-        if let Some(m) = more {
-            v.push(Entry::Separator);
-            v.push(Entry::submenu("More Options", m.entries));
-        }
+        self.add_shell_items(&mut v, more, ITEM_VERBS, ITEM_MENUS);
         tidy(v)
     }
 
@@ -197,7 +267,7 @@ impl FinderWindow {
         let dir = self.target_dir();
         let fs_dir = shell::is_fs_path(&dir) && dir.is_dir();
         let in_trash = dir.as_os_str().eq_ignore_ascii_case(shell::RECYCLE_BIN);
-        let more = self.more_options(shell::background_menu(self.hwnd, &dir), shift);
+        let more = self.more_options(shell::background_menu(self.hwnd, &dir), shift, std::slice::from_ref(&dir), xcmd::Target::Background);
         let mut v = Vec::new();
         if fs_dir {
             v.push(Entry::item("New Folder", self.cmd(NewFolder)).shortcut(Shortcut::new("cs", key('N'), "N")));
@@ -245,10 +315,7 @@ impl FinderWindow {
         if !self.pins.contains(&dir) && !self.places.iter().any(|p| p.path == dir) {
             v.push(Entry::item("Add to Sidebar", self.cmd(Pin(dir.clone()))));
         }
-        if let Some(m) = more {
-            v.push(Entry::Separator);
-            v.push(Entry::submenu("More Options", m.entries));
-        }
+        self.add_shell_items(&mut v, more, BACKGROUND_VERBS, BACKGROUND_MENUS);
         tidy(v)
     }
 
@@ -311,10 +378,9 @@ impl FinderWindow {
         if shell::is_fs_path(&p) {
             v.push(Entry::item("Show in File Explorer", self.cmd(Explorer(p.clone()))));
         }
-        if let Some(m) = self.more_options(shell::item_menu(&[p]), shift) {
-            v.push(Entry::Separator);
-            v.push(Entry::submenu("More Options", m.entries));
-        }
+        let kinds = vec![(true, String::new())];
+        let more = self.more_options(shell::item_menu(std::slice::from_ref(&p)), shift, std::slice::from_ref(&p), xcmd::Target::Items(kinds));
+        self.add_shell_items(&mut v, more, ITEM_VERBS, ITEM_MENUS);
         tidy(v)
     }
 

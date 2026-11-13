@@ -63,7 +63,15 @@ thread_local! {
 static MSG_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Windows the menu mouse hook must not treat as "outside" clicks.
 static OPEN_MENU_HWND: AtomicIsize = AtomicIsize::new(0);
-static OPEN_SUBMENU_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Whether a popup menu is open (Finder keeps the shell's menu items loaded until none is).
+pub fn menu_open() -> bool {
+    OPEN_MENU_HWND.load(Ordering::Relaxed) != 0
+}
+/// The open submenus' windows, outermost first (0: none at that level).
+static OPEN_SUBMENU_HWNDS: [AtomicIsize; MAX_SUBMENUS] = [const { AtomicIsize::new(0) }; MAX_SUBMENUS];
+/// How deep submenus go (the shell's own menus nest a few levels).
+const MAX_SUBMENUS: usize = 8;
 /// The open Control Center (outside clicks close it, like a menu).
 static CONTROL_HWND: AtomicIsize = AtomicIsize::new(0);
 /// Every display's menu bar (clicks on any of them leave an open menu to the bar).
@@ -814,7 +822,11 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
         // Close on any click except on the menu itself, or on the menu bar
         // (which switches between its menus on its own).
         let keep = root != 0
-            && [&OPEN_MENU_HWND, &OPEN_SUBMENU_HWND, &CONTROL_HWND].into_iter().chain(&MENUBAR_HWNDS).any(|h| root == h.load(Ordering::Relaxed));
+            && [&OPEN_MENU_HWND, &CONTROL_HWND]
+                .into_iter()
+                .chain(&OPEN_SUBMENU_HWNDS)
+                .chain(&MENUBAR_HWNDS)
+                .any(|h| root == h.load(Ordering::Relaxed));
         if apps::window_pid(target) != GetCurrentProcessId() || !keep {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_MENU);
         }
@@ -1055,8 +1067,10 @@ pub struct App {
     island: Option<Island>,
     widgets: Option<Widgets>,
     menu: Option<PopupMenu>,
-    /// The open menu's submenu, with the item it belongs to.
-    submenu: Option<(usize, PopupMenu)>,
+    /// The open menu's submenus, outermost first, each with the item (of the
+    /// menu before it) it belongs to: `submenus[k]` hangs off level `k`, where
+    /// level 0 is `menu` and level `k + 1` is `submenus[k]`.
+    submenus: Vec<(usize, PopupMenu)>,
     settings: Option<SettingsWindow>,
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
@@ -1235,7 +1249,7 @@ impl App {
             island: None,
             widgets: None,
             menu: None,
-            submenu: None,
+            submenus: Vec::new(),
             settings: None,
             onboarding: None,
             about: None,
@@ -1376,10 +1390,11 @@ impl App {
             // Backdrop tints depend on light/dark, and glass on refraction; recreate everything.
             self.build();
         }
-        if sidebar_changed {
-            for f in &mut self.finders {
+        for f in &mut self.finders {
+            if sidebar_changed {
                 f.set_sidebar(&self.cfg.finder, &self.theme);
             }
+            f.shell_items = self.cfg.finder.shell_items;
         }
         if rebuild {
             return;
@@ -1936,7 +1951,7 @@ impl App {
         for mb in &mut self.menubars {
             still |= mb.animate(dt);
         }
-        for m in self.menu.iter_mut().chain(self.submenu.as_mut().map(|(_, s)| s)) {
+        for m in self.menu.iter_mut().chain(self.submenus.iter_mut().map(|(_, s)| s)) {
             if m.tick(dt) {
                 m.render(&self.gfx, &self.theme);
                 still = true;
@@ -2119,12 +2134,14 @@ impl App {
         let surfaces = [
             self.island.as_ref().map(|i| &i.surface),
             self.menu.as_ref().map(|m| &m.surface),
-            self.submenu.as_ref().map(|(_, s)| &s.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
         ];
         for s in bars.chain(surfaces.into_iter().flatten()) {
             s.raise();
+        }
+        for (_, s) in &self.submenus {
+            s.surface.raise();
         }
         if let Some(c) = &self.control {
             c.raise();
@@ -2373,7 +2390,7 @@ impl App {
     fn wants_frames(&self) -> bool {
         self.menubars.iter().any(|m| m.animating())
             || self.menu.as_ref().is_some_and(|m| m.animating())
-            || self.submenu.as_ref().is_some_and(|(_, s)| s.animating())
+            || self.submenus.iter().any(|(_, s)| s.animating())
             || self.spotlight.as_ref().is_some_and(|s| s.animating())
             || self.control.as_ref().is_some_and(|c| c.animating())
             || self.closing_control.is_some()
@@ -3435,57 +3452,96 @@ impl App {
         self.reset_menu_openers();
     }
 
-    /// Opens the submenu of the open menu's highlighted item, right away (from
+    /// Menu level `lvl`: 0 is the open menu, `k + 1` its `k`th submenu.
+    fn menu_level(&self, lvl: usize) -> Option<&PopupMenu> {
+        if lvl == 0 {
+            self.menu.as_ref()
+        } else {
+            self.submenus.get(lvl - 1).map(|(_, s)| s)
+        }
+    }
+
+    fn menu_level_mut(&mut self, lvl: usize) -> Option<&mut PopupMenu> {
+        if lvl == 0 {
+            self.menu.as_mut()
+        } else {
+            self.submenus.get_mut(lvl - 1).map(|(_, s)| s)
+        }
+    }
+
+    /// Opens the submenu of level `lvl`'s highlighted item, right away (from
     /// the keyboard, with its first item selected).
-    fn open_submenu(&mut self, keys: bool) {
-        let Some(m) = &self.menu else { return };
-        let Some(i) = m.hovered_submenu() else { return };
-        if self.submenu.as_ref().is_some_and(|(open, _)| *open == i) {
+    fn open_submenu(&mut self, lvl: usize, keys: bool) {
+        let Some(i) = self.menu_level(lvl).and_then(|m| m.hovered_submenu()) else { return };
+        if self.submenus.get(lvl).is_some_and(|(open, _)| *open == i) {
+            self.close_submenus(lvl + 1);
             if keys {
-                let (_, sub) = self.submenu.as_mut().unwrap();
+                let (_, sub) = &mut self.submenus[lvl];
                 if sub.select_first() {
                     sub.render(&self.gfx, &self.theme);
                 }
             }
             return;
         }
-        self.close_submenu();
-        let Some(m) = &self.menu else { return };
+        self.close_submenus(lvl);
+        if lvl >= MAX_SUBMENUS {
+            return;
+        }
+        let Some(m) = self.menu_level(lvl) else { return };
+        let source = m.source;
         let Some((entries, placement)) = m.submenu(i) else { return };
-        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.menu_monitor, m.source) {
+        match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.menu_monitor, source) {
             Ok(mut sub) => {
                 if keys {
                     sub.select_first();
                 }
                 sub.render(&self.gfx, &self.theme);
-                OPEN_SUBMENU_HWND.store(sub.surface.content.0 as isize, Ordering::Relaxed);
-                if let Some(m) = &mut self.menu {
-                    m.aim_at(Some(sub.screen_body()));
+                let body = sub.screen_body();
+                if let Some(m) = self.menu_level_mut(lvl) {
+                    m.aim_at(Some(body));
                 }
-                self.submenu = Some((i, sub));
+                self.submenus.push((i, sub));
+                self.store_submenu_hwnds();
             }
             Err(e) => log!("submenu failed: {e}"),
         }
     }
 
+    /// Closes every submenu.
     fn close_submenu(&mut self) {
-        OPEN_SUBMENU_HWND.store(0, Ordering::Relaxed);
-        let Some((_, sub)) = self.submenu.take() else { return };
-        sub.surface.set_click_through();
-        self.fading.push(Box::new(sub));
+        self.close_submenus(0);
+    }
+
+    /// Closes the submenu hanging off level `lvl`, and any deeper.
+    fn close_submenus(&mut self, lvl: usize) {
+        if self.submenus.len() <= lvl {
+            return;
+        }
+        for (_, sub) in self.submenus.drain(lvl..) {
+            sub.surface.set_click_through();
+            self.fading.push(Box::new(sub));
+        }
         self.animate();
-        if let Some(m) = &mut self.menu {
+        if let Some(m) = self.menu_level_mut(lvl) {
             m.aim_at(None);
+        }
+        self.store_submenu_hwnds();
+    }
+
+    /// Tells the mouse hook which windows are submenus (clicks there keep the menu open).
+    fn store_submenu_hwnds(&self) {
+        for (k, slot) in OPEN_SUBMENU_HWNDS.iter().enumerate() {
+            slot.store(self.submenus.get(k).map_or(0, |(_, s)| s.surface.content.0 as isize), Ordering::Relaxed);
         }
     }
 
-    /// After the menu's highlight moved: the submenu follows it (a highlighted
+    /// After level `lvl`'s highlight moved: its submenu follows it (a highlighted
     /// submenu item opens its submenu; any other item closes it).
-    fn sync_submenu(&mut self) {
-        let Some(m) = &self.menu else { return };
+    fn sync_submenu(&mut self, lvl: usize) {
+        let Some(m) = self.menu_level(lvl) else { return };
         match m.hovered_submenu() {
-            Some(_) => self.open_submenu(false),
-            None if m.has_hover() => self.close_submenu(),
+            Some(_) => self.open_submenu(lvl, false),
+            None if m.has_hover() => self.close_submenus(lvl),
             None => {}
         }
     }
@@ -3585,16 +3641,23 @@ impl App {
             self.animate();
             return;
         }
-        // A submenu with a highlighted item has the keyboard; Left goes back.
-        if let Some((_, sub)) = self.submenu.as_mut().filter(|(_, s)| s.has_hover()) {
+        // The deepest submenu with a highlighted item has the keyboard; Left goes back.
+        if let Some(k) = self.submenus.iter().rposition(|(_, s)| s.has_hover()) {
+            let lvl = k + 1;
+            let (_, sub) = &mut self.submenus[k];
             let (event, redraw) = sub.on_key(vk);
             if redraw {
                 sub.render(&self.gfx, &self.theme);
             }
+            let hovered = sub.hovered_submenu();
+            if self.submenus.get(lvl).is_some_and(|(open, _)| Some(*open) != hovered) {
+                self.close_submenus(lvl);
+            }
             match event {
                 MenuEvent::Activate(a) => self.activate_menu(a),
                 MenuEvent::Close => self.close_menu(),
-                MenuEvent::Step(-1) => self.close_submenu(),
+                MenuEvent::Step(-1) => self.close_submenus(k),
+                MenuEvent::Open => self.open_submenu(lvl, true),
                 _ => {}
             }
             return;
@@ -3606,13 +3669,13 @@ impl App {
         }
         let source = m.source;
         let hovered = m.hovered_submenu();
-        if self.submenu.as_ref().is_some_and(|(open, _)| Some(*open) != hovered) {
+        if self.submenus.first().is_some_and(|(open, _)| Some(*open) != hovered) {
             self.close_submenu();
         }
         match event {
             MenuEvent::Activate(a) => self.activate_menu(a),
             MenuEvent::Close => self.close_menu(),
-            MenuEvent::Open => self.open_submenu(true),
+            MenuEvent::Open => self.open_submenu(0, true),
             MenuEvent::Step(dir) => {
                 if let MenuSource::MenuBar(hit) = source {
                     self.open_menubar_menu(hit.step(dir));
@@ -4005,9 +4068,9 @@ impl App {
         } else if self.control.as_ref().is_some_and(|c| c.hwnd == hwnd) {
             self.on_control_mouse(hwnd, msg, wp, lp)
         } else if self.menu.as_ref().is_some_and(|m| m.surface.content == hwnd) {
-            self.on_menu_mouse(hwnd, msg, lp, false)
-        } else if self.submenu.as_ref().is_some_and(|(_, s)| s.surface.content == hwnd) {
-            self.on_menu_mouse(hwnd, msg, lp, true)
+            self.on_menu_mouse(hwnd, msg, wp, lp, 0)
+        } else if let Some(k) = self.submenus.iter().position(|(_, s)| s.surface.content == hwnd) {
+            self.on_menu_mouse(hwnd, msg, wp, lp, k + 1)
         } else if let Some(i) = self.menubars.iter().position(|m| m.surface.content == hwnd) {
             self.on_menubar_mouse(i, hwnd, msg, lp)
         } else if let Some(i) = self.docks.iter().position(|d| d.surface.content == hwnd) {
@@ -4226,9 +4289,10 @@ impl App {
         Some(LRESULT(0))
     }
 
-    /// `sub`: the message is for the open submenu rather than the menu.
-    fn on_menu_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM, sub: bool) -> Option<LRESULT> {
-        let m = if sub { self.submenu.as_mut().map(|(_, s)| s)? } else { self.menu.as_mut()? };
+    /// `lvl`: which menu the message is for (0: the menu, `k + 1`: its `k`th submenu).
+    fn on_menu_mouse(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM, lvl: usize) -> Option<LRESULT> {
+        // Borrowed field by field, so the menu can render with `gfx` and `theme`.
+        let m = if lvl == 0 { self.menu.as_mut()? } else { &mut self.submenus.get_mut(lvl - 1)?.1 };
         let (x, y) = mouse_pt(lp, m.surface.scale);
         match msg {
             WM_NCHITTEST => {
@@ -4248,11 +4312,15 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 track_leave(hwnd);
-                if m.on_move(x, y) {
+                let changed = m.on_move(x, y);
+                // Resting on a scroll arrow scrolls frame by frame.
+                let scrolling = m.animating();
+                if changed {
                     m.render(&self.gfx, &self.theme);
-                    if !sub {
-                        self.sync_submenu();
-                    }
+                    self.sync_submenu(lvl);
+                }
+                if scrolling {
+                    self.animate();
                 }
             }
             WM_MOUSELEAVE => {
@@ -4260,10 +4328,17 @@ impl App {
                     m.render(&self.gfx, &self.theme);
                 }
             }
+            // Menus taller than the screen scroll.
+            WM_MOUSEWHEEL => {
+                if m.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32) {
+                    m.render(&self.gfx, &self.theme);
+                    self.sync_submenu(lvl);
+                }
+            }
             WM_LBUTTONUP | WM_RBUTTONUP => match m.on_click(x, y, msg == WM_RBUTTONUP) {
                 MenuEvent::Activate(a) => self.activate_menu(a),
                 MenuEvent::Close => self.close_menu(),
-                MenuEvent::Open => self.open_submenu(false),
+                MenuEvent::Open => self.open_submenu(lvl, false),
                 _ => {}
             },
             _ => return None,

@@ -389,6 +389,11 @@ impl Drop for ShellMenu {
     }
 }
 
+/// Lets go of the last menu's shell handlers (their DLLs can unload).
+pub fn release_menu() {
+    MENU.with(|m| m.borrow_mut().take());
+}
+
 /// The context menu for items (they must share a parent folder).
 pub fn item_menu(paths: &[PathBuf]) -> Option<IContextMenu> {
     unsafe { item_array(paths)?.BindToHandler(None, &BHID_SFUIObject).ok() }
@@ -402,7 +407,36 @@ pub fn background_menu(hwnd: HWND, dir: &Path) -> Option<IContextMenu> {
     }
 }
 
+/// Builds throwaway shell menus once, on a background thread, and keeps them a
+/// moment: Windows adds some items (apps' Windows 11 verbs like WinRAR's, and
+/// Send to's targets) asynchronously, so the first menu a process builds lacks
+/// them. Also starts the scan for apps' packaged verbs.
+pub fn warm_menus() {
+    super::xcmd::warm();
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = std::thread::Builder::new().name("finder-warm".into()).spawn(|| unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+            let home = super::fs::known_folder(&FOLDERID_Profile).unwrap_or_else(|| PathBuf::from("C:\\"));
+            let file = std::env::current_exe().unwrap_or_else(|_| home.clone());
+            let menus = [item_menu(&[file]), item_menu(std::slice::from_ref(&home)), background_menu(HWND::default(), &home)];
+            let mut built = Vec::new();
+            for cm in menus.into_iter().flatten() {
+                if let Ok(hmenu) = CreatePopupMenu() {
+                    let _ = cm.QueryContextMenu(hmenu, 0, FIRST_ID, LAST_ID, CMF_NORMAL | CMF_EXPLORE);
+                    built.push((cm, hmenu));
+                }
+            }
+            std::thread::sleep(Duration::from_secs(5));
+            for (_, hmenu) in built {
+                let _ = DestroyMenu(hmenu);
+            }
+        });
+    });
+}
+
 /// A filled shell menu: its entries, and the canonical verbs it offers with their command ids.
+#[derive(Default)]
 pub struct Filled {
     pub entries: Vec<MenuEntry>,
     pub verbs: Vec<(String, u32)>,
@@ -521,6 +555,10 @@ fn invoke_info(hwnd: HWND, verb_a: PCSTR, verb_w: PCWSTR, pt: Option<POINT>) -> 
 
 /// Runs item `id` of the open shell menu. Modal for some verbs: call outside the App borrow.
 pub fn invoke(hwnd: HWND, id: u32, pt: Option<POINT>) {
+    if id >= super::xcmd::FIRST_ID {
+        super::xcmd::invoke(id);
+        return;
+    }
     let Some(cm) = MENU.with(|m| m.borrow().as_ref().map(|m| m.cm.clone())) else { return };
     let offset = (id - FIRST_ID) as usize;
     let info = invoke_info(hwnd, PCSTR(offset as *const u8), PCWSTR(offset as *const u16), pt);

@@ -104,6 +104,21 @@ impl Monitor {
         Self::from_handle(unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) })
     }
 
+    /// The monitor's work area now (without the taskbar and app bars), in physical pixels.
+    /// Queried live rather than stored, so a changing work area never makes monitors unequal.
+    pub fn work_area(&self) -> RECT {
+        use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+        unsafe {
+            let hmon = MonitorFromRect(&self.rect, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() && mi.rcWork.right > mi.rcWork.left && mi.rcWork.bottom > mi.rcWork.top {
+                mi.rcWork
+            } else {
+                self.rect
+            }
+        }
+    }
+
     pub fn contains(&self, x: i32, y: i32) -> bool {
         (self.rect.left..self.rect.right).contains(&x) && (self.rect.top..self.rect.bottom).contains(&y)
     }

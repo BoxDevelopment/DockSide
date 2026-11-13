@@ -285,6 +285,19 @@ pub struct FinderCfg {
     pub sidebar: Backdrop,
     /// Win+E opens a Finder window instead of File Explorer.
     pub replace_win_e: bool,
+    /// Where the context menu puts Windows' and apps' own items.
+    pub shell_items: ShellItems,
+}
+
+/// Where Finder's context menu shows the shell's items (Windows' verbs and apps'
+/// extensions like WinRAR or "Open in Terminal").
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellItems {
+    /// Nested under "More Options".
+    Submenu,
+    /// At the bottom of the menu, without the ones Finder's own items already cover.
+    Inline,
 }
 
 /// Virtual desktop shortcuts.

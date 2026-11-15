@@ -97,6 +97,10 @@ pub struct Window {
     ours: bool,
     /// The desktop (Progman), which holds the wallpaper, live or not.
     desktop: bool,
+    /// Explorer's desktop: Progman, or a top-level WorkerW (before Windows 11
+    /// 24H2, once something asks for one, the wallpaper and the icons move
+    /// into WorkerWs of their own; capturing them can come out black).
+    shell: bool,
 }
 
 fn intersects(a: &RECT, b: &RECT) -> bool {
@@ -116,7 +120,7 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     let mut pid = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid == e.pid {
-        e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect: RECT::default() }, opaque: false, maximized: false, ours: true, desktop: false });
+        e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect: RECT::default() }, opaque: false, maximized: false, ours: true, desktop: false, shell: false });
         return TRUE;
     }
     // Other virtual desktops, suspended Store apps, windows still opening.
@@ -134,7 +138,9 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     }
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let see_through = ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) != 0;
-    e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect }, opaque: !see_through, maximized: IsZoomed(hwnd).as_bool(), ours: false, desktop: crate::win::class_name(hwnd) == "Progman" });
+    let class = crate::win::class_name(hwnd);
+    let shell = class == "Progman" || class == "WorkerW";
+    e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect }, opaque: !see_through, maximized: IsZoomed(hwnd).as_bool(), ours: false, desktop: class == "Progman", shell });
     TRUE
 }
 
@@ -187,13 +193,19 @@ pub fn desktop(windows: &[Window]) -> Vec<Layer> {
 ///
 /// Only windows below `pane` count: one in front of it (the Alt+Tab switcher
 /// over a desktop widget) isn't behind the glass.
-pub fn layers(windows: &[Window], region: &RECT, pane: isize) -> Vec<Layer> {
+///
+/// `over_wallpaper`: the wallpaper image is drawn first instead, so the list
+/// stops at the desktop rather than capturing it.
+pub fn layers(windows: &[Window], region: &RECT, pane: isize, over_wallpaper: bool) -> Vec<Layer> {
     let below = windows.iter().position(|w| w.ours && w.layer.hwnd == pane).map_or(0, |i| i + 1);
     let mut open = vec![*region];
     let mut out = Vec::new();
     for w in &windows[below..] {
         if w.ours || !open.iter().any(|r| intersects(r, &w.layer.rect)) {
             continue;
+        }
+        if over_wallpaper && w.shell {
+            break;
         }
         out.push(w.layer);
         if w.opaque && open.len() < MAX_OPEN {
@@ -387,8 +399,17 @@ impl Scene {
         Some(dirty)
     }
 
-    /// Draws `layers` into `target` (`size` px, showing the screen from `origin`).
-    pub fn draw(&self, context: &ID3D11DeviceContext, target: &ID3D11RenderTargetView, origin: (i32, i32), size: (u32, u32), layers: &[Layer]) {
+    /// Draws `layers` into `target` (`size` px, showing the screen from
+    /// `origin`), over `base` (a wallpaper texture, its screen origin and size).
+    pub fn draw(
+        &self,
+        context: &ID3D11DeviceContext,
+        target: &ID3D11RenderTargetView,
+        origin: (i32, i32),
+        size: (u32, u32),
+        base: Option<(&ID3D11ShaderResourceView, (i32, i32), (i32, i32))>,
+        layers: &[Layer],
+    ) {
         let c = context;
         unsafe {
             c.ClearRenderTargetView(target, &FILL);
@@ -401,6 +422,20 @@ impl Scene {
             c.VSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
             c.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
             c.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
+        }
+        if let Some((srv, at, wh)) = base {
+            let k = Constants {
+                dst: [(at.0 - origin.0) as f32, (at.1 - origin.1) as f32, wh.0 as f32, wh.1 as f32],
+                target: [size.0 as f32, size.1 as f32],
+                uv_max: [1.0, 1.0],
+                color: FILL,
+            };
+            unsafe {
+                c.UpdateSubresource(&self.constants, 0, None, &k as *const _ as _, 0, 0);
+                c.PSSetShader(&self.ps, None);
+                c.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+                c.Draw(4, 0);
+            }
         }
         for l in layers {
             let (x, y) = ((l.rect.left - origin.0) as f32, (l.rect.top - origin.1) as f32);
@@ -513,7 +548,7 @@ mod tests {
     use super::*;
 
     fn win(id: isize, l: i32, t: i32, r: i32, b: i32, opaque: bool) -> Window {
-        Window { layer: Layer { hwnd: id, rect: RECT { left: l, top: t, right: r, bottom: b } }, opaque, maximized: false, ours: false, desktop: false }
+        Window { layer: Layer { hwnd: id, rect: RECT { left: l, top: t, right: r, bottom: b } }, opaque, maximized: false, ours: false, desktop: false, shell: false }
     }
 
     #[test]
@@ -532,7 +567,7 @@ mod tests {
             win(3, 0, 0, 400, 400, true),   // covers
             win(4, 0, 0, 500, 500, true),   // hidden under 3
         ];
-        let got: Vec<isize> = layers(&ws, &region, 0).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 0, false).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![3, 2]);
     }
 
@@ -541,7 +576,7 @@ mod tests {
         let region = RECT { left: 100, top: 100, right: 200, bottom: 150 };
         // Covers, but layered; then one that covers only up to its rounded corners.
         let ws = [win(1, 0, 0, 400, 400, false), win(2, 95, 95, 205, 155, true), win(3, 0, 0, 400, 400, true)];
-        let got: Vec<isize> = layers(&ws, &region, 0).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 0, false).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![3, 2, 1]);
     }
 
@@ -551,7 +586,7 @@ mod tests {
         let region = RECT { left: 1000, top: 0, right: 1500, bottom: 45 };
         let max = |id, opaque| Window { maximized: true, ..win(id, 0, 29, 2560, 1440, opaque) };
         let ws = [max(1, true), max(2, true), max(3, true), win(4, 0, 0, 2560, 1440, true)];
-        let got: Vec<isize> = layers(&ws, &region, 0).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 0, false).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![4, 1]);
     }
 
@@ -561,10 +596,22 @@ mod tests {
         let region = RECT { left: 100, top: 100, right: 200, bottom: 150 };
         let pane = Window { ours: true, ..win(9, 0, 0, 0, 0, false) };
         let ws = [win(1, 0, 0, 400, 400, true), pane, win(2, 90, 120, 300, 300, true)];
-        let got: Vec<isize> = layers(&ws, &region, 9).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 9, false).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![2]);
         // A pane that isn't listed (hidden) sees everything.
-        let got: Vec<isize> = layers(&ws, &region, 5).iter().map(|l| l.hwnd).collect();
+        let got: Vec<isize> = layers(&ws, &region, 5, false).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![1]);
+    }
+
+    #[test]
+    fn stops_at_the_desktop_over_the_wallpaper() {
+        let mut desk = win(1, 0, 0, 1000, 1000, true);
+        desk.shell = true;
+        let ws = vec![win(2, 100, 100, 300, 300, true), desk];
+        let region = RECT { left: 0, top: 0, right: 400, bottom: 400 };
+        let got: Vec<isize> = layers(&ws, &region, 0, true).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![2]);
+        let got: Vec<isize> = layers(&ws, &region, 0, false).iter().map(|l| l.hwnd).collect();
+        assert_eq!(got, vec![1, 2]);
     }
 }

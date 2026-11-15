@@ -41,6 +41,39 @@ fn set_pos(bar: &Bar) {
     abd.uEdge = bar.edge;
     abd.rc = bar.rc;
     unsafe { SHAppBarMessage(ABM_SETPOS, &mut abd) };
+    report(bar, &abd.rc);
+}
+
+/// Logs where a bar ended up, and the work area Windows gives its display,
+/// when that isn't flush with the display's edge: something else (another
+/// appbar, a taskbar we hid) holds space there too, and maximized windows stop
+/// short of the bar.
+fn report(bar: &Bar, placed: &RECT) {
+    let m = bar.monitor;
+    let work = super::Monitor { rect: m, scale: 1.0 }.work_area();
+    let (edge, flush) = if bar.edge == ABE_TOP {
+        ("top", placed.top == m.top && work.top == m.top + bar.thickness)
+    } else {
+        ("bottom", placed.bottom == m.bottom && work.bottom == m.bottom - bar.thickness)
+    };
+    if !flush {
+        log!(
+            "appbar: {edge} {}px on display {},{} {}x{} placed at {},{}-{},{}; work area {},{}-{},{}",
+            bar.thickness,
+            m.left,
+            m.top,
+            m.right - m.left,
+            m.bottom - m.top,
+            placed.left,
+            placed.top,
+            placed.right,
+            placed.bottom,
+            work.left,
+            work.top,
+            work.right,
+            work.bottom
+        );
+    }
 }
 
 /// Reserves `thickness` physical pixels along `edge` (ABE_TOP / ABE_BOTTOM) of `monitor`.

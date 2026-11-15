@@ -599,6 +599,13 @@ impl Engine {
         Ok(srv.unwrap())
     }
 
+    /// Whether `monitor`'s still wallpaper is loaded, for screen panes to draw
+    /// under the windows they capture (see `layers_for`).
+    fn has_wallpaper(&self, monitor: HMONITOR) -> bool {
+        let rect = monitor_rect(monitor);
+        !self.live && self.wallpapers.iter().any(|w| w.handle == monitor && w.rect == rect && w.tex.is_some())
+    }
+
     /// What a pane asking for `want` refracts: the wallpaper image only while
     /// it's a still picture that loaded.
     fn resolve(&mut self, want: Source, monitor: HMONITOR) -> Source {
@@ -713,10 +720,12 @@ impl Engine {
         let panes = self.screen_panes();
         if std::mem::take(&mut self.restack) {
             self.windows = None;
-            let windows = self.windows();
+            self.windows();
+            let windows = &self.windows.as_ref().unwrap().0;
             for pane in &panes {
                 let Ok(mut s) = pane.try_borrow_mut() else { continue };
-                if on_screen(s.hwnd) && (!s.shown || layers_for(s.want, windows, &s.region, s.hwnd) != s.layers) {
+                let base = self.has_wallpaper(s.monitor);
+                if on_screen(s.hwnd) && (!s.shown || layers_for(s.want, windows, &s.region, s.hwnd, base) != s.layers) {
                     s.stale = true;
                 }
             }
@@ -905,11 +914,15 @@ impl Engine {
                     pane.src = Some((tex.unwrap(), srv.unwrap(), rtv.unwrap(), src_size));
                 }
 
-                let layers = layers_for(pane.want, self.windows(), &region, pane.hwnd);
+                // Over the desktop, the wallpaper image rather than a capture
+                // of Explorer's desktop window, which can come out black.
+                let base = if self.live { None } else { self.wallpaper(monitor) };
+                let layers = layers_for(pane.want, self.windows(), &region, pane.hwnd, base.is_some());
                 // Heavy frost hides motion: what's behind it needn't come as often.
                 self.scene.capture(&layers, &self.winrt, self.interval, pane.style == Style::Subtle);
                 let (_, srv, rtv, _) = pane.src.as_ref().unwrap();
-                self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, &layers);
+                let base = base.as_ref().map(|(srv, at, size)| (srv, *at, *size));
+                self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, base, &layers);
                 pane.layers = layers;
                 self.start_poll();
                 // The frost reads its mips.
@@ -1039,11 +1052,12 @@ impl Stats {
 
 /// What a screen pane draws behind it. One made for the wallpaper (it only
 /// sits over the desktop) refracts just the desktop window, holding a live
-/// wallpaper: windows passing over or under it never tint it.
-fn layers_for(want: Source, windows: &[scene::Window], region: &RECT, pane: HWND) -> Vec<Layer> {
+/// wallpaper: windows passing over or under it never tint it. `over_wallpaper`:
+/// the still wallpaper is drawn first, so the desktop window isn't captured.
+fn layers_for(want: Source, windows: &[scene::Window], region: &RECT, pane: HWND, over_wallpaper: bool) -> Vec<Layer> {
     match want {
         Source::Wallpaper => scene::desktop(windows),
-        Source::Screen => scene::layers(windows, region, pane.0 as isize),
+        Source::Screen => scene::layers(windows, region, pane.0 as isize, over_wallpaper),
     }
 }
 

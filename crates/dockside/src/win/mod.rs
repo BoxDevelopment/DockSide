@@ -260,5 +260,7 @@ pub const WM_APP_CALENDAR: u32 = WM_APP + 34;
 pub const WM_APP_BATTERY: u32 = WM_APP + 35;
 /// A Finder Quick Look worker has news (a video frame, a picture, a PDF page, a player state).
 pub const WM_APP_QUICKLOOK: u32 = WM_APP + 37;
+/// Edit Photo…'s picture has loaded (or failed to).
+pub const WM_APP_PHOTO_EDIT: u32 = WM_APP + 38;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

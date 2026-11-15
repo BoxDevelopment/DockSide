@@ -206,6 +206,34 @@ fn has_ext(p: &Path, list: &[&str]) -> bool {
     p.extension().and_then(|e| e.to_str()).is_some_and(|e| list.iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
+/// The part of a `w` x `h` picture a widget `px` pixels in size shows, as
+/// (x, y, width, height) in the picture's pixels. The crop when it has the
+/// widget's shape; otherwise (a slideshow's other pictures, a resized widget,
+/// no crop) as much of the picture as fills the widget, centred on the
+/// crop's middle (or the picture's).
+pub fn source_rect(w: u32, h: u32, px: (u32, u32), crop: Option<[f32; 4]>) -> (u32, u32, u32, u32) {
+    let (fw, fh) = (w as f64, h as f64);
+    let aspect = px.0.max(1) as f64 / px.1.max(1) as f64;
+    if let Some([x, y, cw, ch]) = crop {
+        let (rw, rh) = (cw as f64 * fw, ch as f64 * fh);
+        if rw >= 1.0 && rh >= 1.0 && ((rw / rh) / aspect - 1.0).abs() < 0.02 {
+            let (rx, ry) = ((x as f64 * fw).round(), (y as f64 * fh).round());
+            let (rw, rh) = (rw.round().clamp(1.0, fw - rx.min(fw - 1.0)), rh.round().clamp(1.0, fh - ry.min(fh - 1.0)));
+            return (rx.min(fw - 1.0) as u32, ry.min(fh - 1.0) as u32, rw as u32, rh as u32);
+        }
+    }
+    let (cx, cy) = crop.map_or((0.5, 0.5), |[x, y, cw, ch]| ((x + cw / 2.0) as f64, (y + ch / 2.0) as f64));
+    let (rw, rh) = if fw / fh > aspect { (fh * aspect, fh) } else { (fw, fw / aspect) };
+    let rx = (cx * fw - rw / 2.0).clamp(0.0, fw - rw);
+    let ry = (cy * fh - rh / 2.0).clamp(0.0, fh - rh);
+    (rx.round() as u32, ry.round() as u32, (rw.round() as u32).clamp(1, w), (rh.round() as u32).clamp(1, h))
+}
+
+/// The picture Edit Photo… shows for `path`: the file, or a folder's first picture.
+pub fn first_picture(path: &Path) -> Option<PathBuf> {
+    pictures(path).into_iter().next()
+}
+
 /// The pictures a Photo widget shows: the file, or a folder's pictures in name order.
 fn pictures(path: &Path) -> Vec<PathBuf> {
     if !path.is_dir() {
@@ -219,7 +247,7 @@ fn pictures(path: &Path) -> Vec<PathBuf> {
 
 /// Shows `path` (a picture, GIF or folder) into `feed`, at about `px` pixels
 /// (the widget's size: pictures are decoded just big enough to cover it).
-pub fn play_photo(path: PathBuf, px: (u32, u32), feed: SharedFeed, hwnd: isize, msg: u32) {
+pub fn play_photo(path: PathBuf, px: (u32, u32), crop: Option<[f32; 4]>, feed: SharedFeed, hwnd: isize, msg: u32) {
     spawn("photo widget", move || {
         let Some(wic) = crate::island::media::wic() else { return feed.fail("Pictures can't be opened", hwnd, msg) };
         let files = pictures(&path);
@@ -233,7 +261,7 @@ pub fn play_photo(path: PathBuf, px: (u32, u32), feed: SharedFeed, hwnd: isize, 
                 return;
             }
             let until = Instant::now() + SLIDE;
-            match show_picture(&wic, file, px, false, &feed, hwnd, msg, slideshow.then_some(until)) {
+            match show_picture(&wic, file, px, false, crop, &feed, hwnd, msg, slideshow.then_some(until)) {
                 Some(()) => shown += 1,
                 None => log!("photo widget: couldn't show {}", file.display()),
             }
@@ -260,7 +288,7 @@ pub fn play_fitted(file: PathBuf, px: (u32, u32), feed: SharedFeed, hwnd: isize,
     spawn("quick look picture", move || {
         let Some(wic) = crate::island::media::wic() else { return feed.fail("Can't open this picture", hwnd, msg) };
         // A still picture returns once shown; a GIF plays until stopped.
-        if show_picture(&wic, &file, px, true, &feed, hwnd, msg, None).is_none() {
+        if show_picture(&wic, &file, px, true, None, &feed, hwnd, msg, None).is_none() {
             feed.fail("Can't open this picture", hwnd, msg);
         }
     });
@@ -274,6 +302,7 @@ fn show_picture(
     file: &Path,
     px: (u32, u32),
     contain: bool,
+    crop: Option<[f32; 4]>,
     feed: &Feed,
     hwnd: isize,
     msg: u32,
@@ -286,7 +315,7 @@ fn show_picture(
         let frames = decoder.GetFrameCount().ok()?;
         let gif = decoder.GetContainerFormat().ok() == Some(GUID_ContainerFormatGif);
         if gif && frames > 1 {
-            return play_gif(wic, &decoder, frames, px, contain, feed, hwnd, msg, until);
+            return play_gif(wic, &decoder, frames, px, contain, crop, feed, hwnd, msg, until);
         }
         let frame = decoder.GetFrame(0).ok()?;
         let source: IWICBitmapSource = upright(wic, &frame).unwrap_or_else(|| frame.cast().unwrap());
@@ -295,6 +324,16 @@ fn show_picture(
         if w == 0 || h == 0 {
             return None;
         }
+        // A widget shows only its part of the picture (Quick Look, all of it).
+        let source: IWICBitmapSource = if contain {
+            source
+        } else {
+            let (x, y, cw, ch) = source_rect(w, h, px, crop);
+            let clip = wic.CreateBitmapClipper().ok()?;
+            clip.Initialize(&source, &WICRect { X: x as i32, Y: y as i32, Width: cw as i32, Height: ch as i32 }).ok()?;
+            (w, h) = (cw, ch);
+            clip.cast().ok()?
+        };
         let (kw, kh) = (px.0 as f64 / w as f64, px.1 as f64 / h as f64);
         let k = if contain { kw.min(kh) } else { kw.max(kh) }.min(1.0);
         let (ow, oh) = (((w as f64 * k).round() as u32).max(1), ((h as f64 * k).round() as u32).max(1));
@@ -330,18 +369,18 @@ unsafe fn upright(wic: &IWICImagingFactory, frame: &IWICBitmapFrameDecode) -> Op
 /// widget then draws it one to one. Done here, on the player's own thread, once
 /// per frame, instead of being resampled on the UI thread (high-quality cubic,
 /// through a rounded mask, on the CPU) every time the widget redraws.
-unsafe fn fit(wic: &IWICImagingFactory, data: Vec<u8>, w: u32, h: u32, px: (u32, u32)) -> Frame {
+unsafe fn fit(wic: &IWICImagingFactory, data: Vec<u8>, w: u32, h: u32, px: (u32, u32), crop: Option<[f32; 4]>) -> Frame {
     let (pw, ph) = (px.0.max(1), px.1.max(1));
     if (w, h) == (pw, ph) || w == 0 || h == 0 {
         return Frame { w, h, data };
     }
     let fitted = (|| -> Option<Vec<u8>> {
         let bmp = wic.CreateBitmapFromMemory(w, h, &GUID_WICPixelFormat32bppPBGRA, w * 4, &data).ok()?;
-        // The middle of the picture in the widget's shape (what "cover" shows).
-        let k = (pw as f64 / w as f64).max(ph as f64 / h as f64);
-        let (cw, ch) = (((pw as f64 / k).round() as u32).clamp(1, w), ((ph as f64 / k).round() as u32).clamp(1, h));
+        // The part of the picture in the widget's shape (the middle, or as cropped).
+        let (x, y, cw, ch) = source_rect(w, h, (pw, ph), crop);
+        let k = pw as f64 / cw as f64;
         let clip = wic.CreateBitmapClipper().ok()?;
-        let rc = WICRect { X: ((w - cw) / 2) as i32, Y: ((h - ch) / 2) as i32, Width: cw as i32, Height: ch as i32 };
+        let rc = WICRect { X: x as i32, Y: y as i32, Width: cw as i32, Height: ch as i32 };
         clip.Initialize(&bmp, &rc).ok()?;
         let scaler = wic.CreateBitmapScaler().ok()?;
         // Fant averages when shrinking; bilinear is plenty when growing a moving picture.
@@ -387,6 +426,7 @@ unsafe fn play_gif(
     frames: u32,
     px: (u32, u32),
     contain: bool,
+    crop: Option<[f32; 4]>,
     feed: &Feed,
     hwnd: isize,
     msg: u32,
@@ -450,7 +490,7 @@ unsafe fn play_gif(
             if due {
                 shown_at = Some(Instant::now());
                 let px = if contain { contained(cw, ch, px) } else { px };
-                feed.publish(fit(wic, canvas.clone(), cw, ch, px), hwnd, msg);
+                feed.publish(fit(wic, canvas.clone(), cw, ch, px, crop), hwnd, msg);
             }
             let wait = Duration::from_millis(delay).saturating_sub(started.elapsed());
             if !feed.sleep(wait) {
@@ -646,7 +686,7 @@ unsafe fn video_loop(path: &Path, px: (u32, u32), feed: &Feed, hwnd: isize, msg:
         }
         if let Some(data) = sample_pixels(&sample, w, h) {
             let frame = match &wic {
-                Some(wic) => fit(wic, data, w, h, px),
+                Some(wic) => fit(wic, data, w, h, px, None),
                 None => Frame { w, h, data },
             };
             feed.publish(frame, hwnd, msg);
@@ -941,7 +981,7 @@ mod tests {
             if video {
                 play_video(path, (364, 364), feed.clone(), 0, 0);
             } else {
-                play_photo(path, (364, 364), feed.clone(), 0, 0);
+                play_photo(path, (364, 364), None, feed.clone(), 0, 0);
             }
             // Measured from the first frame: start-up isn't the steady cost.
             let first = Instant::now();

@@ -28,6 +28,7 @@ use crate::dock::{Dock, FileDrop, LAUNCHPAD_PATH, START_PATH};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
+use crate::photo_edit::{PhotoEditEvent, PhotoEditor, PHOTO_EDIT_HWND};
 use crate::rename::{RenameEvent, RenamePanel, RENAME_HWND};
 use crate::island::sources::VolumeKey;
 use crate::keybind;
@@ -802,6 +803,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == RENAME_HWND.load(Ordering::Relaxed) => {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_PICKER);
         }
+        WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == PHOTO_EDIT_HWND.load(Ordering::Relaxed) => {
+            win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_PICKER);
+        }
         // Shell surfaces never take focus; app windows (Finder, Settings) behave normally.
         WM_MOUSEACTIVATE if GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_APPWINDOW.0 == 0 => {
             return LRESULT(MA_NOACTIVATE as isize)
@@ -1164,6 +1168,8 @@ pub struct App {
     icon_picker: Option<IconPicker>,
     /// Rename… for a Dock or Launchpad app.
     rename: Option<RenamePanel>,
+    /// Edit Photo… for a Photo widget.
+    photo_edit: Option<PhotoEditor>,
     index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
     island_hook: Option<HHOOK>,
@@ -1333,6 +1339,7 @@ impl App {
             spotlight_tap: None,
             icon_picker: None,
             rename: None,
+            photo_edit: None,
             index: Default::default(),
             hooks: Vec::new(),
             island_hook: None,
@@ -1788,6 +1795,9 @@ impl App {
 
     /// Adds, removes or resizes a widget: written to the config, then applied.
     fn widget_cmd(&mut self, cmd: WidgetCmd) {
+        if let WidgetCmd::EditPhoto(id) = cmd {
+            return self.open_photo_editor(id);
+        }
         if self.widgets.is_none() && matches!(cmd, WidgetCmd::Add(_) | WidgetCmd::Reset) {
             // Adding (or resetting) widgets while they're off turns them on.
             let on = config::ConfigValue::Bool(true);
@@ -2077,6 +2087,9 @@ impl App {
         if let Some(r) = &mut self.rename {
             still |= r.tick(dt);
         }
+        if let Some(e) = &mut self.photo_edit {
+            still |= e.tick(dt);
+        }
         if let Some(s) = &mut self.settings {
             still |= s.tick(dt);
         }
@@ -2210,6 +2223,7 @@ impl App {
             self.spotlight.as_ref().map(|s| &s.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
             self.rename.as_ref().map(|r| &r.surface),
+            self.photo_edit.as_ref().map(|e| &e.surface),
         ];
         for s in bars.chain(surfaces.into_iter().flatten()) {
             s.raise();
@@ -2442,6 +2456,9 @@ impl App {
         if let Some(r) = self.rename.as_mut().filter(|r| r.dirty) {
             r.render(&self.gfx, &self.theme);
         }
+        if let Some(e) = self.photo_edit.as_mut().filter(|e| e.dirty) {
+            e.render(&self.gfx, &self.theme);
+        }
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
         }
@@ -2477,6 +2494,7 @@ impl App {
             || !self.closing_launchpads.is_empty()
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
             || self.rename.as_ref().is_some_and(|r| r.animating())
+            || self.photo_edit.as_ref().is_some_and(|e| e.animating())
             || self.settings.as_ref().is_some_and(|s| s.animating())
             || self.onboarding.as_ref().is_some_and(|o| o.animating())
             || self.about.as_ref().is_some_and(|a| a.animating())
@@ -2993,6 +3011,97 @@ impl App {
             Ok(()) => self.reload(),
             Err(e) => log!("could not save the icon: {e:#}"),
         }
+    }
+
+    // --- Edit Photo panel --------------------------------------------------
+
+    fn open_photo_editor(&mut self, id: u32) {
+        self.close_menu();
+        self.close_icon_picker();
+        self.close_rename();
+        self.close_photo_editor();
+        let Some((item, monitor, max)) = self.widgets.as_ref().and_then(|w| w.widget_info(id)) else { return };
+        let hwnd = self.msg_hwnd.0 as isize;
+        match PhotoEditor::new(&self.gfx, &self.theme, &self.cfg, &monitor, &item, max, hwnd, win::WM_APP_PHOTO_EDIT) {
+            Ok(mut e) => {
+                e.render(&self.gfx, &self.theme);
+                e.focus();
+                self.photo_edit = Some(e);
+                self.raise_surfaces();
+            }
+            Err(e) => log!("photo editor failed: {e}"),
+        }
+    }
+
+    fn close_photo_editor(&mut self) {
+        let Some(e) = self.photo_edit.take() else { return };
+        PHOTO_EDIT_HWND.store(0, Ordering::Relaxed);
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+        }
+        apps::pass_focus_from(e.surface.content);
+        e.surface.set_click_through();
+        self.fading.push(Box::new(e));
+        self.animate();
+    }
+
+    fn on_photo_edit_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+        let e = self.photo_edit.as_mut()?;
+        let (x, y) = mouse_pt(lp, e.surface.scale);
+        let event = match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => e.on_key(wp.0 as u16),
+            WM_CHAR | WM_SYSCHAR => PhotoEditEvent::None,
+            WM_CLOSE => PhotoEditEvent::Close,
+            WM_MOUSEWHEEL => {
+                // Wheel positions come in screen pixels.
+                let mut pt = POINT { x: (lp.0 & 0xFFFF) as u16 as i16 as i32, y: ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32 };
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ScreenToClient(e.surface.content, &mut pt);
+                }
+                let s = e.surface.scale;
+                e.on_wheel((wp.0 >> 16) as u16 as i16, pt.x as f32 / s, pt.y as f32 / s);
+                PhotoEditEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                if e.on_down(x, y) {
+                    unsafe {
+                        SetCapture(e.surface.content);
+                    }
+                }
+                PhotoEditEvent::None
+            }
+            WM_MOUSEMOVE => {
+                if !e.tracking {
+                    e.tracking = true;
+                    track_leave(e.surface.content);
+                }
+                e.on_move(x, y);
+                PhotoEditEvent::None
+            }
+            WM_MOUSELEAVE => {
+                e.on_leave();
+                PhotoEditEvent::None
+            }
+            WM_LBUTTONUP => {
+                if e.dragging() {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                }
+                e.on_up(x, y)
+            }
+            _ => return None,
+        };
+        match event {
+            PhotoEditEvent::None => {}
+            PhotoEditEvent::Close => self.close_photo_editor(),
+            PhotoEditEvent::Run(action) => {
+                self.close_photo_editor();
+                push(action);
+            }
+        }
+        Some(LRESULT(0))
     }
 
     // --- Rename panel ------------------------------------------------------
@@ -4032,6 +4141,13 @@ impl App {
                 WM_APP_CLOSE_PICKER => {
                     self.close_icon_picker();
                     self.close_rename();
+                    self.close_photo_editor();
+                }
+                win::WM_APP_PHOTO_EDIT => {
+                    if let Some(e) = &mut self.photo_edit {
+                        e.poll();
+                        self.flush();
+                    }
                 }
                 WM_APP_ICON_PICKER => {
                     if let Some(p) = &mut self.icon_picker {
@@ -4261,6 +4377,11 @@ impl App {
         }
         if self.rename.as_ref().is_some_and(|p| p.surface.content == hwnd) {
             let r = self.on_rename_message(msg, wp, lp);
+            self.flush_input(msg);
+            return r;
+        }
+        if self.photo_edit.as_ref().is_some_and(|p| p.surface.content == hwnd) {
+            let r = self.on_photo_edit_message(msg, wp, lp);
             self.flush_input(msg);
             return r;
         }

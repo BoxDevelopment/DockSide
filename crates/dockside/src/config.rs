@@ -428,7 +428,7 @@ pub enum WidgetKind {
     User,
 }
 
-#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum WidgetSize {
     Small,
@@ -459,8 +459,43 @@ pub struct WidgetItem {
     #[serde(default)]
     pub path: Option<String>,
     /// User: which extras it shows ("greeting", "buttons", "device"); none = all.
+    /// Clock: "digital" for a digital face.
     #[serde(default)]
     pub options: Option<Vec<String>>,
+    /// Photo: the part of the picture shown, as [x, y, width, height], each
+    /// 0-1 of the (upright) picture; none = the middle, filling the widget.
+    #[serde(default)]
+    pub crop: Option<Vec<f32>>,
+    /// Photo: sized to the picture instead of `size`: [width, height] in points.
+    #[serde(default)]
+    pub fit: Option<Vec<f32>>,
+}
+
+/// Smallest side of a photo widget sized to its picture, in points.
+pub const FIT_MIN: f32 = 80.0;
+
+impl WidgetItem {
+    /// The crop, if it's a sensible one (a hand-edited config can hold anything).
+    pub fn crop(&self) -> Option<[f32; 4]> {
+        let c = self.crop.as_deref()?;
+        let [x, y, w, h] = <[f32; 4]>::try_from(c).ok()?;
+        let ok = [x, y, w, h].iter().all(|v| v.is_finite()) && w > 0.001 && h > 0.001 && x >= 0.0 && y >= 0.0 && x + w <= 1.001 && y + h <= 1.001;
+        ok.then_some([x, y, w.min(1.0 - x), h.min(1.0 - y)])
+    }
+
+    /// Width and height in points when sized to its picture (Photo only).
+    pub fn fit(&self) -> Option<(f32, f32)> {
+        if self.kind != WidgetKind::Photo {
+            return None;
+        }
+        let [w, h] = <[f32; 2]>::try_from(self.fit.as_deref()?).ok()?;
+        (w.is_finite() && h.is_finite()).then(|| (w.clamp(FIT_MIN, 4000.0), h.clamp(FIT_MIN, 4000.0)))
+    }
+
+    /// Clock: a digital face rather than an analog one.
+    pub fn digital(&self) -> bool {
+        self.options.as_ref().is_some_and(|o| o.iter().any(|s| s == "digital"))
+    }
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -742,6 +777,14 @@ pub fn save_widgets(path: &Path, items: &[WidgetItem]) -> Result<()> {
         if let Some(o) = &w.options {
             t["options"] = value(o.iter().map(String::as_str).collect::<toml_edit::Array>());
         }
+        // Rounded: 4 places for the crop, whole points for the size.
+        let floats = |v: &[f32], k: f64| v.iter().map(|f| ((*f as f64) * k).round() / k).collect::<toml_edit::Array>();
+        if let Some(c) = &w.crop {
+            t["crop"] = value(floats(c, 10_000.0));
+        }
+        if let Some(f) = &w.fit {
+            t["fit"] = value(floats(f, 1.0));
+        }
         arr.push(t);
     }
     doc["widgets"]["items"] = Item::ArrayOfTables(arr);
@@ -880,7 +923,12 @@ y = 4
 [widgets]
 enabled = true
 ").unwrap();
-        let items = defaults().widgets.items;
+        let mut items = defaults().widgets.items;
+        items[0].options = Some(vec!["digital".into()]);
+        items[1].kind = WidgetKind::Photo;
+        items[1].path = Some("C:\\p.jpg".into());
+        items[1].crop = Some(vec![0.25, 0.0, 0.5, 1.0]);
+        items[1].fit = Some(vec![300.0, 200.0]);
         save_widgets(&path, &items).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"));

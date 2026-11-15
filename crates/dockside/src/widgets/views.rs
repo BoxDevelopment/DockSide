@@ -165,7 +165,61 @@ fn local_hms() -> (u32, u32, u32) {
     (t.hour(), t.minute(), t.second())
 }
 
+/// The time as digits, as large as the widget allows, the day over it and the date under it.
+fn digital(p: &Painter, r: Rect, c: &Ctx) {
+    let now = Local::now();
+    let small = c.item.size == WidgetSize::Small;
+    let (time, ampm) = if c.data.h24 {
+        (now.format("%H:%M").to_string(), String::new())
+    } else {
+        (now.format("%-I:%M").to_string(), now.format("%p").to_string())
+    };
+    let x = r.x + PAD + 2.0;
+    let w = r.w - 2.0 * PAD - 4.0;
+    // Small fills its width from the left; medium has room to sit centred.
+    let align = if small { Align::Leading } else { Align::Center };
+    let day = now.format("%A").to_string().to_uppercase();
+    text(p, c, &day, if small { 12.0 } else { 13.0 }, Weight::Bold, align, Rect::new(x, r.y + 18.0, w, 18.0), c.red());
+
+    // Sized for the widest digits, so it doesn't change size from minute to minute.
+    let template: String = time.chars().map(|ch| if ch.is_ascii_digit() { '8' } else { ch }).collect();
+    let ampm_size = if small { 14.0 } else { 20.0 };
+    let ampm_w = if ampm.is_empty() || small { 0.0 } else { width(p, c, &ampm, ampm_size, Weight::Bold) + 6.0 };
+    let size = fitted(p, c, &template, if small { 64.0 } else { 96.0 }, Weight::Bold, w - ampm_w);
+    let line = size * 1.2;
+    let top = if small { r.y + 38.0 } else { r.cy() - line / 2.0 - 4.0 };
+    let tf = p.gfx.format(&c.theme.font, size, Weight::Bold, Align::Leading);
+    // Where the digits' ink is (a tabular "1" leaves a gap on its left), and
+    // the AM/PM just after it.
+    let tw_adv = width(p, c, &template, size, Weight::Bold);
+    let (ink_l, ink_r) = p.tabular_ink(&time, &tf).unwrap_or((0.0, tw_adv));
+    let ampm_gap = 8.0;
+    // Medium: what you see (the digits, and the AM/PM) centred on the card.
+    let tx = if small {
+        x
+    } else {
+        let end = ink_r + if ampm.is_empty() { 0.0 } else { ampm_gap + ampm_w - 6.0 };
+        (r.cx() - (ink_l + end) / 2.0).max(x - ink_l)
+    };
+    p.text_tabular(&time, &tf, Rect::new(tx, top, r.right() - PAD - tx + ink_l, line), c.theme.text);
+    let x_after = tx + ink_r + ampm_gap - 6.0;
+    if !ampm.is_empty() {
+        if small {
+            // Beside the date, which has room for it.
+            text(p, c, &ampm, ampm_size, Weight::Bold, Align::Trailing, Rect::new(x, r.bottom() - 40.0, w, 22.0), c.theme.text_secondary);
+        } else {
+            let ar = Rect::new(x_after + 6.0, top + line * 0.62 - ampm_size, ampm_w + 20.0, ampm_size * 1.4);
+            text(p, c, &ampm, ampm_size, Weight::Bold, Align::Leading, ar, c.theme.text_secondary);
+        }
+    }
+    let date = now.format(if small { "%b %-d" } else { "%B %-d, %Y" }).to_string();
+    text(p, c, &date, 15.0, Weight::Regular, align, Rect::new(x, r.bottom() - 40.0, w, 22.0), c.theme.text_secondary);
+}
+
 fn clock(p: &Painter, r: Rect, c: &Ctx) {
+    if c.item.digital() {
+        return digital(p, r, c);
+    }
     let now = Local::now();
     if c.item.size == WidgetSize::Small {
         let rad = r.w.min(r.h) / 2.0 - 12.0;

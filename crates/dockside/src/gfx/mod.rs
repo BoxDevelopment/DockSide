@@ -807,8 +807,9 @@ impl Painter<'_> {
 
     /// Like [`Painter::text`], with fixed-width digits so changing numbers don't jiggle.
     /// Returns the drawn width (tabular figures are wider than `measure` reports).
-    pub fn text_tabular(&self, text: &str, format: &IDWriteTextFormat, r: Rect, c: Color) -> f32 {
-        let Some(layout) = self.gfx.layout(text, format, r.w, r.h) else { return 0.0 };
+    /// A layout of `text` with tabular (equal-width) figures.
+    fn tabular_layout(&self, text: &str, format: &IDWriteTextFormat, w: f32, h: f32) -> Option<IDWriteTextLayout> {
+        let layout = self.gfx.layout(text, format, w, h)?;
         unsafe {
             if let Ok(typo) = self.gfx.dwrite.CreateTypography() {
                 let feature = DWRITE_FONT_FEATURE { nameTag: DWRITE_FONT_FEATURE_TAG_TABULAR_FIGURES, parameter: 1 };
@@ -816,6 +817,24 @@ impl Painter<'_> {
                     let _ = layout.SetTypography(&typo, DWRITE_TEXT_RANGE { startPosition: 0, length: u32::MAX });
                 }
             }
+        }
+        Some(layout)
+    }
+
+    /// Where `text` (tabular figures, leading-aligned) actually puts ink:
+    /// (from its left edge, to its right edge), in points from where it's drawn.
+    /// A tabular "1" sits in a cell as wide as an "8", so the ink can start
+    /// well right of the text's own left edge.
+    pub fn tabular_ink(&self, text: &str, format: &IDWriteTextFormat) -> Option<(f32, f32)> {
+        const BOX: f32 = 10_000.0;
+        let layout = self.tabular_layout(text, format, BOX, BOX)?;
+        let o = unsafe { layout.GetOverhangMetrics().ok()? };
+        Some((-o.left, BOX + o.right))
+    }
+
+    pub fn text_tabular(&self, text: &str, format: &IDWriteTextFormat, r: Rect, c: Color) -> f32 {
+        let Some(layout) = self.tabular_layout(text, format, r.w, r.h) else { return 0.0 };
+        unsafe {
             self.rt.DrawTextLayout(pt(r.x, r.y), &layout, self.color(c), D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT);
             let mut m = DWRITE_TEXT_METRICS::default();
             match layout.GetMetrics(&mut m) {

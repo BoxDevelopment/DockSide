@@ -130,8 +130,13 @@ pub fn dims(size: WidgetSize) -> (f32, f32) {
     }
 }
 
+/// A widget's width and height in points: its size's, or a Photo sized to its picture.
+pub fn item_dims(i: &WidgetItem) -> (f32, f32) {
+    i.fit().unwrap_or_else(|| dims(i.size))
+}
+
 fn item_rect(i: &WidgetItem) -> Rect {
-    let (w, h) = dims(i.size);
+    let (w, h) = item_dims(i);
     Rect::new(i.x, i.y, w, h)
 }
 
@@ -220,8 +225,7 @@ fn spot(col: u8, row: u8, w: f32, h: f32, area: Rect) -> (f32, f32) {
 
 /// The first spot, column by column from the top left, where a widget of
 /// `size` fits without touching the others.
-fn free_spot(items: &[WidgetItem], size: WidgetSize, area: Rect) -> (f32, f32) {
-    let (w, h) = dims(size);
+fn free_spot(items: &[WidgetItem], (w, h): (f32, f32), area: Rect) -> (f32, f32) {
     let taken: Vec<Rect> = items.iter().map(item_rect).collect();
     let step = (SMALL + GAP) / 2.0;
     let mut x = area.x;
@@ -285,6 +289,13 @@ pub enum WidgetCmd {
     Choose(u32, bool),
     /// User: show or hide one of its extras.
     ToggleOption(u32, &'static str),
+    /// Clock: a digital (true) or analog face.
+    SetDigital(u32, bool),
+    /// Photo: its size, the part of the picture shown, and (Fit to Picture)
+    /// its own width and height in points.
+    SetPhoto { id: u32, size: WidgetSize, crop: Option<[f32; 4]>, fit: Option<(f32, f32)> },
+    /// Photo: open Edit Photo… for it.
+    EditPhoto(u32),
     /// Notifications: clear them from Windows' notification center.
     ClearNotifications,
     /// Fetch the weather again now.
@@ -366,8 +377,8 @@ struct Widget {
 /// A Photo or Video widget's player; it stops when dropped.
 struct Live {
     feed: SharedFeed,
-    /// What it was started for: the path and size in pixels.
-    key: (String, (u32, u32)),
+    /// What it was started for: the path, size in pixels and (Photo) crop.
+    key: (String, (u32, u32), Option<[f32; 4]>),
 }
 
 impl Drop for Live {
@@ -381,7 +392,7 @@ const GLIDE: (f32, f32) = (0.32, 0.9);
 
 impl Widget {
     fn body(&self) -> Rect {
-        let (w, h) = dims(self.item.size);
+        let (w, h) = item_dims(&self.item);
         Rect::new(SHADOW, SHADOW, w, h)
     }
 
@@ -673,7 +684,7 @@ impl Widgets {
     }
 
     fn add_widget(&mut self, gfx: &Gfx, theme: &Theme, mut item: WidgetItem) {
-        let (w, h) = dims(item.size);
+        let (w, h) = item_dims(&item);
         let screen = self.screen_of(&item).clone();
         let bounds = screen.bounds();
         // Keep it on screen (the resolution may have changed since it was placed).
@@ -730,9 +741,10 @@ impl Widgets {
         let w = &mut self.widgets[i];
         let want = match (w.item.kind, &w.item.path) {
             (WidgetKind::Photo | WidgetKind::Video, Some(p)) if !p.is_empty() => {
-                let (pw, ph) = dims(w.item.size);
+                let (pw, ph) = item_dims(&w.item);
                 let s = w.surface.scale;
-                Some((p.clone(), ((pw * s).round() as u32, (ph * s).round() as u32)))
+                let crop = (w.item.kind == WidgetKind::Photo).then(|| w.item.crop()).flatten();
+                Some((p.clone(), ((pw * s).round() as u32, (ph * s).round() as u32), crop))
             }
             _ => None,
         };
@@ -748,7 +760,7 @@ impl Widgets {
         let path = std::path::PathBuf::from(&key.0);
         match w.item.kind {
             WidgetKind::Video => live::play_video(path, key.1, feed.clone(), self.hwnd, self.msg_data),
-            _ => live::play_photo(path, key.1, feed.clone(), self.hwnd, self.msg_data),
+            _ => live::play_photo(path, key.1, key.2, feed.clone(), self.hwnd, self.msg_data),
         }
         w.live = Some(Live { feed, key });
     }
@@ -783,6 +795,14 @@ impl Widgets {
         self.widgets.iter().map(|w| w.item.clone()).collect()
     }
 
+    /// A widget, the display it's on, and the biggest it can be there (points).
+    pub fn widget_info(&self, id: u32) -> Option<(WidgetItem, Monitor, (f32, f32))> {
+        let w = self.widgets.iter().find(|w| w.item.id == id)?;
+        let screen = self.screen_of(&w.item);
+        let b = screen.area();
+        Some((w.item.clone(), screen.monitor, (b.w, b.h)))
+    }
+
     /// Applies a changed `[widgets]` config: widgets that are still there stay
     /// (moved if needed); new and resized ones are created.
     pub fn sync(&mut self, gfx: &Gfx, theme: &Theme, cfg: &Config) {
@@ -795,7 +815,7 @@ impl Widgets {
             // Moved to a display of another scale, it's drawn afresh at that scale.
             let scale = self.screen_of(item).monitor.scale;
             let same = |w: &Widget| {
-                w.item.id == item.id && w.item.kind == item.kind && w.item.size == item.size && w.surface.scale == scale
+                w.item.id == item.id && w.item.kind == item.kind && item_dims(&w.item) == item_dims(item) && w.surface.scale == scale
             };
             match old.iter().position(same) {
                 Some(i) => {
@@ -1230,7 +1250,7 @@ impl Widgets {
                 None => self.screen_of(&self.widgets[j].item).clone(),
             };
             let (cx, cy) = screen.local(p);
-            let (w, h) = dims(self.widgets[j].item.size);
+            let (w, h) = item_dims(&self.widgets[j].item);
             let display = screen.tag();
             let probe = WidgetItem { display: display.clone(), ..self.widgets[j].item.clone() };
             let others: Vec<Rect> = self
@@ -1386,9 +1406,12 @@ impl Widgets {
                     WidgetSize::Medium => "Medium",
                     WidgetSize::Large => "Large",
                 };
-                Entry::item(label, Action::Widget(WidgetCmd::Resize(id, s))).checked(s == w.item.size)
+                Entry::item(label, Action::Widget(WidgetCmd::Resize(id, s))).checked(s == w.item.size && w.item.fit().is_none())
             })
             .collect();
+        if kind == WidgetKind::Photo && w.item.fit().is_some() {
+            entries.push(Entry::item("Fit to Picture", Action::Widget(WidgetCmd::EditPhoto(id))).checked(true));
+        }
         entries.push(Entry::Separator);
         entries.push(Entry::submenu("Align with Neighbour", self.align_entries(i)));
         entries.push(Entry::submenu("Move To", self.move_entries(i)));
@@ -1406,8 +1429,17 @@ impl Widgets {
         }
         match kind {
             WidgetKind::Photo => {
+                if w.item.path.as_deref().is_some_and(|p| !p.is_empty()) {
+                    entries.push(Entry::item("Edit Photo…", Action::Widget(WidgetCmd::EditPhoto(id))));
+                }
                 entries.push(Entry::item("Choose Picture or GIF…", Action::Widget(WidgetCmd::Choose(id, false))));
                 entries.push(Entry::item("Choose Folder for a Slideshow…", Action::Widget(WidgetCmd::Choose(id, true))));
+                entries.push(Entry::Separator);
+            }
+            WidgetKind::Clock => {
+                let digital = w.item.digital();
+                entries.push(Entry::item("Analog", Action::Widget(WidgetCmd::SetDigital(id, false))).checked(!digital));
+                entries.push(Entry::item("Digital", Action::Widget(WidgetCmd::SetDigital(id, true))).checked(digital));
                 entries.push(Entry::Separator);
             }
             WidgetKind::Video => {
@@ -1747,12 +1779,12 @@ impl Widgets {
                 let p = cursor_px();
                 let screen = self.screens.iter().find(|s| s.monitor.contains(p.x, p.y)).unwrap_or(&self.screens[0]).clone();
                 let display = screen.tag();
-                let probe = WidgetItem { id: 0, kind, size: sizes(kind)[0], x: 0.0, y: 0.0, zone: None, display: display.clone(), sensors: None, path: None, options: None };
+                let probe = WidgetItem { id: 0, kind, size: sizes(kind)[0], x: 0.0, y: 0.0, zone: None, display: display.clone(), sensors: None, path: None, options: None, crop: None, fit: None };
                 let here: Vec<WidgetItem> = items.iter().filter(|i| self.same_screen(i, &probe)).cloned().collect();
                 let size = sizes(kind)[0];
-                let (x, y) = free_spot(&here, size, screen.area());
+                let (x, y) = free_spot(&here, dims(size), screen.area());
                 let id = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
-                items.push(WidgetItem { id, kind, size, x, y, zone: None, display, sensors: None, path: None, options: None });
+                items.push(WidgetItem { id, kind, size, x, y, zone: None, display, sensors: None, path: None, options: None, crop: None, fit: None });
             }
             WidgetCmd::MoveToDisplay(id, to) => {
                 let screen = self.screens.iter().find(|s| s.id == to)?.clone();
@@ -1760,7 +1792,7 @@ impl Widgets {
                 let display = screen.tag();
                 let probe = WidgetItem { display: display.clone(), ..items[i].clone() };
                 let here: Vec<WidgetItem> = items.iter().filter(|o| o.id != id && self.same_screen(o, &probe)).cloned().collect();
-                let (x, y) = free_spot(&here, items[i].size, screen.area());
+                let (x, y) = free_spot(&here, item_dims(&items[i]), screen.area());
                 items[i] = WidgetItem { x, y, display, ..items[i].clone() };
             }
             WidgetCmd::Remove(id) => {
@@ -1772,9 +1804,35 @@ impl Widgets {
                 let bounds: Vec<Rect> = items.iter().map(|i| self.screen_of(i).bounds()).collect();
                 for (i, b) in items.iter_mut().zip(bounds).filter(|(i, _)| i.id == id) {
                     i.size = size;
+                    // A fixed size again: no longer the picture's shape.
+                    i.fit = None;
                     i.x = i.x.min((b.right() - w).max(b.x));
                     i.y = i.y.min((b.bottom() - h).max(b.y));
                 }
+            }
+            // Opened by the app (a panel of its own).
+            WidgetCmd::EditPhoto(_) => return None,
+            WidgetCmd::SetDigital(id, on) => {
+                let w = items.iter_mut().find(|w| w.id == id)?;
+                let mut o: Vec<String> = w.options.clone().unwrap_or_default().into_iter().filter(|s| s != "digital").collect();
+                if on {
+                    o.push("digital".into());
+                }
+                w.options = (!o.is_empty()).then_some(o);
+            }
+            WidgetCmd::SetPhoto { id, size, crop, fit } => {
+                let bounds: Vec<Rect> = items.iter().map(|i| self.screen_of(i).bounds()).collect();
+                let (i, b) = items.iter_mut().zip(bounds).find(|(i, _)| i.id == id)?;
+                i.size = size;
+                i.crop = crop.map(|c| c.to_vec());
+                // Never bigger than its display.
+                i.fit = fit.map(|(w, h)| {
+                    let k = (b.w / w).min(b.h / h).min(1.0);
+                    vec![(w * k).max(crate::config::FIT_MIN).round(), (h * k).max(crate::config::FIT_MIN).round()]
+                });
+                let (w, h) = item_dims(i);
+                i.x = i.x.min((b.right() - w).max(b.x));
+                i.y = i.y.min((b.bottom() - h).max(b.y));
             }
             WidgetCmd::Align(id, how) => {
                 let i = self.widgets.iter().position(|w| w.item.id == id)?;
@@ -1802,6 +1860,9 @@ impl Widgets {
                     _ => system::pick_photo(owner),
                 }?;
                 items[i].path = Some(picked);
+                // A new picture: its own middle, at a fixed size.
+                items[i].crop = None;
+                items[i].fit = None;
             }
             WidgetCmd::ToggleOption(id, key) => {
                 let w = items.iter_mut().find(|w| w.id == id)?;
@@ -1897,7 +1958,7 @@ mod tests {
     use super::*;
 
     fn item(id: u32, size: WidgetSize, x: f32, y: f32) -> WidgetItem {
-        WidgetItem { id, kind: WidgetKind::Clock, size, x, y, zone: None, display: None, sensors: None, path: None, options: None }
+        WidgetItem { id, kind: WidgetKind::Clock, size, x, y, zone: None, display: None, sensors: None, path: None, options: None, crop: None, fit: None }
     }
 
     /// Paints every widget, light and dark, with sample data into
@@ -1980,7 +2041,7 @@ mod tests {
             }),
             zones: crate::config::defaults().widgets.world_clocks.iter().filter_map(|z| sources::parse_zone(z)).collect(),
             first_weekday: chrono::Weekday::Mon,
-            h24: false,
+            h24: std::env::var_os("DOCKSIDE_GALLERY_H24").is_some(),
             bands: (0..live::BANDS).map(|i| (0.85 - i as f32 / 48.0) * (0.55 + 0.45 * (i as f32 * 0.9).sin().abs())).collect(),
             notes: {
                 let note = |id: u32, mins: u64, app: &str, title: &str, body: &str| Note {
@@ -2019,12 +2080,14 @@ mod tests {
             let pad = 8.0;
             let (iw, mut placed) = (1100usize, Vec::new());
             let mut y = pad;
-            for kind in KINDS {
+            // Every kind, then the Clock again with its digital face.
+            let rows = KINDS.iter().map(|&k| (k, false)).chain(std::iter::once((WidgetKind::Clock, true)));
+            for (kind, digital) in rows {
                 let mut x = pad;
                 let mut row_h: f32 = 0.0;
                 for &size in sizes(kind) {
                     let (w, h) = dims(size);
-                    placed.push((kind, size, x, y));
+                    placed.push((kind, size, x, y, digital));
                     x += w + 2.0 * SHADOW + pad;
                     row_h = row_h.max(h + 2.0 * SHADOW);
                 }
@@ -2040,14 +2103,15 @@ mod tests {
                     img[o..o + 3].copy_from_slice(&[b as u8, g as u8, r as u8]);
                 }
             }
-            for (kind, size, x, y) in placed {
+            for (kind, size, x, y, digital) in placed {
                 // System: a bit of everything, two GPUs (more than fits as rings).
                 let sensors = (kind == WidgetKind::System).then(|| {
                     ["cpu", "gpu:10de-2504", "memory", "gpu_memory:10de-2504", "gpu_temp:10de-2504", "gpu:8086-9a49", "gpu_temp:8086-9a49", "disk:C", "network:Wi-Fi", "network"]
                         .map(String::from)
                         .to_vec()
                 });
-                let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None, display: None, sensors, path: None, options: None };
+                let options = digital.then(|| vec!["digital".to_string()]);
+                let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None, display: None, sensors, path: None, options, crop: None, fit: None };
                 let (w, h) = dims(size);
                 let (cw, ch) = ((w + 2.0 * SHADOW) as i32, (h + 2.0 * SHADOW) as i32);
                 let mut canvas = Canvas::new(&gfx, cw, ch, 1.0).unwrap();
@@ -2171,9 +2235,9 @@ mod tests {
     #[test]
     fn free_spot_skips_taken() {
         let area = Rect::new(24.0, 48.0, 1232.0, 728.0);
-        assert_eq!(free_spot(&[], WidgetSize::Small, area), (24.0, 48.0));
+        assert_eq!(free_spot(&[], dims(WidgetSize::Small), area), (24.0, 48.0));
         let items = [item(1, WidgetSize::Small, 24.0, 48.0)];
-        let (x, y) = free_spot(&items, WidgetSize::Small, area);
+        let (x, y) = free_spot(&items, dims(WidgetSize::Small), area);
         assert!(!overlaps(Rect::new(x, y, SMALL, SMALL), item_rect(&items[0])));
         assert_eq!(x, 24.0);
         assert_eq!(y, 48.0 + SMALL + GAP);

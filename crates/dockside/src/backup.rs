@@ -198,8 +198,14 @@ fn strip(cfg: &mut Value) -> HashMap<String, Value> {
         for item in items.iter_mut().filter_map(|i| i.as_table_mut()) {
             if let Some(p) = item.remove("path") {
                 let id = item.get("id").and_then(|i| i.as_integer()).unwrap_or(0);
-                let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let kind = item.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
                 taken.insert(format!("widgets.items#{id}#{kind}.path"), p);
+                // How it's framed and sized belongs to that picture: it goes with it.
+                for key in ["crop", "fit"] {
+                    if let Some(v) = item.remove(key) {
+                        taken.insert(format!("widgets.items#{id}#{kind}.{key}"), v);
+                    }
+                }
             }
         }
     }
@@ -211,7 +217,8 @@ fn restore(cfg: &mut Value, mine: HashMap<String, Value>) {
     let Some(root) = cfg.as_table_mut() else { return };
     for (path, value) in mine {
         if let Some(rest) = path.strip_prefix("widgets.items#") {
-            let Some((id, kind)) = rest.strip_suffix(".path").and_then(|r| r.split_once('#')) else { continue };
+            let Some((rest, key)) = rest.rsplit_once('.') else { continue };
+            let Some((id, kind)) = rest.split_once('#') else { continue };
             let Ok(id) = id.parse::<i64>() else { continue };
             // The same widget: same id and kind.
             let items = root.get_mut("widgets").and_then(|w| w.get_mut("items")).and_then(|i| i.as_array_mut());
@@ -220,7 +227,7 @@ fn restore(cfg: &mut Value, mine: HashMap<String, Value>) {
                     i.get("id").and_then(|v| v.as_integer()) == Some(id) && i.get("kind").and_then(|k| k.as_str()) == Some(kind)
                 })
             }) {
-                item.insert("path".into(), value);
+                item.insert(key.into(), value);
             }
             continue;
         }

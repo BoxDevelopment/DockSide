@@ -9,6 +9,7 @@ mod app;
 mod backup;
 mod calsync;
 mod custom;
+mod photo_edit;
 mod rename;
 mod dropdown;
 mod chrome;

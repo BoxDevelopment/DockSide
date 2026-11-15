@@ -60,6 +60,8 @@ pub fn apps(index: &Index) -> Vec<(String, String)> {
         .map(|a| (a.name.clone(), a.target.clone()))
         .chain(state.added.iter().map(|a| (a.name.clone(), a.target.clone())))
         .filter(|(_, t)| !hidden.contains(&t.to_lowercase()) && seen.insert(t.to_lowercase()))
+        // Renamed in the Dock or here: the same name everywhere.
+        .map(|(n, t)| (crate::custom::name(&t).unwrap_or(n), t))
         .collect();
     out.sort_by_key(|(n, _)| n.to_lowercase());
     out
@@ -112,16 +114,26 @@ pub fn request_size(px: f32) -> i32 {
     }
 }
 
+/// What an app's icon is drawn from: the icon set for it in the Dock (or
+/// here), else the app itself. Icon caches are keyed by this, so a changed
+/// icon is loaded afresh.
+pub fn icon_source(target: &str) -> String {
+    crate::custom::icon(target).unwrap_or_else(|| target.to_string())
+}
+
 /// An app icon fitted to `size` points, from `cache` or the loader.
 pub fn icon(p: &Painter, loader: &mut IconLoader, cache: &mut HashMap<(String, u32), Option<ID2D1Bitmap>>, target: &str, size: f32, scale: f32) -> Option<ID2D1Bitmap> {
+    let source = icon_source(target);
+    let custom = source != target;
     let px = (size * scale).round() as u32;
-    let k = (target.to_string(), px);
+    let k = (source.clone(), px);
     if let Some(b) = cache.get(&k) {
         return b.clone();
     }
     let req = request_size(px as f32);
-    let key = format!("lp{req}:{target}");
-    let Some(pixels) = loader.get(&key, Path::new(target), false, req) else {
+    let key = format!("lp{req}:{source}");
+    // A custom icon is a picture: its thumbnail is the picture itself.
+    let Some(pixels) = loader.get(&key, Path::new(&source), custom, req) else {
         // No icon at all (not just not loaded yet): remember that.
         if !loader.is_pending(&key) {
             cache.insert(k, None);
@@ -129,7 +141,18 @@ pub fn icon(p: &Painter, loader: &mut IconLoader, cache: &mut HashMap<(String, u
         return None;
     };
     let full = pixels.to_bitmap(p.rt)?;
-    let b = p.fitted(&full, size, size);
+    let b = if custom && crate::custom::is_library_logo(&source) {
+        // A bare logo goes on a white tile, as in the Dock.
+        let inner = p.fitted(&full, size * 0.6, size * 0.6)?;
+        p.layer(Rect::new(0.0, 0.0, size, size), |q| {
+            let tile = Rect::new(0.0, 0.0, size, size).inset(size * 0.08, size * 0.08);
+            q.fill_round(tile.offset(0.0, size * 0.01), tile.w * 0.225, Color::gray(0, 0.12));
+            q.fill_round(tile, tile.w * 0.225, Color::WHITE);
+            q.stamp(&inner, size * 0.2, size * 0.2, scale);
+        })
+    } else {
+        p.fitted(&full, size, size)
+    };
     cache.insert(k, b.clone());
     b
 }
@@ -522,7 +545,7 @@ impl Ink<'_> {
     /// An app icon `size` points across, noting one that's still loading.
     fn icon(&self, p: &Painter, icons: &mut HashMap<(String, u32), Option<ID2D1Bitmap>>, loader: &mut IconLoader, target: &str, size: f32) -> Option<ID2D1Bitmap> {
         let b = icon(p, loader, icons, target, size, self.scale);
-        if b.is_none() && !icons.contains_key(&(target.to_string(), (size * self.scale).round() as u32)) {
+        if b.is_none() && !icons.contains_key(&(icon_source(target), (size * self.scale).round() as u32)) {
             self.waiting.set(true);
         }
         b
@@ -1693,6 +1716,10 @@ impl Launchpad {
             if !target.to_lowercase().starts_with("shell:") {
                 v.push(Entry::item("Show in File Explorer", Action::Reveal(target.clone())));
             }
+            // The same settings the Dock's Change Icon… and Rename… write.
+            v.push(Entry::Separator);
+            v.push(Entry::item("Change Icon\u{2026}", Action::LaunchpadCustomize { target: target.clone(), name: name.clone(), rename: false }));
+            v.push(Entry::item("Rename\u{2026}", Action::LaunchpadCustomize { target: target.clone(), name: name.clone(), rename: true }));
             v.push(Entry::Separator);
             v.push(Entry::item("Hide from Launchpad", Action::LaunchpadHide { name, target: target.clone() }));
             v.push(Entry::item("Select Apps to Hide\u{2026}", Action::LaunchpadSelect(target)));

@@ -716,6 +716,8 @@ pub(crate) enum Hit {
     OpenConfig,
     OpenLog,
     OpenUpdate,
+    ExportSettings,
+    ImportSettings,
     Field(Key),
     Keybind(Key),
     ConnectClaude(bool),
@@ -1468,10 +1470,20 @@ impl SettingsWindow {
                 },
                 Group {
                     title: Some("Configuration"),
-                    rows: vec![Row::Buttons(
-                        "Settings file",
-                        vec![("Show Log", Hit::OpenLog), ("Open config.toml", Hit::OpenConfig)],
-                    )],
+                    rows: vec![
+                        Row::Buttons(
+                            "Settings file",
+                            vec![("Show Log", Hit::OpenLog), ("Open config.toml", Hit::OpenConfig)],
+                        ),
+                        Row::Buttons(
+                            "Move your settings to another PC",
+                            vec![("Import\u{2026}", Hit::ImportSettings), ("Export\u{2026}", Hit::ExportSettings)],
+                        ),
+                        Row::Note(
+                            "Exports include your Launchpad layout and custom icons, but not API keys, calendar or \
+                             Discord sign-ins, your weather location, widget notes or your Windows user name.",
+                        ),
+                    ],
                 },
                 Group {
                     title: Some("About"),
@@ -1783,7 +1795,8 @@ impl SettingsWindow {
                 Group {
                     title: Some("Custom icons"),
                     rows: vec![
-                        Row::Info("Change an app's icon", "Right-click it (or the Trash) in the Dock, then Change Icon\u{2026}".into()),
+                        Row::Info("Change an app's icon", "Right-click it (or the Trash) in the Dock or Launchpad, then Change Icon\u{2026}".into()),
+                        Row::Info("Rename an app", "Right-click it in the Dock or Launchpad, then Rename\u{2026}".into()),
                         Row::Text("macOSicons.com API key", Key::DockMacIconsKey, "Optional: adds Mac-style icons"),
                     ],
                 },
@@ -2498,6 +2511,8 @@ impl SettingsWindow {
             }
             Hit::AddFinder => Action::TogglePin { path: FINDER_PATH.into(), name: "Finder".into(), pin: true },
             Hit::OpenConfig => Action::OpenConfig,
+            Hit::ExportSettings => Action::ExportSettings,
+            Hit::ImportSettings => Action::ImportSettings,
             Hit::OpenUpdate => Action::Open(
                 crate::update::available().map_or_else(|| crate::update::REPO_URL.to_string() + "/releases", |r| r.url),
             ),

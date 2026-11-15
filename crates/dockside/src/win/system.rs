@@ -273,6 +273,37 @@ pub fn pick_image(owner: HWND) -> Option<String> {
     pick_file(owner, w!("Choose an Icon"), &filters)
 }
 
+/// A DockSide settings file to import.
+pub fn pick_zip(owner: HWND, title: windows::core::PCWSTR) -> Option<String> {
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("DockSide settings"), pszSpec: w!("*.zip") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    pick_file(owner, title, &filters)
+}
+
+/// Where to save a settings export (.zip), starting from `name` in Documents.
+pub fn pick_save_zip(owner: HWND, title: windows::core::PCWSTR, name: &str) -> Option<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{FileSaveDialog, IFileSaveDialog, SIGDN_FILESYSPATH};
+    let filters = [COMDLG_FILTERSPEC { pszName: w!("DockSide settings"), pszSpec: w!("*.zip") }];
+    unsafe {
+        let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetFileTypes(&filters).ok()?;
+        dialog.SetDefaultExtension(w!("zip")).ok()?;
+        dialog.SetFileName(&HSTRING::from(name)).ok()?;
+        dialog.SetTitle(title).ok()?;
+        dialog.Show(owner).ok()?; // Err when cancelled
+        let item = dialog.GetResult().ok()?;
+        let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = path.to_string().ok();
+        CoTaskMemFree(Some(path.0 as *const c_void));
+        s
+    }
+}
+
 /// A picture or GIF for a Photo widget.
 pub fn pick_photo(owner: HWND) -> Option<String> {
     use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;

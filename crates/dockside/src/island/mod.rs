@@ -24,7 +24,7 @@ mod catch;
 pub mod claude;
 mod convert;
 pub mod discord;
-mod encode;
+pub(crate) mod encode;
 pub mod glyphs;
 mod holding;
 pub mod ics;

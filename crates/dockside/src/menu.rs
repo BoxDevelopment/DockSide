@@ -46,6 +46,16 @@ pub enum Action {
     SetAppIcon { target: crate::icon_picker::IconTarget, icon: Option<String> },
     /// Image file picker, then use the file as a Dock app's icon.
     PickIconFile(crate::icon_picker::IconTarget),
+    /// Change Icon… (or, with `rename`, Rename…) for a Launchpad app: works
+    /// out which Dock entry or key it is, then opens the panel.
+    LaunchpadCustomize { target: String, name: String, rename: bool },
+    /// Open the Rename panel for an app (with its display name).
+    RenameApp { target: crate::icon_picker::IconTarget, name: String },
+    /// Set (or, with `None`, reset) the name an app shows under.
+    SetAppName { target: crate::icon_picker::IconTarget, name: Option<String> },
+    /// Save a copy of the settings (without keys or sign-ins) to a .zip / load one.
+    ExportSettings,
+    ImportSettings,
     OpenSettings(Option<crate::settings::Page>),
     /// Show the first-launch Setup Assistant again.
     OpenOnboarding,

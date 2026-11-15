@@ -512,6 +512,11 @@ pub fn load(path: &Path) -> Result<Config> {
     parse(&text)
 }
 
+/// Whether `text` would load as a config.
+pub fn check(text: &str) -> Result<()> {
+    parse(text).map(|_| ())
+}
+
 fn parse(user: &str) -> Result<Config> {
     let mut base: toml::Value = toml::from_str(DEFAULT_TOML)?;
     let mut over: toml::Value = toml::from_str(user).context("config.toml is not valid TOML")?;

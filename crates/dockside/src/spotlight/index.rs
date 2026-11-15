@@ -206,6 +206,9 @@ impl Files {
 #[derive(Default)]
 pub struct Index {
     pub apps: Vec<Item>,
+    /// The exe file name (lower case) behind each desktop app, by lower-cased
+    /// target: what Rename… and Change Icon… key an app by.
+    pub app_exes: std::collections::HashMap<String, String>,
     pub files: Files,
     pub built: Option<Instant>,
 }
@@ -228,7 +231,7 @@ pub fn rebuild(shared: Shared, roots: Vec<PathBuf>, notify: isize, msg: u32) {
             let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
         }
         let started = Instant::now();
-        let apps = apps();
+        let (apps, app_exes) = apps();
         static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         let mut files = Files { generation, roots: roots.iter().map(|r| r.display().to_string()).collect(), ..Default::default() };
@@ -239,7 +242,7 @@ pub fn rebuild(shared: Shared, roots: Vec<PathBuf>, notify: isize, msg: u32) {
         files.entries.shrink_to_fit();
         log!("spotlight index: {} apps, {} files in {:?}", apps.len(), files.len(), started.elapsed());
         if let Ok(mut idx) = shared.lock() {
-            *idx = Index { apps, files, built: Some(Instant::now()) };
+            *idx = Index { apps, app_exes, files, built: Some(Instant::now()) };
         }
         RUNNING.store(false, Ordering::Release);
         crate::win::post(notify, msg);
@@ -258,15 +261,33 @@ fn display_name(item: &IShellItem, kind: SIGDN) -> Option<String> {
     }
 }
 
-/// All entries of the Start menu's "All apps" list (desktop + Store apps).
-fn apps() -> Vec<Item> {
+/// The exe a desktop app's entry starts: its id when that's an exe's path
+/// (under a known folder's GUID), else its shortcut's target.
+fn app_exe(item: &IShellItem, id: &str) -> Option<String> {
+    use windows::core::Interface;
+    use windows::Win32::Storage::EnhancedStorage::PKEY_Link_TargetParsingPath;
+    use windows::Win32::UI::Shell::IShellItem2;
+    let exe = |p: &str| p.to_lowercase().ends_with(".exe").then(|| crate::win::apps::exe_name(p));
+    exe(id).or_else(|| unsafe {
+        let item2: IShellItem2 = item.cast().ok()?;
+        let target = item2.GetString(&PKEY_Link_TargetParsingPath).ok()?;
+        let s = target.to_string().ok();
+        CoTaskMemFree(Some(target.0 as *const c_void));
+        exe(&s?)
+    })
+}
+
+/// All entries of the Start menu's "All apps" list (desktop + Store apps),
+/// and the exe behind each desktop app (by lower-cased target).
+fn apps() -> (Vec<Item>, std::collections::HashMap<String, String>) {
+    let mut exes = std::collections::HashMap::new();
     const NOT_APPS: &[&str] = &[".txt", ".html", ".htm", ".chm", ".pdf", ".url", ".rtf", ".md", ".ini", ".log"];
     let mut out = Vec::new();
     unsafe {
         let Ok(folder) = SHCreateItemFromParsingName::<_, _, IShellItem>(w!("shell:AppsFolder"), None) else {
-            return out;
+            return (out, exes);
         };
-        let Ok(items) = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return out };
+        let Ok(items) = folder.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return (out, exes) };
         loop {
             let mut batch: [Option<IShellItem>; 1] = [None];
             let mut fetched = 0u32;
@@ -280,12 +301,16 @@ fn apps() -> Vec<Item> {
             if name.to_lowercase().contains("uninstall") || NOT_APPS.iter().any(|ext| id_lower.ends_with(ext)) {
                 continue;
             }
-            out.push(Item::new(name, format!("shell:AppsFolder\\{id}"), Kind::App, 0));
+            let target = format!("shell:AppsFolder\\{id}");
+            if let Some(exe) = app_exe(&item, &id) {
+                exes.insert(target.to_lowercase(), exe);
+            }
+            out.push(Item::new(name, target, Kind::App, 0));
         }
     }
     out.sort_by(|a, b| a.lower.cmp(&b.lower));
     out.dedup_by(|a, b| a.lower == b.lower);
-    out
+    (out, exes)
 }
 
 fn walk(dir: &Path, parent: u32, depth: usize, out: &mut Files) {
@@ -547,6 +572,41 @@ mod bench {
             let full = files.top(q, 15, &mut Narrow::default());
             assert_eq!(got.iter().map(|g| &g.1.target).collect::<Vec<_>>(), full.iter().map(|g| &g.1.target).collect::<Vec<_>>());
             println!("{q:>12}: {took:?} typed ({} candidates)", narrow.hits.len());
+        }
+    }
+}
+
+#[cfg(test)]
+mod custom_live {
+    /// Which Start menu apps get an exe, which share one, and which pick up
+    /// a Dock icon or name from the real config: `cargo test launchpad_custom_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn launchpad_custom_live() {
+        unsafe {
+            let _ = super::CoInitializeEx(None, super::COINIT_APARTMENTTHREADED);
+        }
+        let (apps, exes) = super::apps();
+        let cfg = crate::config::load(&crate::config::path()).unwrap();
+        crate::custom::set(&cfg);
+        crate::custom::set_app_exes(&exes);
+        println!("{} apps, {} with an exe", apps.len(), exes.len());
+        let mut by_exe: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+        for a in &apps {
+            if let Some(e) = exes.get(&a.target.to_lowercase()) {
+                by_exe.entry(e).or_default().push(&a.name);
+            }
+        }
+        for (e, names) in by_exe.iter().filter(|(_, n)| n.len() > 1) {
+            println!("shared exe {e}: {names:?}");
+        }
+        for a in &apps {
+            let icon = crate::custom::icon(&a.target);
+            let name = crate::custom::name(&a.target);
+            if icon.is_some() || name.is_some() {
+                let file = icon.as_deref().and_then(|i| std::path::Path::new(i).file_name()).map(|f| f.to_string_lossy().into_owned());
+                println!("{:<28} exe={:<24} icon={:<36} name={:?}", a.name, exes.get(&a.target.to_lowercase()).map(String::as_str).unwrap_or("-"), file.unwrap_or("-".into()), name);
+            }
         }
     }
 }

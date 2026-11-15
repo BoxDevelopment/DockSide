@@ -28,6 +28,7 @@ use crate::dock::{Dock, FileDrop, LAUNCHPAD_PATH, START_PATH};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
+use crate::rename::{RenameEvent, RenamePanel, RENAME_HWND};
 use crate::island::sources::VolumeKey;
 use crate::keybind;
 use crate::island::{Island, IslandEvent};
@@ -603,6 +604,59 @@ fn execute(action: Action) {
         Action::SetAppIcon { target, icon } => {
             with_app(|app| app.set_app_icon(&target, icon));
         }
+        Action::LaunchpadCustomize { target, name, rename } => {
+            with_app(|app| {
+                // The panel takes focus, which would close Launchpad anyway.
+                app.close_launchpad();
+                let t = IconTarget {
+                    pinned: crate::custom::pinned_path(&target, &app.cfg),
+                    exe: Some(crate::custom::key_of(&target)),
+                    trash: None,
+                };
+                if rename {
+                    app.open_rename(t, &name);
+                } else {
+                    app.open_icon_picker(t, &name);
+                }
+            });
+        }
+        Action::RenameApp { target, name } => {
+            with_app(|app| app.open_rename(target, &name));
+        }
+        Action::SetAppName { target, name } => {
+            with_app(|app| app.set_app_name(&target, name));
+        }
+        // File dialogs and message boxes run modal loops: outside the App borrow.
+        Action::ExportSettings => {
+            let owner = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as _);
+            if let Some(out) = system::pick_save_zip(owner, windows::core::w!("Export Settings"), &crate::backup::default_file_name()) {
+                match crate::backup::export(&config::dir(), std::path::Path::new(&out)) {
+                    Ok(report) => system::notice("Settings Exported", &report),
+                    Err(e) => system::notice("Settings Not Exported", &format!("{e:#}")),
+                }
+            }
+        }
+        Action::ImportSettings => {
+            let owner = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as _);
+            if let Some(file) = system::pick_zip(owner, windows::core::w!("Import Settings")) {
+                let go = system::confirm(
+                    "Import Settings",
+                    "Replace your DockSide settings with the ones in this file?\n\n\
+                     Your API keys, calendar and Discord sign-ins, weather location and widget photos stay as they \
+                     are on this PC. A copy of your current settings is kept in the settings folder (config.backup-<date>.toml).",
+                );
+                if go {
+                    with_app(|app| app.close_launchpad());
+                    match crate::backup::import(&config::dir(), std::path::Path::new(&file)) {
+                        Ok(()) => {
+                            with_app(|app| app.reload());
+                            system::notice("Settings Imported", "Your DockSide settings were imported.");
+                        }
+                        Err(e) => system::notice("Settings Not Imported", &format!("{e:#}")),
+                    }
+                }
+            }
+        }
         // The file dialog runs a modal loop: outside the App borrow.
         Action::PickIconFile(target) => {
             with_app(|app| app.close_icon_picker());
@@ -742,6 +796,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_LAUNCHPAD);
         }
         WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == PICKER_HWND.load(Ordering::Relaxed) => {
+            win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_PICKER);
+        }
+        // (The same message closes the Rename panel: only one of them is ever open.)
+        WM_ACTIVATE if wp.0 & 0xFFFF == 0 && hwnd.0 as isize == RENAME_HWND.load(Ordering::Relaxed) => {
             win::post(MSG_HWND.load(Ordering::Relaxed), WM_APP_CLOSE_PICKER);
         }
         // Shell surfaces never take focus; app windows (Finder, Settings) behave normally.
@@ -1104,6 +1162,8 @@ pub struct App {
     spotlight_tap: Option<keybind::TapWatch>,
     /// Change Icon… for a Dock app.
     icon_picker: Option<IconPicker>,
+    /// Rename… for a Dock or Launchpad app.
+    rename: Option<RenamePanel>,
     index: spotlight::index::Shared,
     hooks: Vec<HHOOK>,
     island_hook: Option<HHOOK>,
@@ -1162,6 +1222,7 @@ impl App {
             config::defaults()
         });
         crate::screenshot_mode::set(cfg.general.screenshot_mode);
+        crate::custom::set(&cfg);
         phases.mark("config");
         let theme = Theme::new(&cfg, &gfx);
         phases.mark("theme");
@@ -1271,6 +1332,7 @@ impl App {
             launchpad_modal: false,
             spotlight_tap: None,
             icon_picker: None,
+            rename: None,
             index: Default::default(),
             hooks: Vec::new(),
             island_hook: None,
@@ -1377,6 +1439,7 @@ impl App {
             return;
         }
         let old = std::mem::replace(&mut self.cfg, cfg);
+        crate::custom::set(&self.cfg);
         self.mark_settings_dirty();
         let (g0, g1) = (&old.general, &self.cfg.general);
         let rebuild = g0.appearance != g1.appearance || g0.hide_taskbar != g1.hide_taskbar
@@ -1463,8 +1526,15 @@ impl App {
         if old.dock.enabled != self.cfg.dock.enabled {
             self.apply_taskbar();
         }
-        if old.dock != self.cfg.dock || old.app_icons != self.cfg.app_icons {
-            let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock) && old.app_icons == self.cfg.app_icons;
+        if old.app_names != self.cfg.app_names {
+            // The menu bar shows the front app's name.
+            self.update_foreground();
+        }
+        if old.dock != self.cfg.dock || old.app_icons != self.cfg.app_icons || old.app_names != self.cfg.app_names {
+            // Running apps' names come from `[app_names]`: a rebuild names them afresh.
+            let only_apps = dock_eq_except_apps(&old.dock, &self.cfg.dock)
+                && old.app_icons == self.cfg.app_icons
+                && old.app_names == self.cfg.app_names;
             if only_apps && !self.docks.is_empty() {
                 for d in &mut self.docks {
                     d.set_apps(&self.cfg.dock.apps);
@@ -2004,6 +2074,9 @@ impl App {
         if let Some(p) = &mut self.icon_picker {
             still |= p.tick(dt);
         }
+        if let Some(r) = &mut self.rename {
+            still |= r.tick(dt);
+        }
         if let Some(s) = &mut self.settings {
             still |= s.tick(dt);
         }
@@ -2136,6 +2209,7 @@ impl App {
             self.menu.as_ref().map(|m| &m.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
             self.icon_picker.as_ref().map(|p| &p.surface),
+            self.rename.as_ref().map(|r| &r.surface),
         ];
         for s in bars.chain(surfaces.into_iter().flatten()) {
             s.raise();
@@ -2365,6 +2439,9 @@ impl App {
         if let Some(p) = self.icon_picker.as_mut().filter(|p| p.dirty) {
             p.render(&self.gfx, &self.theme);
         }
+        if let Some(r) = self.rename.as_mut().filter(|r| r.dirty) {
+            r.render(&self.gfx, &self.theme);
+        }
         if let Some(s) = self.spotlight.as_mut().filter(|s| s.dirty) {
             s.render(&self.gfx, &self.theme, &mut self.loader);
         }
@@ -2399,6 +2476,7 @@ impl App {
             || self.launchpad.as_ref().is_some_and(|l| l.animating())
             || !self.closing_launchpads.is_empty()
             || self.icon_picker.as_ref().is_some_and(|p| p.animating())
+            || self.rename.as_ref().is_some_and(|r| r.animating())
             || self.settings.as_ref().is_some_and(|s| s.animating())
             || self.onboarding.as_ref().is_some_and(|o| o.animating())
             || self.about.as_ref().is_some_and(|a| a.animating())
@@ -2915,6 +2993,124 @@ impl App {
             Ok(()) => self.reload(),
             Err(e) => log!("could not save the icon: {e:#}"),
         }
+    }
+
+    // --- Rename panel ------------------------------------------------------
+
+    fn open_rename(&mut self, target: IconTarget, name: &str) {
+        self.close_menu();
+        self.close_spotlight();
+        self.close_icon_picker();
+        self.close_rename();
+        match RenamePanel::new(&self.gfx, &self.theme, &self.cfg, &Monitor::at_cursor(), target, name) {
+            Ok(mut r) => {
+                r.render(&self.gfx, &self.theme);
+                r.focus();
+                self.rename = Some(r);
+                self.raise_surfaces();
+            }
+            Err(e) => log!("rename panel failed: {e}"),
+        }
+    }
+
+    fn close_rename(&mut self) {
+        let Some(r) = self.rename.take() else { return };
+        RENAME_HWND.store(0, Ordering::Relaxed);
+        apps::pass_focus_from(r.surface.content);
+        r.surface.set_click_through();
+        self.fading.push(Box::new(r));
+        self.animate();
+    }
+
+    /// The name an app had before it was renamed: Launchpad's (the Start
+    /// menu's), else the exe's description, else its file name.
+    fn natural_name(&mut self, path: &str) -> String {
+        let listed = self.index.lock().ok().and_then(|i| {
+            i.apps.iter().find(|a| a.target.eq_ignore_ascii_case(path)).map(|a| a.name.clone())
+        });
+        listed.unwrap_or_else(|| {
+            if path.to_lowercase().ends_with(".exe") {
+                self.names.name_for(path, &Default::default())
+            } else {
+                std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string())
+            }
+        })
+    }
+
+    /// Writes an app's name (`None` goes back to its own) and applies it: a
+    /// pinned app's `[[dock.apps]]` entry, and `[app_names]` for its exe, so
+    /// the Dock, Launchpad and the menu bar all agree.
+    fn set_app_name(&mut self, target: &IconTarget, name: Option<String>) {
+        self.close_rename();
+        let path = self.cfg_path.clone();
+        let natural = match (&name, &target.pinned) {
+            (None, Some(p)) => Some(self.natural_name(p)),
+            _ => None,
+        };
+        let written = (|| -> anyhow::Result<()> {
+            if let Some(pinned) = &target.pinned {
+                let mut apps = self.cfg.dock.apps.clone();
+                for a in apps.iter_mut().filter(|a| a.path == *pinned) {
+                    a.name = name.clone().or_else(|| natural.clone());
+                }
+                config::save_dock_apps(&path, &apps)?;
+            }
+            if let Some(key) = &target.exe {
+                // Keep the spelling a key already has ("Code.exe" in the defaults):
+                // a second, differently-cased key would lose to it.
+                let same: Vec<String> = self.cfg.app_names.keys().filter(|k| k.eq_ignore_ascii_case(key)).cloned().collect();
+                let spelling = same.first().cloned().unwrap_or_else(|| key.clone());
+                for k in &same {
+                    config::remove_value(&path, "app_names", k)?;
+                }
+                if let Some(n) = &name {
+                    config::save_value(&path, "app_names", &spelling, &config::ConfigValue::Str(n.clone()))?;
+                }
+            }
+            Ok(())
+        })();
+        match written {
+            Ok(()) => self.reload(),
+            Err(e) => log!("could not save the name: {e:#}"),
+        }
+    }
+
+    fn on_rename_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        let r = self.rename.as_mut()?;
+        let (x, y) = mouse_pt(lp, r.surface.scale);
+        let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetKeyState(vk.0 as i32) < 0 };
+        let event = match msg {
+            WM_KEYDOWN | WM_SYSKEYDOWN => r.on_key(wp.0 as u16, down(VK_CONTROL), down(VK_SHIFT)),
+            WM_CHAR => {
+                if let Some(c) = char::from_u32(wp.0 as u32) {
+                    r.on_char(c);
+                }
+                RenameEvent::None
+            }
+            WM_SYSCHAR => RenameEvent::None,
+            WM_CLOSE => RenameEvent::Close,
+            WM_MOUSEMOVE => {
+                if !r.tracking {
+                    r.tracking = true;
+                    track_leave(r.surface.content);
+                }
+                r.on_move(x, y);
+                RenameEvent::None
+            }
+            WM_MOUSELEAVE => {
+                r.on_leave();
+                RenameEvent::None
+            }
+            WM_LBUTTONUP => r.on_click(x, y),
+            _ => return None,
+        };
+        match event {
+            RenameEvent::None => {}
+            RenameEvent::Close => self.close_rename(),
+            RenameEvent::Run(action) => push(action),
+        }
+        Some(LRESULT(0))
     }
 
     fn on_picker_message(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
@@ -3833,13 +4029,19 @@ impl App {
                         self.close_launchpad();
                     }
                 }
-                WM_APP_CLOSE_PICKER => self.close_icon_picker(),
+                WM_APP_CLOSE_PICKER => {
+                    self.close_icon_picker();
+                    self.close_rename();
+                }
                 WM_APP_ICON_PICKER => {
                     if let Some(p) = &mut self.icon_picker {
                         p.poll();
                     }
                 }
                 WM_APP_INDEX_READY => {
+                    if let Ok(idx) = self.index.lock() {
+                        crate::custom::set_app_exes(&idx.app_exes);
+                    }
                     if let (Some(s), Ok(idx)) = (&mut self.spotlight, self.index.lock()) {
                         s.search(&idx);
                     }
@@ -4054,6 +4256,11 @@ impl App {
         }
         if self.icon_picker.as_ref().is_some_and(|p| p.surface.content == hwnd) {
             let r = self.on_picker_message(msg, wp, lp);
+            self.flush_input(msg);
+            return r;
+        }
+        if self.rename.as_ref().is_some_and(|p| p.surface.content == hwnd) {
+            let r = self.on_rename_message(msg, wp, lp);
             self.flush_input(msg);
             return r;
         }

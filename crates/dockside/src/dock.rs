@@ -137,7 +137,12 @@ impl Item {
             launch: app.path.clone(),
             args: app.args.clone(),
             icon_key: icon_source(&app.path),
-            custom_icon: app.icon.clone().or_else(|| match_name.as_deref().and_then(|m| exe_icon(icons, m))),
+            custom_icon: app
+                .icon
+                .clone()
+                .or_else(|| match_name.as_deref().and_then(|m| exe_icon(icons, m)))
+                // Store apps are keyed by their target (set from Launchpad).
+                .or_else(|| exe_icon(icons, &app.path)),
             match_name,
             pinned: Some(app.clone()),
             windows: Vec::new(),
@@ -339,11 +344,7 @@ pub fn compute_layout(
     Layout { items, left, right }
 }
 
-/// A logo picked from Dashboard Icons (saved as `dash-*.png`): drawn on a tile
-/// like shell icons, where other custom icons are already tile-shaped.
-fn is_library_logo(path: &str) -> bool {
-    Path::new(path).file_name().is_some_and(|f| f.to_string_lossy().starts_with("dash-"))
-}
+use crate::custom::is_library_logo;
 
 /// Finder and Start have icons we draw ourselves; our other windows show
 /// DockSide's own icon.
@@ -1234,6 +1235,22 @@ impl Dock {
                 };
                 if target.pinned.is_some() || target.exe.is_some() {
                     v.push(Entry::item("Change Icon\u{2026}", Action::ChangeIcon { target, name: item.name.clone() }));
+                }
+                // Named by the running app's exe where there is one: that's what the menu bar goes by.
+                let rename = IconTarget {
+                    pinned: item.pinned.as_ref().map(|p| p.path.clone()),
+                    exe: item
+                        .windows
+                        .first()
+                        .map(|w| w.exe_name())
+                        .filter(|e| e.ends_with(".exe"))
+                        .or_else(|| item.match_name.clone().filter(|m| m.ends_with(".exe")))
+                        // A pinned Start menu entry: the exe behind it.
+                        .or_else(|| crate::custom::exe_of(&item.launch)),
+                    trash: None,
+                };
+                if rename.pinned.is_some() || rename.exe.is_some() {
+                    v.push(Entry::item("Rename\u{2026}", Action::RenameApp { target: rename, name: item.name.clone() }));
                 }
                 v.push(Entry::Separator);
                 if item.windows.is_empty() {

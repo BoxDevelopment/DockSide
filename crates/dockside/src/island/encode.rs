@@ -588,7 +588,7 @@ fn deflate_stream(src: &mut impl std::io::Read, out: &mut impl std::io::Write) -
     }
 }
 
-fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+pub(crate) fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
     let table = TABLE.get_or_init(|| {
         let mut t = [0u32; 256];

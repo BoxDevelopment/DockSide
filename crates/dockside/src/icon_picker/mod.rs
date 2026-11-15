@@ -52,7 +52,8 @@ const ICON: f32 = 60.0;
 pub struct IconTarget {
     /// A pinned app's path (its `[[dock.apps]]` entry gets the icon).
     pub pinned: Option<String>,
-    /// The app's exe file name (`[app_icons]`, for apps that aren't pinned).
+    /// The app's `[app_icons]` / `[app_names]` key: its exe file name, or
+    /// its target when it has no exe (a Store app in Launchpad).
     pub exe: Option<String>,
     /// The Trash, empty (`false`: `[dock] trash_icon`) or full (`true`: `trash_icon_full`).
     pub trash: Option<bool>,

@@ -20,8 +20,15 @@ fn build_hook() {
     println!("cargo:rerun-if-changed=../dockside-hook");
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    // OUT_DIR is <target>[/<triple>]/<profile>/build/dockside-<hash>/out.
-    let profile_dir = out.ancestors().nth(3).unwrap();
+    // OUT_DIR is <target>[/<triple>]/<profile>/build/dockside-<hash>/out, or with
+    // newer cargo's build-dir layout <profile>/build/dockside/<hash>/out. Either
+    // way the profile dir is the parent of the nearest `build` ("build" is a
+    // reserved profile name, so it can't be the profile itself).
+    let profile_dir = out
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "build"))
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("no profile dir above OUT_DIR {}", out.display()));
     let profile = match profile_dir.file_name().unwrap().to_str().unwrap() {
         "debug" => "dev",
         p => p,

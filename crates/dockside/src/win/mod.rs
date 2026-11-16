@@ -2,6 +2,7 @@
 
 pub mod accent;
 pub mod appbar;
+pub mod audio;
 pub mod apps;
 pub mod composition;
 pub mod controls;

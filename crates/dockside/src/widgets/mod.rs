@@ -434,6 +434,8 @@ struct Sources {
     gpus: Option<SharedGpus>,
     notes: Option<Inbox>,
     bands: Option<SharedBands>,
+    /// The device `bands` listens to.
+    audio: String,
     user: Option<SharedUser>,
 }
 
@@ -865,7 +867,17 @@ impl Widgets {
     /// (Re)starts the background sources the current widgets need.
     fn restart_sources(&mut self) {
         let key = self.source_key();
-        if self.sources.as_ref().is_some_and(|s| s.key == key) {
+        if let Some(s) = self.sources.as_mut().filter(|s| s.key == key) {
+            // Another device picked for Music Wave: only its listener starts over.
+            if s.bands.is_some() && s.audio != self.cfg.audio_device {
+                if let Some(old) = s.bands.take() {
+                    old.stop();
+                }
+                let shared = SharedBands::default();
+                live::listen(shared.clone(), self.cfg.audio_device.clone(), self.hwnd, self.msg_data);
+                s.bands = Some(shared);
+                s.audio = self.cfg.audio_device.clone();
+            }
             return;
         }
         // Dropping the old set stops its threads.
@@ -905,9 +917,10 @@ impl Widgets {
         }
         let bands = key.music.then(|| {
             let shared = SharedBands::default();
-            live::listen(shared.clone(), self.hwnd, self.msg_data);
+            live::listen(shared.clone(), self.cfg.audio_device.clone(), self.hwnd, self.msg_data);
             shared
         });
+        let audio = self.cfg.audio_device.clone();
         let user = key.user.then(|| {
             let shared = SharedUser::default();
             if self.data.user.is_none() {
@@ -918,7 +931,7 @@ impl Widgets {
         if key.weather.is_some() {
             self.data.weather = WeatherState::Loading;
         }
-        self.sources = Some(Sources { key, stop, calendar, weather, devices, media, gpus, notes, bands, user });
+        self.sources = Some(Sources { key, stop, calendar, weather, devices, media, gpus, notes, bands, audio, user });
     }
 
     /// Gives up the running sources (and their data) for the widgets replacing these.

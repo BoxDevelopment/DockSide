@@ -756,12 +756,13 @@ impl Bands {
 
 const FFT: usize = 1024;
 
-/// Listens to the default speakers (loopback) and keeps `bands` up to date,
-/// about 30 times a second while there's sound; silent, it stays quiet.
-pub fn listen(bands: SharedBands, hwnd: isize, msg: u32) {
+/// Listens to `device` (an output through loopback, or an input; empty for the
+/// default speakers) and keeps `bands` up to date, about 30 times a second
+/// while there's sound; silent, it stays quiet.
+pub fn listen(bands: SharedBands, device: String, hwnd: isize, msg: u32) {
     spawn("music wave", move || {
         while !bands.stopped.load(Ordering::Relaxed) {
-            if let Err(e) = unsafe { capture(&bands, hwnd, msg) } {
+            if let Err(e) = unsafe { capture(&bands, &device, hwnd, msg) } {
                 log!("music wave: {e}");
             }
             // The device went away (headphones unplugged...): try again shortly.
@@ -775,11 +776,21 @@ pub fn listen(bands: SharedBands, hwnd: isize, msg: u32) {
     });
 }
 
-unsafe fn capture(bands: &Bands, hwnd: isize, msg: u32) -> windows::core::Result<()> {
+unsafe fn capture(bands: &Bands, id: &str, hwnd: isize, msg: u32) -> windows::core::Result<()> {
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
     let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-    let device = devices.GetDefaultAudioEndpoint(eRender, eConsole)?;
+    // The device picked, while it's plugged in and enabled; otherwise the default speakers.
+    let picked = (!id.is_empty())
+        .then(|| devices.GetDevice(&HSTRING::from(id)).ok())
+        .flatten()
+        .filter(|d| d.GetState().is_ok_and(|s| s == DEVICE_STATE_ACTIVE));
+    let device = match picked {
+        Some(d) => d,
+        None => devices.GetDefaultAudioEndpoint(eRender, eConsole)?,
+    };
+    // Outputs are heard through loopback; inputs are recorded as they are.
+    let input = device.cast::<IMMEndpoint>().and_then(|e| e.GetDataFlow()).is_ok_and(|f| f == eCapture);
     let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
     let fmt = client.GetMixFormat()?;
     let (channels, rate, bits) = ((*fmt).nChannels.max(1) as usize, (*fmt).nSamplesPerSec as f32, (*fmt).wBitsPerSample);
@@ -787,7 +798,8 @@ unsafe fn capture(bands: &Bands, hwnd: isize, msg: u32) -> windows::core::Result
     // Extensible formats carry their real type in a sub-format; 32-bit mix formats are float.
     const WAVE_FORMAT_IEEE_FLOAT: u32 = 3;
     let float = tag == WAVE_FORMAT_IEEE_FLOAT || (tag == 0xFFFE && bits == 32);
-    let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2_000_000, 0, fmt, None);
+    let flags = if input { 0 } else { AUDCLNT_STREAMFLAGS_LOOPBACK };
+    let init = client.Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 2_000_000, 0, fmt, None);
     CoTaskMemFree(Some(fmt as *const _));
     init?;
     let cap: IAudioCaptureClient = client.GetService()?;
@@ -1004,12 +1016,13 @@ mod tests {
         }
     }
 
-    /// Listens to the speakers for 4 s: `cargo test live_listen -- --ignored --nocapture`.
+    /// Listens to the speakers (or the endpoint ID in `AUDIO_DEVICE`) for 4 s:
+    /// `cargo test live_listen -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn live_listen() {
         let bands = SharedBands::default();
-        listen(bands.clone(), 0, 0);
+        listen(bands.clone(), std::env::var("AUDIO_DEVICE").unwrap_or_default(), 0, 0);
         std::thread::sleep(Duration::from_millis(500));
         let (cpu0, started) = (cpu_ms(), Instant::now());
         let (mut updates, mut loudest) = (0, 0.0f32);

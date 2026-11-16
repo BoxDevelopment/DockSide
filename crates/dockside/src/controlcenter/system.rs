@@ -15,7 +15,7 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use windows::core::{w, Interface, BSTR, GUID, HSTRING, IUnknown, PCWSTR, PWSTR, VARIANT};
+use windows::core::{w, Interface, BSTR, GUID, HSTRING, IUnknown, PCWSTR, VARIANT};
 use windows::Devices::Enumeration::{DeviceInformation, DeviceInformationKind};
 use windows::Devices::Radios::{Radio, RadioKind, RadioState};
 use windows::Devices::WiFi::{WiFiAccessStatus, WiFiAdapter, WiFiAvailableNetwork, WiFiConnectionStatus, WiFiReconnectionKind};
@@ -24,11 +24,9 @@ use windows::Foundation::IReference;
 use windows::Networking::Connectivity::{NetworkAuthenticationType, NetworkConnectivityLevel, NetworkInformation};
 use windows::Networking::NetworkOperators::{NetworkOperatorTetheringManager, TetheringOperationalState};
 use windows::Win32::Media::Audio::*;
-use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::System::Wmi::*;
-use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 
 use crate::win::system;
 
@@ -882,38 +880,18 @@ fn bluetooth_devices() -> Vec<Device> {
 // Audio outputs
 // ---------------------------------------------------------------------------
 
-const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY =
-    PROPERTYKEY { fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0), pid: 14 };
-
 fn outputs() -> Vec<Output> {
-    unsafe {
-        let list = (|| -> windows::core::Result<Vec<Output>> {
-            let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let default = devices.GetDefaultAudioEndpoint(eRender, eConsole).and_then(|d| take_id(d.GetId()?)).ok();
-            let all = devices.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-            let mut out = Vec::new();
-            for i in 0..all.GetCount()? {
-                let d = all.Item(i)?;
-                let id = take_id(d.GetId()?)?;
-                let store = d.OpenPropertyStore(STGM_READ)?;
-                let value = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME)?;
-                let name = take_id(PropVariantToStringAlloc(&value)?)?;
-                out.push(Output { default: default.as_deref() == Some(id.as_str()), id, name });
-            }
-            Ok(out)
-        })();
-        list.unwrap_or_else(|e| {
+    match crate::win::audio::endpoints(eRender) {
+        Ok(list) => list.into_iter().map(|e| Output { id: e.id, name: e.name, default: e.default }).collect(),
+        Err(e) => {
             log!("audio outputs unavailable: {e}");
             Vec::new()
-        })
+        }
     }
 }
 
-unsafe fn take_id(p: PWSTR) -> windows::core::Result<String> {
-    let s = p.to_string().unwrap_or_default();
-    CoTaskMemFree(Some(p.0 as *const c_void));
-    Ok(s)
-}
+#[cfg(test)]
+use {crate::win::audio::take as take_id, windows::core::PWSTR};
 
 const CLSID_POLICY_CONFIG: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
 const IID_POLICY_CONFIG: GUID = GUID::from_u128(0xf8679f50_850a_41cf_9c72_430f290290c8);

@@ -377,6 +377,9 @@ temperature_unit = "auto"
 # World Clock time zones, "Area/City" or "Label=Area/City"
 # (see https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
 world_clocks = ["America/Los_Angeles", "America/New_York", "Europe/London", "Asia/Tokyo"]
+# What Music Wave listens to: "" follows the default speakers; otherwise an
+# output or microphone picked in System Settings > Widgets.
+audio_device = ""
 
 # Widgets and where they sit (top-left corner, in points from the screen's top-left).
 #   kind - clock, world_clock, weather, calendar, up_next, batteries, notes,

@@ -404,6 +404,10 @@ pub struct WidgetsCfg {
     pub temperature_unit: String,
     /// World Clock zones: "Area/City" or "Label=Area/City".
     pub world_clocks: Vec<String>,
+    /// The sound Music Wave follows: an output's or input's endpoint ID, or
+    /// empty for the default output.
+    #[serde(default)]
+    pub audio_device: String,
     #[serde(default)]
     pub items: Vec<WidgetItem>,
 }

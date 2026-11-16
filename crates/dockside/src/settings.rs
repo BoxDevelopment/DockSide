@@ -420,10 +420,61 @@ fn row_text(row: &Row, fonts: &[String], cfg: &Config) -> String {
         Row::Tiles(buttons, _) => buttons.iter().map(|(b, _)| *b).collect::<Vec<_>>().join(" "),
         Row::Widgets(start) => gallery(*start).iter().map(|k| crate::widgets::title(*k)).collect::<Vec<_>>().join(" "),
         Row::Named(l, b, _) => format!("{l} {b}"),
+        Row::Choice(key, i) => {
+            let (labels, values, _) = SettingsWindow::segments(fonts, *key, cfg);
+            let detail = values.get(*i).map_or("", |v| choice_detail(*key, v));
+            format!("{} {detail}", labels.get(*i).map_or("", String::as_str))
+        }
         Row::App(i) => cfg.dock.apps.get(*i).map_or_else(String::new, |a| format!("{} {}", a.name.as_deref().unwrap_or(""), a.path)),
         Row::Excluded(i) => cfg.windows.no_inject.get(*i).map_or_else(String::new, |e| format!("Excluded {e}")),
         Row::Account(i) => crate::calsync::snapshot().accounts.get(*i).map_or_else(String::new, |a| format!("{} {}", a.provider.label(), a.name)),
     }
+}
+
+/// The quieter words at the right of a `Row::Choice`.
+fn choice_detail(key: Key, value: &str) -> &'static str {
+    match key {
+        Key::WidgetsAudio if !value.is_empty() => match audio_devices().iter().find(|d| d.id == value) {
+            Some(d) if d.output => "Output",
+            Some(_) => "Input",
+            None => "",
+        },
+        _ => "",
+    }
+}
+
+struct AudioDevice {
+    id: String,
+    name: String,
+    /// Speakers and headphones (heard through loopback); otherwise a microphone or line in.
+    output: bool,
+    default: bool,
+}
+
+/// Outputs then inputs, each by name. Asked of Windows at most every few
+/// seconds, as the list is drawn (and searched) every frame.
+fn audio_devices() -> std::sync::Arc<Vec<AudioDevice>> {
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use windows::Win32::Media::Audio::{eCapture, eRender};
+    static CACHE: Mutex<Option<(Instant, Arc<Vec<AudioDevice>>)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, list)) = cache.as_ref().filter(|(at, _)| at.elapsed() < Duration::from_secs(3)) {
+        return list.clone();
+    }
+    let mut list = Vec::new();
+    for (flow, output) in [(eRender, true), (eCapture, false)] {
+        match crate::win::audio::endpoints(flow) {
+            Ok(mut found) => {
+                found.sort_by_key(|e| e.name.to_lowercase());
+                list.extend(found.into_iter().map(|e| AudioDevice { id: e.id, name: e.name, output, default: e.default }));
+            }
+            Err(e) => log!("audio devices unavailable: {e}"),
+        }
+    }
+    let list = Arc::new(list);
+    *cache = Some((Instant::now(), list.clone()));
+    list
 }
 
 /// A `[windows] no_inject` entry that names a real file or folder (not a pattern).
@@ -586,6 +637,7 @@ pub(crate) enum Key {
     WidgetsBackdrop,
     WidgetsLocation,
     WidgetsUnit,
+    WidgetsAudio,
     WidgetsClocks,
 }
 
@@ -673,6 +725,7 @@ impl Key {
             Key::WidgetsBackdrop => ("widgets", "backdrop"),
             Key::WidgetsLocation => ("widgets", "location"),
             Key::WidgetsUnit => ("widgets", "temperature_unit"),
+            Key::WidgetsAudio => ("widgets", "audio_device"),
             Key::WidgetsClocks => ("widgets", "world_clocks"),
         }
     }
@@ -789,6 +842,9 @@ pub(crate) enum Row {
     Info(&'static str, String),
     /// Label, key, placeholder.
     Text(&'static str, Key, &'static str),
+    /// One of a key's choices as a row of a list, ticked when chosen: for
+    /// choices too long or too many for a segmented control.
+    Choice(Key, usize),
     /// A keyboard shortcut: click, then press the keys.
     Keybind(&'static str, Key),
     /// A few lines of explanation (taller than other rows).
@@ -1903,6 +1959,12 @@ impl SettingsWindow {
                         title: Some("World Clock"),
                         rows: vec![Row::Text("Time zones", Key::WidgetsClocks, "America/New_York, Europe/London")],
                     },
+                    Group {
+                        title: Some("Music Wave listens to"),
+                        rows: (0..Self::segments(&self.fonts, Key::WidgetsAudio, cfg).0.len())
+                            .map(|i| Row::Choice(Key::WidgetsAudio, i))
+                            .collect(),
+                    },
                 ]
             }
             Page::Desktops => vec![Group {
@@ -2024,6 +2086,26 @@ impl SettingsWindow {
                 const STARTS: [(&str, &str); 3] = [("Automatic", "auto"), ("Sunday", "sunday"), ("Monday", "monday")];
                 let current = cfg.calendar.week_starts.to_lowercase();
                 fixed(&STARTS, Some(STARTS.iter().position(|u| u.1 == current).unwrap_or(0)))
+            }
+            Key::WidgetsAudio => {
+                let devices = audio_devices();
+                let mut labels = vec![match devices.iter().find(|d| d.output && d.default) {
+                    Some(d) => format!("Default output ({})", d.name),
+                    None => "Default output".to_string(),
+                }];
+                let mut values = vec![String::new()];
+                for d in devices.iter() {
+                    labels.push(d.name.clone());
+                    values.push(d.id.clone());
+                }
+                // Picked before but unplugged now: still listed, so it's clear why the default is heard.
+                let current = &cfg.widgets.audio_device;
+                if !values.contains(current) {
+                    labels.push("A device that isn\u{2019}t connected".to_string());
+                    values.push(current.clone());
+                }
+                let sel = values.iter().position(|v| v == current);
+                (labels, values, sel)
             }
             Key::WidgetsUnit => {
                 const UNITS: [(&str, &str); 3] = [("Automatic", "auto"), ("\u{B0}C", "c"), ("\u{B0}F", "f")];
@@ -3171,6 +3253,27 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, indent: f32, ctx: &RowCtx, hits: &m
                 None => {}
             }
             hits.push((f, Hit::Keybind(*key)));
+        }
+        Row::Choice(key, i) => {
+            let (labels, values, sel) = SettingsWindow::segments(fonts, *key, cfg);
+            let Some(label) = labels.get(*i) else { return };
+            let hit = Hit::Segment(*key, *i);
+            let hot = ctx.hover_t(hit);
+            if hot > 0.01 {
+                p.fill_round(r.inset(4.0, 2.0), 6.0, control_bg.alpha(control_bg.a * hot));
+            }
+            let tick = Rect::new(right_edge - 18.0, r.y, 18.0, r.h);
+            let detail = choice_detail(*key, &values[*i]);
+            let dw = if detail.is_empty() { 0.0 } else { p.gfx.measure(detail, &right) + 12.0 };
+            p.text(label, &regular, Rect::new(label_r.x, r.y, tick.x - dw - 8.0 - label_r.x, r.h), theme.text);
+            if !detail.is_empty() {
+                p.text(detail, &right, Rect::new(tick.x - dw - 4.0, r.y, dw, r.h), theme.text_secondary);
+            }
+            if sel == Some(*i) {
+                let gf = p.gfx.format("Segoe Fluent Icons", 13.0, Weight::Regular, Align::Center);
+                p.text("\u{E73E}", &gf, tick, theme.accent);
+            }
+            hits.push((r, hit));
         }
         Row::Info(label, value) => {
             p.text(label, &regular, label_r, theme.text);

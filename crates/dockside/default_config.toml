@@ -14,6 +14,9 @@ hide_taskbar = true
 # "mac" shows ⌘C-style hints in menus (⌘ = Ctrl, ⌥ = Alt, ⌃ = Win),
 # "windows" shows Ctrl+C.
 shortcut_style = "mac"
+# New versions: "off" (never check), "notify" (check daily and say so), or
+# "install" (also download and verify it, ready for Install and Restart).
+updates = "notify"
 # "glass" backgrounds (and the glass Finder sidebar) bend and magnify what's
 # behind them like Apple's Liquid Glass. This captures the screen, so glass
 # surfaces are hidden from screenshots and screen sharing; turn it off to keep

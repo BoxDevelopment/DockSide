@@ -1436,14 +1436,27 @@ impl Island {
 
     // --- alerts ----------------------------------------------------------------
 
-    pub fn show_update(&mut self, release: &crate::update::Release) {
+    /// A new version: ready to install (`ready`: clicking installs it), or
+    /// just available (clicking opens its release page).
+    pub fn show_update(&mut self, release: &crate::update::Release, ready: bool) {
+        if ready {
+            let title = format!("Update ready: {}", release.tag);
+            self.show_message(&title, "Click to install and restart DockSide", Some(crate::update::INSTALL_NOTE.into()));
+        } else {
+            let title = format!("Update available: {}", release.tag);
+            self.show_message(&title, "Click to download it from GitHub", Some(release.url.clone()));
+        }
+    }
+
+    /// A notice from DockSide itself; `link` is what clicking it opens.
+    pub fn show_message(&mut self, title: &str, body: &str, link: Option<String>) {
         let note = notifications::Note {
             id: 0,
             at: SystemTime::now(),
             app: "DockSide".into(),
-            app_id: release.url.clone(),
-            title: format!("Update available: {}", release.tag),
-            body: "Click to download it from GitHub".into(),
+            app_id: link.unwrap_or_default(),
+            title: title.into(),
+            body: body.into(),
             icon: None,
         };
         self.show_alert(Alert::Note(note), 10.0);
@@ -3374,7 +3387,9 @@ fn frac_in(r: Rect, x: f32) -> f32 {
 
 /// What clicking a notification opens: its link, or its app.
 fn note_event(n: &Note) -> Option<IslandEvent> {
-    if n.app_id.starts_with("https://") {
+    if n.app_id == crate::update::INSTALL_NOTE {
+        Some(IslandEvent::Run(Action::InstallUpdate))
+    } else if n.app_id.starts_with("https://") {
         Some(IslandEvent::Run(Action::Open(n.app_id.clone())))
     } else if !n.app_id.is_empty() {
         Some(IslandEvent::OpenApp(n.app_id.clone()))

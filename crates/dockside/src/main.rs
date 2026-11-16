@@ -72,6 +72,17 @@ fn main() {
         return;
     }
     let args: Vec<String> = std::env::args().collect();
+    // Updates: signing releases (the release workflow), and the steps of installing one.
+    if let Some(i) = args.iter().position(|a| a == "--update-sign") {
+        std::process::exit(update::sign_cli(&args[i + 1..]));
+    }
+    if let Some(i) = args.iter().position(|a| a == "--update-keygen") {
+        std::process::exit(update::keygen_cli(&args[i + 1..]));
+    }
+    if let Some(i) = args.iter().position(|a| a == update::GUARD) {
+        update::guard(&args[i + 1..]);
+        return;
+    }
     // A development aid: what UI Automation reads from an app's menu bar, with timings.
     if let Some(i) = args.iter().position(|a| a == "--uia-dump") {
         win::appmenu::dump(&args[i + 1..]);

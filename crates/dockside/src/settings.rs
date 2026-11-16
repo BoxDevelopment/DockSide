@@ -562,6 +562,7 @@ pub(crate) enum Key {
     CalDraft(crate::calsync::Field),
     HideTaskbar,
     ShortcutStyle,
+    Updates,
     Appearance,
     Font,
     GlassRefraction,
@@ -653,6 +654,7 @@ impl Key {
             Key::CalDraft(_) => ("", ""),
             Key::HideTaskbar => ("general", "hide_taskbar"),
             Key::ShortcutStyle => ("general", "shortcut_style"),
+            Key::Updates => ("general", "updates"),
             Key::Appearance => ("general", "appearance"),
             Key::Font => ("general", "font"),
             Key::GlassRefraction => ("general", "glass_refraction"),
@@ -771,6 +773,7 @@ pub(crate) enum Hit {
     OpenConfig,
     OpenLog,
     OpenUpdate,
+    InstallUpdate,
     ExportSettings,
     ImportSettings,
     Field(Key),
@@ -1546,9 +1549,18 @@ impl SettingsWindow {
                 Group {
                     title: Some("About"),
                     rows: {
-                        let mut rows = vec![Row::Info("Version", crate::update::current())];
-                        if crate::update::available().is_some() {
+                        let mut rows = vec![Row::Info("Version", crate::update::current()), Row::Segmented("Updates", Key::Updates)];
+                        if let Some(tag) = crate::update::staged() {
+                            rows.push(Row::Info("Ready to install", tag));
+                            rows.push(Row::Buttons("", vec![("Install and Restart", Hit::InstallUpdate)]));
+                        } else if crate::update::available().is_some() {
                             rows.push(Row::Buttons("A newer version is available", vec![("Download", Hit::OpenUpdate)]));
+                        }
+                        if cfg.general.updates == crate::config::Updates::Install {
+                            rows.push(Row::Note(
+                                "New versions download in the background and are checked against DockSide's signing key. \
+                                 Nothing installs until you choose Install and Restart.",
+                            ));
                         }
                         rows.push(Row::Info("Settings folder", crate::config::dir().display().to_string()));
                         rows
@@ -2043,6 +2055,14 @@ impl SettingsWindow {
         const MB_BACKDROPS: [(&str, &str); 5] =
             [("Acrylic", "acrylic"), ("Blur", "blur"), ("Glass", "glass"), ("None", "none"), ("Clear", "clear")];
         match key {
+            Key::Updates => fixed(
+                &[("Off", "off"), ("Notify", "notify"), ("Install", "install")],
+                Some(match cfg.general.updates {
+                    crate::config::Updates::Off => 0,
+                    crate::config::Updates::Notify => 1,
+                    crate::config::Updates::Install => 2,
+                }),
+            ),
             Key::ShortcutStyle => fixed(
                 &[("Mac  ⌘C", "mac"), ("Windows  Ctrl+C", "windows")],
                 Some((cfg.general.shortcut_style == ShortcutStyle::Windows) as usize),
@@ -2605,6 +2625,7 @@ impl SettingsWindow {
             Hit::OpenConfig => Action::OpenConfig,
             Hit::ExportSettings => Action::ExportSettings,
             Hit::ImportSettings => Action::ImportSettings,
+            Hit::InstallUpdate => Action::InstallUpdate,
             Hit::OpenUpdate => Action::Open(
                 crate::update::available().map_or_else(|| crate::update::REPO_URL.to_string() + "/releases", |r| r.url),
             ),

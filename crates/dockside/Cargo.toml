@@ -21,6 +21,8 @@ windows-core = "0.58"
 winvd = "0.0.49"
 # Deflate for the shelf's Zip Quick Action (raw streams; the zip container is our own).
 miniz_oxide = "0.8"
+# Checks downloaded updates against the release signing key (ed25519).
+ed25519-compact = { version = "2", default-features = false }
 
 [dependencies.windows]
 version = "0.58"

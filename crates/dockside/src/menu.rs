@@ -105,6 +105,8 @@ pub enum Action {
     SetDarkMode(bool),
     /// Click an app's notification-area icon.
     TrayClick(crate::win::tray::IconId, crate::win::tray::Button),
+    /// Install the downloaded update and restart (see `update`).
+    InstallUpdate,
     /// Choose an item of an app's own menus (read through `win::appmenu`).
     AppMenu { hwnd: HWND, path: crate::win::appmenu::Path },
     Quit,

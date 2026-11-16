@@ -52,6 +52,21 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "zip=$zip" >> $env:GITHUB_OUTPUT
 
+      # Signs the exe for DockSide's own updater (its tag is part of what's
+      # signed). Without the DOCKSIDE_SIGNING_KEY secret the release still goes
+      # out, but DockSide won't install it.
+      - name: Sign
+        shell: pwsh
+        env:
+          DOCKSIDE_SIGNING_KEY: ${{ secrets.DOCKSIDE_SIGNING_KEY }}
+        run: |
+          if (-not $env:DOCKSIDE_SIGNING_KEY) {
+            Write-Warning "No DOCKSIDE_SIGNING_KEY secret: this release can't be installed from DockSide."
+            exit 0
+          }
+          $p = Start-Process -FilePath target/release/dockside.exe -ArgumentList '--update-sign', 'dist/dockside.exe', '${{ steps.package.outputs.tag }}' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0 -or -not (Test-Path dist/dockside.exe.sig)) { throw "Signing failed (exit $($p.ExitCode))" }
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -73,4 +88,5 @@ jobs:
             **Install:** download `dockside.exe` and run it. If the Windows taskbar ever stays hidden, run `dockside.exe --restore-taskbar`.
           files: |
             dist/dockside.exe
+            dist/dockside.exe.sig
             ${{ steps.package.outputs.zip }}

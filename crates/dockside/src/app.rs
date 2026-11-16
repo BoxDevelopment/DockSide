@@ -222,6 +222,7 @@ pub fn run() -> anyhow::Result<()> {
             app.open_onboarding();
         }
     });
+    with_app(|app| crate::update::set_mode(app.cfg.general.updates));
     crate::update::watch(msg_hwnd.0 as isize, WM_APP_UPDATE);
 
     unsafe {
@@ -377,6 +378,9 @@ fn drain_actions() {
 fn execute(action: Action) {
     log!("action: {action:?}");
     match action {
+        Action::InstallUpdate => {
+            with_app(|app| app.install_update());
+        }
         Action::AppMenu { hwnd, path } => {
             with_app(|app| {
                 if let Some(m) = &app.app_menus {
@@ -1494,6 +1498,7 @@ impl App {
         }
         let old = std::mem::replace(&mut self.cfg, cfg);
         crate::custom::set(&self.cfg);
+        crate::update::set_mode(self.cfg.general.updates);
         self.mark_settings_dirty();
         let (g0, g1) = (&old.general, &self.cfg.general);
         let rebuild = g0.appearance != g1.appearance || g0.hide_taskbar != g1.hide_taskbar
@@ -2440,6 +2445,22 @@ impl App {
             mb.set_app(name.clone(), fg, exe.clone());
         }
         self.watch_app_menus(if exe.is_some() { fg } else { HWND::default() }, exe.as_deref());
+    }
+
+    /// Installs the downloaded update and quits; the new version starts as
+    /// this one goes. On failure, says why on the island.
+    fn install_update(&mut self) {
+        match crate::update::install() {
+            Ok(_) => push(Action::Quit),
+            Err(e) => {
+                log!("update not installed: {e}");
+                if let Some(i) = &mut self.island {
+                    i.show_message("Couldn't install the update", &e, None);
+                    self.animate();
+                }
+                self.mark_settings_dirty();
+            }
+        }
     }
 
     /// Shows `hwnd`'s own menus on the bars (once read). Until then, and for
@@ -4473,9 +4494,14 @@ impl App {
                     }
                 }
                 WM_APP_UPDATE => {
-                    if let (Some(i), Some(r)) = (&mut self.island, crate::update::available()) {
-                        i.show_update(&r);
-                        self.animate();
+                    if let Some(i) = &mut self.island {
+                        if wp.0 == 1 {
+                            i.show_message("DockSide updated", &format!("Now running {}", crate::update::current()), None);
+                            self.animate();
+                        } else if let Some(r) = crate::update::available() {
+                            i.show_update(&r, crate::update::staged().is_some());
+                            self.animate();
+                        }
                     }
                     self.mark_settings_dirty();
                 }

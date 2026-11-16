@@ -44,6 +44,20 @@ pub struct General {
     pub onboarding_done: bool,
     /// Personal details are swapped for demo data (see `screenshot_mode`).
     pub screenshot_mode: bool,
+    /// What DockSide does about new releases (see `update`).
+    pub updates: Updates,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Updates {
+    /// Never check.
+    Off,
+    /// Check daily and say when there's a new version.
+    Notify,
+    /// Also download it (checked against the release signing key), ready to
+    /// install when the user chooses Install and Restart.
+    Install,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]

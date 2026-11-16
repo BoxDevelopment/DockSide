@@ -22,6 +22,12 @@ updates = "notify"
 # surfaces are hidden from screenshots and screen sharing; turn it off to keep
 # a non-bending glass that shows up in captures.
 glass_refraction = true
+# How much of what's behind refracting glass shows through: "tinted" (calmest
+# under text), "balanced" or "clear" (the most colour, like macOS's Clear).
+glass_clarity = "balanced"
+# How strongly refracting glass bends what's behind it, in percent: 0 is flat
+# glass, 100 the normal lens, up to 300 for a heavy, liquid look.
+glass_refraction_amount = 100
 # Set once the Setup Assistant has been finished or skipped. Set it back to
 # false to see it on the next launch (or open it from System Settings > General).
 onboarding_done = false

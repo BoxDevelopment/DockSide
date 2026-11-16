@@ -29,6 +29,7 @@ mod keybind;
 mod launchpad;
 mod menu;
 mod menubar;
+mod menupack;
 mod net;
 mod onboarding;
 mod settings;
@@ -71,6 +72,15 @@ fn main() {
         return;
     }
     let args: Vec<String> = std::env::args().collect();
+    // A development aid: what UI Automation reads from an app's menu bar, with timings.
+    if let Some(i) = args.iter().position(|a| a == "--uia-dump") {
+        win::appmenu::dump(&args[i + 1..]);
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--uia-probe") {
+        win::appmenu::probe(&args[i + 1..]);
+        return;
+    }
     // Finder's unelevated helper for apps' context menu items (see finder::xcmd::remote).
     if let Some(i) = args.iter().position(|a| a == finder::xcmd::remote::ARG) {
         if let Some(pipe) = args.get(i + 1) {

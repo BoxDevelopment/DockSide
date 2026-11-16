@@ -586,6 +586,7 @@ pub(crate) enum Key {
     MbSearch,
     MbControlCenter,
     MbTray,
+    MbAppMenus,
     MbDisplays,
     /// An on/off setting in `[island]`, by name.
     Island(&'static str),
@@ -676,6 +677,7 @@ impl Key {
             Key::MbSearch => ("menubar", "show_search"),
             Key::MbControlCenter => ("menubar", "show_control_center"),
             Key::MbTray => ("menubar", "show_tray"),
+            Key::MbAppMenus => ("menubar", "app_menus"),
             Key::MbDisplays => ("menubar", "displays"),
             Key::IslandDisplay => ("island", "display"),
             Key::DockDisplays => ("dock", "displays"),
@@ -1593,6 +1595,13 @@ impl SettingsWindow {
                     rows: vec![Row::Toggle("Show menu bar", Key::MbEnabled), Row::Toggle("Keep windows below the menu bar", Key::MbReserve)],
                 },
                 Group {
+                    title: Some("Menus"),
+                    rows: vec![
+                        Row::Toggle("Show the app's own menus", Key::MbAppMenus),
+                        Row::Note("Apps with a menu bar show their own menus. Others get File, Edit, View, Window and Help, which send the usual shortcuts."),
+                    ],
+                },
+                Group {
                     title: Some("Appearance"),
                     rows: vec![
                         Row::Picker("Background", Key::MbBackdrop),
@@ -1998,6 +2007,7 @@ impl SettingsWindow {
             Key::MbSearch => m.show_search,
             Key::MbControlCenter => m.show_control_center,
             Key::MbTray => m.show_tray,
+            Key::MbAppMenus => m.app_menus,
             Key::Island(name) => island_flag(&cfg.island, name),
             Key::Control(name) => crate::controlcenter::shows(cfg, name),
             Key::DockEnabled => d.enabled,

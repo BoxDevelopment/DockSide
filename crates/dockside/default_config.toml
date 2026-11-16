@@ -69,6 +69,9 @@ show_search = true
 show_control_center = true
 # Lists every app's tray icon (left click = click it, right click = its menu).
 show_tray = true
+# Show the focused app's own menus (File, Edit, Format, ...) when it has a menu
+# bar DockSide can read; other apps get generic File/Edit/View/Window/Help.
+app_menus = true
 # App name shown when the desktop has focus.
 desktop_app_name = "Finder"
 # Keep maximized windows from covering the menu bar.

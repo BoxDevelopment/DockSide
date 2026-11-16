@@ -34,7 +34,8 @@ use crate::island::sources::VolumeKey;
 use crate::keybind;
 use crate::island::{Island, IslandEvent};
 use crate::menu::{self, Action, Entry, MenuCtx, MenuEvent, MenuSource, Placement, PopupMenu};
-use crate::menubar::{Hit, MenuBar};
+use crate::menubar::{Hit, MenuBar, Title};
+use crate::win::appmenu::{self, AppMenus};
 use crate::genie::Genie;
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
@@ -123,6 +124,9 @@ const TIMER_LAUNCHPAD_BLINK: usize = 17;
 const LAUNCHPAD_BLINK_MS: u32 = 265;
 /// A second look at the backdrop state after a power setting change.
 const TIMER_POWER: usize = 18;
+/// The focused app showed no menu bar yet: look again (a window that just
+/// opened may build its menu bar a moment later).
+const TIMER_APP_MENUS: usize = 19;
 const DOCK_FOLLOW_MS: u32 = 100;
 const DOCK_FOLLOW_DWELL_MS: u64 = 300;
 /// Long enough for DWM to present a new surface's backdrop.
@@ -373,6 +377,13 @@ fn drain_actions() {
 fn execute(action: Action) {
     log!("action: {action:?}");
     match action {
+        Action::AppMenu { hwnd, path } => {
+            with_app(|app| {
+                if let Some(m) = &app.app_menus {
+                    m.invoke(hwnd, path);
+                }
+            });
+        }
         // The Dock's Trash opens in Finder, like macOS.
         Action::Launch { path, .. } | Action::Open(path) if path.eq_ignore_ascii_case("shell:RecycleBinFolder") => {
             with_app(|app| app.open_finder(Some(PathBuf::from(finder::shell::RECYCLE_BIN))));
@@ -1099,6 +1110,21 @@ fn dock_eq_except_apps(a: &config::DockCfg, b: &config::DockCfg) -> bool {
     config::DockCfg { apps: Vec::new(), ..a.clone() } == config::DockCfg { apps: Vec::new(), ..b.clone() }
 }
 
+/// A menu of an app's own, waiting to be read from the app.
+struct AppMenuWait {
+    hwnd: HWND,
+    path: appmenu::Path,
+    place: AppMenuPlace,
+}
+
+/// Where a menu read from an app opens.
+enum AppMenuPlace {
+    /// From this menu bar title.
+    Bar(Hit),
+    /// Off level `lvl`'s item `i` (`keys`: opened from the keyboard).
+    Sub { lvl: usize, i: usize, keys: bool },
+}
+
 pub struct App {
     gfx: Gfx,
     cfg: Config,
@@ -1133,6 +1159,20 @@ pub struct App {
     /// menu before it) it belongs to: `submenus[k]` hangs off level `k`, where
     /// level 0 is `menu` and level `k + 1` is `submenus[k]`.
     submenus: Vec<(usize, PopupMenu)>,
+    /// The focused app's own menus, read on a worker thread (started when first needed).
+    app_menus: Option<AppMenus>,
+    /// Menu titles read per app window, and when, newest last (so refocusing
+    /// one shows them at once, and soon after without asking the app again).
+    app_menu_titles: Vec<(isize, Instant, Option<Vec<appmenu::Item>>)>,
+    /// The app window whose menus the bars show (0: none, the generic menus).
+    app_menu_target: isize,
+    /// A menu waiting on the app to be read, by request number.
+    app_menu_wait: Option<(u64, AppMenuWait)>,
+    app_menu_gen: u64,
+    /// How many times the focused window was looked at again for a menu bar.
+    app_menu_retries: u32,
+    /// Curated menus for the app whose menus the bars show, when it has some.
+    menu_pack: Option<std::rc::Rc<crate::menupack::App>>,
     settings: Option<SettingsWindow>,
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
@@ -1317,6 +1357,13 @@ impl App {
             widgets: None,
             menu: None,
             submenus: Vec::new(),
+            app_menus: None,
+            app_menu_titles: Vec::new(),
+            app_menu_target: 0,
+            app_menu_wait: None,
+            app_menu_gen: 0,
+            app_menu_retries: 0,
+            menu_pack: None,
             settings: None,
             onboarding: None,
             about: None,
@@ -1590,6 +1637,8 @@ impl App {
         for (i, slot) in MENUBAR_HWNDS.iter().enumerate() {
             slot.store(self.menubars.get(i).map_or(0, |m| m.surface.content.0 as isize), Ordering::Relaxed);
         }
+        // New bars start with the generic titles: the next foreground check gives them the app's.
+        self.app_menu_target = 0;
     }
 
     /// The displays the Dock goes on: the main one, every one, or (following
@@ -2348,7 +2397,15 @@ impl App {
             for mb in &mut self.menubars {
                 mb.set_app("Finder".into(), fg, Some(FINDER_PATH.to_string()));
             }
+            self.watch_app_menus(HWND::default(), None);
             return;
+        }
+        // DockSide's own windows show the generic menus.
+        if self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
+            || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
+            || self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+        {
+            self.watch_app_menus(HWND::default(), None);
         }
         if self.settings.as_ref().is_some_and(|s| s.hwnd == fg) {
             for mb in &mut self.menubars {
@@ -2382,6 +2439,117 @@ impl App {
         for mb in &mut self.menubars {
             mb.set_app(name.clone(), fg, exe.clone());
         }
+        self.watch_app_menus(if exe.is_some() { fg } else { HWND::default() }, exe.as_deref());
+    }
+
+    /// Shows `hwnd`'s own menus on the bars (once read). Until then, and for
+    /// apps without readable menus, the curated menus for its `exe`, or else
+    /// the generic ones.
+    fn watch_app_menus(&mut self, hwnd: HWND, exe: Option<&str>) {
+        // A popup or dialog of the app shows its main window's menus.
+        let hwnd = if hwnd.is_invalid() { hwnd } else { unsafe { GetAncestor(hwnd, GA_ROOTOWNER) } };
+        let h = if self.cfg.menubar.app_menus { hwnd.0 as isize } else { 0 };
+        if h == self.app_menu_target {
+            return;
+        }
+        self.app_menu_target = h;
+        self.app_menu_retries = 0;
+        self.menu_pack = exe.filter(|_| h != 0).and_then(crate::menupack::find);
+        let pack = self.menu_pack.as_ref().map(|p| p.titles());
+        // Known titles show at once, and are read again unless they're recent.
+        let known = self.app_menu_titles.iter().find(|(w, ..)| *w == h);
+        let fresh = known.is_some_and(|(_, at, _)| at.elapsed() < std::time::Duration::from_secs(30));
+        let known = known.and_then(|(.., t)| t.clone());
+        for mb in &mut self.menubars {
+            mb.set_app_menus(known.as_deref(), pack.as_deref());
+        }
+        if h != 0 && !fresh {
+            let notify = self.msg_hwnd;
+            self.app_menus.get_or_insert_with(|| AppMenus::start(notify, win::WM_APP_APP_MENUS)).read_bar(hwnd, false);
+        }
+    }
+
+    /// Takes the app-menus worker's replies: titles for the bars, or a menu
+    /// that was waiting on the app.
+    fn on_app_menus(&mut self) {
+        let Some(replies) = self.app_menus.as_ref().map(AppMenus::take) else { return };
+        for r in replies {
+            match r {
+                appmenu::Reply::Bar { hwnd, titles } => {
+                    self.app_menu_titles.retain(|(w, ..)| *w != hwnd);
+                    self.app_menu_titles.push((hwnd, Instant::now(), titles.clone()));
+                    if self.app_menu_titles.len() > 24 {
+                        self.app_menu_titles.remove(0);
+                    }
+                    // Not under an open menu (its title would move).
+                    if hwnd == self.app_menu_target && self.menu.is_none() {
+                        let pack = self.menu_pack.as_ref().map(|p| p.titles());
+                        for mb in &mut self.menubars {
+                            mb.set_app_menus(titles.as_deref(), pack.as_deref());
+                        }
+                    }
+                    // None yet: an app just opened may add its menu bar a moment later.
+                    if hwnd == self.app_menu_target && titles.is_none() && self.app_menu_retries < 2 {
+                        self.app_menu_retries += 1;
+                        self.timer(TIMER_APP_MENUS, 800 * self.app_menu_retries);
+                    }
+                }
+                appmenu::Reply::Menu { gen, items } => self.on_app_menu(gen, items),
+            }
+        }
+    }
+
+    /// A menu read from the app arrived: open it, if it's still wanted.
+    fn on_app_menu(&mut self, gen: u64, items: Option<Vec<appmenu::Item>>) {
+        if self.app_menu_wait.as_ref().map(|(g, _)| *g) != Some(gen) {
+            return;
+        }
+        let Some((_, wait)) = self.app_menu_wait.take() else { return };
+        let entries = match &items {
+            Some(items) => menu::app_entries(wait.hwnd, &wait.path, items),
+            None => vec![Entry::disabled("Not Responding")],
+        };
+        if items.is_none() {
+            // Maybe the app's menus changed: read its titles again.
+            if let Some(m) = &self.app_menus {
+                m.read_bar(wait.hwnd, true);
+            }
+        }
+        match wait.place {
+            AppMenuPlace::Bar(hit) => {
+                let opener = self.menu_opener;
+                let Some(mb) = self.menubars.iter().find(|m| m.surface.content == opener) else { return };
+                // Another title was clicked meanwhile, or the app lost focus.
+                if mb.open != Some(hit) {
+                    return;
+                }
+                if self.app_menu_target != wait.hwnd.0 as isize {
+                    if self.menu.is_none() {
+                        self.reset_menu_openers();
+                    }
+                    return;
+                }
+                let Some(placement) = mb.menu_placement(hit) else { return };
+                self.open_menu(entries, placement, MenuSource::MenuBar(hit));
+            }
+            AppMenuPlace::Sub { lvl, i, keys } => {
+                let Some(m) = self.menu_level(lvl).filter(|m| m.hovered_submenu() == Some(i)) else { return };
+                if self.submenus.get(lvl).is_some_and(|(open, _)| *open == i) {
+                    return;
+                }
+                let placement = m.submenu_placement(i);
+                self.close_submenus(lvl);
+                self.show_submenu(lvl, i, entries, placement, keys);
+            }
+        }
+    }
+
+    /// Asks the app for the menu at `path`; it opens at `place` when it arrives.
+    fn request_app_menu(&mut self, hwnd: HWND, path: appmenu::Path, place: AppMenuPlace) {
+        let Some(m) = &self.app_menus else { return };
+        self.app_menu_gen += 1;
+        m.read_menu(self.app_menu_gen, hwnd, path.clone());
+        self.app_menu_wait = Some((self.app_menu_gen, AppMenuWait { hwnd, path, place }));
     }
 
     fn toggle_pin(&mut self, path: &str, name: &str, pin: bool) {
@@ -3748,6 +3916,7 @@ impl App {
         self.close_control();
         self.close_dropdown();
         self.close_submenu();
+        self.app_menu_wait = None;
         OPEN_MENU_HWND.store(0, Ordering::Relaxed);
         let Some(m) = self.menu.take() else { return };
         m.surface.set_click_through();
@@ -3793,8 +3962,24 @@ impl App {
             return;
         }
         let Some(m) = self.menu_level(lvl) else { return };
-        let source = m.source;
+        // One of an app's own submenus: read from the app, opening when it arrives.
+        if let Some((hwnd, path)) = m.lazy_submenu(i) {
+            let asked = self
+                .app_menu_wait
+                .as_ref()
+                .is_some_and(|(_, w)| matches!(w.place, AppMenuPlace::Sub { lvl: l, i: k, .. } if l == lvl && k == i));
+            if !asked {
+                self.request_app_menu(hwnd, path, AppMenuPlace::Sub { lvl, i, keys });
+            }
+            return;
+        }
         let Some((entries, placement)) = m.submenu(i) else { return };
+        self.show_submenu(lvl, i, entries, placement, keys);
+    }
+
+    /// Opens a submenu of `entries` off level `lvl`'s item `i`.
+    fn show_submenu(&mut self, lvl: usize, i: usize, entries: Vec<Entry>, placement: Placement, keys: bool) {
+        let Some(source) = self.menu_level(lvl).map(|m| m.source) else { return };
         match PopupMenu::new(&self.gfx, &self.theme, &self.cfg, entries, placement, &self.menu_monitor, source) {
             Ok(mut sub) => {
                 if keys {
@@ -3881,11 +4066,33 @@ impl App {
             Some(exe) => apps::list_windows().into_iter().filter(|w| w.exe.eq_ignore_ascii_case(exe)).collect(),
             None => Vec::new(),
         };
+        let title = match hit {
+            Hit::Title(i) => mb.titles.get(i).cloned(),
+            _ => None,
+        };
+        // One of the app's own menus: read from the app, opening when it arrives.
+        if let Some(Title::App { index, name }) = &title {
+            let app = HWND(self.app_menu_target as _);
+            let path = vec![(*index, name.clone())];
+            if let Some(mb) = self.menubars.iter_mut().find(|m| m.surface.content == opener) {
+                mb.set_open(Some(hit));
+            }
+            self.close_submenu();
+            self.request_app_menu(app, path, AppMenuPlace::Bar(hit));
+            return;
+        }
         let ctx = MenuCtx { app_name: &app_name, target, app_windows: &app_windows };
         let entries = match hit {
             Hit::Logo => menu::apple_menu(),
             Hit::AppName => menu::app_menu(&ctx),
-            Hit::Title(i) => menu::title_menu(i, &ctx),
+            Hit::Title(_) => match &title {
+                Some(Title::Generic(t)) => menu::title_menu(t, &ctx),
+                Some(Title::Pack { index, .. }) => match self.menu_pack.as_ref().and_then(|p| p.menu.get(*index)) {
+                    Some(m) => crate::menupack::entries(&m.items),
+                    None => return,
+                },
+                _ => return,
+            },
             Hit::Tray => {
                 use crate::win::tray::{self, Button};
                 let px = (16.0 * mb.surface.scale).round() as i32;
@@ -3983,7 +4190,9 @@ impl App {
             MenuEvent::Open => self.open_submenu(0, true),
             MenuEvent::Step(dir) => {
                 if let MenuSource::MenuBar(hit) = source {
-                    self.open_menubar_menu(hit.step(dir));
+                    let opener = self.menu_opener;
+                    let titles = self.menubars.iter().find(|m| m.surface.content == opener).map_or(0, MenuBar::shown_titles);
+                    self.open_menubar_menu(hit.step(dir, titles));
                 }
             }
             MenuEvent::None => {}
@@ -4033,6 +4242,11 @@ impl App {
                     match id {
                         TIMER_TICK => self.on_tick(),
                         TIMER_REFRESH => self.refresh_windows(),
+                        TIMER_APP_MENUS => {
+                            if let (Some(m), true) = (&self.app_menus, self.app_menu_target != 0) {
+                                m.read_bar(HWND(self.app_menu_target as _), true);
+                            }
+                        }
                         TIMER_RELOAD => self.reload(),
                         TIMER_REBUILD => {
                             log!("rebuilding: dark mode set");
@@ -4090,6 +4304,10 @@ impl App {
                     }
                 }
                 WM_APP_RELOAD => self.timer(TIMER_RELOAD, 150),
+                win::WM_APP_APP_MENUS => {
+                    self.on_app_menus();
+                    self.flush();
+                }
                 WM_APP_FOREGROUND => {
                     self.update_foreground();
                     self.timer(TIMER_REFRESH, 100);

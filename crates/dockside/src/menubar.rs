@@ -14,6 +14,7 @@ use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
 use crate::gfx::{pt, Align, Gfx, Painter, Weight};
 use crate::menu::{Action, Placement, MENU_TITLES};
+use crate::win::appmenu::Item;
 use crate::surface::Surface;
 use crate::theme::Theme;
 use crate::win::system::{self, Battery, Shortcut};
@@ -40,13 +41,50 @@ impl Hit {
         matches!(self, Hit::Logo | Hit::AppName | Hit::Title(_) | Hit::Tray)
     }
 
-    /// The neighbouring menu for Left/Right arrow navigation.
-    pub fn step(self, dir: i32) -> Hit {
-        let order: Vec<Hit> =
-            [Hit::Logo, Hit::AppName].into_iter().chain((0..MENU_TITLES.len()).map(Hit::Title)).collect();
+    /// The neighbouring menu for Left/Right arrow navigation, on a bar showing `titles` menu titles.
+    pub fn step(self, dir: i32, titles: usize) -> Hit {
+        let order: Vec<Hit> = [Hit::Logo, Hit::AppName].into_iter().chain((0..titles).map(Hit::Title)).collect();
         let i = order.iter().position(|h| *h == self).unwrap_or(0) as i32;
         order[(i + dir).rem_euclid(order.len() as i32) as usize]
     }
+}
+
+/// A menu title on the bar: one of the generic menus, or one of the app's own.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Title {
+    Generic(&'static str),
+    /// The app's menu at `index` on its own bar.
+    App { index: usize, name: String },
+    /// The app's curated menu at `index` (see `menupack`).
+    Pack { index: usize, name: String },
+}
+
+impl Title {
+    pub fn label(&self) -> &str {
+        match self {
+            Title::Generic(s) => s,
+            Title::App { name, .. } | Title::Pack { name, .. } => name,
+        }
+    }
+}
+
+fn generic_titles() -> Vec<Title> {
+    MENU_TITLES.iter().map(|t| Title::Generic(t)).collect()
+}
+
+/// The app's titles (read from it, or else curated), with DockSide's Window
+/// menu before Help as on a Mac (unless the app has a Window menu of its own).
+fn app_titles(items: Option<&[Item]>, pack: Option<&[String]>) -> Vec<Title> {
+    let mut v: Vec<Title> = match (items, pack) {
+        (Some(items), _) => items.iter().map(|i| Title::App { index: i.index, name: i.name.clone() }).collect(),
+        (None, Some(pack)) => pack.iter().enumerate().map(|(index, n)| Title::Pack { index, name: n.clone() }).collect(),
+        (None, None) => return generic_titles(),
+    };
+    if !v.iter().any(|t| t.label().eq_ignore_ascii_case("window")) {
+        let help = v.iter().rposition(|t| t.label().eq_ignore_ascii_case("help") || t.label() == "?");
+        v.insert(help.unwrap_or(v.len()), Title::Generic("Window"));
+    }
+    v
 }
 
 const FONT_SIZE: f32 = 13.0;
@@ -67,6 +105,8 @@ pub struct MenuBar {
     pub app_name: String,
     pub target: HWND,
     pub target_exe: Option<String>,
+    /// The menu titles after the app name: the app's own, or the generic ones.
+    pub titles: Vec<Title>,
     clock: String,
     battery: Option<Battery>,
     hits: Vec<(Rect, Hit)>,
@@ -108,6 +148,7 @@ impl MenuBar {
             app_name: m.desktop_app_name.clone(),
             target: HWND::default(),
             target_exe: None,
+            titles: generic_titles(),
             clock: String::new(),
             battery: None,
             hits: Vec::new(),
@@ -160,6 +201,21 @@ impl MenuBar {
         self.target_exe = exe;
         if name != self.app_name {
             self.app_name = name;
+            self.dirty = true;
+        }
+    }
+
+    /// How many titles fit on the bar (the rest are left off).
+    pub fn shown_titles(&self) -> usize {
+        self.hits.iter().filter(|(_, h)| matches!(h, Hit::Title(_))).count()
+    }
+
+    /// Shows the app's own menu titles, or else its curated ones (`pack`), or
+    /// else the generic ones.
+    pub fn set_app_menus(&mut self, items: Option<&[Item]>, pack: Option<&[String]>) {
+        let titles = app_titles(items, pack);
+        if titles != self.titles {
+            self.titles = titles;
             self.dirty = true;
         }
     }
@@ -240,18 +296,6 @@ impl MenuBar {
         let bold = gfx.format(&theme.font, FONT_SIZE, Weight::Bold, Align::Center);
         let mut hits = Vec::new();
 
-        let mut x = 10.0;
-        hits.push((Rect::new(x, 0.0, 34.0, h), Hit::Logo));
-        x += 34.0;
-        let aw = gfx.measure(&self.app_name, &bold) + 20.0;
-        hits.push((Rect::new(x, 0.0, aw, h), Hit::AppName));
-        x += aw;
-        for (i, t) in MENU_TITLES.iter().enumerate() {
-            let tw = gfx.measure(t, &regular) + 20.0;
-            hits.push((Rect::new(x, 0.0, tw, h), Hit::Title(i)));
-            x += tw;
-        }
-
         let mut rx = w - 8.0;
         let cw = gfx.measure(&self.clock, &regular) + 16.0;
         rx -= cw;
@@ -281,6 +325,22 @@ impl MenuBar {
         if crate::screenshot_mode::on() {
             rx -= 30.0;
             hits.push((Rect::new(rx, 0.0, 30.0, h), Hit::Private));
+        }
+
+        let mut x = 10.0;
+        hits.push((Rect::new(x, 0.0, 34.0, h), Hit::Logo));
+        x += 34.0;
+        let aw = gfx.measure(&self.app_name, &bold) + 20.0;
+        hits.push((Rect::new(x, 0.0, aw, h), Hit::AppName));
+        x += aw;
+        // Titles that don't fit before the status items are left off, like macOS.
+        for (i, t) in self.titles.iter().enumerate() {
+            let tw = gfx.measure(t.label(), &regular) + 20.0;
+            if x + tw > rx - 12.0 {
+                break;
+            }
+            hits.push((Rect::new(x, 0.0, tw, h), Hit::Title(i)));
+            x += tw;
         }
         self.hits = hits;
     }
@@ -316,7 +376,7 @@ impl MenuBar {
             self.pill_last = want;
         }
         let pill = self.pill_last.map(|r| r.inset(0.0, 2.5));
-        let (app_name, clock, battery, logo) = (&self.app_name, &self.clock, self.battery, &self.logo);
+        let (app_name, clock, battery, logo, titles) = (&self.app_name, &self.clock, self.battery, &self.logo, &self.titles);
         let show_pct = self.cfg.show_battery_percent;
         // A clear bar takes its colours from the wallpaper, not the app theme.
         let (c, highlight) = match self.on_dark {
@@ -343,7 +403,7 @@ impl MenuBar {
                         _ => draw_apple(p, r, c),
                     },
                     Hit::AppName => p.text(app_name, &bold, r, c),
-                    Hit::Title(i) => p.text(MENU_TITLES[i], &regular, r, c),
+                    Hit::Title(i) => p.text(titles.get(i).map_or("", Title::label), &regular, r, c),
                     Hit::Clock => p.text(clock, &regular, r, c),
                     Hit::ControlCenter => draw_control_center(p, r, c),
                     Hit::Tray => draw_tray(p, r, c, tray_turn),

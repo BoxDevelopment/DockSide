@@ -105,6 +105,8 @@ pub enum Action {
     SetDarkMode(bool),
     /// Click an app's notification-area icon.
     TrayClick(crate::win::tray::IconId, crate::win::tray::Button),
+    /// Choose an item of an app's own menus (read through `win::appmenu`).
+    AppMenu { hwnd: HWND, path: crate::win::appmenu::Path },
     Quit,
 }
 
@@ -120,11 +122,18 @@ pub struct MenuItem {
     pub alt_action: Option<Action>,
     /// Items shown beside this one while it's highlighted (empty: none).
     pub submenu: Vec<Entry>,
+    /// A submenu of an app's own menus, read from the app when it opens.
+    pub lazy: Option<(HWND, crate::win::appmenu::Path)>,
 }
 
 impl MenuItem {
     fn new(label: String, shortcut: Option<Shortcut>, action: Option<Action>) -> Self {
-        MenuItem { label, shortcut, action, checked: false, icon: None, alt_action: None, submenu: Vec::new() }
+        MenuItem { label, shortcut, action, checked: false, icon: None, alt_action: None, submenu: Vec::new(), lazy: None }
+    }
+
+    /// Whether it opens a submenu (one it has, or one read when it opens).
+    fn opens(&self) -> bool {
+        !self.submenu.is_empty() || self.lazy.is_some()
     }
 }
 
@@ -193,11 +202,11 @@ impl Entry {
     }
 
     fn enabled(&self) -> bool {
-        matches!(self, Entry::Item(i) if i.action.is_some() || !i.submenu.is_empty())
+        matches!(self, Entry::Item(i) if i.action.is_some() || i.opens())
     }
 
     fn has_submenu(&self) -> bool {
-        matches!(self, Entry::Item(i) if !i.submenu.is_empty())
+        matches!(self, Entry::Item(i) if i.opens())
     }
 }
 
@@ -478,9 +487,21 @@ impl PopupMenu {
         if item.submenu.is_empty() {
             return None;
         }
+        Some((item.submenu.clone(), self.submenu_placement(i)))
+    }
+
+    /// Where item `i`'s submenu opens.
+    pub fn submenu_placement(&self, i: usize) -> Placement {
         let (ox, oy) = self.origin();
-        let placement = Placement::Beside { left: ox + self.body.x, right: ox + self.body.right(), top: oy + self.shown(i).y - PAD_Y };
-        Some((item.submenu.clone(), placement))
+        Placement::Beside { left: ox + self.body.x, right: ox + self.body.right(), top: oy + self.shown(i).y - PAD_Y }
+    }
+
+    /// Item `i`'s submenu, when it's one of an app's menus still to be read: the app and its path.
+    pub fn lazy_submenu(&self, i: usize) -> Option<(HWND, crate::win::appmenu::Path)> {
+        match self.entries.get(i) {
+            Some(Entry::Item(item)) => item.lazy.clone(),
+            _ => None,
+        }
     }
 
     /// Tells the menu where its open submenu is (body, in screen points), or that it closed.
@@ -538,7 +559,7 @@ impl PopupMenu {
         let draw_item = |p: &crate::gfx::Painter, i: usize, lit: bool| {
             let (Entry::Item(item), r) = (&entries[i], rects[i]) else { return };
             // Submenu items have no action of their own, but they're live when they open one.
-            let enabled = item.action.is_some() || !item.submenu.is_empty();
+            let enabled = item.action.is_some() || item.opens();
             let color = if lit {
                 Color::WHITE
             } else if enabled {
@@ -561,7 +582,7 @@ impl PopupMenu {
                 let c = if lit { Color::WHITE } else { theme.text_secondary };
                 p.text(&sc.label(mac), &font_right, Rect::new(r.x, r.y, r.w - 16.0, r.h), c);
             }
-            if !item.submenu.is_empty() {
+            if item.opens() {
                 let (cx, cy, h) = (r.right() - 16.0 - CHEVRON / 2.0, r.cy(), 4.0);
                 p.line(cx - h * 0.45, cy - h, cx + h * 0.55, cy, color, 1.5);
                 p.line(cx + h * 0.55, cy, cx - h * 0.45, cy + h, color, 1.5);
@@ -772,9 +793,10 @@ pub fn app_menu(ctx: &MenuCtx) -> Vec<Entry> {
     v
 }
 
-pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
-    match MENU_TITLES.get(index).copied() {
-        Some("File") => vec![
+/// One of the generic menus, by its title (one of [`MENU_TITLES`]).
+pub fn title_menu(title: &str, ctx: &MenuCtx) -> Vec<Entry> {
+    match title {
+        "File" => vec![
             Entry::keys("New Window", Shortcut::new("c", ch(b'N'), "N")),
             Entry::keys("New Tab", Shortcut::new("c", ch(b'T'), "T")),
             Entry::keys("Open…", Shortcut::new("c", ch(b'O'), "O")),
@@ -785,7 +807,7 @@ pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
             Entry::Separator,
             Entry::keys("Print…", Shortcut::new("c", ch(b'P'), "P")),
         ],
-        Some("Edit") => vec![
+        "Edit" => vec![
             Entry::keys("Undo", Shortcut::new("c", ch(b'Z'), "Z")),
             Entry::keys("Redo", Shortcut::new("c", ch(b'Y'), "Y")),
             Entry::Separator,
@@ -798,7 +820,7 @@ pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
             Entry::Separator,
             Entry::keys("Emoji & Symbols", Shortcut::new("w", VK_PERIOD, ".")),
         ],
-        Some("View") => vec![
+        "View" => vec![
             Entry::keys("Reload", Shortcut::new("c", ch(b'R'), "R")),
             Entry::Separator,
             Entry::keys("Actual Size", Shortcut::new("c", ch(b'0'), "0")),
@@ -807,7 +829,7 @@ pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
             Entry::Separator,
             Entry::keys("Enter Full Screen", Shortcut::new("", VK_F11, "F11")),
         ],
-        Some("Window") => {
+        "Window" => {
             let mut v = vec![
                 Entry::item("Minimize", Action::Minimize(ctx.target)).shortcut(Shortcut::new("c", ch(b'M'), "M")),
                 Entry::item("Zoom", Action::Zoom(ctx.target)),
@@ -828,7 +850,7 @@ pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
             }
             v
         }
-        Some("Help") => vec![
+        "Help" => vec![
             Entry::keys(format!("{} Help", ctx.app_name), Shortcut::new("", VK_F1, "F1")),
             Entry::Separator,
             Entry::keys("Search", Shortcut::new("w", ch(b'S'), "S")),
@@ -837,11 +859,168 @@ pub fn title_menu(index: usize, ctx: &MenuCtx) -> Vec<Entry> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// An app's own menus
+// ---------------------------------------------------------------------------
+
+/// Entries for an app's menu at `path` (read through `win::appmenu`): its
+/// commands choose themselves in the app, and its submenus are read when they
+/// open. Stray separators (leading, trailing, doubled) are left out.
+pub fn app_entries(hwnd: HWND, path: &[(usize, String)], items: &[crate::win::appmenu::Item]) -> Vec<Entry> {
+    use crate::win::appmenu::Kind;
+    let mut out: Vec<Entry> = Vec::with_capacity(items.len());
+    for it in items {
+        let at = || {
+            let mut p = path.to_vec();
+            p.push((it.index, it.name.clone()));
+            p
+        };
+        match it.kind {
+            Kind::Separator => {
+                if out.last().is_some_and(|e| !matches!(e, Entry::Separator)) {
+                    out.push(Entry::Separator);
+                }
+            }
+            Kind::Submenu => {
+                let mut item = MenuItem::new(it.name.clone(), parse_accel(&it.accel), None);
+                if it.enabled {
+                    item.lazy = Some((hwnd, at()));
+                }
+                out.push(Entry::Item(item));
+            }
+            Kind::Command => {
+                let action = it.enabled.then(|| Action::AppMenu { hwnd, path: at() });
+                let mut item = MenuItem::new(it.name.clone(), parse_accel(&it.accel), action);
+                item.checked = it.checked;
+                out.push(Entry::Item(item));
+            }
+        }
+    }
+    if matches!(out.last(), Some(Entry::Separator)) {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(Entry::disabled("No Items"));
+    }
+    out
+}
+
+/// "Ctrl+Shift+S" → a shortcut to show beside an item (never sent: choosing
+/// the item asks the app). `None` for anything that isn't a key chord.
+pub fn parse_accel(s: &str) -> Option<Shortcut> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut sc = Shortcut::new("", 0, "");
+    let mut rest = s;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let take = ["ctrl+", "control+", "shift+", "alt+", "win+", "windows+"].into_iter().find(|m| lower.starts_with(m));
+        let Some(m) = take else { break };
+        match m {
+            "ctrl+" | "control+" => sc.ctrl = true,
+            "shift+" => sc.shift = true,
+            "alt+" => sc.alt = true,
+            _ => sc.win = true,
+        }
+        rest = &rest[m.len()..];
+    }
+    let key = rest.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let lower = key.to_ascii_lowercase();
+    // Its label (Mac symbols where macOS uses them) and virtual-key code (0: one we can't send).
+    let (label, vk): (&str, u16) = match lower.as_str() {
+        "del" | "delete" => ("⌦", 0x2E),
+        "backspace" | "bksp" => ("⌫", 0x08),
+        "enter" | "return" => ("↩", 0x0D),
+        "esc" | "escape" => ("⎋", 0x1B),
+        "tab" => ("⇥", 0x09),
+        "left" => ("←", 0x25),
+        "right" => ("→", 0x27),
+        "up" => ("↑", 0x26),
+        "down" => ("↓", 0x28),
+        "pgup" | "pageup" | "page up" => ("⇞", 0x21),
+        "pgdn" | "pagedown" | "page down" => ("⇟", 0x22),
+        "home" => ("↖", 0x24),
+        "end" => ("↘", 0x23),
+        "ins" | "insert" => ("Insert", 0x2D),
+        "space" => ("Space", 0x20),
+        "=" | "plus" => ("+", 0xBB),
+        "-" | "minus" => ("-", 0xBD),
+        "," => (",", 0xBC),
+        "." => (".", 0xBE),
+        "/" => ("/", 0xBF),
+        ";" => (";", 0xBA),
+        "'" => ("'", 0xDE),
+        "[" => ("[", 0xDB),
+        "]" => ("]", 0xDD),
+        "\\" => ("\\", 0xDC),
+        "`" => ("`", 0xC0),
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => (key, k.as_bytes()[0].to_ascii_uppercase() as u16),
+        k if k.starts_with('f') && k[1..].parse::<u16>().is_ok_and(|n| (1..=24).contains(&n)) => {
+            (key, 0x6F + k[1..].parse::<u16>().unwrap_or(1))
+        }
+        _ => (key, 0),
+    };
+    sc.vk = vk;
+    sc.key = intern(&if label.chars().count() == 1 { label.to_uppercase() } else { label.to_string() });
+    Some(sc)
+}
+
+/// A key's label kept for good (`Shortcut` holds `&'static str`): each
+/// distinct label is leaked once, and apps only ever use a few.
+fn intern(s: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static KEYS: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+    let Ok(mut g) = KEYS.lock() else { return "" };
+    let set = g.get_or_insert_with(HashSet::new);
+    if let Some(k) = set.get(s) {
+        return k;
+    }
+    let k: &'static str = Box::leak(s.to_string().into_boxed_str());
+    set.insert(k);
+    k
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const AREA: Bounds = Bounds { left: 4.0, top: 34.0, right: 1916.0, bottom: 1036.0 };
+
+    #[test]
+    fn app_shortcuts_read_as_chords() {
+        let sc = parse_accel("Ctrl+Shift+S").unwrap();
+        assert!(sc.ctrl && sc.shift && !sc.alt);
+        assert_eq!(sc.label(true), "⇧⌘S");
+        assert_eq!(parse_accel("Del").unwrap().label(false), "⌦");
+        assert_eq!(parse_accel("F5").unwrap().label(false), "F5");
+        assert_eq!(parse_accel("F5").unwrap().vk, 0x74);
+        assert_eq!(parse_accel("Ctrl+=").unwrap().vk, 0xBB);
+        assert_eq!(parse_accel("Ctrl+-").unwrap().vk, 0xBD);
+        assert_eq!(parse_accel("Ctrl+Shift+N").unwrap().vk, b'N' as u16);
+        assert_eq!(parse_accel("Ctrl+\\").unwrap().vk, 0xDC);
+        assert_eq!(parse_accel("Numpad +").unwrap().vk, 0);
+        assert!(parse_accel("").is_none());
+    }
+
+    #[test]
+    fn app_menus_drop_stray_separators() {
+        use crate::win::appmenu::{Item, Kind};
+        let it = |index, kind, name: &str| Item { index, name: name.into(), accel: String::new(), enabled: true, checked: false, kind };
+        let items = [it(0, Kind::Separator, ""), it(1, Kind::Command, "Open"), it(2, Kind::Separator, ""), it(3, Kind::Separator, ""), it(4, Kind::Submenu, "Recent"), it(5, Kind::Separator, "")];
+        let e = app_entries(HWND::default(), &[(0, "File".into())], &items);
+        assert_eq!(e.len(), 3);
+        match &e[0] {
+            Entry::Item(MenuItem { action: Some(Action::AppMenu { path, .. }), .. }) => assert_eq!(path, &vec![(0, "File".to_string()), (1, "Open".to_string())]),
+            _ => panic!("Open should choose itself in the app"),
+        }
+        assert!(matches!(&e[2], Entry::Item(i) if i.lazy.is_some()));
+    }
 
     #[test]
     fn context_menus_open_down_and_right_where_they_fit() {

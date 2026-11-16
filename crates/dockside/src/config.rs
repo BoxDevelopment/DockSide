@@ -194,6 +194,9 @@ pub struct MenuBarCfg {
     pub show_control_center: bool,
     /// An item listing every app's notification-area (tray) icon.
     pub show_tray: bool,
+    /// The focused app's own menus (when it has a menu bar DockSide can read)
+    /// in place of the generic File, Edit and View menus.
+    pub app_menus: bool,
     pub desktop_app_name: String,
     pub reserve_space: bool,
     /// "main" or "all" ("follow" means "main").

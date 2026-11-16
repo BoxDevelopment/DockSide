@@ -1,0 +1,893 @@
+# Mac-style menus for apps whose own menus DockSide can't read (Electron and
+# Chromium apps, browsers, ...). Apps with a readable menu bar show their own.
+#
+# To change one, copy its [[app]] block into %APPDATA%\DockSide\app_menus.toml
+# and edit it there: an app listed there replaces the one here. An app's name
+# menu and the Window menu are DockSide's own and always shown.
+#
+# Each [[app.menu]] is one title. Its items are:
+#   { name = "Save", keys = "Ctrl+S" }   sends that shortcut to the app
+#   { name = "Library", open = "steam://open/games" }   opens a link or path
+#   { name = "Zoom", items = [ ... ] }   a submenu (written on one line)
+#   "-"                                   a separator
+
+# ---------------------------------------------------------------------------
+# Browsers
+# ---------------------------------------------------------------------------
+
+[[app]]
+exes = ["chrome.exe", "brave.exe", "vivaldi.exe", "chromium.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Tab", keys = "Ctrl+T" },
+  { name = "New Window", keys = "Ctrl+N" },
+  { name = "New Incognito Window", keys = "Ctrl+Shift+N" },
+  { name = "Reopen Closed Tab", keys = "Ctrl+Shift+T" },
+  { name = "Open File…", keys = "Ctrl+O" },
+  { name = "Open Location…", keys = "Ctrl+L" },
+  "-",
+  { name = "Close Tab", keys = "Ctrl+W" },
+  { name = "Close Window", keys = "Ctrl+Shift+W" },
+  { name = "Save Page As…", keys = "Ctrl+S" },
+  "-",
+  { name = "Print…", keys = "Ctrl+P" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Paste and Match Style", keys = "Ctrl+Shift+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find", items = [ { name = "Find…", keys = "Ctrl+F" }, { name = "Find Next", keys = "Ctrl+G" }, { name = "Find Previous", keys = "Ctrl+Shift+G" } ] },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Always Show Bookmarks Bar", keys = "Ctrl+Shift+B" },
+  "-",
+  { name = "Stop", keys = "Esc" },
+  { name = "Reload This Page", keys = "Ctrl+R" },
+  { name = "Force Reload This Page", keys = "Ctrl+Shift+R" },
+  "-",
+  { name = "Enter Full Screen", keys = "F11" },
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+  "-",
+  { name = "Developer", items = [ { name = "View Source", keys = "Ctrl+U" }, { name = "Developer Tools", keys = "Ctrl+Shift+I" }, { name = "JavaScript Console", keys = "Ctrl+Shift+J" } ] },
+]
+
+[[app.menu]]
+title = "History"
+items = [
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+  { name = "Home", keys = "Alt+Home" },
+  "-",
+  { name = "Show Full History", keys = "Ctrl+H" },
+  { name = "Downloads", keys = "Ctrl+J" },
+]
+
+[[app.menu]]
+title = "Bookmarks"
+items = [
+  { name = "Bookmark This Tab…", keys = "Ctrl+D" },
+  { name = "Bookmark All Tabs…", keys = "Ctrl+Shift+D" },
+  { name = "Bookmark Manager", keys = "Ctrl+Shift+O" },
+]
+
+[[app.menu]]
+title = "Tab"
+items = [
+  { name = "Show Next Tab", keys = "Ctrl+Tab" },
+  { name = "Show Previous Tab", keys = "Ctrl+Shift+Tab" },
+  "-",
+  { name = "Go to Last Tab", keys = "Ctrl+9" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Help", keys = "F1" },
+]
+
+[[app]]
+exes = ["msedge.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Tab", keys = "Ctrl+T" },
+  { name = "New Window", keys = "Ctrl+N" },
+  { name = "New InPrivate Window", keys = "Ctrl+Shift+N" },
+  { name = "Reopen Closed Tab", keys = "Ctrl+Shift+T" },
+  { name = "Open File…", keys = "Ctrl+O" },
+  { name = "Open Location…", keys = "Ctrl+L" },
+  "-",
+  { name = "Close Tab", keys = "Ctrl+W" },
+  { name = "Close Window", keys = "Ctrl+Shift+W" },
+  { name = "Save Page As…", keys = "Ctrl+S" },
+  "-",
+  { name = "Print…", keys = "Ctrl+P" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Paste as Plain Text", keys = "Ctrl+Shift+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find on Page…", keys = "Ctrl+F" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Show Favorites Bar", keys = "Ctrl+Shift+B" },
+  "-",
+  { name = "Stop", keys = "Esc" },
+  { name = "Refresh", keys = "Ctrl+R" },
+  { name = "Hard Refresh", keys = "Ctrl+Shift+R" },
+  "-",
+  { name = "Enter Full Screen", keys = "F11" },
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+  "-",
+  { name = "Developer", items = [ { name = "View Source", keys = "Ctrl+U" }, { name = "Developer Tools", keys = "Ctrl+Shift+I" }, { name = "Console", keys = "Ctrl+Shift+J" } ] },
+]
+
+[[app.menu]]
+title = "History"
+items = [
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+  { name = "Home", keys = "Alt+Home" },
+  "-",
+  { name = "Show History", keys = "Ctrl+H" },
+  { name = "Downloads", keys = "Ctrl+J" },
+]
+
+[[app.menu]]
+title = "Favorites"
+items = [
+  { name = "Add This Page to Favorites…", keys = "Ctrl+D" },
+  { name = "Add Open Pages to Favorites…", keys = "Ctrl+Shift+D" },
+  { name = "Favorites", keys = "Ctrl+Shift+O" },
+  "-",
+  { name = "Collections", keys = "Ctrl+Shift+Y" },
+]
+
+[[app.menu]]
+title = "Tab"
+items = [
+  { name = "Show Next Tab", keys = "Ctrl+Tab" },
+  { name = "Show Previous Tab", keys = "Ctrl+Shift+Tab" },
+  "-",
+  { name = "Go to Last Tab", keys = "Ctrl+9" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Help", keys = "F1" },
+]
+
+[[app]]
+exes = ["zen.exe", "firefox.exe", "librewolf.exe", "floorp.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Tab", keys = "Ctrl+T" },
+  { name = "New Window", keys = "Ctrl+N" },
+  { name = "New Private Window", keys = "Ctrl+Shift+P" },
+  { name = "Reopen Closed Tab", keys = "Ctrl+Shift+T" },
+  { name = "Open File…", keys = "Ctrl+O" },
+  { name = "Open Location…", keys = "Ctrl+L" },
+  "-",
+  { name = "Close Tab", keys = "Ctrl+W" },
+  { name = "Close Window", keys = "Ctrl+Shift+W" },
+  { name = "Save Page As…", keys = "Ctrl+S" },
+  "-",
+  { name = "Print…", keys = "Ctrl+P" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Paste Without Formatting", keys = "Ctrl+Shift+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find in Page…", keys = "Ctrl+F" },
+  { name = "Find Again", keys = "Ctrl+G" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Stop", keys = "Esc" },
+  { name = "Reload", keys = "Ctrl+R" },
+  { name = "Reload Ignoring Cache", keys = "Ctrl+Shift+R" },
+  "-",
+  { name = "Enter Full Screen", keys = "F11" },
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+  "-",
+  { name = "Reader View", keys = "F9" },
+]
+
+[[app.menu]]
+title = "History"
+items = [
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+  { name = "Home", keys = "Alt+Home" },
+  "-",
+  { name = "Show All History", keys = "Ctrl+Shift+H" },
+  { name = "History Sidebar", keys = "Ctrl+H" },
+]
+
+[[app.menu]]
+title = "Bookmarks"
+items = [
+  { name = "Bookmark Current Tab…", keys = "Ctrl+D" },
+  { name = "Bookmark All Tabs…", keys = "Ctrl+Shift+D" },
+  { name = "Manage Bookmarks", keys = "Ctrl+Shift+O" },
+  { name = "Bookmarks Sidebar", keys = "Ctrl+B" },
+]
+
+[[app.menu]]
+title = "Tools"
+items = [
+  { name = "Downloads", keys = "Ctrl+Shift+Y" },
+  { name = "Add-ons and Themes", keys = "Ctrl+Shift+A" },
+  "-",
+  { name = "Web Developer Tools", keys = "Ctrl+Shift+I" },
+  { name = "Browser Console", keys = "Ctrl+Shift+J" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Help", keys = "F1" },
+]
+
+# ---------------------------------------------------------------------------
+# Chat and notes
+# ---------------------------------------------------------------------------
+
+[[app]]
+exes = ["claude.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Chat", keys = "Ctrl+Shift+O" },
+  { name = "Search Chats…", keys = "Ctrl+K" },
+  "-",
+  { name = "Settings…", keys = "Ctrl+," },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Reload", keys = "Ctrl+R" },
+  "-",
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+  "-",
+  { name = "Enter Full Screen", keys = "F11" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Keyboard Shortcuts", keys = "Ctrl+/" },
+  { name = "Claude Help Center", open = "https://support.claude.com" },
+]
+
+[[app]]
+exes = ["discord.exe", "discordptb.exe", "discordcanary.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "Quick Switcher…", keys = "Ctrl+K" },
+  { name = "Upload a File…", keys = "Ctrl+Shift+U" },
+  "-",
+  { name = "User Settings…", keys = "Ctrl+," },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Search…", keys = "Ctrl+F" },
+  { name = "Emoji Picker", keys = "Ctrl+E" },
+  { name = "GIF Picker", keys = "Ctrl+G" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Member List", keys = "Ctrl+U" },
+  { name = "Pinned Messages", keys = "Ctrl+P" },
+  { name = "Inbox", keys = "Ctrl+I" },
+  "-",
+  { name = "Mark Channel as Read", keys = "Esc" },
+  { name = "Mark Server as Read", keys = "Shift+Esc" },
+  "-",
+  { name = "Reload", keys = "Ctrl+R" },
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+]
+
+[[app.menu]]
+title = "Voice"
+items = [
+  { name = "Mute", keys = "Ctrl+Shift+M" },
+  { name = "Deafen", keys = "Ctrl+Shift+D" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Keyboard Shortcuts", keys = "Ctrl+/" },
+  { name = "Help Center", keys = "Ctrl+Shift+H" },
+]
+
+[[app]]
+exes = ["notion.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Page", keys = "Ctrl+N" },
+  { name = "New Window", keys = "Ctrl+Shift+N" },
+  { name = "Search…", keys = "Ctrl+P" },
+  "-",
+  { name = "Copy Link to Page", keys = "Ctrl+L" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Paste and Match Style", keys = "Ctrl+Shift+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find…", keys = "Ctrl+F" },
+]
+
+[[app.menu]]
+title = "Format"
+items = [
+  { name = "Bold", keys = "Ctrl+B" },
+  { name = "Italic", keys = "Ctrl+I" },
+  { name = "Underline", keys = "Ctrl+U" },
+  { name = "Strikethrough", keys = "Ctrl+Shift+S" },
+  { name = "Inline Code", keys = "Ctrl+E" },
+  { name = "Add Link…", keys = "Ctrl+K" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Back", keys = "Ctrl+[" },
+  { name = "Forward", keys = "Ctrl+]" },
+  "-",
+  { name = "Toggle Sidebar", keys = "Ctrl+\\" },
+  { name = "Toggle Dark Mode", keys = "Ctrl+Shift+L" },
+  "-",
+  { name = "Reload", keys = "Ctrl+R" },
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Notion Help", open = "https://www.notion.com/help" },
+]
+
+[[app]]
+exes = ["obsidian.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Note", keys = "Ctrl+N" },
+  { name = "Quick Switcher…", keys = "Ctrl+O" },
+  "-",
+  { name = "Close Tab", keys = "Ctrl+W" },
+  { name = "Reopen Closed Tab", keys = "Ctrl+Shift+T" },
+  "-",
+  { name = "Settings…", keys = "Ctrl+," },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find…", keys = "Ctrl+F" },
+  { name = "Replace…", keys = "Ctrl+H" },
+  { name = "Search in All Files…", keys = "Ctrl+Shift+F" },
+]
+
+[[app.menu]]
+title = "Format"
+items = [
+  { name = "Bold", keys = "Ctrl+B" },
+  { name = "Italic", keys = "Ctrl+I" },
+  { name = "Insert Link", keys = "Ctrl+K" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Command Palette…", keys = "Ctrl+P" },
+  { name = "Toggle Reading View", keys = "Ctrl+E" },
+  { name = "Graph View", keys = "Ctrl+G" },
+  "-",
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+  "-",
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Obsidian Help", open = "https://help.obsidian.md" },
+]
+
+# ---------------------------------------------------------------------------
+# Editors (VS Code shows its own menus when its menu bar is in the title bar;
+# this is for when it isn't)
+# ---------------------------------------------------------------------------
+
+[[app]]
+exes = ["code.exe", "code - insiders.exe", "cursor.exe", "windsurf.exe", "vscodium.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Text File", keys = "Ctrl+N" },
+  { name = "New Window", keys = "Ctrl+Shift+N" },
+  "-",
+  { name = "Open File…", keys = "Ctrl+O" },
+  "-",
+  { name = "Save", keys = "Ctrl+S" },
+  { name = "Save As…", keys = "Ctrl+Shift+S" },
+  "-",
+  { name = "Settings", keys = "Ctrl+," },
+  "-",
+  { name = "Close Editor", keys = "Ctrl+W" },
+  { name = "Close Window", keys = "Ctrl+Shift+W" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Y" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  "-",
+  { name = "Find", keys = "Ctrl+F" },
+  { name = "Replace", keys = "Ctrl+H" },
+  { name = "Find in Files", keys = "Ctrl+Shift+F" },
+  { name = "Replace in Files", keys = "Ctrl+Shift+H" },
+  "-",
+  { name = "Toggle Line Comment", keys = "Ctrl+/" },
+  { name = "Toggle Block Comment", keys = "Shift+Alt+A" },
+]
+
+[[app.menu]]
+title = "Selection"
+items = [
+  { name = "Select All", keys = "Ctrl+A" },
+  { name = "Expand Selection", keys = "Shift+Alt+Right" },
+  { name = "Shrink Selection", keys = "Shift+Alt+Left" },
+  "-",
+  { name = "Copy Line Up", keys = "Shift+Alt+Up" },
+  { name = "Copy Line Down", keys = "Shift+Alt+Down" },
+  { name = "Move Line Up", keys = "Alt+Up" },
+  { name = "Move Line Down", keys = "Alt+Down" },
+  "-",
+  { name = "Add Cursor Above", keys = "Ctrl+Alt+Up" },
+  { name = "Add Cursor Below", keys = "Ctrl+Alt+Down" },
+  { name = "Add Next Occurrence", keys = "Ctrl+D" },
+  { name = "Select All Occurrences", keys = "Ctrl+Shift+L" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Command Palette…", keys = "Ctrl+Shift+P" },
+  "-",
+  { name = "Explorer", keys = "Ctrl+Shift+E" },
+  { name = "Search", keys = "Ctrl+Shift+F" },
+  { name = "Source Control", keys = "Ctrl+Shift+G" },
+  { name = "Run and Debug", keys = "Ctrl+Shift+D" },
+  { name = "Extensions", keys = "Ctrl+Shift+X" },
+  "-",
+  { name = "Problems", keys = "Ctrl+Shift+M" },
+  { name = "Output", keys = "Ctrl+Shift+U" },
+  { name = "Terminal", keys = "Ctrl+`" },
+  "-",
+  { name = "Toggle Primary Side Bar", keys = "Ctrl+B" },
+  { name = "Word Wrap", keys = "Alt+Z" },
+  { name = "Enter Full Screen", keys = "F11" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+]
+
+[[app.menu]]
+title = "Go"
+items = [
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+  "-",
+  { name = "Go to File…", keys = "Ctrl+P" },
+  { name = "Go to Symbol in Workspace…", keys = "Ctrl+T" },
+  { name = "Go to Symbol in Editor…", keys = "Ctrl+Shift+O" },
+  { name = "Go to Definition", keys = "F12" },
+  { name = "Go to References", keys = "Shift+F12" },
+  { name = "Go to Line/Column…", keys = "Ctrl+G" },
+  "-",
+  { name = "Next Problem", keys = "F8" },
+  { name = "Previous Problem", keys = "Shift+F8" },
+]
+
+[[app.menu]]
+title = "Run"
+items = [
+  { name = "Start Debugging", keys = "F5" },
+  { name = "Run Without Debugging", keys = "Ctrl+F5" },
+  { name = "Stop Debugging", keys = "Shift+F5" },
+  { name = "Restart Debugging", keys = "Ctrl+Shift+F5" },
+  "-",
+  { name = "Toggle Breakpoint", keys = "F9" },
+]
+
+[[app.menu]]
+title = "Terminal"
+items = [
+  { name = "New Terminal", keys = "Ctrl+Shift+`" },
+  { name = "Split Terminal", keys = "Ctrl+Shift+5" },
+  "-",
+  { name = "Run Build Task…", keys = "Ctrl+Shift+B" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Show All Commands", keys = "Ctrl+Shift+P" },
+  { name = "Documentation", open = "https://code.visualstudio.com/docs" },
+]
+
+[[app]]
+exes = ["zed.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New", keys = "Ctrl+N" },
+  { name = "New Window", keys = "Ctrl+Shift+N" },
+  { name = "Open…", keys = "Ctrl+O" },
+  "-",
+  { name = "Save", keys = "Ctrl+S" },
+  { name = "Save As…", keys = "Ctrl+Shift+S" },
+  "-",
+  { name = "Settings", keys = "Ctrl+," },
+  "-",
+  { name = "Close Editor", keys = "Ctrl+W" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find", keys = "Ctrl+F" },
+  { name = "Find in Project", keys = "Ctrl+Shift+F" },
+  "-",
+  { name = "Toggle Comments", keys = "Ctrl+/" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Command Palette", keys = "Ctrl+Shift+P" },
+  "-",
+  { name = "Project Panel", keys = "Ctrl+Shift+E" },
+  { name = "Terminal Panel", keys = "Ctrl+`" },
+  "-",
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+  { name = "Reset Zoom", keys = "Ctrl+0" },
+]
+
+[[app.menu]]
+title = "Go"
+items = [
+  { name = "Go to File…", keys = "Ctrl+P" },
+  { name = "Go to Line/Column…", keys = "Ctrl+G" },
+  { name = "Go to Definition", keys = "F12" },
+  "-",
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Documentation", open = "https://zed.dev/docs" },
+]
+
+# JetBrains IDEs, for when Java Access Bridge is off (with it on, DockSide
+# reads their real menus). Default Windows keymap.
+[[app]]
+exes = ["idea64.exe", "idea.exe", "pycharm64.exe", "webstorm64.exe", "clion64.exe", "rider64.exe", "goland64.exe", "rustrover64.exe", "phpstorm64.exe", "datagrip64.exe", "studio64.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New…", keys = "Alt+Insert" },
+  "-",
+  { name = "Settings…", keys = "Ctrl+Alt+S" },
+  { name = "Project Structure…", keys = "Ctrl+Alt+Shift+S" },
+  "-",
+  { name = "Save All", keys = "Ctrl+S" },
+  { name = "Reload All from Disk", keys = "Ctrl+Alt+Y" },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Copy Path/Reference…", keys = "Ctrl+Shift+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Find", items = [ { name = "Find…", keys = "Ctrl+F" }, { name = "Replace…", keys = "Ctrl+R" }, { name = "Find in Files…", keys = "Ctrl+Shift+F" }, { name = "Replace in Files…", keys = "Ctrl+Shift+R" } ] },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Recent Files", keys = "Ctrl+E" },
+  { name = "Project", keys = "Alt+1" },
+  { name = "Terminal", keys = "Alt+F12" },
+  "-",
+  { name = "Quick Documentation", keys = "Ctrl+Q" },
+]
+
+[[app.menu]]
+title = "Navigate"
+items = [
+  { name = "Back", keys = "Ctrl+Alt+Left" },
+  { name = "Forward", keys = "Ctrl+Alt+Right" },
+  "-",
+  { name = "Class…", keys = "Ctrl+N" },
+  { name = "File…", keys = "Ctrl+Shift+N" },
+  { name = "Symbol…", keys = "Ctrl+Alt+Shift+N" },
+  { name = "Action…", keys = "Ctrl+Shift+A" },
+  "-",
+  { name = "Line/Column…", keys = "Ctrl+G" },
+  { name = "Declaration or Usages", keys = "Ctrl+B" },
+  { name = "Implementation(s)", keys = "Ctrl+Alt+B" },
+]
+
+[[app.menu]]
+title = "Code"
+items = [
+  { name = "Generate…", keys = "Alt+Insert" },
+  { name = "Show Context Actions", keys = "Alt+Enter" },
+  "-",
+  { name = "Reformat Code", keys = "Ctrl+Alt+L" },
+  { name = "Optimize Imports", keys = "Ctrl+Alt+O" },
+  "-",
+  { name = "Comment with Line Comment", keys = "Ctrl+/" },
+  { name = "Comment with Block Comment", keys = "Ctrl+Shift+/" },
+]
+
+[[app.menu]]
+title = "Refactor"
+items = [
+  { name = "Refactor This…", keys = "Ctrl+Alt+Shift+T" },
+  { name = "Rename…", keys = "Shift+F6" },
+  "-",
+  { name = "Extract Method…", keys = "Ctrl+Alt+M" },
+  { name = "Introduce Variable…", keys = "Ctrl+Alt+V" },
+]
+
+[[app.menu]]
+title = "Run"
+items = [
+  { name = "Run", keys = "Shift+F10" },
+  { name = "Debug", keys = "Shift+F9" },
+  { name = "Stop", keys = "Ctrl+F2" },
+  "-",
+  { name = "Build Project", keys = "Ctrl+F9" },
+  { name = "Toggle Breakpoint", keys = "Ctrl+F8" },
+]
+
+[[app.menu]]
+title = "Git"
+items = [
+  { name = "Commit…", keys = "Ctrl+K" },
+  { name = "Push…", keys = "Ctrl+Shift+K" },
+  { name = "Update Project…", keys = "Ctrl+T" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Find Action…", keys = "Ctrl+Shift+A" },
+]
+
+# ---------------------------------------------------------------------------
+# Media and others
+# ---------------------------------------------------------------------------
+
+[[app]]
+exes = ["spotify.exe"]
+
+[[app.menu]]
+title = "File"
+items = [
+  { name = "New Playlist", keys = "Ctrl+N" },
+  "-",
+  { name = "Settings…", keys = "Ctrl+," },
+]
+
+[[app.menu]]
+title = "Edit"
+items = [
+  { name = "Undo", keys = "Ctrl+Z" },
+  { name = "Redo", keys = "Ctrl+Shift+Z" },
+  "-",
+  { name = "Cut", keys = "Ctrl+X" },
+  { name = "Copy", keys = "Ctrl+C" },
+  { name = "Paste", keys = "Ctrl+V" },
+  { name = "Select All", keys = "Ctrl+A" },
+  "-",
+  { name = "Search…", keys = "Ctrl+K" },
+]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Back", keys = "Alt+Left" },
+  { name = "Forward", keys = "Alt+Right" },
+  "-",
+  { name = "Your Library", open = "spotify:collection" },
+  "-",
+  { name = "Actual Size", keys = "Ctrl+0" },
+  { name = "Zoom In", keys = "Ctrl+=" },
+  { name = "Zoom Out", keys = "Ctrl+-" },
+]
+
+[[app.menu]]
+title = "Playback"
+items = [
+  { name = "Play/Pause", keys = "Space" },
+  { name = "Next", keys = "Ctrl+Right" },
+  { name = "Previous", keys = "Ctrl+Left" },
+  "-",
+  { name = "Shuffle", keys = "Ctrl+S" },
+  { name = "Repeat", keys = "Ctrl+R" },
+  "-",
+  { name = "Volume Up", keys = "Ctrl+Up" },
+  { name = "Volume Down", keys = "Ctrl+Down" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Keyboard Shortcuts", keys = "Ctrl+/" },
+  { name = "Spotify Support", open = "https://support.spotify.com" },
+]
+
+[[app]]
+exes = ["steamwebhelper.exe", "steam.exe"]
+
+[[app.menu]]
+title = "View"
+items = [
+  { name = "Store", open = "steam://store" },
+  { name = "Library", open = "steam://open/games" },
+  { name = "Community", open = "steam://url/CommunityHome" },
+  "-",
+  { name = "Downloads", open = "steam://open/downloads" },
+  { name = "Friends List", open = "steam://open/friends" },
+  "-",
+  { name = "Settings", open = "steam://open/settings" },
+]
+
+[[app.menu]]
+title = "Games"
+items = [
+  { name = "Activate a Product on Steam…", open = "steam://open/activateproduct" },
+  { name = "Redeem a Steam Wallet Code…", open = "https://store.steampowered.com/account/redeemwalletcode" },
+]
+
+[[app.menu]]
+title = "Help"
+items = [
+  { name = "Steam Support", open = "https://help.steampowered.com" },
+]

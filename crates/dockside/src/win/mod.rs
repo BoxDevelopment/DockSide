@@ -1,6 +1,8 @@
 //! Thin Win32 platform layer.
 
 pub mod accent;
+pub mod appmenu;
+pub mod jab;
 pub mod appbar;
 pub mod audio;
 pub mod apps;
@@ -263,5 +265,7 @@ pub const WM_APP_BATTERY: u32 = WM_APP + 35;
 pub const WM_APP_QUICKLOOK: u32 = WM_APP + 37;
 /// Edit Photo…'s picture has loaded (or failed to).
 pub const WM_APP_PHOTO_EDIT: u32 = WM_APP + 38;
+/// The app-menus worker has replies (see `appmenu`).
+pub const WM_APP_APP_MENUS: u32 = WM_APP + 39;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

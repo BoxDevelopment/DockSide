@@ -60,6 +60,9 @@ const POLL: Duration = Duration::from_millis(250);
 /// meanwhile), and already showing (it keeps its last frame meanwhile).
 const READY_WAIT: Duration = Duration::from_millis(250);
 const READY_WAIT_SHOWN: Duration = Duration::from_millis(100);
+/// A pane that had to wait for what's behind it fades in over the plain blur
+/// (which shows meanwhile) this fast, instead of replacing it in one frame.
+const FADE_IN: Duration = Duration::from_millis(160);
 /// How often to check whether a live wallpaper app started or stopped (they
 /// don't announce it).
 const LIVE_POLL: Duration = Duration::from_secs(2);
@@ -111,7 +114,8 @@ cbuffer C : register(b0) {
     float4 melt[5];   // x: how far (px) a shape reaches to merge with those before it
     float4 coat;      // painted over the glass, straight alpha
     float4 border;    // a hairline around its edge, straight alpha
-    float4 power;     // x: refraction amount (1 = normal), widening the colour split with it
+    float4 power;     // x: refraction amount (1 = normal), widening the colour split with it;
+                      // y: how faded out the whole pane is (fading in over the plain blur)
 };
 
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -271,7 +275,7 @@ float4 ps(V i) : SV_Target {
     // the glass exactly, through every merge, and never a frame behind it.
     c = lerp(saturate(c), coat.rgb, coat.a * keep);
     c = lerp(c, border.rgb, border.a * saturate(0.5 * scale - depth + 0.5));
-    return float4(saturate(c) * alpha, alpha);
+    return float4(saturate(c) * alpha, alpha) * (1 - power.y);
 }
 "#;
 
@@ -519,6 +523,8 @@ struct Engine {
     moved: Option<DispatcherQueueTimer>,
     /// Renders panes still waiting for windows behind them (see `READY_WAIT`).
     waiter: Option<DispatcherQueueTimer>,
+    /// Renders the next step of panes fading in (see `FADE_IN`).
+    fader: Option<DispatcherQueueTimer>,
     /// Windows may have moved, opened or closed since panes last rendered.
     restack: bool,
     /// See `windows()`.
@@ -630,6 +636,7 @@ impl Engine {
             refresh: refresh_period(),
             moved: None,
             waiter: None,
+            fader: None,
             restack: false,
             windows: None,
             live: wallpaper::is_live(),
@@ -958,7 +965,20 @@ impl Engine {
         if self.waiter.is_none() {
             self.waiter = engine_timer(false, Engine::flush);
         }
-        if let Some(t) = &self.waiter {
+        Self::arm(&self.waiter, after);
+    }
+
+    /// Flushes a refresh from now, for the next step of a fade.
+    fn fade_step(&mut self) {
+        if self.fader.is_none() {
+            self.fader = engine_timer(false, Engine::flush);
+        }
+        Self::arm(&self.fader, self.refresh);
+    }
+
+    /// Starts a one-shot timer unless it's already counting down.
+    fn arm(timer: &Option<DispatcherQueueTimer>, after: Duration) {
+        if let Some(t) = timer {
             if !t.IsRunning().unwrap_or(false) {
                 let _ = t.SetInterval(timespan(after));
                 let _ = t.Start();
@@ -989,6 +1009,7 @@ impl Engine {
         if pane.source == Source::Screen && !on_screen(pane.hwnd) {
             pane.layers.clear();
             pane.drawn = None;
+            pane.appear = None;
             return Ok(());
         }
         let monitor = unsafe { MonitorFromWindow(pane.hwnd, MONITOR_DEFAULTTONEAREST) };
@@ -1078,7 +1099,10 @@ impl Engine {
                         return Ok(());
                     }
                 }
-                pane.waiting = None;
+                // It waited, with the plain blur showing: fade in over that.
+                if pane.waiting.take().is_some() && !pane.shown {
+                    pane.appear = Some(Instant::now());
+                }
                 let (_, srv, rtv, _) = pane.src.as_ref().unwrap();
                 let base = base.as_ref().map(|(srv, at, size)| (srv, *at, *size));
                 self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, base, &layers);
@@ -1105,6 +1129,14 @@ impl Engine {
             [(wr.left - region.left) as f32, (wr.top - region.top) as f32],
             [src_size.0 as f32, src_size.1 as f32],
         );
+
+        let mut consts = consts;
+        // Fading in (see `FADE_IN`): eased, and a frame ahead so the first isn't blank.
+        let hide = pane.appear.map_or(0.0, |t| {
+            let k = ((t.elapsed() + self.refresh).as_secs_f32() / FADE_IN.as_secs_f32()).min(1.0);
+            1.0 - k * k * (3.0 - 2.0 * k)
+        });
+        consts.power[1] = hide;
 
         unsafe {
             self.context.UpdateSubresource(&self.constants, 0, None, &consts as *const _ as _, 0, 0);
@@ -1137,6 +1169,13 @@ impl Engine {
         pane.drawn = Some(key);
         pane.presented = Some(Instant::now());
         pane.shown = true;
+        if hide > 0.0 {
+            // The next step of the fade, a refresh from now.
+            pane.stale = true;
+            self.fade_step();
+        } else {
+            pane.appear = None;
+        }
         count(|s| s.renders += 1);
         Ok(())
     }
@@ -1149,7 +1188,7 @@ pub fn shutdown() {
     // Nothing may start the engine again.
     FAILED.with(|f| f.set(true));
     let Some(mut engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
-    for t in [&engine.timer, &engine.poll, &engine.moved, &engine.waiter, &engine.live_poll].into_iter().flatten() {
+    for t in [&engine.timer, &engine.poll, &engine.moved, &engine.waiter, &engine.fader, &engine.live_poll].into_iter().flatten() {
         let _ = t.Stop();
     }
     engine.scene.close();
@@ -1348,6 +1387,8 @@ struct PaneState {
     shown: bool,
     /// Since when it's been waiting for windows behind it to arrive.
     waiting: Option<Instant>,
+    /// When it started fading in (see `FADE_IN`), until it has.
+    appear: Option<Instant>,
 }
 
 /// One refracting glass pane: a swap chain the caller puts in its visual tree.
@@ -1401,6 +1442,7 @@ impl Pane {
             moved: false,
             shown: false,
             waiting: None,
+            appear: None,
         }));
         with_engine(|engine| engine.panes.push(Rc::downgrade(&state)));
         Some((Self(state), swapchain))
@@ -1455,9 +1497,10 @@ impl Pane {
         self.render();
     }
 
-    /// Whether it has drawn a frame yet.
+    /// Whether it has drawn a frame yet, and finished fading in: the layers
+    /// under it can go then.
     pub fn shown(&self) -> bool {
-        self.0.try_borrow().is_ok_and(|s| s.shown)
+        self.0.try_borrow().is_ok_and(|s| s.shown && s.appear.is_none())
     }
 
     /// Re-renders now (after the window moved or reshaped).

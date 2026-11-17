@@ -47,9 +47,14 @@ const CORNER: i32 = 12;
 /// Uncovered pieces tracked per pane; past this, windows stop covering any
 /// more (so a few extra get drawn) rather than splitting it further.
 const MAX_OPEN: usize = 64;
-/// How long a capture no pane needs keeps running, so a window that only
-/// briefly stops being under glass (a drag across the Dock) needn't restart.
-const GRACE: Duration = Duration::from_secs(5);
+/// How long a capture no pane needs keeps running, so the next menu or panel
+/// over the same window has it at once: setting one up takes 50-90 ms, which
+/// would show as the plain blur first.
+const GRACE: Duration = Duration::from_secs(30);
+/// Unneeded for this long, a capture slows to `IDLE_PACE`: it only has to
+/// hold a recent frame for the next pane, not follow every change.
+const IDLE_AFTER: Duration = Duration::from_secs(1);
+const IDLE_PACE: Duration = Duration::from_millis(250);
 /// A capture whose setup hasn't reported back by now is given up on (and may
 /// be asked for again).
 const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -268,6 +273,8 @@ struct Capture {
     frosted: bool,
     /// Last needed by a pane.
     used: Instant,
+    /// Slowed to `IDLE_PACE` since no pane needs it.
+    idle: bool,
 }
 
 impl Capture {
@@ -388,10 +395,11 @@ impl Scene {
         for l in layers {
             if let Some(c) = self.captures.iter_mut().find(|c| c.hwnd == l.hwnd) {
                 c.used = now;
-                // A clear pane shows it now: back to full pace.
-                if c.frosted && !frosted {
-                    c.frosted = false;
-                    let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop, interval)));
+                // A clear pane shows it now, or a pane again after a rest: back to full pace.
+                if (c.frosted && !frosted) || c.idle {
+                    c.frosted &= frosted;
+                    c.idle = false;
+                    let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop || c.frosted, interval)));
                 }
                 continue;
             }
@@ -441,6 +449,7 @@ impl Scene {
                 desktop: s.desktop,
                 frosted: s.frosted,
                 used: Instant::now(),
+                idle: false,
             }),
             Err(e) => {
                 log!("glass can't capture window {hwnd:#x}: {e}");
@@ -584,9 +593,13 @@ impl Scene {
         self.pending.retain(|p| now.duration_since(p.1) < SETUP_TIMEOUT);
         let before = self.captures.len();
         self.captures.retain_mut(|c| {
-            let keep = unsafe { IsWindow(HWND(c.hwnd as _)) }.as_bool() && now.duration_since(c.used) < GRACE;
+            let rest = now.duration_since(c.used);
+            let keep = unsafe { IsWindow(HWND(c.hwnd as _)) }.as_bool() && rest < GRACE;
             if !keep {
                 c.close();
+            } else if rest >= IDLE_AFTER && !c.idle {
+                c.idle = true;
+                let _ = c.session.SetMinUpdateInterval(timespan(IDLE_PACE));
             }
             keep
         });
@@ -600,7 +613,7 @@ impl Scene {
 
     /// Re-paces every capture (battery saver turned on or off).
     pub fn set_interval(&self, interval: Duration) {
-        for c in &self.captures {
+        for c in self.captures.iter().filter(|c| !c.idle) {
             let _ = c.session.SetMinUpdateInterval(timespan(pace(c.desktop || c.frosted, interval)));
         }
     }

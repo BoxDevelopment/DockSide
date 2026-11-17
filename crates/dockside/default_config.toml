@@ -129,6 +129,9 @@ tint_dark = "#2A2A2C80"
 icon_style = "native"
 # Show running apps that aren't pinned.
 show_running = true
+# Rest the pointer on a running app's icon to see live previews of its windows
+# and pick one (handy with two terminals or several browser windows open).
+window_previews = true
 show_trash = true
 # Custom Trash icons (.png / .ico) for when it's empty and when it's full; "" uses
 # the Recycle Bin's own. Right-click the Trash > Change Icon… sets the current one.

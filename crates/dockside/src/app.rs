@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::anim::{approach, FrameClock, FRAME_PENDING};
 use crate::config::{self, Config, DisplayMode, DockApp};
 use crate::dock::{Dock, FileDrop, LAUNCHPAD_PATH, START_PATH};
+use crate::dock_preview::{self, DockPreview};
 use crate::gfx::icons::IconStore;
 use crate::gfx::Gfx;
 use crate::icon_picker::{IconPicker, IconTarget, PickerEvent, PICKER_HWND, PICKER_PATH};
@@ -128,6 +129,9 @@ const TIMER_POWER: usize = 18;
 /// The focused app showed no menu bar yet: look again (a window that just
 /// opened may build its menu bar a moment later).
 const TIMER_APP_MENUS: usize = 19;
+/// The pointer came to rest on a running app's icon (open its window previews),
+/// or left icon and previews alike (close them, unless it came back).
+const TIMER_PREVIEW: usize = 20;
 const DOCK_FOLLOW_MS: u32 = 100;
 const DOCK_FOLLOW_DWELL_MS: u64 = 300;
 /// Long enough for DWM to present a new surface's backdrop.
@@ -1197,6 +1201,13 @@ pub struct App {
     closing_finders: Vec<FinderWindow>,
     /// Closed menus and panels, still fading out (click-through meanwhile).
     fading: Vec<Box<dyn Fading>>,
+    /// Live window previews over a Dock icon, and ones fading out.
+    preview: Option<DockPreview>,
+    closing_previews: Vec<DockPreview>,
+    /// The icon (Dock, launch target) the pointer is resting on, waiting for its previews.
+    preview_pending: Option<(usize, String)>,
+    /// An icon just clicked: no previews for it until the pointer moves off it.
+    preview_suppressed: Option<(usize, String)>,
     /// Closed app windows (Settings, Setup Assistant), fading out: the owner, its window and opacity.
     closing_windows: Vec<(Box<dyn std::any::Any>, HWND, f32)>,
     next_finder_id: u32,
@@ -1387,6 +1398,10 @@ impl App {
             finders: Vec::new(),
             closing_finders: Vec::new(),
             fading: Vec::new(),
+            preview: None,
+            closing_previews: Vec::new(),
+            preview_pending: None,
+            preview_suppressed: None,
             closing_windows: Vec::new(),
             next_finder_id: 1,
             loader: finder::loader::IconLoader::new(msg_hwnd.0 as isize, WM_APP_ICONS),
@@ -1773,6 +1788,8 @@ impl App {
     }
 
     fn retire_dock(&mut self) {
+        self.close_preview();
+        self.preview_pending = None;
         for mut d in std::mem::take(&mut self.docks) {
             // A fading-out Dock mustn't take drops meant for its replacement.
             crate::dock_drop::revoke(d.surface.content);
@@ -2235,6 +2252,25 @@ impl App {
             o > 0.0
         });
         still |= !self.fading.is_empty();
+        if let Some(p) = &mut self.preview {
+            still |= p.tick(dt);
+            // Over its icon as the Dock magnifies under the pointer.
+            if let Some((cx, _)) = self.docks.get(p.dock).and_then(|d| d.preview_anchor(&p.key)) {
+                p.follow(cx);
+            }
+        }
+        // Closed previews shrink back into their icon as they fade.
+        let (gfx, theme) = (&self.gfx, &self.theme);
+        self.closing_previews.retain_mut(|p| {
+            p.tick(dt);
+            let o = approach(p.surface.opacity(), 0.0, dt, 10.0);
+            p.set_opacity(o);
+            if p.dirty && o > 0.0 {
+                p.render(gfx, theme);
+            }
+            o > 0.0
+        });
+        still |= !self.closing_previews.is_empty();
         self.closing_windows.retain_mut(|(_, hwnd, a)| {
             *a = approach(*a, 0.0, dt, 24.0);
             crate::gfx::set_window_alpha(*hwnd, *a);
@@ -2327,6 +2363,7 @@ impl App {
         if moved {
             self.animate();
         }
+        self.sync_preview();
         self.update_foreground();
     }
 
@@ -2340,6 +2377,7 @@ impl App {
         }
         let bars = self.docks.iter().map(|d| &d.surface).chain(self.menubars.iter().map(|m| &m.surface));
         let surfaces = [
+            self.preview.as_ref().map(|p| &p.surface),
             self.island.as_ref().map(|i| &i.surface),
             self.menu.as_ref().map(|m| &m.surface),
             self.spotlight.as_ref().map(|s| &s.surface),
@@ -2700,6 +2738,9 @@ impl App {
         for d in self.docks.iter_mut().filter(|d| d.dirty) {
             d.render(&self.gfx, &self.theme, &mut self.icons);
         }
+        if let Some(p) = self.preview.as_mut().filter(|p| p.dirty) {
+            p.render(&self.gfx, &self.theme);
+        }
         if let Some(i) = self.island.as_mut().filter(|i| i.dirty) {
             i.render(&self.gfx, &self.theme);
         }
@@ -2774,6 +2815,7 @@ impl App {
             || self.finders.iter().any(|f| f.animating())
             || !self.closing_finders.is_empty()
             || !self.fading.is_empty()
+            || !self.closing_previews.is_empty()
             || !self.closing_windows.is_empty()
     }
 
@@ -4378,6 +4420,7 @@ impl App {
                             }
                         }
                         TIMER_DRAG_WATCH => self.watch_drag(),
+                        TIMER_PREVIEW => self.update_preview(true),
                         // Wallpaper Engine and similar re-tint the accent color constantly;
                         // a full rebuild each time makes everything flicker away.
                         TIMER_THEME | TIMER_POWER
@@ -4727,6 +4770,11 @@ impl App {
             return r;
         }
 
+        // The windows holding the previews' thumbnails let the pointer through to the panel under them.
+        if msg == WM_NCHITTEST && self.preview.iter().chain(&self.closing_previews).any(|p| p.is_host(hwnd)) {
+            return Some(LRESULT(HTTRANSPARENT as isize));
+        }
+
         let result = if self.dropdown.as_ref().is_some_and(|d| d.hwnd == hwnd) {
             self.on_dropdown_mouse(hwnd, msg, wp, lp)
         } else if self.control.as_ref().is_some_and(|c| c.hwnd == hwnd) {
@@ -4739,6 +4787,8 @@ impl App {
             self.on_menubar_mouse(i, hwnd, msg, lp)
         } else if let Some(i) = self.docks.iter().position(|d| d.surface.content == hwnd) {
             self.on_dock_mouse(i, hwnd, msg, wp, lp)
+        } else if self.preview.as_ref().is_some_and(|p| p.surface.content == hwnd) {
+            self.on_preview_mouse(hwnd, msg, lp)
         } else if self.island.as_ref().is_some_and(|i| i.owns(hwnd)) {
             self.on_island_mouse(hwnd, msg, wp, lp)
         } else if self.widgets.as_ref().is_some_and(|w| w.owns(hwnd)) {
@@ -5347,6 +5397,174 @@ impl App {
         }
     }
 
+    // --- Dock window previews --------------------------------------------
+
+    /// The running app icon (Dock, launch target) the pointer rests on, whose previews may show.
+    fn preview_target(&self) -> Option<(usize, String)> {
+        self.docks.iter().enumerate().find_map(|(i, d)| d.preview_target().map(|k| (i, k)))
+    }
+
+    /// Decides what the previews do after the pointer moved (or, `timer`, after
+    /// it rested): rise after a rest on an icon, switch straight over to the
+    /// next icon once up, and close once the pointer has left icon and panel.
+    fn update_preview(&mut self, timer: bool) {
+        let mut target = self.preview_target();
+        if let Some(s) = &self.preview_suppressed {
+            let under = self.docks.get(s.0).and_then(|d| d.hovered_key());
+            if under.as_ref() != Some(&s.1) {
+                self.preview_suppressed = None;
+            }
+        }
+        if target.is_some() && target == self.preview_suppressed {
+            target = None;
+        }
+        let Some(p) = &self.preview else {
+            if target.is_none() {
+                self.preview_pending = None;
+            } else if timer && target == self.preview_pending {
+                self.preview_pending = None;
+                self.open_preview(target, 0.0);
+            } else if target != self.preview_pending {
+                self.preview_pending = target;
+                self.timer(TIMER_PREVIEW, dock_preview::HOVER_MS);
+            }
+            return;
+        };
+        let same = target.as_ref().is_some_and(|(d, k)| *d == p.dock && *k == p.key);
+        if p.hovering || same {
+            return;
+        }
+        if target.is_some() {
+            // Sliding along the Dock with previews up: the next app's, at once.
+            self.open_preview(target, 0.8);
+        } else if !timer {
+            // Left the icon: a moment to cross over to the panel (or come back).
+            self.timer(TIMER_PREVIEW, dock_preview::GRACE_MS);
+        } else {
+            self.close_preview();
+        }
+    }
+
+    /// `from`: how far grown the bubble starts (0 out of the icon, a quick pop when switching apps, 1 when only re-laid).
+    fn open_preview(&mut self, target: Option<(usize, String)>, from: f32) {
+        let Some((dock, key)) = target else { return };
+        let Some(d) = self.docks.get(dock) else { return };
+        let Some(item) = d.preview_source(&key) else { return };
+        let monitor = d.monitor();
+        // The Dock has loaded its icon already: this finds it cached.
+        let icon = self.icons.request(&item.bitmap_key, &item.icon_key, item.custom.as_deref());
+        let src = dock_preview::PreviewSource { windows: item.windows, name: item.name, icon, anchor: item.anchor };
+        // Switching apps: the old panel goes at once, the new one takes its place.
+        if let Some(old) = self.preview.take() {
+            if let Some(d) = self.docks.get_mut(old.dock) {
+                d.previewing = None;
+                d.dirty = true;
+                // Over to another display's Dock: this one settles.
+                if !d.tracking && d.menu_item.is_none() {
+                    d.on_leave();
+                }
+            }
+        }
+        match DockPreview::new(&self.gfx, &self.theme, &self.cfg, monitor, dock, key.clone(), src) {
+            Ok(mut p) => {
+                p.grow_from(from);
+                p.render(&self.gfx, &self.theme);
+                self.preview = Some(p);
+                if let Some(d) = self.docks.get_mut(dock) {
+                    d.previewing = Some(key);
+                    d.dirty = true;
+                }
+                self.animate();
+            }
+            Err(e) => log!("dock preview failed: {e}"),
+        }
+    }
+
+    /// Closes the previews (they fade out), and lets the Dock settle if the
+    /// pointer isn't on it any more.
+    fn close_preview(&mut self) {
+        let Some(mut p) = self.preview.take() else { return };
+        p.surface.set_click_through();
+        p.close();
+        if let Some(d) = self.docks.get_mut(p.dock) {
+            d.previewing = None;
+            d.dirty = true;
+            if !d.tracking && d.menu_item.is_none() {
+                d.on_leave();
+            }
+        }
+        self.closing_previews.push(p);
+        self.animate();
+    }
+
+    /// A click on the Dock: previews close, and stay away from that icon until the pointer leaves it.
+    fn suppress_preview(&mut self) {
+        self.preview_suppressed = self.docks.iter().enumerate().find_map(|(i, d)| d.hovered_key().map(|k| (i, k)));
+        self.preview_pending = None;
+        self.close_preview();
+    }
+
+    /// The window list changed: open previews follow their app's windows
+    /// (titles in place; windows opening or closing re-lay the panel).
+    fn sync_preview(&mut self) {
+        let Some(p) = &mut self.preview else { return };
+        let source = self.docks.get(p.dock).and_then(|d| d.preview_source(&p.key));
+        match source {
+            None => self.close_preview(),
+            Some(item) if p.shows(&item.windows) => {
+                if p.set_titles(&item.windows) {
+                    self.flush();
+                }
+            }
+            Some(_) => {
+                let (dock, key, hovering) = (p.dock, p.key.clone(), p.hovering);
+                self.open_preview(Some((dock, key)), 1.0);
+                if let Some(p) = &mut self.preview {
+                    p.hovering = hovering;
+                }
+            }
+        }
+    }
+
+    fn on_preview_mouse(&mut self, hwnd: HWND, msg: u32, lp: LPARAM) -> Option<LRESULT> {
+        let p = self.preview.as_mut()?;
+        let (x, y) = mouse_pt(lp, p.surface.scale);
+        match msg {
+            WM_MOUSEMOVE => {
+                if !p.tracking {
+                    p.tracking = true;
+                    track_leave(hwnd);
+                }
+                p.on_move(x, y);
+                self.update_preview(false);
+            }
+            WM_MOUSELEAVE => {
+                p.on_leave();
+                self.update_preview(false);
+            }
+            WM_LBUTTONDOWN => p.on_down(x, y),
+            WM_LBUTTONUP => {
+                match p.on_up(x, y) {
+                    Some(dock_preview::Click::Activate(h)) => {
+                        push(Action::Activate(h));
+                        self.preview_suppressed = self.preview.as_ref().map(|p| (p.dock, p.key.clone()));
+                        self.close_preview();
+                    }
+                    // The panel stays: a closed window's card goes when the window list catches up.
+                    Some(dock_preview::Click::Light(h, light)) => push(match light {
+                        dock_preview::Light::Close => Action::CloseWindows(vec![h]),
+                        dock_preview::Light::Minimize => Action::Minimize(h),
+                        dock_preview::Light::Zoom => Action::Zoom(h),
+                    }),
+                    None => {}
+                }
+            }
+            _ => return None,
+        }
+        self.animate();
+        Some(LRESULT(0))
+    }
+
     fn on_dock_mouse(&mut self, i: usize, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let d = self.docks.get_mut(i)?;
         let (x, y) = mouse_pt(lp, d.surface.scale);
@@ -5373,12 +5591,15 @@ impl App {
                 if d.dragging() && unsafe { GetCapture() } != hwnd {
                     unsafe { SetCapture(hwnd) };
                 }
+                self.update_preview(false);
             }
             WM_MOUSELEAVE => {
                 d.tracking = false;
-                if d.menu_item.is_none() {
+                // An open menu or previews keep the Dock as it is (magnified, shown).
+                if d.menu_item.is_none() && d.previewing.is_none() {
                     animate = d.on_leave();
                 }
+                self.update_preview(false);
             }
             WM_CAPTURECHANGED => {
                 if lp.0 != hwnd.0 as isize {
@@ -5388,6 +5609,7 @@ impl App {
             }
             WM_LBUTTONDOWN => {
                 self.close_menu();
+                self.suppress_preview();
                 if let Some(d) = self.docks.get_mut(i) {
                     d.on_down(x, y);
                 }
@@ -5405,6 +5627,8 @@ impl App {
                 }
             }
             WM_RBUTTONUP => {
+                self.suppress_preview();
+                let Some(d) = self.docks.get_mut(i) else { return Some(LRESULT(0)) };
                 if let Some((idx, entries, placement)) = d.context_menu(x, y) {
                     self.menu_opener = hwnd;
                     self.open_menu(entries, placement, MenuSource::Dock(idx));

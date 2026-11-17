@@ -57,6 +57,18 @@ pub enum FileDrop {
     Trash,
 }
 
+/// A running app whose window previews are about to show (see `Dock::preview_source`).
+pub struct PreviewItem {
+    pub windows: Vec<AppWindow>,
+    /// The icon's centre and top, in screen points.
+    pub anchor: (f32, f32),
+    pub name: String,
+    /// Its icon as the Dock loads it: cache key, what to load, and a custom icon.
+    pub bitmap_key: String,
+    pub icon_key: String,
+    pub custom: Option<String>,
+}
+
 /// A drag from another app over the Dock.
 struct FileHover {
     item: Option<usize>,
@@ -447,6 +459,8 @@ pub struct Dock {
     /// The desktop has focus (for `show_on_desktop`).
     on_desktop: bool,
     pub menu_item: Option<usize>,
+    /// The item (by launch target) whose window previews are showing above it.
+    pub previewing: Option<String>,
     pub tracking: bool,
     reserved: bool,
     /// `[app_icons]`: custom icons by exe file name.
@@ -511,6 +525,7 @@ impl Dock {
             idle: 0.0,
             on_desktop,
             menu_item: None,
+            previewing: None,
             tracking: false,
             reserved,
             app_icons: cfg.app_icons.clone(),
@@ -746,6 +761,68 @@ impl Dock {
         self.ease_left > 0.0
     }
 
+    /// The running app under the pointer whose window previews may show (by
+    /// launch target): only while the pointer really rests on the shown Dock,
+    /// with nothing else going on.
+    pub fn preview_target(&self) -> Option<String> {
+        if !self.cfg.window_previews
+            || !self.tracking
+            || !self.hovering
+            || self.drag.is_some()
+            || self.pressed.is_some()
+            || self.menu_item.is_some()
+            || self.file_hover.is_some()
+            || self.hide_t > 0.01
+        {
+            return None;
+        }
+        let item = &self.items[self.item_at(self.mouse.0, self.mouse.1)?];
+        // The icon picker is a panel of ours, not a window to pick.
+        (item.kind == Kind::App && !item.windows.is_empty() && item.launch != PICKER_PATH).then(|| item.launch.clone())
+    }
+
+    /// The item under the pointer (by launch target), whatever is going on.
+    pub fn hovered_key(&self) -> Option<String> {
+        if !self.tracking || !self.hovering {
+            return None;
+        }
+        self.item_at(self.mouse.0, self.mouse.1).map(|i| self.items[i].launch.clone())
+    }
+
+    /// What the previews of item `key` show: its windows, and where its icon's
+    /// centre and top are (screen points), with the Dock as magnified as it is now.
+    pub fn preview_source(&self, key: &str) -> Option<PreviewItem> {
+        let i = self.preview_index(key)?;
+        let item = &self.items[i];
+        Some(PreviewItem {
+            windows: item.windows.clone(),
+            anchor: self.anchor_of(i)?,
+            name: item.name.clone(),
+            bitmap_key: item.bitmap_key().to_string(),
+            icon_key: item.icon_key.clone(),
+            custom: item.custom_icon.clone(),
+        })
+    }
+
+    /// Where item `key`'s icon is now (centre and top, screen points), for previews following it.
+    pub fn preview_anchor(&self, key: &str) -> Option<(f32, f32)> {
+        self.anchor_of(self.preview_index(key)?)
+    }
+
+    fn preview_index(&self, key: &str) -> Option<usize> {
+        self.items.iter().position(|it| it.kind == Kind::App && it.launch == key && !it.windows.is_empty())
+    }
+
+    fn anchor_of(&self, i: usize) -> Option<(f32, f32)> {
+        let (cx, size) = self.slots().get(i)?;
+        let s = self.surface.scale;
+        let (left, top) = (self.surface.rect.left as f32 / s, self.surface.rect.top as f32 / s);
+        // Level with the tallest the icons get, so the panel doesn't sit on a
+        // neighbour that magnifies under it.
+        let tallest = size.max(self.metrics.max);
+        Some((left + cx, top + self.icon_bottom() - tallest))
+    }
+
     /// Starts the launch bounce on the item that launches `path`.
     pub fn bounce(&mut self, path: &str) -> bool {
         match self.items.iter_mut().find(|i| i.kind == Kind::App && i.launch.eq_ignore_ascii_case(path)) {
@@ -824,7 +901,7 @@ impl Dock {
             self.dirty = true;
         }
 
-        let target = if self.hovering && self.cfg.magnification && self.drag.is_none() { 1.0 } else { 0.0 };
+        let target = if (self.hovering || self.previewing.is_some()) && self.cfg.magnification && self.drag.is_none() { 1.0 } else { 0.0 };
         if self.hover_t != target {
             self.hover_t = approach(self.hover_t, target, dt, 15.0);
             animating = true;
@@ -849,6 +926,7 @@ impl Dock {
                 || self.drag.is_some()
                 || self.file_hover.is_some()
                 || self.menu_item.is_some()
+                || self.previewing.is_some()
                 || self.pressed.is_some()
                 || (self.cfg.show_on_desktop && self.on_desktop);
             let target = if wants_shown {
@@ -1333,7 +1411,7 @@ impl Dock {
         let drag = self.drag;
         let label: Option<(usize, String)> = if let Some(d) = drag {
             d.out.then(|| (d.from, "Remove".to_string()))
-        } else if self.hovering && self.pressed.is_none() && self.menu_item.is_none() && self.hide_t < 0.01 {
+        } else if self.hovering && self.pressed.is_none() && self.menu_item.is_none() && self.previewing.is_none() && self.hide_t < 0.01 {
             self.item_at(self.mouse.0, self.mouse.1).map(|i| (i, self.items[i].name.clone()))
         } else {
             None

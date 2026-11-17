@@ -21,6 +21,7 @@ mod cpu_stacks;
 mod cpu_watch;
 mod dock;
 mod dock_drop;
+mod dock_preview;
 mod finder;
 mod geom;
 mod gfx;

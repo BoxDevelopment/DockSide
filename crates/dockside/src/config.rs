@@ -256,6 +256,8 @@ pub struct DockCfg {
     pub tint_dark: String,
     pub icon_style: IconStyle,
     pub show_running: bool,
+    /// Resting the pointer on a running app's icon shows its windows' live previews.
+    pub window_previews: bool,
     pub show_trash: bool,
     /// Custom Trash icons (.png / .ico) for when it's empty and full ("" = the Recycle Bin's own).
     pub trash_icon: String,

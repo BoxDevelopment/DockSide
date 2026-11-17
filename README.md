@@ -27,6 +27,8 @@ hidden while DockSide runs and is always restored when it exits.
 - Pinned apps plus running apps, the Trash, a separator and running indicators
 - macOS-style magnification (cosine falloff, cursor-anchored), a launch bounce and tooltips
 - Click to launch or activate; clicking an app that's already frontmost cycles its windows
+- Window previews: rest the pointer on a running app's icon for live thumbnails of each of its windows
+  (DWM's own, so they cost nothing to keep live) and click one to switch to it (`window_previews = true`)
 - Context menu: the app's windows, Keep in Dock, Show in Explorer, Open / Quit, Empty Trash
 - Drag icons to reorder them, or drag one up out of the Dock to remove it (both are saved to config)
 - Auto-hide (`autohide = true`): the Dock slides away and returns when the pointer touches the bottom edge

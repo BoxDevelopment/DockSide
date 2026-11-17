@@ -621,6 +621,7 @@ pub(crate) enum Key {
     DockIconStyle,
     DockBackdrop,
     DockRunning,
+    DockPreviews,
     DockTrash,
     DockShadow,
     DockBorder,
@@ -714,6 +715,7 @@ impl Key {
             Key::DockIconStyle => ("dock", "icon_style"),
             Key::DockBackdrop => ("dock", "backdrop"),
             Key::DockRunning => ("dock", "show_running"),
+            Key::DockPreviews => ("dock", "window_previews"),
             Key::DockTrash => ("dock", "show_trash"),
             Key::DockShadow => ("dock", "shadow"),
             Key::DockBorder => ("dock", "border"),
@@ -1868,7 +1870,11 @@ impl SettingsWindow {
                 },
                 Group {
                     title: Some("In the Dock"),
-                    rows: vec![Row::Toggle("Show running apps", Key::DockRunning), Row::Toggle("Show Trash", Key::DockTrash)],
+                    rows: vec![
+                        Row::Toggle("Show running apps", Key::DockRunning),
+                        Row::Toggle("Show window previews", Key::DockPreviews),
+                        Row::Toggle("Show Trash", Key::DockTrash),
+                    ],
                 },
                 Group {
                     title: Some("Displays"),
@@ -2043,6 +2049,7 @@ impl SettingsWindow {
             Key::DockAutohide => d.autohide,
             Key::DockShowOnDesktop => d.show_on_desktop,
             Key::DockRunning => d.show_running,
+            Key::DockPreviews => d.window_previews,
             Key::DockTrash => d.show_trash,
             Key::DockShadow => d.shadow,
             Key::DockBorder => d.border,

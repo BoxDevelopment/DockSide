@@ -36,44 +36,49 @@ pub struct CalendarMenu {
     accounts: usize,
 }
 
-fn days(d: NaiveDate) -> i32 {
+pub(crate) fn days(d: NaiveDate) -> i32 {
     (d - NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default()).num_days() as i32
 }
 
-fn from_days(n: i32) -> NaiveDate {
+pub(crate) fn from_days(n: i32) -> NaiveDate {
     NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or_default() + Duration::days(n as i64)
 }
 
-fn midnight(d: NaiveDate) -> i64 {
+pub(crate) fn midnight(d: NaiveDate) -> i64 {
     crate::calsync::google::local_midnight(d)
 }
 
-fn local_date(t: i64) -> NaiveDate {
+pub(crate) fn local_date(t: i64) -> NaiveDate {
     Local.timestamp_opt(t, 0).single().map(|d| d.date_naive()).unwrap_or_default()
 }
 
-fn clock(t: i64) -> String {
+pub(crate) fn clock(t: i64) -> String {
     Local.timestamp_opt(t, 0).single().map(|d| d.format("%-I:%M %p").to_string()).unwrap_or_default()
 }
 
-fn first_of(d: NaiveDate) -> NaiveDate {
+pub(crate) fn first_of(d: NaiveDate) -> NaiveDate {
     d.with_day(1).unwrap_or(d)
 }
 
-fn add_months(d: NaiveDate, n: i32) -> NaiveDate {
+pub(crate) fn add_months(d: NaiveDate, n: i32) -> NaiveDate {
     let m0 = d.year() * 12 + d.month0() as i32 + n;
     NaiveDate::from_ymd_opt(m0.div_euclid(12), m0.rem_euclid(12) as u32 + 1, 1).unwrap_or(d)
+}
+
+/// Whether weeks start on Monday (else Sunday), from the setting or Windows'.
+pub(crate) fn monday_first(cfg: &Config) -> bool {
+    match cfg.calendar.week_starts.to_ascii_lowercase().as_str() {
+        "monday" => true,
+        "sunday" => false,
+        // Windows: 0 = Monday … 6 = Sunday.
+        _ => crate::win::system::intl_string("iFirstDayOfWeek").map(|v| v.trim() == "0").unwrap_or(false),
+    }
 }
 
 impl CalendarMenu {
     pub fn new(cfg: &Config) -> Self {
         let today = Local::now().date_naive();
-        let monday = match cfg.calendar.week_starts.to_ascii_lowercase().as_str() {
-            "monday" => true,
-            "sunday" => false,
-            // Windows: 0 = Monday … 6 = Sunday.
-            _ => crate::win::system::intl_string("iFirstDayOfWeek").map(|v| v.trim() == "0").unwrap_or(false),
-        };
+        let monday = monday_first(cfg);
         let mut m = Self { month: first_of(today), selected: today, monday, events: Vec::new(), gen: u64::MAX, accounts: 0 };
         m.reload();
         m
@@ -124,7 +129,7 @@ impl CalendarMenu {
 }
 
 /// Screenshot Mode's placeholder day.
-fn demo_events() -> Vec<Event> {
+pub(crate) fn demo_events() -> Vec<Event> {
     crate::screenshot_mode::events()
         .into_iter()
         .enumerate()
@@ -172,6 +177,14 @@ impl Content for CalendarMenu {
             }
             hits.push((r, *hit));
         }
+        // Full screen: the Calendar app.
+        let r = Rect::new(W - PAD - 84.0 - 32.0, y + 8.0, 26.0, 24.0);
+        if ctx.hover == Some(Hit::Expand) {
+            p.fill_round(r, 7.0, pal.chip);
+        }
+        let expand = p.gfx.format("Segoe Fluent Icons", 11.0, Weight::Regular, Align::Center);
+        p.text("\u{E740}", &expand, r, pal.text);
+        hits.push((r, Hit::Expand));
         y += HEADER_H;
 
         // Weekday initials.
@@ -299,6 +312,7 @@ impl Content for CalendarMenu {
 
     fn click(&mut self, hit: Hit) -> DropEvent {
         match hit {
+            Hit::Expand => return DropEvent::Run(Action::OpenCalendar),
             Hit::Prev => self.set_month(add_months(self.month, -1)),
             Hit::Next => self.set_month(add_months(self.month, 1)),
             Hit::Today => {

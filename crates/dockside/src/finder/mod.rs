@@ -3920,10 +3920,10 @@ impl FinderWindow {
 /// their sizing messages are handled even when they arrive while the App is busy
 /// (it is whenever the window resizes itself, e.g. from the green button).
 const FRAME_PROP: windows::core::PCWSTR = windows::core::w!("DockSide.FinderFrame");
-const FRAME_NORMAL: usize = 1;
-const FRAME_FULL: usize = 2;
+pub(crate) const FRAME_NORMAL: usize = 1;
+pub(crate) const FRAME_FULL: usize = 2;
 
-fn set_frame_state(hwnd: HWND, state: usize) {
+pub(crate) fn set_frame_state(hwnd: HWND, state: usize) {
     unsafe {
         let _ = SetPropW(hwnd, FRAME_PROP, windows::Win32::Foundation::HANDLE(state as _));
     }
@@ -3979,7 +3979,7 @@ pub fn frame_message(hwnd: HWND, msg: u32, lp: windows::Win32::Foundation::LPARA
 
 /// Tells the taskbar a window is full screen, so it gets out of the way while that
 /// window is in front (it only spots ordinary fullscreen windows on its own).
-fn mark_fullscreen(hwnd: HWND, on: bool) {
+pub(crate) fn mark_fullscreen(hwnd: HWND, on: bool) {
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::{ITaskbarList2, TaskbarList};
     unsafe {

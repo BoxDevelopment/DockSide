@@ -61,6 +61,8 @@ pub enum Action {
     OpenOnboarding,
     /// The About This PC window.
     OpenAbout,
+    /// The Calendar app window.
+    OpenCalendar,
     /// Open a Finder window (at a folder, or Home).
     OpenFinder(Option<std::path::PathBuf>),
     /// Show or hide the Spotlight search panel.

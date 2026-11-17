@@ -29,7 +29,8 @@ use crate::finder::FINDER_PATH;
 use crate::keybind;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::IconStore;
-use crate::gfx::{finder_icon, launchpad_icon, start_icon, Align, Canvas, Gfx, Painter, Weight};
+use crate::calapp::CALENDAR_PATH;
+use crate::gfx::{calendar_icon, finder_icon, launchpad_icon, start_icon, Align, Canvas, Gfx, Painter, Weight};
 use crate::menu::Action;
 use crate::spotlight::web;
 use crate::theme::Theme;
@@ -248,6 +249,7 @@ fn calendar_groups() -> Vec<Group> {
         return vec![
             Group { title: Some("Accounts"), rows },
             Group { title: Some("Menu Bar Calendar"), rows: vec![Row::Segmented("Weeks start on", Key::CalWeekStart)] },
+            Group { title: Some("Calendar App"), rows: vec![Row::Segmented("Open in", Key::CalDefaultView)] },
         ];
     };
 
@@ -558,6 +560,7 @@ pub(crate) enum Key {
     CalGoogleSecret,
     CalMsId,
     CalWeekStart,
+    CalDefaultView,
     /// Calendar setup: typed into the draft, not config.toml.
     CalDraft(crate::calsync::Field),
     HideTaskbar,
@@ -651,6 +654,7 @@ impl Key {
             Key::CalGoogleSecret => ("calendar", "google_client_secret"),
             Key::CalMsId => ("calendar", "microsoft_client_id"),
             Key::CalWeekStart => ("calendar", "week_starts"),
+            Key::CalDefaultView => ("calendar", "default_view"),
             Key::CalDraft(_) => ("", ""),
             Key::HideTaskbar => ("general", "hide_taskbar"),
             Key::ShortcutStyle => ("general", "shortcut_style"),
@@ -765,6 +769,7 @@ pub(crate) enum Hit {
     AddApp,
     AddStart,
     AddFinder,
+    AddCalendar,
     AddLaunchpad,
     ResetLaunchpad,
     LaunchpadUnhide(usize),
@@ -1887,6 +1892,7 @@ impl SettingsWindow {
                             std::iter::once(("Add App…", Hit::AddApp))
                                 .chain((!cfg.dock.apps.iter().any(|a| a.path == FINDER_PATH)).then_some(("Add Finder", Hit::AddFinder)))
                                 .chain((!cfg.dock.apps.iter().any(|a| a.path == START_PATH)).then_some(("Add Start", Hit::AddStart)))
+                                .chain((!cfg.dock.apps.iter().any(|a| a.path == CALENDAR_PATH)).then_some(("Add Calendar", Hit::AddCalendar)))
                                 .chain((!cfg.dock.apps.iter().any(|a| a.path == LAUNCHPAD_PATH)).then_some(("Add Launchpad", Hit::AddLaunchpad)))
                                 .collect(),
                         )))
@@ -2116,6 +2122,11 @@ impl SettingsWindow {
                 const STARTS: [(&str, &str); 3] = [("Automatic", "auto"), ("Sunday", "sunday"), ("Monday", "monday")];
                 let current = cfg.calendar.week_starts.to_lowercase();
                 fixed(&STARTS, Some(STARTS.iter().position(|u| u.1 == current).unwrap_or(0)))
+            }
+            Key::CalDefaultView => {
+                const VIEWS: [(&str, &str); 4] = [("Day", "day"), ("Week", "week"), ("Month", "month"), ("Year", "year")];
+                let current = cfg.calendar.default_view.to_lowercase();
+                fixed(&VIEWS, Some(VIEWS.iter().position(|u| u.1 == current).unwrap_or(2)))
             }
             Key::WidgetsAudio => {
                 let devices = audio_devices();
@@ -2622,6 +2633,7 @@ impl SettingsWindow {
                 return SettingsEvent::None;
             }
             Hit::AddFinder => Action::TogglePin { path: FINDER_PATH.into(), name: "Finder".into(), pin: true },
+            Hit::AddCalendar => Action::TogglePin { path: CALENDAR_PATH.into(), name: "Calendar".into(), pin: true },
             Hit::OpenConfig => Action::OpenConfig,
             Hit::ExportSettings => Action::ExportSettings,
             Hit::ImportSettings => Action::ImportSettings,
@@ -2682,6 +2694,10 @@ impl SettingsWindow {
                         (FINDER_PATH, None) => icons.builtin(finder_icon::KEY, || finder_icon::render(gfx)),
                         (START_PATH, None) => icons.builtin(start_icon::KEY, || start_icon::render(gfx)),
                         (LAUNCHPAD_PATH, None) => icons.builtin(launchpad_icon::KEY, || launchpad_icon::render(gfx)),
+                        (CALENDAR_PATH, None) => {
+                            let day = chrono::Local::now().date_naive();
+                            icons.builtin(&calendar_icon::key(day), || calendar_icon::render(gfx, day))
+                        }
                         (path, custom) => icons.get(&gfx.wic, path, custom),
                     };
                     // Fitted to the row's icon once: scaling a big custom icon (often

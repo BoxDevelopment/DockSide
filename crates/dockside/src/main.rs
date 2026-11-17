@@ -7,6 +7,7 @@ mod about;
 mod anim;
 mod app;
 mod backup;
+mod calapp;
 mod calsync;
 mod custom;
 mod photo_edit;

@@ -40,6 +40,7 @@ use crate::genie::Genie;
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
 use crate::about::{About, AboutEvent, ABOUT_PATH};
+use crate::calapp::{CalendarApp, CalendarEvent, CALENDAR_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
 use crate::launchpad::{Launchpad, LaunchpadEvent, LAUNCHPAD_HWND};
 use crate::spotlight::{self, Spotlight, SpotlightEvent, SPOTLIGHT_HWND};
@@ -476,6 +477,9 @@ fn execute(action: Action) {
                 }
             });
         }
+        Action::Launch { path, .. } if path == CALENDAR_PATH => {
+            with_app(|app| app.open_calendar());
+        }
         Action::Launch { path, .. } if path == SETTINGS_PATH => {
             with_app(|app| app.open_settings(None));
         }
@@ -688,6 +692,9 @@ fn execute(action: Action) {
         }
         Action::OpenAbout => {
             with_app(|app| app.open_about());
+        }
+        Action::OpenCalendar => {
+            with_app(|app| app.open_calendar());
         }
         Action::SetDockApps(list) => {
             match config::save_dock_apps(&config::path(), &list) {
@@ -1181,6 +1188,10 @@ pub struct App {
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
     about: Option<About>,
+    /// The Calendar app, from the menu bar calendar or a Calendar widget.
+    calendar: Option<CalendarApp>,
+    /// The Calendar app after closing, while it zooms away.
+    closing_calendar: Option<CalendarApp>,
     finders: Vec<FinderWindow>,
     /// Closed Finder windows, still fading out.
     closing_finders: Vec<FinderWindow>,
@@ -1371,6 +1382,8 @@ impl App {
             settings: None,
             onboarding: None,
             about: None,
+            calendar: None,
+            closing_calendar: None,
             finders: Vec::new(),
             closing_finders: Vec::new(),
             fading: Vec::new(),
@@ -1528,6 +1541,9 @@ impl App {
             }
             if let Some(a) = &mut self.about {
                 a.dirty = true;
+            }
+            if let Some(c) = &mut self.calendar {
+                c.update();
             }
             if let Some(c) = &mut self.control {
                 c.dirty = true;
@@ -1964,6 +1980,36 @@ impl App {
         }
     }
 
+    fn open_calendar(&mut self) {
+        self.close_dropdown();
+        match &mut self.calendar {
+            Some(c) => c.show(),
+            None => match CalendarApp::new(&self.gfx, &self.theme, &self.cfg, &Monitor::at_cursor()) {
+                Ok(c) => {
+                    self.calendar = Some(c);
+                    self.animate();
+                }
+                Err(e) => log!("calendar window failed: {e}"),
+            },
+        }
+        self.refresh_windows();
+        self.flush();
+    }
+
+    fn close_calendar(&mut self) {
+        if let Some(mut c) = self.calendar.take() {
+            apps::pass_focus_from(c.hwnd);
+            let full = c.is_fullscreen();
+            c.begin_close();
+            self.closing_calendar = Some(c);
+            self.animate();
+            self.refresh_windows();
+            if full {
+                self.update_fullscreen();
+            }
+        }
+    }
+
     fn open_onboarding(&mut self) {
         match &mut self.onboarding {
             Some(o) => o.show(),
@@ -2153,6 +2199,16 @@ impl App {
         if let Some(a) = &mut self.about {
             still |= a.tick(dt);
         }
+        if let Some(c) = &mut self.calendar {
+            still |= c.tick(dt);
+        }
+        if let Some(c) = &mut self.closing_calendar {
+            c.tick(dt);
+            if c.closed() {
+                self.closing_calendar = None;
+            }
+        }
+        still |= self.closing_calendar.is_some();
         if let Some(w) = &mut self.widgets {
             still |= w.animate(dt);
         }
@@ -2223,6 +2279,12 @@ impl App {
         }
         if let Some(w) = &mut self.widgets {
             w.on_tick();
+        }
+        if let Some(c) = &mut self.calendar {
+            c.on_tick();
+        }
+        for d in &mut self.docks {
+            d.refresh_calendar_icon();
         }
         if self.hides_taskbar() {
             taskbar::reapply();
@@ -2305,7 +2367,8 @@ impl App {
         // Launchpad fills the screen too: the menu bar and island make way for it, the Dock doesn't.
         let launchpad = self.launchpad.iter().chain(&self.closing_launchpads).any(|l| l.hwnd == fg);
         // Finder in full screen too (layered windows don't count as fullscreen apps).
-        let finder_full = self.finders.iter().any(|f| f.hwnd == fg && f.is_fullscreen());
+        let finder_full = self.finders.iter().any(|f| f.hwnd == fg && f.is_fullscreen())
+            || self.calendar.as_ref().is_some_and(|c| c.hwnd == fg && c.is_fullscreen());
         let full = (finder_full || apps::is_fullscreen_app(fg, mon.rect)).then_some((mon.rect, launchpad));
         if full == self.fullscreen_on {
             return;
@@ -2334,7 +2397,8 @@ impl App {
         let surface = !shell && apps::window_pid(fg) == self.pid && !self.finders.iter().any(|f| f.hwnd == fg)
             && !self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
             && !self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
-            && !self.about.as_ref().is_some_and(|a| a.hwnd == fg);
+            && !self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+            && !self.calendar.as_ref().is_some_and(|c| c.hwnd == fg);
         if surface {
             return;
         }
@@ -2375,7 +2439,8 @@ impl App {
         // Our own shell surfaces (Dock, menu bar, menus) leave the state as it was.
         let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
             || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
-            || self.about.as_ref().is_some_and(|a| a.hwnd == fg);
+            || self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+            || self.calendar.as_ref().is_some_and(|c| c.hwnd == fg);
         let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || ours {
             Some(false)
         } else if fg.is_invalid() || apps::window_pid(fg) == self.pid {
@@ -2409,6 +2474,7 @@ impl App {
         if self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
             || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
             || self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+            || self.calendar.as_ref().is_some_and(|c| c.hwnd == fg)
         {
             self.watch_app_menus(HWND::default(), None);
         }
@@ -2427,6 +2493,12 @@ impl App {
         if self.about.as_ref().is_some_and(|a| a.hwnd == fg) {
             for mb in &mut self.menubars {
                 mb.set_app(crate::about::TITLE.into(), fg, None);
+            }
+            return;
+        }
+        if self.calendar.as_ref().is_some_and(|c| c.hwnd == fg) {
+            for mb in &mut self.menubars {
+                mb.set_app(crate::calapp::TITLE.into(), fg, None);
             }
             return;
         }
@@ -2639,6 +2711,9 @@ impl App {
         if let Some(a) = self.about.as_mut().filter(|a| a.dirty) {
             a.render(&self.gfx, &self.theme);
         }
+        for c in self.calendar.iter_mut().chain(&mut self.closing_calendar).filter(|c| c.dirty) {
+            c.render(&self.gfx, &self.theme);
+        }
         if let Some(p) = self.icon_picker.as_mut().filter(|p| p.dirty) {
             p.render(&self.gfx, &self.theme);
         }
@@ -2687,6 +2762,8 @@ impl App {
             || self.settings.as_ref().is_some_and(|s| s.animating())
             || self.onboarding.as_ref().is_some_and(|o| o.animating())
             || self.about.as_ref().is_some_and(|a| a.animating())
+            || self.calendar.as_ref().is_some_and(|c| c.animating())
+            || self.closing_calendar.is_some()
             || self.widgets.as_ref().is_some_and(|w| w.animating())
             || self.finders.iter().any(|f| f.animating())
             || !self.closing_finders.is_empty()
@@ -3570,6 +3647,7 @@ impl App {
         v.extend(self.settings.as_ref().map(|s| window(s.hwnd, SETTINGS_PATH, "System Settings")));
         v.extend(self.onboarding.as_ref().map(|o| window(o.hwnd, ONBOARDING_PATH, "Setup Assistant")));
         v.extend(self.about.as_ref().map(|a| window(a.hwnd, ABOUT_PATH, crate::about::TITLE)));
+        v.extend(self.calendar.as_ref().map(|c| window(c.hwnd, CALENDAR_PATH, crate::calapp::TITLE)));
         v.extend(self.icon_picker.as_ref().map(|p| window(p.surface.content, PICKER_PATH, "Icon Picker")));
         v
     }
@@ -4450,6 +4528,9 @@ impl App {
                     if let Some(d) = &mut self.dropdown {
                         d.update();
                     }
+                    if let Some(c) = self.calendar.as_mut().filter(|_| msg == win::WM_APP_CALENDAR) {
+                        c.update();
+                    }
                     if msg == win::WM_APP_CALENDAR {
                         self.mark_settings_dirty();
                     }
@@ -4587,6 +4668,11 @@ impl App {
         }
         if self.about.as_ref().is_some_and(|a| a.hwnd == hwnd) {
             let r = self.on_about_message(hwnd, msg, wp, lp);
+            self.flush_input(msg);
+            return r;
+        }
+        if self.calendar.as_ref().is_some_and(|c| c.hwnd == hwnd) {
+            let r = self.on_calendar_message(hwnd, msg, wp, lp);
             self.flush_input(msg);
             return r;
         }
@@ -4791,6 +4877,91 @@ impl App {
             AboutEvent::None => {}
             AboutEvent::Action(act) => push(act),
             AboutEvent::Close => self.close_about(),
+        }
+        Some(LRESULT(0))
+    }
+
+    fn on_calendar_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+        let c = self.calendar.as_mut()?;
+        let was_full = c.is_fullscreen();
+        let scale = c.scale();
+        let (x, y) = mouse_pt(lp, scale);
+        let mut rc = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(hwnd, &mut rc);
+        }
+        // Hit tests and the wheel carry screen coordinates.
+        let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+        let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+        let (lx, ly) = ((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
+        let event = match msg {
+            WM_NCHITTEST => return Some(LRESULT(c.nc_hit(lx, ly) as isize)),
+            WM_WINDOWPOSCHANGED => {
+                c.on_window_pos();
+                return None;
+            }
+            WM_SIZE => {
+                c.on_size();
+                return None;
+            }
+            WM_ACTIVATE => {
+                c.focused = (wp.0 & 0xFFFF) != 0;
+                c.redraw();
+                return None;
+            }
+            WM_MOUSEMOVE => {
+                if !c.tracking {
+                    c.tracking = true;
+                    track_leave(hwnd);
+                }
+                c.on_move(x, y);
+                CalendarEvent::None
+            }
+            WM_MOUSELEAVE => {
+                c.on_leave();
+                CalendarEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                c.on_down(x, y);
+                unsafe { SetCapture(hwnd) };
+                CalendarEvent::None
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                c.on_up(x, y)
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                c.on_wheel(lx, ((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32, msg == WM_MOUSEHWHEEL);
+                CalendarEvent::None
+            }
+            // Alt+F4 keeps its default meaning (WM_CLOSE).
+            WM_SYSKEYDOWN if wp.0 == 0x73 => return None,
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+                c.on_key(wp.0 as u16, ctrl)
+            }
+            WM_SYSCHAR => return Some(LRESULT(0)),
+            WM_CLOSE => CalendarEvent::Close,
+            // Full screen has no maximize or move (Win+Up, the window menu).
+            WM_SYSCOMMAND if c.is_fullscreen() && matches!((wp.0 & 0xFFF0) as u32, SC_MAXIMIZE | SC_MOVE | SC_SIZE) => {
+                return Some(LRESULT(0));
+            }
+            _ => return None,
+        };
+        let full_changed = c.is_fullscreen() != was_full;
+        if c.animating() {
+            self.animate();
+        }
+        match event {
+            CalendarEvent::None => {}
+            CalendarEvent::Action(act) => push(act),
+            CalendarEvent::Close => self.close_calendar(),
+        }
+        if full_changed {
+            self.update_fullscreen();
         }
         Some(LRESULT(0))
     }

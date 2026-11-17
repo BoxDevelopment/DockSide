@@ -15,10 +15,11 @@ use crate::config::{Config, ConfigValue, DockApp, DockCfg, IconStyle};
 use crate::finder::FINDER_PATH;
 use crate::geom::{Color, Rect};
 use crate::gfx::icons::{IconStore, RECYCLE_BIN};
-use crate::gfx::{finder_icon, launchpad_icon, start_icon, Align, Gfx, Weight};
+use crate::gfx::{calendar_icon, finder_icon, launchpad_icon, start_icon, Align, Gfx, Weight};
 use crate::icon_picker::{IconTarget, PICKER_PATH};
 use crate::onboarding::ONBOARDING_PATH;
 use crate::about::ABOUT_PATH;
+use crate::calapp::CALENDAR_PATH;
 use crate::settings::SETTINGS_PATH;
 use crate::menu::{Action, Entry, Placement};
 use crate::surface::Surface;
@@ -353,6 +354,7 @@ fn icon_source(path: &str) -> String {
         FINDER_PATH => finder_icon::KEY.to_string(),
         START_PATH => start_icon::KEY.to_string(),
         LAUNCHPAD_PATH => launchpad_icon::KEY.to_string(),
+        CALENDAR_PATH => calendar_icon::key(chrono::Local::now().date_naive()),
         SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH | ABOUT_PATH => {
             std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
         }
@@ -362,7 +364,7 @@ fn icon_source(path: &str) -> String {
 
 /// Our drawn icons are already tiles.
 fn is_drawn_icon(key: &str) -> bool {
-    key == finder_icon::KEY || key == start_icon::KEY || key == launchpad_icon::KEY
+    key == finder_icon::KEY || key == start_icon::KEY || key == launchpad_icon::KEY || key.starts_with(calendar_icon::PREFIX)
 }
 
 /// Names for DockSide's own windows, which show in the Dock like apps.
@@ -373,6 +375,7 @@ fn own_app_name(path: &str) -> Option<&'static str> {
         PICKER_PATH => Some("Icon Picker"),
         ONBOARDING_PATH => Some("Setup Assistant"),
         ABOUT_PATH => Some(crate::about::TITLE),
+        CALENDAR_PATH => Some(crate::calapp::TITLE),
         _ => None,
     }
 }
@@ -520,6 +523,15 @@ impl Dock {
         phases.mark("drop target");
         log!("dock: {}", phases.summary());
         Ok(dock)
+    }
+
+    /// Turns the Calendar's icon over to today's date (after midnight).
+    pub fn refresh_calendar_icon(&mut self) {
+        let today = calendar_icon::key(chrono::Local::now().date_naive());
+        for item in self.items.iter_mut().filter(|i| i.icon_key.starts_with(calendar_icon::PREFIX) && i.icon_key != today) {
+            item.icon_key = today.clone();
+            self.dirty = true;
+        }
     }
 
     /// Applies a new pinned-app list in place: running windows and bounces are
@@ -958,7 +970,7 @@ impl Dock {
             Kind::App if item.launch == FINDER_PATH => {
                 if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
             }
-            Kind::App if [START_PATH, LAUNCHPAD_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH, ABOUT_PATH].contains(&item.launch.as_str()) => FileDrop::None,
+            Kind::App if [START_PATH, LAUNCHPAD_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH, ABOUT_PATH, CALENDAR_PATH].contains(&item.launch.as_str()) => FileDrop::None,
             Kind::App => FileDrop::Open,
         }
     }
@@ -1285,6 +1297,7 @@ impl Dock {
                 (finder_icon::KEY, None) => icons.builtin(key, || finder_icon::render(gfx)),
                 (start_icon::KEY, None) => icons.builtin(key, || start_icon::render(gfx)),
                 (launchpad_icon::KEY, None) => icons.builtin(key, || launchpad_icon::render(gfx)),
+                (k, None) if k.starts_with(calendar_icon::PREFIX) => icons.builtin(k, || calendar_icon::render(gfx, calendar_icon::day_of(k)?)),
                 // The shell's Recycle Bin icon follows its state: cache one per state.
                 (TRASH_EMPTY | TRASH_FULL, custom) => icons.request(bitmap_key, RECYCLE_BIN, custom),
                 (_, custom) => icons.request(bitmap_key, key, custom),

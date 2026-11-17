@@ -48,6 +48,8 @@ pub enum Hit {
     Prev,
     Next,
     Today,
+    /// Opens the Calendar app.
+    Expand,
     /// A day, as days since 1970-01-01 (local).
     Day(i32),
     Event(u16),

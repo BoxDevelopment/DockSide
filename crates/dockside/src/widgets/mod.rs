@@ -1397,7 +1397,7 @@ impl Widgets {
                     None => WidgetEvent::None,
                 },
                 WidgetKind::Clock | WidgetKind::WorldClock => WidgetEvent::Action(Action::Open("ms-clock:".into())),
-                WidgetKind::Calendar | WidgetKind::UpNext => WidgetEvent::Action(Action::Open("outlookcal:".into())),
+                WidgetKind::Calendar | WidgetKind::UpNext => WidgetEvent::Action(Action::OpenCalendar),
                 WidgetKind::Batteries => WidgetEvent::Action(Action::Open("ms-settings:bluetooth".into())),
                 WidgetKind::System => WidgetEvent::Action(Action::Open("taskmgr.exe".into())),
                 _ => WidgetEvent::None,

@@ -4,6 +4,7 @@
 //! render target draws into, pushed to the screen with `UpdateLayeredWindow`.
 //! Render targets use the monitor DPI, so all drawing is in logical points.
 
+pub mod calendar_icon;
 pub mod finder_icon;
 pub mod icons;
 pub mod launchpad_icon;
@@ -955,6 +956,17 @@ impl Painter<'_> {
     /// Draws `f` at `opacity` as one group (overlaps don't double up). Fully
     /// opaque or fully clear skips the offscreen layer.
     pub fn faded(&self, opacity: f32, f: impl FnOnce()) {
+        self.faded_layer(None, opacity, f)
+    }
+
+    /// [`Self::faded`] for drawing that stays inside `bounds`: the layer is only
+    /// that big. An unbounded layer is the whole target, which on a big window
+    /// costs a full-window blend each time.
+    pub fn faded_in(&self, bounds: Rect, opacity: f32, f: impl FnOnce()) {
+        self.faded_layer(Some(bounds), opacity, f)
+    }
+
+    fn faded_layer(&self, bounds: Option<Rect>, opacity: f32, f: impl FnOnce()) {
         if opacity >= 0.999 {
             return f();
         }
@@ -964,7 +976,7 @@ impl Painter<'_> {
         unsafe {
             let Ok(layer) = self.rt.CreateLayer(None) else { return f() };
             let params = D2D1_LAYER_PARAMETERS {
-                contentBounds: D2D_RECT_F { left: -f32::MAX, top: -f32::MAX, right: f32::MAX, bottom: f32::MAX },
+                contentBounds: bounds.map_or(D2D_RECT_F { left: -f32::MAX, top: -f32::MAX, right: f32::MAX, bottom: f32::MAX }, |r| r.d2d()),
                 geometricMask: std::mem::ManuallyDrop::new(None),
                 maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 maskTransform: Matrix3x2::identity(),

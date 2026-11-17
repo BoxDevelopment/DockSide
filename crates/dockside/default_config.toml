@@ -367,6 +367,8 @@ microsoft_client_id = ""
 # The first day of the week in the menu bar calendar: "auto" (from Windows'
 # region settings), "sunday" or "monday".
 week_starts = "auto"
+# What the Calendar app opens in: "day", "week", "month" or "year".
+default_view = "month"
 
 [widgets]
 # Widgets on the desktop, below your windows. Drag them to move them (they snap

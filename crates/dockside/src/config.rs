@@ -336,6 +336,8 @@ pub struct CalendarCfg {
     pub microsoft_client_id: String,
     /// "auto", "sunday" or "monday".
     pub week_starts: String,
+    /// What the Calendar app opens in: "day", "week", "month" or "year".
+    pub default_view: String,
 }
 
 /// The Dynamic Island at the top center of the screen.

@@ -1433,6 +1433,8 @@ impl App {
         let started = Instant::now();
         let mut phases = crate::log::Phases::new();
         crate::win::glass::set_enabled(self.cfg.general.glass_refraction);
+        crate::win::glass::set_clarity(self.cfg.general.glass_clarity.amount());
+        crate::win::glass::set_refraction(self.cfg.general.glass_refraction_amount.clamp(0.0, 300.0) / 100.0);
         // Control Center stays open across a rebuild (Dark Mode switched from it), in the new look.
         let reopen = self.control.as_ref().map(|c| c.page());
         self.close_menu();
@@ -1520,6 +1522,10 @@ impl App {
             || g0.glass_refraction != g1.glass_refraction
             || old.finder.sidebar != self.cfg.finder.sidebar;
         let general_changed = g0 != g1;
+        if !rebuild {
+            crate::win::glass::set_clarity(g1.glass_clarity.amount());
+            crate::win::glass::set_refraction(g1.glass_refraction_amount.clamp(0.0, 300.0) / 100.0);
+        }
         let private_changed = crate::screenshot_mode::set(g1.screenshot_mode);
         if rebuild {
             // Backdrop tints depend on light/dark, and glass on refraction; recreate everything.

@@ -569,6 +569,8 @@ pub(crate) enum Key {
     Appearance,
     Font,
     GlassRefraction,
+    GlassClarity,
+    GlassRefractionAmount,
     ScreenshotMode,
     FinderSidebar,
     FinderView,
@@ -662,6 +664,8 @@ impl Key {
             Key::Appearance => ("general", "appearance"),
             Key::Font => ("general", "font"),
             Key::GlassRefraction => ("general", "glass_refraction"),
+            Key::GlassClarity => ("general", "glass_clarity"),
+            Key::GlassRefractionAmount => ("general", "glass_refraction_amount"),
             Key::ScreenshotMode => ("general", "screenshot_mode"),
             Key::FinderSidebar => ("finder", "sidebar"),
             Key::FinderView => ("finder", "view"),
@@ -1603,7 +1607,12 @@ impl SettingsWindow {
                     rows: vec![
                         // Refraction hides glass surfaces from screenshots and screen sharing.
                         Row::Toggle("Refraction (hidden from screenshots)", Key::GlassRefraction),
-                    ],
+                    ]
+                    .into_iter()
+                    // Clarity only changes refracting glass.
+                    .chain(cfg.general.glass_refraction.then_some(Row::Segmented("Look", Key::GlassClarity)))
+                    .chain(cfg.general.glass_refraction.then_some(Row::Slider("Refraction strength", Key::GlassRefractionAmount)))
+                    .collect(),
                 },
             ],
             Page::MenuBar => vec![
@@ -2069,6 +2078,14 @@ impl SettingsWindow {
                     crate::config::Updates::Install => 2,
                 }),
             ),
+            Key::GlassClarity => fixed(
+                &[("Tinted", "tinted"), ("Balanced", "balanced"), ("Clear", "clear")],
+                Some(match cfg.general.glass_clarity {
+                    crate::config::GlassClarity::Tinted => 0,
+                    crate::config::GlassClarity::Balanced => 1,
+                    crate::config::GlassClarity::Clear => 2,
+                }),
+            ),
             Key::ShortcutStyle => fixed(
                 &[("Mac  ⌘C", "mac"), ("Windows  Ctrl+C", "windows")],
                 Some((cfg.general.shortcut_style == ShortcutStyle::Windows) as usize),
@@ -2459,6 +2476,7 @@ impl SettingsWindow {
             Key::DockOffset => (cfg.dock.bottom_margin, 0.0, 120.0),
             Key::DockSpacing => (cfg.dock.item_spacing, 0.0, 50.0),
             Key::IslandOffset => (cfg.island.vertical_offset, -10.0, 40.0),
+            Key::GlassRefractionAmount => (cfg.general.glass_refraction_amount, 0.0, 300.0),
             _ => (0.0, 0.0, 1.0),
         }
     }

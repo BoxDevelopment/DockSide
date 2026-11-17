@@ -98,11 +98,12 @@ cbuffer C : register(b0) {
     float strength;  // 1 = bold (Dock, menus); lower = subtle, frostier (sidebars)
     float lod;       // extra blur, in mip levels
     float count;     // shapes in the pane
-    float pad;
+    float clear;     // 0 = tinted (calm under text), 1 = clearest glass
     float4 shapes[5]; // x, y, w, h in pane px
     float4 melt[5];   // x: how far (px) a shape reaches to merge with those before it
     float4 coat;      // painted over the glass, straight alpha
     float4 border;    // a hairline around its edge, straight alpha
+    float4 power;     // x: refraction amount (1 = normal), widening the colour split with it
 };
 
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -169,59 +170,82 @@ float4 ps(V i) : SV_Target {
     float alpha = saturate(0.5 - d);
     if (alpha <= 0) return 0;
 
-    // The lens normal comes from the shape rounded to at least the bezel's
-    // width, so it turns smoothly through tight corners instead of snapping
-    // between the two edges along the diagonal.
-    float e = 0.5;
-    float2 n = float2(field(p + float2(e, 0), bezel) - field(p - float2(e, 0), bezel),
-                      field(p + float2(0, e), bezel) - field(p - float2(0, e), bezel));
-    n = n / max(length(n), 1e-4);
     float depth = -d;
-
-    // Convex bezel with a circular profile: what's behind is pulled in from
-    // further inside near the edge (magnified, steeply at the rim), easing to
-    // flat glass in the middle.
     float t = bezel > 0 ? saturate(depth / bezel) : 1;
     float u = 1 - t;
-    float bend = refract * (1 - sqrt(saturate(1 - u * u)));
+
+    // The lens normal comes from the shape rounded to at least the bezel's
+    // width, so it turns smoothly through tight corners instead of snapping
+    // between the two edges along the diagonal. Only the bezel bends light,
+    // so the middle (most of the pane) skips the four extra distances.
+    float2 n = 0;
+    if (u > 0) {
+        float e = 0.5;
+        n = float2(field(p + float2(e, 0), bezel) - field(p - float2(e, 0), bezel),
+                   field(p + float2(0, e), bezel) - field(p - float2(0, e), bezel));
+        n = n / max(length(n), 1e-4);
+    }
+
+    // A convex bezel: what's behind is pulled in from further inside near the
+    // edge, easing to flat glass in the middle. Half a circular profile
+    // (squeezing hard right at the rim) and half a parabola (magnifying
+    // across the whole band), so the lens reads well inside the edge rather
+    // than as a sliver at it.
+    float circle = 1 - sqrt(saturate(1 - u * u));
+    float bend = refract * lerp(u * u, circle, 0.5);
     float2 q = p - n * bend + origin;
 
     // Toward the rim the bend outruns the pixels, so each one spans several
     // texels of what's behind; sample a mip that covers them, or moving
     // content shimmers there.
-    float slope = bezel > 0 ? refract * u / (bezel * sqrt(max(1 - u * u, 1e-3))) : 0;
+    float slope = bezel > 0 ? refract / bezel * (u + 0.5 * u / sqrt(max(1 - u * u, 1e-3))) : 0;
     float lv = lod + clamp(log2(max(abs(1 - slope), 1)), 0, 3);
 
-    // Dispersion: red and blue shift apart along the normal, as a correction
-    // on top of the frost rather than a frost per channel.
     float3 mid;
     float3 c = frosted(q, lv, mid);
-    if (bend > 0.4) {
-        float ca = bend * 0.14;
-        c.r += 0.6 * (tap(q + n * ca, 1.0 + lv).r - mid.r);
-        c.b += 0.6 * (tap(q - n * ca, 1.0 + lv).b - mid.b);
+    // Dispersion: like a prism, the bezel bends blue a little more than red,
+    // so edges behind it split into colour along the normal. Read from a
+    // sharper level than the frost, or the blur would swallow the split.
+    // Kept aside and added last: through the vibrancy boost it turns neon.
+    float2 fringe = 0;
+    if (bend > 0.3) {
+        // A few pixels at most: wider, it smears text behind into rainbows,
+        // worst in tight corners where the whole corner is bending.
+        float ca = min(bend * (0.08 + 0.2 * strength), 3.0 * scale * clamp(power.x, 0.5, 2.0));
+        float ld = lod + 0.5 + 0.5 * (lv - lod);
+        float3 g = tap(q, ld);
+        fringe = clamp(float2(tap(q + n * ca, ld).r - g.r, tap(q - n * ca, ld).b - g.b), -0.4, 0.4);
     }
+
+    // Across the outer part of the bezel the glass is at its clearest: the
+    // legibility wash below thins out there, so the lens shows what's behind
+    // in full colour while the middle, where text sits, stays calm.
+    float edge = (1 - smoothstep(0.0, 0.7, t)) * strength;
+    float keep = 1 - 0.75 * edge;
 
     // Vibrancy, then the body of the glass.
     // Light glass gets a gentler boost: saturated colour behind dark text is
-    // what makes it hard to read.
+    // what makes it hard to read. The lens gets more.
     float l = dot(c, float3(0.2126, 0.7152, 0.0722));
-    c = lerp(l.xxx, c, 1 + (dark > 0.5 ? 0.4 : 0.2) * strength);
+    c = lerp(l.xxx, c, 1 + ((dark > 0.5 ? 0.45 : 0.3) + 0.15 * clear) * strength + 0.3 * edge);
     // Adaptive, like macOS: dark glass dims further over bright content and
     // light glass lifts over dark content, so what's written on it stays
     // readable. Judged from the coarsest mip, so it eases across the pane
-    // instead of following every detail behind it.
+    // instead of following every detail behind it. `clear` thins it.
     float back = dot(tap(q, 4.0), float3(0.2126, 0.7152, 0.0722));
-    c = dark > 0.5 ? c * lerp(0.86, 0.5, smoothstep(0.55, 0.95, back))
-                   : lerp(c, 1, lerp(0.2, 0.6, 1 - smoothstep(0.2, 0.85, back)));
-    c = lerp(c, tint.rgb, tint.a);
+    float wash = keep * (1 - 0.6 * clear * strength);
+    float3 adapted = dark > 0.5 ? c * lerp(0.86, 0.5, smoothstep(0.55, 0.95, back))
+                                : lerp(c, 1, lerp(0.2, 0.6, 1 - smoothstep(0.2, 0.85, back)));
+    c = lerp(c, adapted, wash);
+    c = lerp(c, tint.rgb, tint.a * wash);
     if (dark < 0.5) {
         // A floor under dark text: whatever's behind, light glass stays light
         // enough to read on (a grey lift, so it keeps its colour). Subtle
         // glass is mostly tint already and needs less.
-        float floorL = lerp(0.66, 0.74, strength);
-        c += max(floorL - dot(c, float3(0.2126, 0.7152, 0.0722)), 0);
+        float floorL = lerp(0.66, 0.74, strength) - 0.16 * clear * strength;
+        c += keep * max(floorL - dot(c, float3(0.2126, 0.7152, 0.0722)), 0);
     }
+    c.rb += fringe * (0.55 + 0.45 * edge);
 
     if (bezel > 0) {
         // Light from the top-left: a bright glint on the facing rim, a softer
@@ -237,7 +261,7 @@ float4 ps(V i) : SV_Target {
     }
     // What a surface would otherwise paint over its glass: here it follows
     // the glass exactly, through every merge, and never a frame behind it.
-    c = lerp(saturate(c), coat.rgb, coat.a);
+    c = lerp(saturate(c), coat.rgb, coat.a * keep);
     c = lerp(c, border.rgb, border.a * saturate(0.5 * scale - depth + 0.5));
     return float4(saturate(c) * alpha, alpha);
 }
@@ -259,18 +283,114 @@ struct Constants {
     strength: f32,
     lod: f32,
     count: f32,
-    pad: f32,
+    clear: f32,
     shapes: [[f32; 4]; MAX_SHAPES],
     melt: [[f32; 4]; MAX_SHAPES],
     coat: [f32; 4],
     border: [f32; 4],
+    power: [f32; 4],
 }
 
 /// The most shapes one pane can hold (see `Pane::set_shapes`).
 pub const MAX_SHAPES: usize = 5;
 
+/// How a pane looks, in physical pixels: what `constants` turns into the shader's inputs.
+struct Look<'a> {
+    w: f32,
+    h: f32,
+    /// DPI scale.
+    scale: f32,
+    radius: f32,
+    tint: Color,
+    style: Style,
+    shapes: &'a [([f32; 4], f32)],
+    coat: Color,
+    border: Color,
+}
+
+/// How clear glass is, 0 to 1 (`[general] glass_clarity`): at 0 it keeps its
+/// full legibility wash (lift, tint and floor); toward 1 more of what's
+/// behind shows through.
+fn clarity() -> f32 {
+    #[cfg(test)]
+    if let Some(v) = std::env::var("DOCKSIDE_GLASS_CLEAR").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    CLARITY.with(|c| c.get())
+}
+
+/// How strongly glass bends what's behind it, 1 = normal
+/// (`[general] glass_refraction_amount`, a percent).
+fn refraction() -> f32 {
+    #[cfg(test)]
+    if let Some(v) = std::env::var("DOCKSIDE_GLASS_REFRACT").ok().and_then(|v| v.parse().ok()) {
+        return v;
+    }
+    REFRACTION.with(|c| c.get())
+}
+
+/// Sets `refraction` and redraws the glass on screen with it.
+pub fn set_refraction(amount: f32) {
+    if REFRACTION.with(|c| c.replace(amount)) != amount {
+        with_running(|engine| engine.resource_all());
+    }
+}
+
+/// Sets `clarity` and redraws the glass on screen with it.
+pub fn set_clarity(amount: f32) {
+    if CLARITY.with(|c| c.replace(amount)) != amount {
+        with_running(|engine| engine.resource_all());
+    }
+}
+
+/// The shader's inputs for a pane whose (0,0) sits at `origin` in a source texture `tex_size` across.
+fn constants(look: Look, origin: [f32; 2], tex_size: [f32; 2]) -> Constants {
+    let Look { w, h, scale, radius, tint, style, shapes: given, coat, border } = look;
+    let r = radius.min(w / 2.0).min(h / 2.0);
+    let flat = r < 0.5;
+    // The lens hugs the edge: wide on round shapes (the Dock, Spotlight), and
+    // no wider than twice the corner on tight ones, where a wide lens bends
+    // the whole corner into a blob.
+    // Stronger refraction also widens the lens a little (up to half again).
+    let k = refraction();
+    let widen = (0.8 + 0.2 * k).clamp(0.8, 1.5);
+    let bezel = if flat { 0.0 } else { (h.min(w) * 0.45).min(24.0 * scale * widen).min((2.0 * r).max(10.0 * scale)).max(r * 0.6) };
+    let subtle = style == Style::Subtle;
+    // No shapes given: the pane is one, filling it.
+    let (mut shapes, mut melt) = ([[0.0; 4]; MAX_SHAPES], [[0.0; 4]; MAX_SHAPES]);
+    shapes[0] = [0.0, 0.0, w, h];
+    for (i, (r, k)) in given.iter().take(MAX_SHAPES).enumerate() {
+        shapes[i] = *r;
+        melt[i][0] = *k;
+    }
+    Constants {
+        size: [w, h],
+        origin,
+        tex_size,
+        radius: r,
+        scale,
+        tint: [tint.r, tint.g, tint.b, tint.a],
+        dark: (tint.r + tint.g + tint.b < 1.5) as u8 as f32,
+        bezel,
+        // Never further than across the pane: past that it would read beyond what's captured behind it.
+        refract: (bezel * k * if subtle { 0.3 } else { 1.3 }).min(h.min(w)),
+        frost: if subtle { 5.0 } else { 2.5 } * scale,
+        strength: if subtle { 0.25 } else { 1.0 },
+        lod: if subtle { 1.5 } else { 0.0 },
+        count: given.len().clamp(1, MAX_SHAPES) as f32,
+        clear: clarity(),
+        shapes,
+        melt,
+        coat: [coat.r, coat.g, coat.b, coat.a],
+        border: [border.r, border.g, border.b, border.a],
+        power: [k, 0.0, 0.0, 0.0],
+    }
+}
+
 thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(true) };
+    static CLARITY: Cell<f32> = const { Cell::new(0.5) };
+    static REFRACTION: Cell<f32> = const { Cell::new(1.0) };
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
     static FAILED: Cell<bool> = const { Cell::new(false) };
     static STATS: RefCell<Stats> = RefCell::new(Stats::new());
@@ -941,39 +1061,11 @@ impl Engine {
         pane.region = region;
 
         let dpi = unsafe { GetDpiForWindow(pane.hwnd) }.max(96) as f32;
-        let scale = dpi / 96.0;
-        let r = pane.radius.min(w as f32 / 2.0).min(h as f32 / 2.0);
-        let flat = r < 0.5;
-        let bezel = if flat { 0.0 } else { (h.min(w) as f32 * 0.45).min(20.0 * scale).max(r * 0.6) };
-        let tint = pane.tint;
-        let subtle = pane.style == Style::Subtle;
-        // No shapes given: the pane is one, filling it.
-        let (mut shapes, mut melt) = ([[0.0; 4]; MAX_SHAPES], [[0.0; 4]; MAX_SHAPES]);
-        shapes[0] = [0.0, 0.0, w as f32, h as f32];
-        for (i, (r, k)) in pane.shapes.iter().enumerate() {
-            shapes[i] = *r;
-            melt[i][0] = *k;
-        }
-        let consts = Constants {
-            size: [w as f32, h as f32],
-            origin: [(wr.left - region.left) as f32, (wr.top - region.top) as f32],
-            tex_size: [src_size.0 as f32, src_size.1 as f32],
-            radius: r,
-            scale,
-            tint: [tint.r, tint.g, tint.b, tint.a],
-            dark: (tint.r + tint.g + tint.b < 1.5) as u8 as f32,
-            bezel,
-            refract: bezel * if subtle { 0.3 } else { 1.1 },
-            frost: if subtle { 5.0 } else { 2.5 } * scale,
-            strength: if subtle { 0.25 } else { 1.0 },
-            lod: if subtle { 1.5 } else { 0.0 },
-            count: pane.shapes.len().max(1) as f32,
-            pad: 0.0,
-            shapes,
-            melt,
-            coat: [pane.coat.r, pane.coat.g, pane.coat.b, pane.coat.a],
-            border: [pane.border.r, pane.border.g, pane.border.b, pane.border.a],
-        };
+        let consts = constants(
+            Look { w: w as f32, h: h as f32, scale: dpi / 96.0, radius: pane.radius, tint: pane.tint, style: pane.style, shapes: &pane.shapes, coat: pane.coat, border: pane.border },
+            [(wr.left - region.left) as f32, (wr.top - region.top) as f32],
+            [src_size.0 as f32, src_size.1 as f32],
+        );
 
         unsafe {
             self.context.UpdateSubresource(&self.constants, 0, None, &consts as *const _ as _, 0, 0);
@@ -1327,5 +1419,301 @@ mod tests {
     fn shader_compiles() {
         compile(SHADER, s!("glass.hlsl"), s!("vs"), s!("vs_4_0")).unwrap();
         compile(SHADER, s!("glass.hlsl"), s!("ps"), s!("ps_4_0")).unwrap();
+    }
+
+    /// Canvas the shots render on.
+    const CW: usize = 1280;
+    const CH: usize = 760;
+
+    fn fill(px: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize, bgr: [u8; 3]) {
+        for y in y0..y1.min(CH) {
+            for x in x0..x1.min(CW) {
+                px[(y * CW + x) * 4..][..3].copy_from_slice(&bgr);
+            }
+        }
+    }
+
+    /// Blends a straight-alpha colour over opaque pixels.
+    fn blend(px: &mut [u8], x0: usize, y0: usize, x1: usize, y1: usize, c: Color) {
+        for y in y0..y1.min(CH) {
+            for x in x0..x1.min(CW) {
+                let p = &mut px[(y * CW + x) * 4..][..3];
+                for (v, s) in p.iter_mut().zip([c.b, c.g, c.r]) {
+                    *v = (*v as f32 * (1.0 - c.a) + s * 255.0 * c.a).round() as u8;
+                }
+            }
+        }
+    }
+
+    /// Glyph-like rows of "words" (thin vertical strokes) from `x0`, `rows` lines `pitch` apart.
+    fn text(px: &mut [u8], x0: usize, y0: usize, width: usize, rows: usize, pitch: usize, c: Color, seed: u32) {
+        let mut s = seed;
+        let mut rand = || {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (s >> 16) as usize
+        };
+        for row in 0..rows {
+            let y = y0 + row * pitch;
+            let mut x = x0;
+            let end = x0 + width - rand() % (width / 3).max(1);
+            while x < end {
+                let word = (14 + rand() % 46).min(end - x);
+                for k in 0..word {
+                    let tall = if k % 7 == 0 { 0 } else { 2 };
+                    if k % 3 != 2 {
+                        blend(px, x + k, y + tall, x + k + 1, y + 10, c);
+                    }
+                }
+                blend(px, x, y + 5, x + word, y + 6, c.alpha(c.a * 0.6));
+                x += word + 5;
+            }
+        }
+    }
+
+    /// The primary monitor's wallpaper, cropped 1:1 from its middle, with
+    /// sharp content on it: a page of text, a grid of saturated tiles and bars.
+    fn background() -> Vec<u8> {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
+        let mon = monitor_rect(unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) });
+        let (mw, mh) = ((mon.right - mon.left) as usize, (mon.bottom - mon.top) as usize);
+        let wall = wallpaper::render(mon).unwrap();
+        let mut px = vec![255u8; CW * CH * 4];
+        let (ox, oy) = (mw.saturating_sub(CW) / 2, mh.saturating_sub(CH) / 2);
+        for y in 0..CH {
+            for x in 0..CW {
+                let (sx, sy) = ((ox + x).min(mw - 1), (oy + y).min(mh - 1));
+                px[(y * CW + x) * 4..][..3].copy_from_slice(&wall[(sy * mw + sx) * 4..][..3]);
+            }
+        }
+        // A window of text, its edge under the menu and Dock.
+        fill(&mut px, 40, 40, 600, 600, [250, 250, 250]);
+        fill(&mut px, 40, 40, 600, 74, [236, 234, 234]);
+        text(&mut px, 70, 100, 500, 22, 21, Color::rgba(25, 25, 30, 0.95), 7);
+        text(&mut px, 70, 100 + 21 * 4, 240, 1, 21, Color::rgba(0, 110, 230, 1.0), 3);
+        text(&mut px, 70, 100 + 21 * 11, 300, 1, 21, Color::rgba(220, 40, 40, 1.0), 5);
+        // Saturated tiles, like a photo grid or app icons.
+        let hues: [[u8; 3]; 8] = [[60, 60, 235], [40, 170, 250], [60, 210, 80], [230, 200, 30], [235, 90, 40], [200, 60, 190], [255, 255, 255], [30, 30, 30]];
+        for (i, y) in (60..540).step_by(84).enumerate() {
+            for (j, x) in (650..1270).step_by(84).enumerate() {
+                fill(&mut px, x, y, x + 66, y + 66, hues[(i + j) % hues.len()]);
+            }
+        }
+        // Bars under the Dock's right half.
+        for (k, x) in (620..CW).step_by(16).enumerate() {
+            fill(&mut px, x, 600, x + 16, CH, hues[k % hues.len()]);
+        }
+        px
+    }
+
+    /// Renders the glass over a picture with sharp, saturated content, light
+    /// sheet over dark, to `$DOCKSIDE_GLASS_SHOTS/glass<tag>.png` (and a 3x
+    /// crop of the Dock's rim to `glass<tag>-zoom.png`), and prints how long
+    /// the GPU takes per pane. Uses the panes' real tints and shapes.
+    /// `DOCKSIDE_GLASS_SHOTS=<dir> [DOCKSIDE_GLASS_TAG=-x] cargo test --profile fast -p dockside glass::tests::shots -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn shots() {
+        use crate::chrome::SidebarBackdrop;
+        use crate::config::{Appearance, Backdrop};
+        use crate::surface::effective_tint;
+        use crate::theme::Theme;
+        let Ok(dir) = std::env::var("DOCKSIDE_GLASS_SHOTS") else { return };
+        let tag = std::env::var("DOCKSIDE_GLASS_TAG").unwrap_or_default();
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let gfx = crate::gfx::Gfx::new().unwrap();
+        let bg = background();
+
+        let (mut device, mut context) = (None, None);
+        unsafe {
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, Some(&mut context)).unwrap();
+        }
+        let (device, c) = (device.unwrap(), context.unwrap());
+        // Another shader with the same inputs, to compare (DOCKSIDE_GLASS_HLSL=<file>).
+        let source = std::env::var("DOCKSIDE_GLASS_HLSL").map(|f| std::fs::read_to_string(f).unwrap()).unwrap_or_else(|_| SHADER.into());
+        let vs_code = compile(&source, s!("glass.hlsl"), s!("vs"), s!("vs_4_0")).unwrap();
+        let ps_code = compile(&source, s!("glass.hlsl"), s!("ps"), s!("ps_4_0")).unwrap();
+        let tex = |mips: u32, bind: D3D11_BIND_FLAG, misc: u32, usage: D3D11_USAGE, cpu: u32| {
+            let desc = D3D11_TEXTURE2D_DESC {
+                Width: CW as u32,
+                Height: CH as u32,
+                MipLevels: mips,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: usage,
+                BindFlags: bind.0 as u32,
+                CPUAccessFlags: cpu,
+                MiscFlags: misc,
+            };
+            let mut t = None;
+            unsafe { device.CreateTexture2D(&desc, None, Some(&mut t)).unwrap() };
+            t.unwrap()
+        };
+        let (mut vs, mut ps, mut sampler, mut cb, mut blend_state, mut src_srv, mut out_rtv) = (None, None, None, None, None, None, None);
+        let src = tex(MIPS, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32, D3D11_USAGE_DEFAULT, 0);
+        let out = tex(1, D3D11_BIND_RENDER_TARGET, 0, D3D11_USAGE_DEFAULT, 0);
+        let staging = tex(1, D3D11_BIND_FLAG(0), 0, D3D11_USAGE_STAGING, D3D11_CPU_ACCESS_READ.0 as u32);
+        unsafe {
+            device.CreateVertexShader(&vs_code, None, Some(&mut vs)).unwrap();
+            device.CreatePixelShader(&ps_code, None, Some(&mut ps)).unwrap();
+            let desc = D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            };
+            device.CreateSamplerState(&desc, Some(&mut sampler)).unwrap();
+            let desc = D3D11_BUFFER_DESC { ByteWidth: std::mem::size_of::<Constants>() as u32, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32, ..Default::default() };
+            device.CreateBuffer(&desc, None, Some(&mut cb)).unwrap();
+            // Premultiplied over: as Composition shows the swap chain.
+            let mut desc = D3D11_BLEND_DESC::default();
+            desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: true.into(),
+                SrcBlend: D3D11_BLEND_ONE,
+                DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOp: D3D11_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D11_BLEND_ONE,
+                DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D11_BLEND_OP_ADD,
+                RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            };
+            device.CreateBlendState(&desc, Some(&mut blend_state)).unwrap();
+            device.CreateShaderResourceView(&src, None, Some(&mut src_srv)).unwrap();
+            device.CreateRenderTargetView(&out, None, Some(&mut out_rtv)).unwrap();
+            c.UpdateSubresource(&src, 0, None, bg.as_ptr() as _, (CW * 4) as u32, 0);
+            c.GenerateMips(src_srv.as_ref().unwrap());
+            c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            c.VSSetShader(vs.as_ref(), None);
+            c.PSSetShader(ps.as_ref(), None);
+            c.PSSetShaderResources(0, Some(&[src_srv.clone()]));
+            c.PSSetSamplers(0, Some(&[sampler.clone()]));
+            c.PSSetConstantBuffers(0, Some(&[cb.clone()]));
+            c.OMSetRenderTargets(Some(&[out_rtv.clone()]), None);
+        }
+        let (cb, out_rtv) = (cb.unwrap(), out_rtv.unwrap());
+        let draw = |x: f32, y: f32, look: Look| {
+            let (w, h) = (look.w, look.h);
+            let k = constants(look, [x, y], [CW as f32, CH as f32]);
+            unsafe {
+                c.UpdateSubresource(&cb, 0, None, &k as *const _ as _, 0, 0);
+                c.RSSetViewports(Some(&[D3D11_VIEWPORT { TopLeftX: x, TopLeftY: y, Width: w, Height: h, MaxDepth: 1.0, ..Default::default() }]));
+                c.Draw(3, 0);
+            }
+        };
+        // Waits for the GPU (an event query) so timings cover the work.
+        let finish = || unsafe {
+            let mut q = None;
+            device.CreateQuery(&D3D11_QUERY_DESC { Query: D3D11_QUERY_EVENT, MiscFlags: 0 }, Some(&mut q)).unwrap();
+            let q = q.unwrap();
+            c.End(&q);
+            let mut done = 0i32;
+            while done == 0 {
+                let _ = c.GetData(&q, Some(&mut done as *mut _ as _), 4, 0);
+            }
+        };
+
+        let mut sheet = Vec::with_capacity(CW * CH * 8);
+        let mut zoom = Vec::new();
+        let spot = [([0.0, 0.0, 520.0, 52.0], 0.0), ([528.0, 1.0, 50.0, 50.0], 24.0)];
+        for dark in [false, true] {
+            let mut cfg = crate::config::defaults();
+            cfg.general.appearance = if dark { Appearance::Dark } else { Appearance::Light };
+            let t = Theme::new(&cfg, &gfx);
+            let none = Color::TRANSPARENT;
+            let bold = |w, h, radius, tint, shapes, coat, border| Look { w, h, scale: 1.0, radius, tint, style: Style::Bold, shapes, coat, border };
+            let dock = effective_tint(Backdrop::Glass, t.dock_tint);
+            let menu = effective_tint(Backdrop::Glass, t.menu_tint);
+            unsafe {
+                c.OMSetBlendState(None, None, u32::MAX);
+                c.CopySubresourceRegion(&out, 0, 0, 0, 0, &src, 0, None);
+                c.OMSetBlendState(blend_state.as_ref(), None, u32::MAX);
+            }
+            draw(240.0, 676.0, bold(800.0, 64.0, 19.2, dock, &[], none, none));
+            draw(470.0, 70.0, bold(250.0, 290.0, 7.0, menu, &[], none, none));
+            draw(680.0, 120.0, bold(578.0, 52.0, 26.0, menu, &spot, t.menu_tint.alpha(0.28), t.menu_border));
+            draw(700.0, 230.0, Look { w: 200.0, h: 300.0, scale: 1.0, radius: 10.0, tint: SidebarBackdrop::tint(&t, Backdrop::Glass), style: Style::Subtle, shapes: &[], coat: none, border: none });
+
+            // GPU time per pane, at 1.5x (a typical laptop scale), drawn into the sheet's own target.
+            for (name, look) in [
+                ("dock", bold(1200.0, 96.0, 28.8, dock, &[], none, none)),
+                ("menu", bold(375.0, 435.0, 10.5, menu, &[], none, none)),
+                ("spotlight", bold(578.0, 52.0, 26.0, menu, &spot, t.menu_tint.alpha(0.28), t.menu_border)),
+            ] {
+                if dark {
+                    continue;
+                }
+                let k = constants(Look { scale: 1.5, ..look }, [0.0, 0.0], [CW as f32, CH as f32]);
+                let (w, h) = (k.size[0], k.size[1]);
+                let (mut rt, mut rtv) = (None, None);
+                unsafe {
+                    let desc = D3D11_TEXTURE2D_DESC { Width: w as u32, Height: h as u32, MipLevels: 1, ArraySize: 1, Format: DXGI_FORMAT_B8G8R8A8_UNORM, SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Usage: D3D11_USAGE_DEFAULT, BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32, ..Default::default() };
+                    device.CreateTexture2D(&desc, None, Some(&mut rt)).unwrap();
+                    device.CreateRenderTargetView(rt.as_ref().unwrap(), None, Some(&mut rtv)).unwrap();
+                    c.OMSetRenderTargets(Some(&[rtv.clone()]), None);
+                    c.UpdateSubresource(&cb, 0, None, &k as *const _ as _, 0, 0);
+                    c.RSSetViewports(Some(&[D3D11_VIEWPORT { Width: w, Height: h, MaxDepth: 1.0, ..Default::default() }]));
+                }
+                // The best of several runs: the GPU's clocks wander.
+                const N: u32 = 300;
+                let mut best = f64::MAX;
+                for _ in 0..8 {
+                    finish();
+                    let start = Instant::now();
+                    for _ in 0..N {
+                        unsafe { c.Draw(3, 0) };
+                    }
+                    finish();
+                    best = best.min(start.elapsed().as_secs_f64() * 1e6 / N as f64);
+                }
+                println!("glass {name} {w}x{h}: {best:.1} us per render");
+                unsafe { c.OMSetRenderTargets(Some(&[Some(out_rtv.clone())]), None) };
+            }
+
+            let mut px = vec![0u8; CW * CH * 4];
+            unsafe {
+                c.CopyResource(&staging, &out);
+                let mut map = D3D11_MAPPED_SUBRESOURCE::default();
+                c.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut map)).unwrap();
+                for y in 0..CH {
+                    let row = std::slice::from_raw_parts((map.pData as *const u8).add(y * map.RowPitch as usize), CW * 4);
+                    px[y * CW * 4..][..CW * 4].copy_from_slice(row);
+                }
+                c.Unmap(&staging, 0);
+            }
+            // What the surfaces draw on their glass.
+            text(&mut px, 486, 84, 200, 13, 22, t.text, 11);
+            text(&mut px, 724, 141, 160, 1, 22, t.text_secondary, 2);
+            text(&mut px, 716, 250, 120, 12, 22, t.text, 19);
+            for i in 0..14 {
+                let x = 256 + i * 56;
+                let hue = [[0.95, 0.35, 0.3], [0.3, 0.6, 0.95], [0.35, 0.8, 0.45], [0.95, 0.75, 0.25]][i % 4];
+                blend(&mut px, x, 684, x + 48, 732, Color { r: hue[0], g: hue[1], b: hue[2], a: 1.0 });
+            }
+            for p in px.chunks_exact_mut(4) {
+                p[3] = 255;
+            }
+            // The Dock's left end and the Spotlight bubble, 3x.
+            const Z: usize = 3;
+            let crops = [(200usize, 650usize, 200usize, 110usize), (1080, 100, 200, 110)];
+            let zw = crops.iter().map(|c| c.2).sum::<usize>() * Z;
+            for zy in 0..110 * Z {
+                for (x0, y0, cw, _) in crops {
+                    for zx in 0..cw * Z {
+                        let i = ((y0 + zy / Z) * CW + x0 + zx / Z) * 4;
+                        zoom.extend_from_slice(&px[i..i + 4]);
+                    }
+                }
+            }
+            let _ = zw;
+            sheet.extend_from_slice(&px);
+        }
+        let zw = (200 + 200) * 3;
+        crate::gfx::write_png(&gfx, CW as u32, (CH * 2) as u32, &sheet, &format!("{dir}/glass{tag}.png"));
+        crate::gfx::write_png(&gfx, zw as u32, (110 * 3 * 2) as u32, &zoom, &format!("{dir}/glass{tag}-zoom.png"));
     }
 }

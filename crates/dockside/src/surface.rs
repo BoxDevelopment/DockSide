@@ -89,7 +89,7 @@ fn soft_shadow(p: &Painter, body: Rect, radius: f32, blur: f32, dy: f32, alpha: 
 /// lighter still, leaving the sheen and rim to define the surface.
 /// Light glass keeps more of its tint: dark text needs a calmer, lighter
 /// surface under it than light text does.
-fn effective_tint(kind: Backdrop, tint: Color) -> Color {
+pub(crate) fn effective_tint(kind: Backdrop, tint: Color) -> Color {
     let light = tint.r + tint.g + tint.b >= 1.5;
     match kind {
         Backdrop::Blur => tint.alpha(tint.a * if light { 0.5 } else { 0.35 }),

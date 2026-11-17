@@ -40,6 +40,10 @@ pub struct General {
     pub shortcut_style: ShortcutStyle,
     /// "glass" backdrops bend what's behind them (hides them from screen capture).
     pub glass_refraction: bool,
+    /// How much of what's behind refracting glass shows through.
+    pub glass_clarity: GlassClarity,
+    /// How strongly refracting glass bends what's behind it, in percent (100 = normal).
+    pub glass_refraction_amount: f32,
     /// The Setup Assistant was finished or skipped (it opens on launch until then).
     pub onboarding_done: bool,
     /// Personal details are swapped for demo data (see `screenshot_mode`).
@@ -58,6 +62,27 @@ pub enum Updates {
     /// Also download it (checked against the release signing key), ready to
     /// install when the user chooses Install and Restart.
     Install,
+}
+
+/// Like macOS 26.1's Liquid Glass setting: tinted is calmest under text,
+/// clear shows the most of what's behind.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum GlassClarity {
+    Tinted,
+    Balanced,
+    Clear,
+}
+
+impl GlassClarity {
+    /// The glass shader's `clear` input.
+    pub fn amount(self) -> f32 {
+        match self {
+            GlassClarity::Tinted => 0.0,
+            GlassClarity::Balanced => 0.5,
+            GlassClarity::Clear => 1.0,
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]

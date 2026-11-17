@@ -14,8 +14,11 @@
 //! reserved space, desktop widgets) refract the wallpaper image instead (see
 //! [`Source`]), which needs no capture at all.
 //!
-//! Everything runs on the UI thread: frame pools are created with `Create`
-//! (not free-threaded), so frames arrive through its DispatcherQueue.
+//! Rendering runs on the UI thread. Window captures are set up on threads of
+//! their own (Windows takes 50-90 ms over each) and their frames arrive on a
+//! thread pool; both are handed to the UI thread through its DispatcherQueue.
+//! A pane waits (briefly) for every window behind it to arrive before it
+//! first shows, rather than show holes where the rest will go.
 
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
@@ -52,6 +55,11 @@ const LOW_POWER_INTERVAL: Duration = Duration::from_millis(33);
 /// How often to look for windows that moved, opened or closed under glass
 /// without telling us (the foreground window's moves come right away).
 const POLL: Duration = Duration::from_millis(250);
+/// How long a pane waits for windows behind it whose capture is still being
+/// set up before it renders without them: not yet shown (the plain blur shows
+/// meanwhile), and already showing (it keeps its last frame meanwhile).
+const READY_WAIT: Duration = Duration::from_millis(250);
+const READY_WAIT_SHOWN: Duration = Duration::from_millis(100);
 /// How often to check whether a live wallpaper app started or stopped (they
 /// don't announce it).
 const LIVE_POLL: Duration = Duration::from_secs(2);
@@ -509,6 +517,8 @@ struct Engine {
     refresh: Duration,
     /// Renders panes that moved too soon after their last render (see `request`).
     moved: Option<DispatcherQueueTimer>,
+    /// Renders panes still waiting for windows behind them (see `READY_WAIT`).
+    waiter: Option<DispatcherQueueTimer>,
     /// Windows may have moved, opened or closed since panes last rendered.
     restack: bool,
     /// See `windows()`.
@@ -619,6 +629,7 @@ impl Engine {
             poll: None,
             refresh: refresh_period(),
             moved: None,
+            waiter: None,
             restack: false,
             windows: None,
             live: wallpaper::is_live(),
@@ -942,6 +953,19 @@ impl Engine {
         }
     }
 
+    /// Flushes once `after` has passed (a pane gives up waiting then).
+    fn wake(&mut self, after: Duration) {
+        if self.waiter.is_none() {
+            self.waiter = engine_timer(false, Engine::flush);
+        }
+        if let Some(t) = &self.waiter {
+            if !t.IsRunning().unwrap_or(false) {
+                let _ = t.SetInterval(timespan(after));
+                let _ = t.Start();
+            }
+        }
+    }
+
     fn start_poll(&mut self) {
         if self.poll.is_none() {
             self.poll = engine_timer(true, Engine::poll);
@@ -1040,6 +1064,21 @@ impl Engine {
                 let layers = layers_for(pane.want, self.windows(), &region, pane.hwnd, base.is_some());
                 // Heavy frost hides motion: what's behind it needn't come as often.
                 self.scene.capture(&layers, &self.winrt, self.interval, pane.style == Style::Subtle);
+                // Some windows behind it haven't arrived: wait for them (their
+                // first frames mark it stale) rather than show holes.
+                if !self.scene.ready(&layers) {
+                    let since = *pane.waiting.get_or_insert_with(Instant::now);
+                    let limit = if pane.shown { READY_WAIT_SHOWN } else { READY_WAIT };
+                    if let Some(left) = limit.checked_sub(since.elapsed()) {
+                        pane.layers = layers;
+                        pane.region = region;
+                        pane.stale = true;
+                        self.start_poll();
+                        self.wake(left);
+                        return Ok(());
+                    }
+                }
+                pane.waiting = None;
                 let (_, srv, rtv, _) = pane.src.as_ref().unwrap();
                 let base = base.as_ref().map(|(srv, at, size)| (srv, *at, *size));
                 self.scene.draw(&self.context, rtv, (region.left, region.top), src_size, base, &layers);
@@ -1110,7 +1149,7 @@ pub fn shutdown() {
     // Nothing may start the engine again.
     FAILED.with(|f| f.set(true));
     let Some(mut engine) = ENGINE.with(|e| e.try_borrow_mut().ok().and_then(|mut e| e.take())) else { return };
-    for t in [&engine.timer, &engine.poll, &engine.moved, &engine.live_poll].into_iter().flatten() {
+    for t in [&engine.timer, &engine.poll, &engine.moved, &engine.waiter, &engine.live_poll].into_iter().flatten() {
         let _ = t.Stop();
     }
     engine.scene.close();
@@ -1252,6 +1291,20 @@ fn with_engine<R>(f: impl FnOnce(&mut Engine) -> R) -> Option<R> {
     })
 }
 
+/// A capture set up on another thread came back. One arriving after the engine
+/// stopped is stopped too.
+pub(crate) fn capture_started(hwnd: isize, started: std::result::Result<scene::Started, String>) {
+    let mut started = Some(started);
+    with_running(|engine| {
+        if let Some(s) = started.take() {
+            engine.scene.started(hwnd, s);
+        }
+    });
+    if let Some(Ok(s)) = started {
+        s.close();
+    }
+}
+
 /// A captured window sent a new frame.
 pub(crate) fn on_window_frame(hwnd: isize) {
     crate::cpu_watch::glass_frame();
@@ -1293,6 +1346,8 @@ struct PaneState {
     moved: bool,
     /// Has presented at least once.
     shown: bool,
+    /// Since when it's been waiting for windows behind it to arrive.
+    waiting: Option<Instant>,
 }
 
 /// One refracting glass pane: a swap chain the caller puts in its visual tree.
@@ -1345,6 +1400,7 @@ impl Pane {
             presented: None,
             moved: false,
             shown: false,
+            waiting: None,
         }));
         with_engine(|engine| engine.panes.push(Rc::downgrade(&state)));
         Some((Self(state), swapchain))

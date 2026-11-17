@@ -287,6 +287,8 @@ impl SidebarBackdrop {
         }
         let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TRANSPARENT;
         let hwnd = create_window(ex, WS_POPUP, RECT::default(), HWND::default()).ok()?;
+        // Part of its app window, so menus over the sidebar show it too.
+        crate::win::scene::show_under_glass(hwnd);
         accent::prepare(hwnd);
         let tint = Self::tint(theme, kind);
         match CompositionBackdrop::new(hwnd, tint, glass.then_some(glass::Style::Subtle), glass::Source::Screen) {

@@ -6,15 +6,20 @@
 //! Windows.Graphics.Capture, and the windows are drawn back to front, from the
 //! top-most one that hides everything under it. Explorer's desktop (Progman:
 //! wallpaper and icons) is a window like any other, at the bottom. Our own
-//! windows are simply left out, so DockSide stays visible to every capture.
+//! overlays (the Dock, bars, menus, popups) are simply left out, so DockSide
+//! stays visible to every capture. Our app windows (Finder, Settings, the
+//! Calendar app...) are drawn like any other app's, so a menu opened over one
+//! refracts it rather than whatever is behind it.
 //!
 //! Some things never make it in: what DWM draws itself (window shadows,
 //! open / minimize animations), and windows we may not capture (an elevated
 //! app while we aren't), which are drawn as a solid fill instead.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use windows::core::{s, Interface, Result};
+use windows::core::{s, w, Interface, Result, PCWSTR};
 use windows::Foundation::{TimeSpan, TypedEventHandler};
 use windows::Graphics::Capture::{
     Direct3D11CaptureFrame, Direct3D11CaptureFramePool, GraphicsCaptureDirtyRegionMode, GraphicsCaptureItem, GraphicsCaptureSession,
@@ -22,10 +27,12 @@ use windows::Graphics::Capture::{
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::System::{DispatcherQueue, DispatcherQueueHandler};
+use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
+use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -43,6 +50,9 @@ const MAX_OPEN: usize = 64;
 /// How long a capture no pane needs keeps running, so a window that only
 /// briefly stops being under glass (a drag across the Dock) needn't restart.
 const GRACE: Duration = Duration::from_secs(5);
+/// A capture whose setup hasn't reported back by now is given up on (and may
+/// be asked for again).
+const SETUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Drawn for a window that can't be captured.
 const FILL: [f32; 4] = [0.16, 0.16, 0.17, 1.0];
 
@@ -93,7 +103,8 @@ pub struct Window {
     /// Hides what's behind it wherever it covers (no transparency to show through).
     opaque: bool,
     maximized: bool,
-    /// One of ours: never drawn, only marks where a pane sits in the stack.
+    /// One of our overlays (not an app window): never drawn, only marks where
+    /// a pane sits in the stack.
     ours: bool,
     /// The desktop (Progman), which holds the wallpaper, live or not.
     desktop: bool,
@@ -101,6 +112,18 @@ pub struct Window {
     /// 24H2, once something asks for one, the wallpaper and the icons move
     /// into WorkerWs of their own; capturing them can come out black).
     shell: bool,
+}
+
+/// A window property marking one of our windows that glass should draw like
+/// another app's (a sidebar's backdrop, under its app window). Windows made
+/// with `WS_EX_APPWINDOW` count without it.
+const UNDER_GLASS: PCWSTR = w!("DockSide.UnderGlass");
+
+/// Lets glass over `hwnd` (one of ours) show it instead of looking past it.
+pub fn show_under_glass(hwnd: HWND) {
+    unsafe {
+        let _ = SetPropW(hwnd, UNDER_GLASS, HANDLE(1 as _));
+    }
 }
 
 fn intersects(a: &RECT, b: &RECT) -> bool {
@@ -119,7 +142,9 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     }
     let mut pid = 0;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == e.pid {
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let app = ex & WS_EX_APPWINDOW.0 != 0 || !GetPropW(hwnd, UNDER_GLASS).is_invalid();
+    if pid == e.pid && !app {
         e.out.push(Window { layer: Layer { hwnd: hwnd.0 as isize, rect: RECT::default() }, opaque: false, maximized: false, ours: true, desktop: false, shell: false });
         return TRUE;
     }
@@ -136,7 +161,6 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     if rect.right - rect.left < 2 || rect.bottom - rect.top < 2 {
         return TRUE;
     }
-    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
     let see_through = ex & (WS_EX_LAYERED.0 | WS_EX_TRANSPARENT.0) != 0;
     let class = crate::win::class_name(hwnd);
     let shell = class == "Progman" || class == "WorkerW";
@@ -144,7 +168,8 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
     TRUE
 }
 
-/// Every other app's window on screen, top-most first, with markers for ours.
+/// Every app's window on screen (ours included), top-most first, with markers
+/// for our overlays.
 pub fn windows() -> Vec<Window> {
     let mut e = Enum { pid: std::process::id(), out: Vec::new() };
     unsafe {
@@ -197,7 +222,7 @@ pub fn desktop(windows: &[Window]) -> Vec<Layer> {
 /// `over_wallpaper`: the wallpaper image is drawn first instead, so the list
 /// stops at the desktop rather than capturing it.
 pub fn layers(windows: &[Window], region: &RECT, pane: isize, over_wallpaper: bool) -> Vec<Layer> {
-    let below = windows.iter().position(|w| w.ours && w.layer.hwnd == pane).map_or(0, |i| i + 1);
+    let below = windows.iter().position(|w| w.layer.hwnd == pane).map_or(0, |i| i + 1);
     let mut open = vec![*region];
     let mut out = Vec::new();
     for w in &windows[below..] {
@@ -255,6 +280,31 @@ impl Capture {
     }
 }
 
+/// A capture set up off the UI thread (see `Scene::capture`), on its way back to it.
+pub struct Started {
+    hwnd: isize,
+    pool: Direct3D11CaptureFramePool,
+    session: GraphicsCaptureSession,
+    item: GraphicsCaptureItem,
+    size: SizeInt32,
+    reports_dirty: bool,
+    desktop: bool,
+    frosted: bool,
+}
+
+impl Started {
+    /// Stops it (it arrived after it was no longer wanted).
+    pub fn close(self) {
+        let _ = self.session.Close();
+        let _ = self.pool.Close();
+    }
+}
+
+/// The engine's Direct3D device, for a setup thread. Direct3D 11 devices are
+/// free-threaded (only the context isn't), and so is the WinRT wrapper.
+struct SendDevice(IDirect3DDevice);
+unsafe impl Send for SendDevice {}
+
 /// What changed in a window's newest frames, in screen pixels; None for all of it.
 pub type Dirty = Option<Vec<RECT>>;
 
@@ -268,6 +318,8 @@ pub struct Scene {
     captures: Vec<Capture>,
     /// Windows that couldn't be captured; not retried while they exist.
     failed: Vec<isize>,
+    /// Captures being set up on other threads, and since when.
+    pending: Vec<(isize, Instant)>,
 }
 
 impl Scene {
@@ -319,13 +371,20 @@ impl Scene {
             constants: constants.unwrap(),
             captures: Vec::new(),
             failed: Vec::new(),
+            pending: Vec::new(),
         })
     }
 
     /// Starts capturing any of `layers` not captured yet, and marks them all in
     /// use. `frosted`: the pane asking blurs them heavily (see `pace`).
+    ///
+    /// Setting a capture up takes Windows 50-90 ms (mostly making its item),
+    /// so each is set up on a thread of its own and handed back through the UI
+    /// thread's DispatcherQueue (`glass::capture_started`): the UI never waits,
+    /// and a pane over several new windows waits for the slowest, not the sum.
     pub fn capture(&mut self, layers: &[Layer], winrt: &IDirect3DDevice, interval: Duration, frosted: bool) {
         let now = Instant::now();
+        let queue = DispatcherQueue::GetForCurrentThread().ok();
         for l in layers {
             if let Some(c) = self.captures.iter_mut().find(|c| c.hwnd == l.hwnd) {
                 c.used = now;
@@ -336,23 +395,73 @@ impl Scene {
                 }
                 continue;
             }
-            if self.failed.contains(&l.hwnd) {
+            if self.failed.contains(&l.hwnd) || self.pending.iter().any(|p| p.0 == l.hwnd) {
                 continue;
             }
-            match start(l.hwnd, winrt, interval, frosted) {
-                Ok(c) => self.captures.push(c),
+            let Some(queue) = queue.clone() else { continue };
+            let (hwnd, device) = (l.hwnd, SendDevice(winrt.clone()));
+            let spawned = std::thread::Builder::new().name("glass capture".into()).spawn(move || {
+                let device = device;
+                unsafe {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                }
+                let started = start(hwnd, &device.0, interval, frosted, &queue).map_err(|e| e.to_string());
+                // The handler is FnMut but runs once.
+                let started = std::sync::Mutex::new(Some(started));
+                let _ = queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
+                    if let Some(s) = started.lock().ok().and_then(|mut s| s.take()) {
+                        glass::capture_started(hwnd, s);
+                    }
+                    Ok(())
+                }));
+            });
+            match spawned {
+                Ok(_) => self.pending.push((hwnd, now)),
                 Err(e) => {
-                    log!("glass can't capture window {:#x}: {e}", l.hwnd);
-                    self.failed.push(l.hwnd);
+                    log!("glass can't start a capture thread: {e}");
+                    self.failed.push(hwnd);
                 }
             }
         }
+    }
+
+    /// A capture set up by `capture` came back (or couldn't be made).
+    pub fn started(&mut self, hwnd: isize, started: std::result::Result<Started, String>) {
+        self.pending.retain(|p| p.0 != hwnd);
+        match started {
+            Ok(s) if self.captures.iter().any(|c| c.hwnd == hwnd) => s.close(),
+            Ok(s) => self.captures.push(Capture {
+                hwnd: s.hwnd,
+                pool: s.pool,
+                session: s.session,
+                _item: s.item,
+                size: s.size,
+                frame: None,
+                reports_dirty: s.reports_dirty,
+                desktop: s.desktop,
+                frosted: s.frosted,
+                used: Instant::now(),
+            }),
+            Err(e) => {
+                log!("glass can't capture window {hwnd:#x}: {e}");
+                self.failed.push(hwnd);
+            }
+        }
+    }
+
+    /// Whether every one of `layers` can be drawn as it is: it has a frame, or
+    /// can't be captured (and is drawn as a fill). Until then a pane would show
+    /// holes where windows still to arrive go.
+    pub fn ready(&self, layers: &[Layer]) -> bool {
+        layers.iter().all(|l| self.failed.contains(&l.hwnd) || self.captures.iter().any(|c| c.hwnd == l.hwnd && c.frame.is_some()))
     }
 
     /// Takes `hwnd`'s newest frame. Returns what changed, or None when no new frame came.
     pub fn take(&mut self, device: &ID3D11Device, winrt: &IDirect3DDevice, hwnd: isize, rect: Option<RECT>) -> Option<Dirty> {
         let c = self.captures.iter_mut().find(|c| c.hwnd == hwnd)?;
         let mut frame = c.pool.TryGetNextFrame().ok()?;
+        // The first frame is new everywhere, whatever its dirty regions say.
+        let first = c.frame.is_none();
         let mut dirty: Dirty = Some(Vec::new());
         let mut add = |f: &Direct3D11CaptureFrame| {
             let rects = c.reports_dirty.then(|| f.DirtyRegions().ok()).flatten();
@@ -396,7 +505,7 @@ impl Scene {
                 log!("glass window capture resize failed: {e}");
             }
         }
-        Some(dirty)
+        Some(if first { None } else { dirty })
     }
 
     /// Draws `layers` into `target` (`size` px, showing the screen from
@@ -472,6 +581,7 @@ impl Scene {
     pub fn prune(&mut self) -> bool {
         let now = Instant::now();
         self.failed.retain(|&h| unsafe { IsWindow(HWND(h as _)) }.as_bool());
+        self.pending.retain(|p| now.duration_since(p.1) < SETUP_TIMEOUT);
         let before = self.captures.len();
         self.captures.retain_mut(|c| {
             let keep = unsafe { IsWindow(HWND(c.hwnd as _)) }.as_bool() && now.duration_since(c.used) < GRACE;
@@ -521,12 +631,15 @@ fn pace(half: bool, interval: Duration) -> Duration {
     if half { (interval * 3).max(Duration::from_millis(50)) } else { interval }
 }
 
-fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration, frosted: bool) -> Result<Capture> {
+/// Sets up a window's capture (on a setup thread). Its frames arrive on a
+/// thread pool and are handed to the UI thread through `queue`, one hand-off
+/// at a time: taking a frame takes every frame that's come since.
+fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration, frosted: bool, queue: &DispatcherQueue) -> Result<Started> {
     let desktop = crate::win::class_name(HWND(hwnd as _)) == "Progman";
     let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()?;
     let item: GraphicsCaptureItem = unsafe { interop.CreateForWindow(HWND(hwnd as _))? };
     let size = item.Size()?;
-    let pool = Direct3D11CaptureFramePool::Create(winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size)?;
     let session = pool.CreateCaptureSession(&item)?;
     let _ = session.SetIsCursorCaptureEnabled(false);
     // No yellow capture border (Windows 11).
@@ -535,12 +648,22 @@ fn start(hwnd: isize, winrt: &IDirect3DDevice, interval: Duration, frosted: bool
     // panes over a still part of a window skip the redraw.
     let _ = session.SetMinUpdateInterval(timespan(pace(desktop || frosted, interval)));
     let reports_dirty = session.SetDirtyRegionMode(GraphicsCaptureDirtyRegionMode::ReportOnly).is_ok();
+    let queued = Arc::new(AtomicBool::new(false));
+    let queue = queue.clone();
     pool.FrameArrived(&TypedEventHandler::new(move |_, _| {
-        glass::on_window_frame(hwnd);
+        if !queued.swap(true, Ordering::AcqRel) {
+            let queued = queued.clone();
+            let _ = queue.TryEnqueue(&DispatcherQueueHandler::new(move || {
+                // Cleared first: a frame arriving while this one is taken gets a hand-off of its own.
+                queued.store(false, Ordering::Release);
+                glass::on_window_frame(hwnd);
+                Ok(())
+            }));
+        }
         Ok(())
     }))?;
     session.StartCapture()?;
-    Ok(Capture { hwnd, pool, session, _item: item, size, frame: None, reports_dirty, desktop, frosted, used: Instant::now() })
+    Ok(Started { hwnd, pool, session, item, size, reports_dirty, desktop, frosted })
 }
 
 #[cfg(test)]
@@ -601,6 +724,57 @@ mod tests {
         // A pane that isn't listed (hidden) sees everything.
         let got: Vec<isize> = layers(&ws, &region, 5, false).iter().map(|l| l.hwnd).collect();
         assert_eq!(got, vec![1]);
+    }
+
+    /// How long Windows takes from starting a capture to its first frame, for
+    /// the top few windows on screen: what a pane over a window it hasn't
+    /// captured yet waits for.
+    /// `cargo test --profile fast -p dockside first_frame_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn first_frame_latency() {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+        use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
+        let (mut device, mut context) = (None, None);
+        unsafe {
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, None, D3D11_SDK_VERSION, Some(&mut device), None, Some(&mut context)).unwrap();
+        }
+        let dxgi: IDXGIDevice = device.unwrap().cast().unwrap();
+        let winrt: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }.unwrap().cast().unwrap();
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>().unwrap();
+        for w in windows().iter().filter(|w| !w.ours && crate::win::class_name(HWND(w.layer.hwnd as _)) != "DockSideSurface").take(8) {
+            let hwnd = HWND(w.layer.hwnd as _);
+            let t0 = Instant::now();
+            let item: Result<GraphicsCaptureItem> = unsafe { interop.CreateForWindow(hwnd) };
+            let Ok(item) = item else { continue };
+            let size = item.Size().unwrap();
+            let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(&winrt, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size).unwrap();
+            let session = pool.CreateCaptureSession(&item).unwrap();
+            let _ = session.SetIsBorderRequired(false);
+            let _ = session.SetIsCursorCaptureEnabled(false);
+            let _ = session.SetMinUpdateInterval(timespan(Duration::from_millis(16)));
+            session.StartCapture().unwrap();
+            let started = t0.elapsed();
+            let mut first = None;
+            while t0.elapsed() < Duration::from_secs(3) {
+                if pool.TryGetNextFrame().is_ok() {
+                    first = Some(t0.elapsed());
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            println!(
+                "{:>8} {:>5}x{:<5} setup {:>6.1} ms, first frame {}",
+                crate::win::class_name(hwnd).chars().take(24).collect::<String>(),
+                size.Width,
+                size.Height,
+                started.as_secs_f64() * 1000.0,
+                first.map_or("none in 3 s".into(), |f| format!("{:.1} ms", f.as_secs_f64() * 1000.0))
+            );
+            let _ = session.Close();
+            let _ = pool.Close();
+        }
     }
 
     #[test]

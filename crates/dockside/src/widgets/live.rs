@@ -810,6 +810,7 @@ unsafe fn capture(bands: &Bands, id: &str, hwnd: isize, msg: u32) -> windows::co
     let mut levels = vec![0f32; BANDS];
     let mut last = Instant::now();
     let mut quiet = true;
+    let mut gain = Normalizer::default();
     let window: Vec<f32> = (0..FFT).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / FFT as f32).cos()).collect();
     loop {
         if bands.stopped.load(Ordering::Relaxed) {
@@ -859,7 +860,7 @@ unsafe fn capture(bands: &Bands, id: &str, hwnd: isize, msg: u32) -> windows::co
         }
         last = Instant::now();
         // No packets at all: the speakers are silent; the bars fall.
-        let fresh = if got { spectrum(&ring, at, &window, rate) } else { vec![0.0; BANDS] };
+        let fresh = if got { gain.apply(spectrum(&ring, at, &window, rate)) } else { vec![0.0; BANDS] };
         let mut moving = false;
         for (l, f) in levels.iter_mut().zip(fresh) {
             // Quick to rise, slow to fall, like a real meter.
@@ -877,6 +878,61 @@ unsafe fn capture(bands: &Bands, id: &str, hwnd: isize, msg: u32) -> windows::co
             }
         }
         quiet = !moving;
+    }
+}
+
+/// Automatic gain for the bands: stretches whatever range the music is using
+/// right now (a quiet track, a loud master, a low system volume) across the
+/// whole 0..1, so the bars always swing well up and down. The ceiling follows
+/// the loudest band (jumping up at once, easing down over a second or two) and
+/// the floor the quietest; a minimum gap between them, and a minimum ceiling,
+/// keep hiss and faint sound from being blown up into a full-height wave.
+#[derive(Default)]
+struct Normalizer {
+    /// (floor, ceiling) once sound has been heard.
+    range: Option<(f32, f32)>,
+}
+
+impl Normalizer {
+    /// Below this, a frame is silence and is passed through as is.
+    const SILENT: f32 = 0.1;
+    /// The narrowest range stretched to full height.
+    const MIN_SPAN: f32 = 0.15;
+    /// The lowest ceiling stretched to full height (about -36 dB): fainter
+    /// sound than that is quiet, not something to amplify.
+    const MIN_CEIL: f32 = 0.4;
+    /// Normalized levels sit a little above zero, so quiet bands still show.
+    const BASE: f32 = 0.06;
+
+    fn apply(&mut self, fresh: Vec<f32>) -> Vec<f32> {
+        let max = fresh.iter().copied().fold(0.0f32, f32::max);
+        if max < Self::SILENT {
+            return fresh;
+        }
+        let min = fresh.iter().copied().fold(1.0f32, f32::min);
+        let (lo, hi) = match self.range {
+            None => (min, max),
+            Some((lo, hi)) => (
+                // The floor drifts both ways; the ceiling jumps up and eases down.
+                lo + (min - lo) * 0.05,
+                if max > hi { max } else { hi + (max - hi) * 0.03 },
+            ),
+        };
+        self.range = Some((lo, hi));
+        let hi = hi.max(Self::MIN_CEIL);
+        let lo = lo.min(hi - Self::MIN_SPAN).max(0.0);
+        let span = hi - lo;
+        fresh
+            .into_iter()
+            .map(|f| {
+                let n = ((f - lo) / span).clamp(0.0, 1.0);
+                if n > 0.0 {
+                    Self::BASE + (1.0 - Self::BASE) * n
+                } else {
+                    0.0
+                }
+            })
+            .collect()
     }
 }
 
@@ -951,6 +1007,28 @@ mod tests {
         // 1 kHz sits about 46% of the way along 40 Hz..16 kHz on a log scale.
         assert!((13..=17).contains(&loudest), "loudest band {loudest}: {s:?}");
         assert!(s[0] < s[loudest] * 0.6);
+    }
+
+    #[test]
+    fn normalizer_fills_the_range() {
+        let mut g = Normalizer::default();
+        // Quiet music using only 0.35..0.55 of the scale.
+        let quiet: Vec<f32> = (0..BANDS).map(|i| 0.35 + 0.2 * (i as f32 / (BANDS - 1) as f32)).collect();
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            out = g.apply(quiet.clone());
+        }
+        let (lo, hi) = (out.iter().copied().fold(1.0f32, f32::min), out.iter().copied().fold(0.0f32, f32::max));
+        assert!(hi > 0.6 && lo < 0.1, "{lo}..{hi}");
+        // Silence stays silent.
+        assert!(g.apply(vec![0.0; BANDS]).iter().all(|&v| v == 0.0));
+        // Faint hiss isn't blown up to full height.
+        let mut g = Normalizer::default();
+        let hiss: Vec<f32> = (0..BANDS).map(|i| 0.12 + 0.03 * (i as f32 * 2.3).sin()).collect();
+        for _ in 0..200 {
+            out = g.apply(hiss.clone());
+        }
+        assert!(out.iter().all(|&v| v < 0.5), "{out:?}");
     }
 
     #[test]

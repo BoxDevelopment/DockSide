@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::Shell::{
     IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    SIIGBF_THUMBNAILONLY, SIIGBF,
 };
 
 pub const ICON_PX: i32 = 256;
@@ -291,10 +292,26 @@ pub fn load_shell_icon(parse_name: &str) -> Option<IconPixels> {
 
 /// Shell image for `parse_name` at `size` px. With `thumbnail`, images, videos
 /// and documents return a preview of their content instead of a type icon.
+///
+/// Left to itself the shell answers a thumbnail request it can't fill with the
+/// type icon, which is the default app's (a picture opened with a video player
+/// shows the player's logo). So: a real thumbnail, else the picture decoded
+/// directly, and only then the type icon.
 pub fn load_shell_image(parse_name: &str, size: i32, thumbnail: bool) -> Option<IconPixels> {
+    if !thumbnail {
+        return shell_image(parse_name, size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK);
+    }
+    shell_image(parse_name, size, SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK)
+        .or_else(|| {
+            let wic: IWICImagingFactory = unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()? };
+            load_image_fit(&wic, parse_name, size.max(1) as u32)
+        })
+        .or_else(|| shell_image(parse_name, size, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK))
+}
+
+fn shell_image(parse_name: &str, size: i32, flags: SIIGBF) -> Option<IconPixels> {
     unsafe {
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(&HSTRING::from(parse_name), None).ok()?;
-        let flags = if thumbnail { SIIGBF_BIGGERSIZEOK } else { SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK };
         let hbmp = factory.GetImage(SIZE { cx: size, cy: size }, flags).ok()?;
         let px = read_hbitmap(hbmp);
         let _ = DeleteObject(hbmp);

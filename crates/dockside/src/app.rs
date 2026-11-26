@@ -1628,7 +1628,18 @@ impl App {
             self.setup_desktops();
         }
         if old.menubar != self.cfg.menubar {
-            self.rebuild_menubar();
+            // A text/icon color change only needs a repaint: a rebuild would
+            // re-run the appbar registration and the wallpaper check.
+            let mut repainted = old.menubar.clone();
+            repainted.text_color = self.cfg.menubar.text_color.clone();
+            repainted.icon_color = self.cfg.menubar.icon_color.clone();
+            if repainted == self.cfg.menubar {
+                for mb in &mut self.menubars {
+                    mb.dirty = true;
+                }
+            } else {
+                self.rebuild_menubar();
+            }
         }
         // (The island's Widgets page reads the weather place and units, world clocks and clock format.)
         let island_widgets = |c: &Config| {

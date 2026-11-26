@@ -16,6 +16,10 @@ use crate::win::Monitor;
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    /// Docky: sign in with ChatGPT (true), or sign out.
+    DockyChatGpt(bool),
+    /// Docky: ask a quick hello with the current AI settings.
+    DockyTest,
     Open(String),
     Launch { path: String, args: Option<String> },
     Keys(Shortcut),

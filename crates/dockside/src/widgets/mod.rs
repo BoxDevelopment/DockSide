@@ -16,6 +16,7 @@ pub(crate) mod glyphs;
 pub mod live;
 pub mod sensors;
 pub mod sources;
+mod speech;
 mod store;
 pub mod user;
 mod views;
@@ -72,7 +73,8 @@ pub fn placing() -> bool {
     PLACING.load(Ordering::Relaxed)
 }
 
-pub const KINDS: [WidgetKind; 15] = [
+pub const KINDS: [WidgetKind; 16] = [
+    WidgetKind::Docky,
     WidgetKind::Clock,
     WidgetKind::WorldClock,
     WidgetKind::Weather,
@@ -107,6 +109,7 @@ pub fn title(kind: WidgetKind) -> &'static str {
         WidgetKind::Video => "Video",
         WidgetKind::Notifications => "Notifications",
         WidgetKind::User => "User",
+        WidgetKind::Docky => "Docky",
     }
 }
 
@@ -114,7 +117,7 @@ pub fn title(kind: WidgetKind) -> &'static str {
 pub fn sizes(kind: WidgetKind) -> &'static [WidgetSize] {
     use WidgetSize::*;
     match kind {
-        WidgetKind::Clock | WidgetKind::NowPlaying | WidgetKind::MusicWave | WidgetKind::User => &[Small, Medium],
+        WidgetKind::Clock | WidgetKind::NowPlaying | WidgetKind::MusicWave | WidgetKind::User | WidgetKind::Docky => &[Small, Medium],
         WidgetKind::Weather | WidgetKind::Notifications => &[Medium, Small, Large],
         _ => &[Small, Medium, Large],
     }
@@ -291,6 +294,10 @@ pub enum WidgetCmd {
     ToggleOption(u32, &'static str),
     /// Clock: a digital (true) or analog face.
     SetDigital(u32, bool),
+    /// Docky: his look (see `docky::STYLES`).
+    SetDockyStyle(u32, &'static str),
+    /// Add a Docky widget with this look.
+    AddDocky(&'static str),
     /// Photo: its size, the part of the picture shown, and (Fit to Picture)
     /// its own width and height in points.
     SetPhoto { id: u32, size: WidgetSize, crop: Option<[f32; 4]>, fit: Option<(f32, f32)> },
@@ -372,6 +379,37 @@ struct Widget {
     pictures: Vec<(u64, ID2D1Bitmap)>,
     /// Hidden behind an app window: nothing moves.
     covered: bool,
+    /// Docky: what he's up to.
+    pet: crate::docky::Pet,
+    /// Docky: the pointer is close by.
+    near: bool,
+    /// Docky (Auto): picks his look and what to say.
+    auto: crate::docky::Auto,
+    /// Docky moved (and nothing else did): only the part of the card around
+    /// him is redrawn, `drawn_at` being where he was last drawn.
+    docky_dirty: bool,
+    drawn_at: Option<Rect>,
+    /// When he was last drawn moving (for pacing his frames).
+    docky_frame: std::time::Instant,
+    /// Docky: you asked him something here and he's answering; his reply,
+    /// shown until then; and kept awake until then after you talk to him.
+    asked: bool,
+    reply: Option<(String, std::time::Instant, std::time::Instant)>,
+    awake_until: std::time::Instant,
+}
+
+impl Widget {
+    /// Docky's look right now: his style, or (Auto) the one he's chosen.
+    fn docky_look(&self) -> &str {
+        match self.item.docky_style() {
+            "auto" | "pixel-auto" => self.auto.look(),
+            s => s,
+        }
+    }
+
+    fn auto(&self) -> bool {
+        self.item.kind == WidgetKind::Docky && matches!(self.item.docky_style(), "auto" | "pixel-auto")
+    }
 }
 
 /// A Photo or Video widget's player; it stops when dropped.
@@ -398,6 +436,66 @@ impl Widget {
 
     fn hit_at(&self, x: f32, y: f32) -> Option<Hit> {
         self.hits.iter().rev().find(|(r, _)| r.contains(x, y)).map(|(_, h)| *h)
+    }
+}
+
+/// A cheap coin toss from where the pointer is.
+fn x_seed(p: POINT) -> u32 {
+    (p.x.unsigned_abs() ^ p.y.unsigned_abs().rotate_left(7)).wrapping_mul(2654435761) >> 31
+}
+
+/// What Docky keeps an eye on between polls (see `Widgets::poll_docky`).
+struct Watch {
+    cursor: POINT,
+    /// When the last key press or mouse move was (GetTickCount ms).
+    input: u32,
+    /// Seconds without input, as of the last poll.
+    idle: u32,
+    fg: isize,
+    /// Which way the pointer last moved fast, and when it turned back on itself: a shake.
+    dir: i32,
+    turns: Vec<std::time::Instant>,
+    last_nod: std::time::Instant,
+    /// Typing: since when (without a long pause), and the last key.
+    typing_since: std::time::Instant,
+    last_typed: std::time::Instant,
+    /// The song last announced, and whether music was playing.
+    track: String,
+    playing: bool,
+    /// The machine's CPU use, how many samples in a row it's been flat out,
+    /// and when Docky may get hot and bothered again.
+    cpu: crate::docky::Cpu,
+    hot_streak: u8,
+    hot_after: std::time::Instant,
+    /// The calendar event he last waved about (its start).
+    waved_event: i64,
+    /// No dizzy spells or hellos again before these.
+    dizzy_after: std::time::Instant,
+    hello_after: std::time::Instant,
+}
+
+impl Watch {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Watch {
+            cursor: cursor_px(),
+            input: crate::docky::last_input(),
+            idle: 0,
+            fg: 0,
+            dir: 0,
+            turns: Vec::new(),
+            last_nod: now,
+            typing_since: now,
+            last_typed: now.checked_sub(std::time::Duration::from_secs(3600)).unwrap_or(now),
+            track: String::new(),
+            playing: false,
+            cpu: crate::docky::Cpu::default(),
+            hot_streak: 0,
+            hot_after: now,
+            waved_event: 0,
+            dizzy_after: now,
+            hello_after: now,
+        }
     }
 }
 
@@ -582,6 +680,8 @@ fn paint(p: &crate::gfx::Painter, body: Rect, ctx: &views::Ctx, solid: bool, hit
 pub struct Widgets {
     widgets: Vec<Widget>,
     cfg: WidgetsCfg,
+    docky: crate::config::DockyCfg,
+    watch: Watch,
     calendar_ics: String,
     /// Every display, the main one first.
     screens: Vec<Screen>,
@@ -598,7 +698,13 @@ pub struct Widgets {
     msg_data: u32,
     /// Removed (or replaced, when resized) widgets fading out.
     leaving: Vec<Surface>,
+    /// Docky's speech box, floating by his widget while you talk to him.
+    speech: Option<speech::SpeechBox>,
 }
+
+/// Docky's reply bubble: how long it takes to pop in and to fade away (seconds).
+const REPLY_IN: f32 = 0.24;
+const REPLY_OUT: f32 = 0.32;
 
 const VK_TAB: u16 = 0x09;
 const VK_RETURN: u16 = 0x0D;
@@ -626,6 +732,8 @@ impl Widgets {
         let mut w = Widgets {
             widgets: Vec::new(),
             cfg: cfg.widgets.clone(),
+            docky: cfg.docky.clone(),
+            watch: Watch::new(),
             calendar_ics: cfg.island.calendar_ics.clone(),
             screens,
             data: Data {
@@ -652,6 +760,7 @@ impl Widgets {
             hwnd,
             msg_data,
             leaving: Vec::new(),
+            speech: None,
         };
         for item in cfg.widgets.items.clone() {
             w.add_widget(gfx, theme, item);
@@ -734,6 +843,15 @@ impl Widgets {
             frame: None,
             pictures: Vec::new(),
             covered: false,
+            pet: crate::docky::Pet::new(),
+            near: false,
+            auto: crate::docky::Auto::new(),
+            docky_dirty: false,
+            drawn_at: None,
+            docky_frame: std::time::Instant::now(),
+            asked: false,
+            reply: None,
+            awake_until: std::time::Instant::now(),
         });
         self.refresh_live(self.widgets.len() - 1);
     }
@@ -809,6 +927,7 @@ impl Widgets {
     /// (moved if needed); new and resized ones are created.
     pub fn sync(&mut self, gfx: &Gfx, theme: &Theme, cfg: &Config) {
         self.cfg = cfg.widgets.clone();
+        self.docky = cfg.docky.clone();
         self.calendar_ics = cfg.island.calendar_ics.clone();
         self.data.zones = cfg.widgets.world_clocks.iter().filter_map(|z| sources::parse_zone(z)).collect();
         self.data.h24 = cfg.menubar.clock_format.contains("%H");
@@ -853,10 +972,10 @@ impl Widgets {
         let fahrenheit = sources::fahrenheit(&self.cfg.temperature_unit);
         SourceKey {
             weather: self.has(WidgetKind::Weather).then(|| (self.cfg.location.clone(), fahrenheit, self.data.h24)),
-            calendar: (self.has(WidgetKind::Calendar) || self.has(WidgetKind::UpNext)).then(|| self.calendar_ics.clone()),
+            calendar: (self.has(WidgetKind::Calendar) || self.has(WidgetKind::UpNext) || self.has(WidgetKind::Docky)).then(|| self.calendar_ics.clone()),
             devices: self.has(WidgetKind::Batteries),
             // Music Wave names the track playing too.
-            media: self.has(WidgetKind::NowPlaying) || self.has(WidgetKind::MusicWave),
+            media: self.has(WidgetKind::NowPlaying) || self.has(WidgetKind::MusicWave) || self.has(WidgetKind::Docky),
             gpu: sensors::wants_gpu(self.system_items()),
             notes: self.has(WidgetKind::Notifications),
             music: self.has(WidgetKind::MusicWave),
@@ -1022,6 +1141,26 @@ impl Widgets {
         if let Some(m) = self.sources.as_ref().and_then(|s| s.media.as_ref()) {
             self.data.now = m.snapshot();
             self.mark(&[WidgetKind::NowPlaying, WidgetKind::MusicWave]);
+            // Docky dances to whatever's playing, starting the moment it does.
+            let playing = self.data.now.as_ref().is_some_and(|n| n.playing);
+            let title = self.data.now.as_ref().filter(|n| n.playing).map(|n| n.title.clone()).unwrap_or_default();
+            let new_song = !title.is_empty() && title != self.watch.track;
+            if !title.is_empty() {
+                self.watch.track = title.clone();
+            }
+            // When music starts, he usually has a little dance (then does as he likes).
+            let started = playing && !self.watch.playing;
+            self.watch.playing = playing;
+            for w in self.widgets.iter_mut().filter(|w| w.item.kind == WidgetKind::Docky) {
+                if started && !w.auto() && !w.pet.asleep() && !w.pet.busy() && !w.covered && !w.near {
+                    w.pet.play(crate::docky::Act::Dance);
+                }
+                w.pet.set_music(playing);
+                if new_song && w.auto() && !w.pet.asleep() {
+                    w.auto.cue(crate::docky::Cue::Track, &mut w.pet);
+                    w.dirty = true;
+                }
+            }
         }
     }
 
@@ -1036,9 +1175,10 @@ impl Widgets {
         self.data.sys = self.sampler.stats.clone();
     }
 
-    /// Every second: clocks, playback progress, stats, and the date rolling over.
-    pub fn on_tick(&mut self) {
+    /// Every second: clocks, playback progress, stats, and the date rolling over. True when Docky has started something and needs frames.
+    pub fn on_tick(&mut self) -> bool {
         self.ticks += 1;
+        let docky = self.tick_docky();
         self.mark(&[WidgetKind::Clock, WidgetKind::WorldClock]);
         if self.data.now.as_ref().is_some_and(|n| n.playing) {
             self.mark(&[WidgetKind::NowPlaying]);
@@ -1049,6 +1189,15 @@ impl Widgets {
         }
         if self.ticks % 10 == 0 {
             let b = system::battery();
+            let plugged = b.is_some_and(|b| b.charging) && self.data.battery.is_some_and(|o| !o.charging);
+            if plugged {
+                for w in self.widgets.iter_mut().filter(|w| w.item.kind == WidgetKind::Docky && !w.pet.asleep()) {
+                    w.pet.play(crate::docky::Act::Love);
+                    if w.auto() {
+                        w.auto.cue(crate::docky::Cue::Charger, &mut w.pet);
+                    }
+                }
+            }
             if b != self.data.battery {
                 self.data.battery = b;
                 self.mark(&[WidgetKind::Batteries]);
@@ -1067,12 +1216,261 @@ impl Widgets {
             self.mark(&[WidgetKind::Reminders]);
         }
         self.store.save_if_dirty();
+        docky
+    }
+
+    /// The conversation changed: a Docky you spoke to says his reply, long
+    /// enough to read it. True when any did.
+    pub fn on_chat(&mut self) -> bool {
+        if crate::docky_ai::chat_pending() {
+            return false;
+        }
+        let Some(reply) = crate::docky_ai::last_reply() else { return false };
+        let now = std::time::Instant::now();
+        let mut any = false;
+        for w in self.widgets.iter_mut().filter(|w| w.item.kind == WidgetKind::Docky && w.asked) {
+            w.asked = false;
+            // Brief: long enough to read at a glance (pointing at him keeps it up).
+            let secs = (2.5 + reply.chars().count() as f32 / 30.0).min(9.0);
+            w.reply = Some((reply.clone(), now, now + std::time::Duration::from_secs_f32(secs)));
+            w.awake_until = now + std::time::Duration::from_secs(300);
+            w.pet.play(crate::docky::Act::Happy);
+            w.dirty = true;
+            any = true;
+        }
+        any
+    }
+
+    /// Whether a Docky is on screen to watch the pointer for.
+    pub fn watching(&self) -> bool {
+        self.widgets.iter().any(|w| w.item.kind == WidgetKind::Docky && !w.covered)
+    }
+
+    /// Polled while a Docky is on screen (not behind a window): his eyes follow
+    /// the pointer wherever it is, and he reacts to what you're doing. Returns
+    /// (keep polling, needs frames).
+    pub fn poll_docky(&mut self) -> (bool, bool) {
+        use std::time::{Duration, Instant};
+        use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId};
+        if !self.watching() {
+            return (false, false);
+        }
+        let now = Instant::now();
+        let p = cursor_px();
+        let input = crate::docky::last_input();
+        let idle = crate::docky::idle_secs();
+        let fg = unsafe { GetForegroundWindow() };
+        let w8 = &mut self.watch;
+
+        // A key typed (on the keyboard: clicks and the wheel don't count).
+        let typed = crate::docky::keys_typed() && now.duration_since(w8.last_nod) > Duration::from_millis(80);
+        if typed {
+            w8.last_nod = now;
+            if now.duration_since(w8.last_typed) > Duration::from_secs(3) {
+                w8.typing_since = now;
+            }
+            w8.last_typed = now;
+        }
+        let since_typed = now.duration_since(w8.last_typed).as_secs_f32();
+        let typing_for = if since_typed < 3.0 { now.duration_since(w8.typing_since).as_secs_f32() } else { 0.0 };
+        // A shake: the pointer moving fast and turning back on itself again and again.
+        let dx = p.x - w8.cursor.x;
+        if dx.abs() > 28 {
+            if w8.dir != 0 && dx.signum() != w8.dir {
+                w8.turns.push(now);
+            }
+            w8.dir = dx.signum();
+        }
+        w8.turns.retain(|t| now.duration_since(*t) < Duration::from_millis(1100));
+        let shaken = w8.turns.len() >= 5 && now >= w8.dizzy_after;
+        if shaken {
+            w8.turns.clear();
+            w8.dizzy_after = now + Duration::from_secs(6);
+        }
+        // Back after a minute or more away.
+        let back = w8.idle >= 60 && idle < 2;
+        w8.idle = idle;
+        // Another app came to the front (not one of ours): he glances at it.
+        let own = |h: HWND| {
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+            pid == std::process::id()
+        };
+        let switched = !fg.0.is_null() && fg.0 as isize != w8.fg && !own(fg);
+        w8.fg = fg.0 as isize;
+        let opened = switched.then(|| {
+            let mut r = RECT::default();
+            unsafe { GetWindowRect(fg, &mut r) }.ok().map(|_| ((r.left + r.right) as f32 / 2.0, (r.top + r.bottom) as f32 / 2.0))
+        });
+        w8.cursor = p;
+        w8.input = input;
+        let hello = now >= w8.hello_after;
+        // The app switched to, by name, for an Auto Docky to remark on.
+        let app = (switched && self.widgets.iter().any(|w| w.auto())).then(|| {
+            let path = crate::win::apps::process_path(crate::win::apps::effective_pid(fg)).unwrap_or_default();
+            crate::win::apps::file_description(&path).filter(|d| !d.is_empty()).unwrap_or_else(|| crate::win::apps::exe_name(&path))
+        });
+        let music = self.data.now.as_ref().is_some_and(|n| n.playing);
+        let battery = self.data.battery.map(|b| (b.percent, b.charging));
+        let next_event = self.data.events.iter().filter(|e| e.starts_in() >= 0).min_by_key(|e| e.start).map(|e| (e.title.clone(), e.starts_in()));
+
+        let mut frames = false;
+        let mut greeted = false;
+        for w in self.widgets.iter_mut().filter(|w| w.item.kind == WidgetKind::Docky && !w.covered) {
+            let s = w.surface.scale;
+            let auto = w.auto();
+            if auto {
+                w.auto.set_pixel(w.item.docky_style() == "pixel-auto");
+            }
+            let (ex, ey) = views::docky_eyes(w.body(), &w.item, w.docky_look(), w.pet.position(now), auto);
+            let (sx, sy) = (w.surface.rect.left as f32 + ex * s, w.surface.rect.top as f32 + ey * s);
+            // A direction from his eyes, looking all the way once it's a little way off.
+            let toward = |x: f32, y: f32| {
+                let (dx, dy) = ((x - sx) / s, (y - sy) / s);
+                let d = dx.hypot(dy).max(1.0);
+                let m = (d / 140.0).min(1.0);
+                ((dx / d * m), (dy / d * m * 0.85))
+            };
+            let dist = ((p.x as f32 - sx) / s).hypot((p.y as f32 - sy) / s);
+            let mut changed = w.pet.aim(Some(toward(p.x as f32, p.y as f32)));
+            let near = dist < 130.0;
+            let arrived = near && !w.near;
+            w.near = near;
+            if w.auto() {
+                let signals = crate::docky::Signals {
+                    asleep: w.pet.asleep(),
+                    typing_for,
+                    since_typed,
+                    near,
+                    idle,
+                    music,
+                    battery,
+                    next_event: next_event.as_ref().map(|(t, s)| (t.as_str(), *s)),
+                };
+                if w.auto.tick(now, &signals, &mut w.pet) || w.auto.busy(now) {
+                    w.dirty = true;
+                    changed = true;
+                }
+            }
+            // Asleep, his eyes are shut: nothing more to draw.
+            if w.pet.asleep() {
+                if changed {
+                    w.dirty = true;
+                    frames = true;
+                }
+                continue;
+            }
+            changed |= w.pet.set_drowsy(idle >= 90);
+            if typed {
+                w.pet.nod();
+                changed = true;
+            }
+            if shaken && dist < 600.0 {
+                w.pet.play(crate::docky::Act::Dizzy);
+                if auto {
+                    w.auto.cue(crate::docky::Cue::Dizzy, &mut w.pet);
+                }
+                changed = true;
+            } else if back {
+                w.pet.play(crate::docky::Act::Wave);
+                if auto {
+                    w.auto.cue(crate::docky::Cue::Back, &mut w.pet);
+                }
+                changed = true;
+            } else if arrived && hello && !w.pet.busy() {
+                // The pointer came to see him.
+                w.pet.play(crate::docky::Act::Happy);
+                greeted = true;
+                changed = true;
+            } else if let (Some(Some((x, y))), true) = (opened, ((x_seed(p) + w.item.id) % 2) == 0) {
+                // Half the time he glances at the app you switched to.
+                w.pet.glance(toward(x, y));
+                if let (true, Some(name)) = (auto, &app) {
+                    w.auto.cue(crate::docky::Cue::Switched(name.clone()), &mut w.pet);
+                }
+                changed = true;
+            }
+            if changed {
+                // Eyes and nods are his motion alone (the frame loop paces them);
+                // what Auto changed (a look, a bubble) redraws the card itself.
+                frames = true;
+            }
+        }
+        if greeted {
+            self.watch.hello_after = now + Duration::from_secs(20);
+        }
+        // A reply about to fade, or a speech box gone idle, needs frames.
+        frames |= self.widgets.iter().any(|w| w.reply.as_ref().is_some_and(|(_, _, until)| until.saturating_duration_since(now).as_secs_f32() < REPLY_OUT + 0.1));
+        frames |= self.speech.as_ref().is_some_and(|b| b.idle());
+        (true, frames)
+    }
+
+    /// Puts Docky to bed (at night, or while you're away) and wakes him, and
+    /// starts whatever he does next. True when he's started moving.
+    fn tick_docky(&mut self) -> bool {
+        if !self.has(WidgetKind::Docky) {
+            return false;
+        }
+        let hour = chrono::Local::now().hour();
+        let night = self.docky.sleep_at_night && !(7..23).contains(&hour);
+        let away = self.docky.nap_when_away && crate::docky::idle_secs() >= 600;
+        let now = std::time::Instant::now();
+        // The computer flat out (85%+ for a few seconds): he gets hot. Not too often.
+        let mut hot = false;
+        if self.ticks % 2 == 0 {
+            let busy = self.watch.cpu.sample().is_some_and(|c| c >= 85.0);
+            self.watch.hot_streak = if busy { self.watch.hot_streak.saturating_add(1) } else { 0 };
+            if self.watch.hot_streak >= 2 && now >= self.watch.hot_after {
+                hot = true;
+                self.watch.hot_after = now + std::time::Duration::from_secs(180);
+            }
+        }
+        // Something on the calendar in the next five minutes: he waves (once for each).
+        let soon = self.data.events.iter().find(|e| (0..=300).contains(&e.starts_in())).map(|e| e.start);
+        let wave = soon.is_some_and(|s| s != self.watch.waved_event);
+        if let (true, Some(s)) = (wave, soon) {
+            self.watch.waved_event = s;
+        }
+        let mut moving = false;
+        let idle = crate::docky::idle_secs();
+        for w in self.widgets.iter_mut().filter(|w| w.item.kind == WidgetKind::Docky) {
+            w.pet.set_energy(&self.docky.energy);
+            // Asleep with nobody at the computer: he lies still (no frames at all).
+            w.pet.set_still(w.pet.asleep() && idle >= 120);
+            if !w.pet.asleep() && !w.pet.busy() && !w.covered {
+                if hot {
+                    w.pet.play(crate::docky::Act::Hot);
+                    if w.auto() {
+                        w.auto.cue(crate::docky::Cue::Hot, &mut w.pet);
+                    }
+                    w.dirty = true;
+                } else if wave && !w.auto() {
+                    // (An Auto Docky says so himself.)
+                    w.pet.play(crate::docky::Act::Wave);
+                    w.dirty = true;
+                }
+            }
+            // Talking to him keeps him up for a while.
+            if w.reply.as_ref().is_some_and(|(_, _, until)| *until <= now) {
+                w.reply = None;
+                w.dirty = true;
+            }
+            let chatting = now < w.awake_until || w.asked;
+            if w.pet.set_asleep(!chatting && (w.item.docky_style() == "sleepy" || night || away)) {
+                w.dirty = true;
+            }
+            if !w.covered && w.pet.update(now) {
+                w.dirty = true;
+                moving = true;
+            }
+        }
+        moving
     }
 
     /// Moving widgets hidden behind app windows stop (their workers sleep);
     /// Music Wave stops listening when every one of them is hidden.
     fn pause_covered(&mut self) {
-        let moving = |k| matches!(k, WidgetKind::Photo | WidgetKind::Video | WidgetKind::MusicWave);
+        let moving = |k| matches!(k, WidgetKind::Photo | WidgetKind::Video | WidgetKind::MusicWave | WidgetKind::Docky);
         if !self.widgets.iter().any(|w| moving(w.item.kind)) {
             return;
         }
@@ -1097,8 +1495,55 @@ impl Widgets {
     /// Advances fades and springs; returns true while anything moves.
     pub fn animate(&mut self, dt: f32) -> bool {
         let mut moving = false;
+        let now = std::time::Instant::now();
+        let cursor = self.widgets.iter().any(|w| w.item.kind == WidgetKind::Docky && !w.covered && !w.pet.asleep()).then(cursor_px);
         for i in 0..self.widgets.len() {
             let w = &mut self.widgets[i];
+            if let (WidgetKind::Docky, false, false, Some(p)) = (w.item.kind, w.covered, w.pet.asleep(), cursor) {
+                // Sample the pointer at display refresh rate while frames already run,
+                // so his eyes glide at full vsync without 40ms timer stair-steps.
+                let s = w.surface.scale;
+                let (ex, ey) = views::docky_eyes(w.body(), &w.item, w.docky_look(), w.pet.position(now), w.auto());
+                let (dx, dy) = ((p.x as f32 - (w.surface.rect.left as f32 + ex * s)) / s, (p.y as f32 - (w.surface.rect.top as f32 + ey * s)) / s);
+                let d = dx.hypot(dy).max(1.0);
+                let m = (d / 140.0).min(1.0);
+                w.pet.aim(Some((dx / d * m, dy / d * m * 0.85)));
+            }
+            if let Some((_, since, until)) = w.reply.as_mut() {
+                // Pointing at him keeps his reply up; it pops in, then fades as time runs out.
+                if w.tracking {
+                    *until = (*until).max(now + std::time::Duration::from_secs_f32(1.2));
+                }
+                let popping = now.duration_since(*since).as_secs_f32() < REPLY_IN + 0.02;
+                let left = until.saturating_duration_since(now).as_secs_f32();
+                if popping || left < REPLY_OUT + 0.02 {
+                    w.dirty = true;
+                    moving = true;
+                }
+                if left <= 0.0 {
+                    w.reply = None;
+                    w.dirty = true;
+                }
+            }
+            if w.item.kind == WidgetKind::Docky && !w.covered {
+                let switching = w.auto() && w.auto.busy(now);
+                if switching {
+                    // A change of look or a speech bubble: the whole card.
+                    w.dirty = true;
+                    moving = true;
+                }
+                if w.pet.update(now) | w.pet.ease(dt) {
+                    moving = true;
+                    // Evenly paced: his motion is drawn at ~60 or ~30 fps, not
+                    // at the display's full rate (on a 165 Hz screen, every 3rd
+                    // or 6th frame), so he stays smooth for a fraction of the work.
+                    let every = 1.0 / w.pet.fps(now);
+                    if now.duration_since(w.docky_frame).as_secs_f32() >= every * 0.9 {
+                        w.docky_frame = now;
+                        w.docky_dirty = true;
+                    }
+                }
+            }
             if w.appear.step(dt) {
                 w.surface.set_opacity(w.appear.value);
                 moving = true;
@@ -1112,6 +1557,16 @@ impl Widgets {
                 self.follow(i);
             }
         }
+        if let Some(b) = &mut self.speech {
+            moving |= b.tick(dt);
+            if b.idle() {
+                b.close();
+                moving = true;
+            }
+            if b.gone() {
+                self.speech = None;
+            }
+        }
         self.leaving.retain_mut(|s| {
             let o = approach(s.opacity(), 0.0, dt, 20.0);
             s.set_opacity(o);
@@ -1122,12 +1577,18 @@ impl Widgets {
 
     pub fn animating(&self) -> bool {
         !self.leaving.is_empty()
-            || self.widgets.iter().any(|w| !w.appear.settled() || w.motion.moving() || !w.at.0.settled() || !w.at.1.settled())
+            || self.speech.as_ref().is_some_and(|b| b.moving())
+            || self.widgets.iter().any(|w| {
+                !w.appear.settled() || w.motion.moving() || !w.at.0.settled() || !w.at.1.settled() || ((w.pet.moving(std::time::Instant::now()) || w.pet.settling() || (w.auto() && w.auto.busy(std::time::Instant::now()))) && !w.covered)
+            })
     }
 
     // --- drawing -----------------------------------------------------------
 
     pub fn render(&mut self, gfx: &Gfx, theme: &Theme) {
+        if let Some(b) = self.speech.as_mut().filter(|b| b.dirty) {
+            b.render(gfx, theme);
+        }
         let solid = self.cfg.backdrop == Backdrop::None;
         // Screenshot Mode paints demo data in place of anything personal.
         let private = crate::screenshot_mode::on().then(|| {
@@ -1140,8 +1601,28 @@ impl Widgets {
             Some((d, s)) => (d, s),
             None => (&*data, &*store),
         };
-        for w in widgets.iter_mut().filter(|w| w.dirty || w.bars_dirty) {
-            let part = (!w.dirty).then(|| views::wave_area(w.body(), w.item.size));
+        for w in widgets.iter_mut().filter(|w| w.dirty || w.bars_dirty || w.docky_dirty) {
+            // Docky moving: just where he was and where he is now.
+            let docky_part = (w.item.kind == WidgetKind::Docky).then(|| {
+                let auto = w.auto();
+                let scene_full = auto && w.auto.scene(std::time::Instant::now()).say.is_some();
+                let walk = w.pet.position(std::time::Instant::now());
+                let now_at = views::docky_part(w.body(), &w.item, w.docky_look(), walk, auto).filter(|_| !scene_full);
+                let part = match (now_at, w.drawn_at) {
+                    (Some(a), Some(b)) => Some(a.union(b)),
+                    (a, _) => a,
+                };
+                w.drawn_at = now_at;
+                part
+            });
+            let part = if w.dirty {
+                None
+            } else if w.docky_dirty {
+                docky_part.flatten()
+            } else {
+                Some(views::wave_area(w.body(), w.item.size))
+            };
+            w.docky_dirty = false;
             w.dirty = false;
             w.bars_dirty = false;
             if matches!(w.item.kind, WidgetKind::NowPlaying | WidgetKind::MusicWave) {
@@ -1200,6 +1681,19 @@ impl Widgets {
                 motion: Some(&w.motion),
                 pictures: &w.pictures,
                 error: error.as_deref(),
+                docky: (w.item.kind == WidgetKind::Docky).then(|| w.pet.pose(std::time::Instant::now())),
+                docky_scene: w.auto().then(|| w.auto.scene(std::time::Instant::now())),
+                docky_say: if w.asked && crate::docky_ai::chat_pending() {
+                    Some(("hmm\u{2026}".to_string(), 1.0))
+                } else {
+                    // His reply pops in, and fades as its time runs out.
+                    let now = std::time::Instant::now();
+                    w.reply.as_ref().filter(|(_, _, until)| *until > now).map(|(t, since, until)| {
+                        let pop = (now.duration_since(*since).as_secs_f32() / REPLY_IN).min(1.0);
+                        let fade = (until.duration_since(now).as_secs_f32() / REPLY_OUT).min(1.0);
+                        (t.clone(), (1.0 - (1.0 - pop).powi(3)).min(fade * fade * (3.0 - 2.0 * fade)))
+                    })
+                },
             };
             let result = w.surface.render_part(gfx, part, |p| paint(p, body, &ctx, solid, &mut hits));
             if let Err(e) = result {
@@ -1226,7 +1720,7 @@ impl Widgets {
     }
 
     pub fn needs_render(&self) -> bool {
-        self.widgets.iter().any(|w| w.dirty || w.bars_dirty)
+        self.widgets.iter().any(|w| w.dirty || w.bars_dirty || w.docky_dirty) || self.speech.as_ref().is_some_and(|b| b.dirty)
     }
 
     // --- input -------------------------------------------------------------
@@ -1236,16 +1730,82 @@ impl Widgets {
     }
 
     pub fn owns(&self, hwnd: HWND) -> bool {
-        self.index(hwnd).is_some()
+        self.index(hwnd).is_some() || self.is_speech(hwnd)
     }
 
     /// The scale widget window `hwnd` draws at.
     pub fn scale_of(&self, hwnd: HWND) -> f32 {
+        if let Some(b) = self.speech.as_ref().filter(|b| b.surface.content == hwnd) {
+            return b.surface.scale;
+        }
         self.index(hwnd).map_or(1.0, |i| self.widgets[i].surface.scale)
+    }
+
+    fn is_speech(&self, hwnd: HWND) -> bool {
+        self.speech.as_ref().is_some_and(|b| b.surface.content == hwnd)
+    }
+
+    /// Opens Docky's speech box by widget `i` (or brings back the one that's
+    /// there); returns its window, to give it the keyboard.
+    fn open_speech(&mut self, i: usize, gfx: &Gfx) -> Option<HWND> {
+        let id = self.widgets[i].item.id;
+        if let Some(b) = self.speech.as_mut().filter(|b| b.id == id && !b.closing) {
+            b.last_input = std::time::Instant::now();
+            return Some(b.surface.content);
+        }
+        if let Some(b) = &mut self.speech {
+            b.close();
+        }
+        let w = &self.widgets[i];
+        let s = w.surface.scale;
+        let pad = (SHADOW * s).round() as i32;
+        let r = w.surface.rect;
+        let anchor = RECT { left: r.left + pad, top: r.top + pad, right: r.right - pad, bottom: r.bottom - pad };
+        let bottom = self.screen_of(&w.item).monitor.rect.bottom;
+        let pixel = w.docky_look() == "pixel";
+        match speech::SpeechBox::open(gfx, anchor, bottom, s, id, pixel) {
+            Ok(b) => {
+                unsafe {
+                    SetWindowLongPtrW(b.surface.content, GWLP_USERDATA, TAG);
+                }
+                place_on_desktop(b.surface.root());
+                let h = b.surface.content;
+                self.speech = Some(b);
+                Some(h)
+            }
+            Err(e) => {
+                log!("docky speech box failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Says what's in the speech box to its Docky, and lets the box go.
+    fn speak(&mut self) {
+        let Some(b) = &mut self.speech else { return };
+        let text = b.field.string();
+        if text.trim().is_empty() || !crate::docky_ai::send(&text, self.hwnd) {
+            return;
+        }
+        b.close();
+        let id = b.id;
+        if let Some(w) = self.widgets.iter_mut().find(|w| w.item.id == id) {
+            w.asked = true;
+            w.reply = None;
+            w.awake_until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            w.pet.play(crate::docky::Act::Look);
+            w.dirty = true;
+        }
     }
 
     /// Pointer moved over a widget (or anywhere, while one is held).
     pub fn on_move(&mut self, hwnd: HWND, x: f32, y: f32) -> bool {
+        if let Some(b) = self.speech.as_mut().filter(|b| b.surface.content == hwnd) {
+            b.hover = true;
+            let first = !b.tracking;
+            b.tracking = true;
+            return first;
+        }
         let Some(i) = self.index(hwnd) else { return false };
         if let Some(d) = &mut self.drag {
             let p = cursor_px();
@@ -1303,6 +1863,12 @@ impl Widgets {
     }
 
     pub fn on_leave(&mut self, hwnd: HWND) {
+        if let Some(b) = self.speech.as_mut().filter(|b| b.surface.content == hwnd) {
+            b.hover = false;
+            b.tracking = false;
+            b.last_input = std::time::Instant::now();
+            return;
+        }
         if let Some(i) = self.index(hwnd) {
             let w = &mut self.widgets[i];
             w.tracking = false;
@@ -1313,6 +1879,9 @@ impl Widgets {
     }
 
     pub fn on_down(&mut self, hwnd: HWND, x: f32, y: f32) {
+        if self.is_speech(hwnd) {
+            return;
+        }
         let Some(i) = self.index(hwnd) else { return };
         let w = &self.widgets[i];
         // Any press may become a drag, even on text being typed into: a click
@@ -1330,6 +1899,12 @@ impl Widgets {
     }
 
     pub fn on_up(&mut self, hwnd: HWND, x: f32, y: f32, gfx: &Gfx, theme: &Theme) -> WidgetEvent {
+        if self.is_speech(hwnd) {
+            if self.speech.as_ref().is_some_and(|b| b.on_send(x, y)) {
+                self.speak();
+            }
+            return WidgetEvent::None;
+        }
         if let Some(d) = self.drag.take() {
             if d.moved {
                 return WidgetEvent::Save(self.items());
@@ -1400,6 +1975,21 @@ impl Widgets {
                 WidgetKind::Calendar | WidgetKind::UpNext => WidgetEvent::Action(Action::OpenCalendar),
                 WidgetKind::Batteries => WidgetEvent::Action(Action::Open("ms-settings:bluetooth".into())),
                 WidgetKind::System => WidgetEvent::Action(Action::Open("taskmgr.exe".into())),
+                WidgetKind::Docky => {
+                    // A click opens his speech box: he wakes up and listens.
+                    let w = &mut self.widgets[i];
+                    w.awake_until = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                    if w.pet.asleep() {
+                        w.pet.set_asleep(false);
+                    } else if w.pet.poke() && w.auto() {
+                        w.auto.cue(crate::docky::Cue::Click, &mut w.pet);
+                    }
+                    w.dirty = true;
+                    match self.open_speech(i, gfx) {
+                        Some(h) => WidgetEvent::Focus(h),
+                        None => WidgetEvent::None,
+                    }
+                }
                 _ => WidgetEvent::None,
             },
         }
@@ -1458,6 +2048,14 @@ impl Widgets {
             WidgetKind::Video => {
                 entries.push(Entry::item("Choose Video…", Action::Widget(WidgetCmd::Choose(id, false))));
                 entries.push(Entry::Separator);
+            }
+            WidgetKind::Docky => {
+                let style = w.item.docky_style();
+                for (key, label) in crate::docky::STYLES {
+                    entries.push(Entry::item(label, Action::Widget(WidgetCmd::SetDockyStyle(id, key))).checked(style == key));
+                }
+                entries.push(Entry::Separator);
+                entries.push(Entry::item("Docky Settings…", Action::OpenSettings(Some(crate::settings::Page::Docky))));
             }
             WidgetKind::User => {
                 for (key, label) in user::OPTIONS {
@@ -1638,6 +2236,11 @@ impl Widgets {
 
     /// The widget lost the keyboard.
     pub fn on_deactivate(&mut self, hwnd: HWND) {
+        // The speech box goes once you're elsewhere.
+        if let Some(b) = self.speech.as_mut().filter(|b| b.surface.content == hwnd) {
+            b.close();
+            return;
+        }
         if let Some(i) = self.index(hwnd) {
             self.end_edit(i);
         }
@@ -1669,6 +2272,23 @@ impl Widgets {
     }
 
     pub fn on_key(&mut self, hwnd: HWND, vk: u16, ctrl: bool, shift: bool, gfx: &Gfx, theme: &Theme) -> bool {
+        if let Some(b) = self.speech.as_mut().filter(|b| b.surface.content == hwnd) {
+            b.last_input = std::time::Instant::now();
+            b.dirty = true;
+            match vk {
+                VK_RETURN => self.speak(),
+                VK_ESCAPE => b.close(),
+                0x56 if ctrl => {
+                    if let Some(s) = crate::finder::fs::paste_text() {
+                        b.field.insert(&s.replace(['\r', '\n'], " "));
+                    }
+                }
+                _ => {
+                    b.field.on_key(vk, ctrl, shift);
+                }
+            }
+            return true;
+        }
         let Some(i) = self.index(hwnd) else { return false };
         if self.widgets[i].edit.is_none() {
             return false;
@@ -1738,6 +2358,14 @@ impl Widgets {
     }
 
     pub fn on_char(&mut self, hwnd: HWND, c: char, gfx: &Gfx, theme: &Theme) {
+        if let Some(b) = self.speech.as_mut().filter(|b| b.surface.content == hwnd) {
+            if !c.is_control() {
+                b.field.insert(&c.to_string());
+                b.last_input = std::time::Instant::now();
+                b.dirty = true;
+            }
+            return;
+        }
         let Some(i) = self.index(hwnd) else { return };
         let w = &mut self.widgets[i];
         let notes = w.item.kind == WidgetKind::Notes;
@@ -1797,7 +2425,9 @@ impl Widgets {
                 let size = sizes(kind)[0];
                 let (x, y) = free_spot(&here, dims(size), screen.area());
                 let id = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
-                items.push(WidgetItem { id, kind, size, x, y, zone: None, display, sensors: None, path: None, options: None, crop: None, fit: None });
+                // A new Docky lives his own life (Auto).
+                let options = (kind == WidgetKind::Docky).then(|| vec!["auto".to_string()]);
+                items.push(WidgetItem { id, kind, size, x, y, zone: None, display, sensors: None, path: None, options, crop: None, fit: None });
             }
             WidgetCmd::MoveToDisplay(id, to) => {
                 let screen = self.screens.iter().find(|s| s.id == to)?.clone();
@@ -1825,6 +2455,22 @@ impl Widgets {
             }
             // Opened by the app (a panel of its own).
             WidgetCmd::EditPhoto(_) => return None,
+            WidgetCmd::SetDockyStyle(id, style) => {
+                let w = items.iter_mut().find(|w| w.id == id)?;
+                w.options = (style != "classic").then(|| vec![style.to_string()]);
+            }
+            WidgetCmd::AddDocky(style) => {
+                let kind = WidgetKind::Docky;
+                let p = cursor_px();
+                let screen = self.screens.iter().find(|s| s.monitor.contains(p.x, p.y)).unwrap_or(&self.screens[0]).clone();
+                let display = screen.tag();
+                let options = (style != "classic").then(|| vec![style.to_string()]);
+                let probe = WidgetItem { id: 0, kind, size: WidgetSize::Small, x: 0.0, y: 0.0, zone: None, display: display.clone(), sensors: None, path: None, options, crop: None, fit: None };
+                let here: Vec<WidgetItem> = items.iter().filter(|i| self.same_screen(i, &probe)).cloned().collect();
+                let (x, y) = free_spot(&here, dims(WidgetSize::Small), screen.area());
+                let id = items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+                items.push(WidgetItem { id, x, y, ..probe });
+            }
             WidgetCmd::SetDigital(id, on) => {
                 let w = items.iter_mut().find(|w| w.id == id)?;
                 let mut o: Vec<String> = w.options.clone().unwrap_or_default().into_iter().filter(|s| s != "digital").collect();
@@ -2093,8 +2739,16 @@ mod tests {
             let pad = 8.0;
             let (iw, mut placed) = (1100usize, Vec::new());
             let mut y = pad;
-            // Every kind, then the Clock again with its digital face.
-            let rows = KINDS.iter().map(|&k| (k, false)).chain(std::iter::once((WidgetKind::Clock, true)));
+            // Every kind, then the Clock again with its digital face, and Docky's other looks.
+            let rows = KINDS
+                .iter()
+                .map(|&k| (k, None))
+                .chain(std::iter::once((WidgetKind::Clock, Some("digital"))))
+                .chain(crate::docky::STYLES.iter().filter(|(s, _)| !matches!(*s, "classic" | "auto")).map(|(s, _)| (WidgetKind::Docky, Some(*s))))
+                // Auto, saying something in each look.
+                .chain(["say-classic", "say-peek", "say-pixel"].map(|s| (WidgetKind::Docky, Some(s))))
+                // Talking to him: his speech box open, and a long reply.
+                .chain(["chat-classic", "chat-pixel"].map(|s| (WidgetKind::Docky, Some(s))));
             for (kind, digital) in rows {
                 let mut x = pad;
                 let mut row_h: f32 = 0.0;
@@ -2123,7 +2777,7 @@ mod tests {
                         .map(String::from)
                         .to_vec()
                 });
-                let options = digital.then(|| vec!["digital".to_string()]);
+                let options = digital.map(|o| vec![o.to_string()]);
                 let item = WidgetItem { id: 1, kind, size, x: 0.0, y: 0.0, zone: None, display: None, sensors, path: None, options, crop: None, fit: None };
                 let (w, h) = dims(size);
                 let (cw, ch) = ((w + 2.0 * SHADOW) as i32, (h + 2.0 * SHADOW) as i32);
@@ -2142,17 +2796,35 @@ mod tests {
                     }
                     IconPixels { width: pw, height: ph, data }.to_bitmap(canvas.target()).unwrap()
                 });
+                let typing = Edit { field: TextField::new("name my goldfish?"), scroll: 0.0 };
+                let chatting = digital.is_some_and(|o| o.starts_with("chat-"));
+                let item = WidgetItem {
+                    options: item.options.as_ref().map(|o| o.iter().map(|s| s.replace("chat-", "")).collect()),
+                    ..item
+                };
                 let ctx = views::Ctx {
                     theme: &theme,
                     data: &data,
                     store: &store,
                     item: &item,
-                    edit: None,
+                    edit: chatting.then_some(&typing),
                     art: photo.as_ref(),
                     hover: None,
                     motion: None,
                     pictures: &[],
                     error: None,
+                    docky: None,
+                    docky_say: digital.filter(|o| o.starts_with("chat-")).map(|_| {
+                        ("ooh a fishy friend! how about bubbles, finn, or captain splash? hehe".to_string(), 1.0)
+                    }),
+                    docky_scene: digital.and_then(|o| o.strip_prefix("say-")).map(|look| {
+                        let (look, said) = match look {
+                            "peek" => ("peek", "Boo!"),
+                            "pixel" => ("pixel", "> focus mode"),
+                            _ => ("classic", "Ooh, Visual Studio Code!"),
+                        };
+                        crate::docky::Scene { look, from: None, say: Some((said.to_string(), 1.0)) }
+                    }),
                 };
                 let mut hits = Vec::new();
                 // Solid cards: there's no blurred backdrop window here.

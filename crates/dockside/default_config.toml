@@ -379,6 +379,37 @@ week_starts = "auto"
 # What the Calendar app opens in: "day", "week", "month" or "year".
 default_view = "month"
 
+[docky]
+# Docky, DockSide's little friend. Add him to the desktop from System Settings >
+# Docky, or right-click a Docky widget to change his look.
+# He curls up and sleeps from 11 pm to 7 am...
+sleep_at_night = true
+# ...and naps once you've been away for 10 minutes. Click him to say hi.
+nap_when_away = true
+# How often he does things on his own: "calm", "normal" or "playful".
+energy = "normal"
+# He takes the spark's place in the Dynamic Island while Claude Code works:
+# tapping at his laptop, waving when it needs you, hopping when it's done.
+island = true
+# Ask him anything from Spotlight (type ? or "docky" first). Who answers:
+#   "anthropic"            Claude, with your own Anthropic API key
+#   "chatgpt"              ChatGPT, on your ChatGPT plan (Sign in with ChatGPT)
+#   "cloudflare"           Cloudflare Workers AI: free, nothing kept or trained on
+#   "openai"               any OpenAI-style API at custom_url (Ollama, LM Studio, ...)
+#   "anthropic-compatible" any Anthropic-style API at custom_url
+# Keys and sign-ins are set in System Settings > Docky and stored encrypted, never here.
+provider = "anthropic"
+# The model for Claude and Anthropic-style APIs.
+model = "claude-opus-5-5"
+# ChatGPT's model ("" = the first your plan offers).
+chatgpt_model = ""
+# A custom API's address (plain http only to this PC), and an OpenAI-style API's model.
+custom_url = ""
+custom_model = ""
+# Cloudflare Workers AI: your account ID, and the model (the token is set in Settings).
+cloudflare_account = ""
+cloudflare_model = "@cf/google/gemma-4-26b-a4b-it"
+
 [widgets]
 # Widgets on the desktop, below your windows. Drag them to move them (they snap
 # to each other and the screen edges); right-click one to resize or remove it.
@@ -401,7 +432,7 @@ audio_device = ""
 # Widgets and where they sit (top-left corner, in points from the screen's top-left).
 #   kind - clock, world_clock, weather, calendar, up_next, batteries, notes,
 #          reminders, notifications, now_playing, music_wave, photo, video,
-#          system or user
+#          system, user or docky
 #   size - small, medium or large (not every widget has every size)
 #   zone - world_clock: the time zone of a small one (optional)
 #   display - the display it's on (optional; set by dragging it to another screen)
@@ -415,6 +446,8 @@ audio_device = ""
 #          video: a video file (loops, muted). Right-click › Choose… to pick.
 #   options - user: the extras it shows, from "greeting", "buttons" (Lock,
 #             Sign Out, Sleep) and "device" (PC name and uptime); none = all.
+#             docky: his look, one of "classic" (the default), "sleepy",
+#             "peek" or "pixel".
 [[widgets.items]]
 kind = "clock"
 size = "small"

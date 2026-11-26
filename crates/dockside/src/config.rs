@@ -19,6 +19,7 @@ pub struct Config {
     pub island: IslandCfg,
     pub desktops: DesktopsCfg,
     pub widgets: WidgetsCfg,
+    pub docky: DockyCfg,
     pub windows: WindowsCfg,
     pub calendar: CalendarCfg,
     /// Which controls Control Center shows, by name (see `controlcenter::MODULES`).
@@ -458,6 +459,58 @@ pub struct WidgetsCfg {
     pub items: Vec<WidgetItem>,
 }
 
+/// Docky, DockSide's little friend (see `docky`).
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct DockyCfg {
+    /// He curls up and sleeps from 11 pm to 7 am.
+    pub sleep_at_night: bool,
+    /// He naps once you've been away from the keyboard and mouse for 10 minutes.
+    pub nap_when_away: bool,
+    /// How often he does things on his own: "calm", "normal" or "playful".
+    pub energy: String,
+    /// He stands in for the spark in the Dynamic Island while Claude Code works.
+    #[serde(default = "yes")]
+    pub island: bool,
+    /// Who answers his questions: "anthropic" (Claude, API key), "chatgpt" (your
+    /// ChatGPT plan), "openai" or "anthropic-compatible" (any API at `custom_url`).
+    #[serde(default = "docky_provider")]
+    pub provider: String,
+    /// The model for Claude and Anthropic-style APIs.
+    #[serde(default = "docky_model")]
+    pub model: String,
+    /// ChatGPT's model; empty for the first your plan offers.
+    #[serde(default)]
+    pub chatgpt_model: String,
+    /// A custom API's address, e.g. "http://localhost:11434/v1" (Ollama).
+    #[serde(default)]
+    pub custom_url: String,
+    /// The model for an OpenAI-style API.
+    #[serde(default)]
+    pub custom_model: String,
+    /// Cloudflare Workers AI: your account ID (the API token is kept encrypted).
+    #[serde(default)]
+    pub cloudflare_account: String,
+    /// Cloudflare Workers AI's model.
+    #[serde(default = "cloudflare_model")]
+    pub cloudflare_model: String,
+}
+
+fn cloudflare_model() -> String {
+    crate::docky_ai::CLOUDFLARE_MODELS[0].0.to_string()
+}
+
+fn docky_provider() -> String {
+    "anthropic".into()
+}
+
+fn docky_model() -> String {
+    crate::docky_ai::DEFAULT_MODEL.to_string()
+}
+
+fn yes() -> bool {
+    true
+}
+
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum WidgetKind {
@@ -476,6 +529,7 @@ pub enum WidgetKind {
     Video,
     Notifications,
     User,
+    Docky,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -540,6 +594,11 @@ impl WidgetItem {
         }
         let [w, h] = <[f32; 2]>::try_from(self.fit.as_deref()?).ok()?;
         (w.is_finite() && h.is_finite()).then(|| (w.clamp(FIT_MIN, 4000.0), h.clamp(FIT_MIN, 4000.0)))
+    }
+
+    /// Docky: "auto", "pixel-auto", "classic", "sleepy", "peek" or "pixel".
+    pub fn docky_style(&self) -> &str {
+        self.options.as_ref().and_then(|o| o.iter().find(|s| crate::docky::STYLES.iter().any(|(k, _)| k == s))).map_or("classic", |s| s.as_str())
     }
 
     /// Clock: a digital face rather than an analog one.
@@ -628,6 +687,8 @@ fn parse(user: &str) -> Result<Config> {
         cfg.menubar.logo = expand_env(&cfg.menubar.logo);
     }
     assign_widget_ids(&mut cfg.widgets.items);
+    crate::docky::set_on_island(cfg.docky.island);
+    crate::docky_ai::set_config(&cfg.docky);
     Ok(cfg)
 }
 

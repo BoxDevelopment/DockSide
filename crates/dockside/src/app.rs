@@ -41,6 +41,7 @@ use crate::genie::Genie;
 use crate::finder::{self, FinderEvent, FinderWindow, FINDER_PATH};
 use crate::onboarding::{Onboarding, OnboardingEvent, ONBOARDING_PATH};
 use crate::about::{About, AboutEvent, ABOUT_PATH};
+use crate::docky_chat::{ChatEvent, DockyChat};
 use crate::calapp::{CalendarApp, CalendarEvent, CALENDAR_PATH};
 use crate::settings::{Page, SettingsEvent, SettingsWindow, SETTINGS_HWND, SETTINGS_PATH};
 use crate::launchpad::{Launchpad, LaunchpadEvent, LAUNCHPAD_HWND};
@@ -132,6 +133,9 @@ const TIMER_APP_MENUS: usize = 19;
 /// The pointer came to rest on a running app's icon (open its window previews),
 /// or left icon and previews alike (close them, unless it came back).
 const TIMER_PREVIEW: usize = 20;
+/// A Docky widget is on screen: polls the pointer and input for him to react to.
+const TIMER_DOCKY: usize = 21;
+const DOCKY_POLL_MS: u32 = 40;
 const DOCK_FOLLOW_MS: u32 = 100;
 const DOCK_FOLLOW_DWELL_MS: u64 = 300;
 /// Long enough for DWM to present a new surface's backdrop.
@@ -405,6 +409,24 @@ fn execute(action: Action) {
         Action::Launch { path, .. } if path == LAUNCHPAD_PATH => {
             with_app(|app| app.open_launchpad(app.cfg.launchpad.dock));
         }
+        Action::DockyTest => {
+            crate::docky_ai::test(MSG_HWND.load(Ordering::Relaxed));
+            with_app(|app| {
+                app.mark_settings_dirty();
+                app.animate();
+            });
+        }
+        Action::DockyChatGpt(sign_in) => {
+            if sign_in {
+                crate::docky_ai::chatgpt_sign_in(MSG_HWND.load(Ordering::Relaxed));
+            } else {
+                crate::docky_ai::chatgpt_sign_out();
+            }
+            with_app(|app| {
+                app.mark_settings_dirty();
+                app.animate();
+            });
+        }
         Action::OpenLaunchpad(style) => {
             with_app(|app| app.open_launchpad(style));
         }
@@ -505,6 +527,17 @@ fn execute(action: Action) {
         }
         Action::Finder { window, cmd } => {
             with_app(|app| app.finder_cmd(window, cmd));
+        }
+        // Docky's Dock tile: he hops and says something (nothing opens).
+        // Docky's Dock tile: he hops, and his chat window opens.
+        Action::Launch { path, .. } if path == crate::dock::DOCKY_PATH => {
+            with_app(|app| {
+                for d in &mut app.docks {
+                    d.docky_hello();
+                }
+                app.open_docky_chat();
+                app.animate();
+            });
         }
         Action::Launch { path, args } => {
             with_app(|app| {
@@ -1192,6 +1225,7 @@ pub struct App {
     /// The Setup Assistant, on first launch or when reopened.
     onboarding: Option<Onboarding>,
     about: Option<About>,
+    docky_chat: Option<DockyChat>,
     /// The Calendar app, from the menu bar calendar or a Calendar widget.
     calendar: Option<CalendarApp>,
     /// The Calendar app after closing, while it zooms away.
@@ -1393,6 +1427,7 @@ impl App {
             settings: None,
             onboarding: None,
             about: None,
+            docky_chat: None,
             calendar: None,
             closing_calendar: None,
             finders: Vec::new(),
@@ -1599,7 +1634,8 @@ impl App {
         let island_widgets = |c: &Config| {
             (c.widgets.location.clone(), c.widgets.temperature_unit.clone(), c.widgets.world_clocks.clone(), c.menubar.clock_format.clone())
         };
-        if old.island != self.cfg.island || old.menubar.enabled != self.cfg.menubar.enabled
+        crate::docky::set_on_island(self.cfg.docky.island);
+        if old.island != self.cfg.island || old.docky.island != self.cfg.docky.island || old.menubar.enabled != self.cfg.menubar.enabled
             || old.menubar.height != self.cfg.menubar.height
             || old.menubar.displays != self.cfg.menubar.displays
             || island_widgets(&old) != island_widgets(&self.cfg)
@@ -1614,6 +1650,7 @@ impl App {
             self.rebuild_widgets();
         } else if w0 != w1 || old.island.calendar_ics != self.cfg.island.calendar_ics
             || old.menubar.clock_format != self.cfg.menubar.clock_format
+            || old.docky != self.cfg.docky
         {
             if let Some(w) = &mut self.widgets {
                 w.sync(&self.gfx, &self.theme, &self.cfg);
@@ -1995,6 +2032,30 @@ impl App {
         self.flush();
     }
 
+    fn open_docky_chat(&mut self) {
+        match &mut self.docky_chat {
+            Some(c) => c.show(),
+            None => match DockyChat::new(&self.gfx, &Monitor::at_cursor(), MSG_HWND.load(Ordering::Relaxed)) {
+                Ok(c) => {
+                    // It shows (and takes the keyboard) once its first frame is drawn.
+                    self.docky_chat = Some(c);
+                    self.animate();
+                }
+                Err(e) => log!("docky chat window failed: {e}"),
+            },
+        }
+        self.refresh_windows();
+        self.flush();
+    }
+
+    fn close_docky_chat(&mut self) {
+        if let Some(c) = self.docky_chat.take() {
+            let hwnd = c.hwnd;
+            self.fade_out_window(Box::new(c), hwnd);
+            self.refresh_windows();
+        }
+    }
+
     fn close_about(&mut self) {
         if let Some(a) = self.about.take() {
             let hwnd = a.hwnd;
@@ -2222,6 +2283,9 @@ impl App {
         if let Some(a) = &mut self.about {
             still |= a.tick(dt);
         }
+        if let Some(c) = &mut self.docky_chat {
+            still |= c.tick(dt);
+        }
         if let Some(c) = &mut self.calendar {
             still |= c.tick(dt);
         }
@@ -2319,8 +2383,15 @@ impl App {
         if self.island.as_mut().is_some_and(|i| i.on_tick(system::battery())) {
             self.animate();
         }
-        if let Some(w) = &mut self.widgets {
-            w.on_tick();
+        if self.widgets.as_mut().is_some_and(|w| w.on_tick()) {
+            self.animate();
+        }
+        // (Re)starts Docky's watch once he's back in view.
+        if self.widgets.as_ref().is_some_and(|w| w.watching()) {
+            self.timer(TIMER_DOCKY, DOCKY_POLL_MS);
+        }
+        if self.settings.as_mut().is_some_and(|s| s.on_tick()) {
+            self.animate();
         }
         if let Some(c) = &mut self.calendar {
             c.on_tick();
@@ -2442,6 +2513,7 @@ impl App {
             && !self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
             && !self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
             && !self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+            && !self.docky_chat.as_ref().is_some_and(|c| c.hwnd == fg)
             && !self.calendar.as_ref().is_some_and(|c| c.hwnd == fg);
         if surface {
             return;
@@ -2484,6 +2556,7 @@ impl App {
         let ours = self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
             || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
             || self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+            || self.docky_chat.as_ref().is_some_and(|c| c.hwnd == fg)
             || self.calendar.as_ref().is_some_and(|c| c.hwnd == fg);
         let on_desktop = if self.finders.iter().any(|f| f.hwnd == fg) || ours {
             Some(false)
@@ -2518,6 +2591,7 @@ impl App {
         if self.settings.as_ref().is_some_and(|s| s.hwnd == fg)
             || self.onboarding.as_ref().is_some_and(|o| o.hwnd == fg)
             || self.about.as_ref().is_some_and(|a| a.hwnd == fg)
+            || self.docky_chat.as_ref().is_some_and(|c| c.hwnd == fg)
             || self.calendar.as_ref().is_some_and(|c| c.hwnd == fg)
         {
             self.watch_app_menus(HWND::default(), None);
@@ -2537,6 +2611,12 @@ impl App {
         if self.about.as_ref().is_some_and(|a| a.hwnd == fg) {
             for mb in &mut self.menubars {
                 mb.set_app(crate::about::TITLE.into(), fg, None);
+            }
+            return;
+        }
+        if self.docky_chat.as_ref().is_some_and(|c| c.hwnd == fg) {
+            for mb in &mut self.menubars {
+                mb.set_app(crate::docky_chat::TITLE.into(), fg, None);
             }
             return;
         }
@@ -2758,6 +2838,9 @@ impl App {
         if let Some(a) = self.about.as_mut().filter(|a| a.dirty) {
             a.render(&self.gfx, &self.theme);
         }
+        if let Some(c) = self.docky_chat.as_mut().filter(|c| c.dirty) {
+            c.render(&self.gfx, &self.theme);
+        }
         for c in self.calendar.iter_mut().chain(&mut self.closing_calendar).filter(|c| c.dirty) {
             c.render(&self.gfx, &self.theme);
         }
@@ -2809,6 +2892,7 @@ impl App {
             || self.settings.as_ref().is_some_and(|s| s.animating())
             || self.onboarding.as_ref().is_some_and(|o| o.animating())
             || self.about.as_ref().is_some_and(|a| a.animating())
+            || self.docky_chat.as_ref().is_some_and(|c| c.animating())
             || self.calendar.as_ref().is_some_and(|c| c.animating())
             || self.closing_calendar.is_some()
             || self.widgets.as_ref().is_some_and(|w| w.animating())
@@ -3245,6 +3329,14 @@ impl App {
             SpotlightEvent::RunAll(actions) => {
                 self.close_spotlight();
                 actions.into_iter().for_each(push);
+            }
+            // Docky gets asked something: he thinks about it on a worker thread.
+            SpotlightEvent::AskDocky(question) => {
+                let id = crate::docky_ai::ask(question.clone(), MSG_HWND.load(Ordering::Relaxed));
+                if let Some(s) = &mut self.spotlight {
+                    s.docky_asked(question, id);
+                }
+                self.animate();
             }
         }
     }
@@ -3695,6 +3787,7 @@ impl App {
         v.extend(self.settings.as_ref().map(|s| window(s.hwnd, SETTINGS_PATH, "System Settings")));
         v.extend(self.onboarding.as_ref().map(|o| window(o.hwnd, ONBOARDING_PATH, "Setup Assistant")));
         v.extend(self.about.as_ref().map(|a| window(a.hwnd, ABOUT_PATH, crate::about::TITLE)));
+        v.extend(self.docky_chat.as_ref().map(|c| window(c.hwnd, crate::docky_chat::CHAT_PATH, crate::docky_chat::TITLE)));
         v.extend(self.calendar.as_ref().map(|c| window(c.hwnd, CALENDAR_PATH, crate::calapp::TITLE)));
         v.extend(self.icon_picker.as_ref().map(|p| window(p.surface.content, PICKER_PATH, "Icon Picker")));
         v
@@ -4413,6 +4506,15 @@ impl App {
                         TIMER_APPBAR => self.on_appbar_change(),
                         TIMER_FULLSCREEN => self.update_fullscreen(),
                         TIMER_SPOTLIGHT_POLL => self.poll_spotlight(),
+                        TIMER_DOCKY => {
+                            let (again, frames) = self.widgets.as_mut().map_or((false, false), |w| w.poll_docky());
+                            if again {
+                                self.timer(TIMER_DOCKY, DOCKY_POLL_MS);
+                            }
+                            if frames {
+                                self.animate();
+                            }
+                        }
                         TIMER_LAUNCHPAD_BLINK => {
                             if let Some(l) = &mut self.launchpad {
                                 l.blink();
@@ -4519,6 +4621,20 @@ impl App {
                     if let Some(p) = &mut self.icon_picker {
                         p.poll();
                     }
+                }
+                // An answer is in, or a ChatGPT sign-in finished.
+                win::WM_APP_DOCKY => {
+                    if let Some(s) = &mut self.spotlight {
+                        s.docky_answered();
+                    }
+                    if let Some(c) = &mut self.docky_chat {
+                        c.update();
+                    }
+                    if let Some(w) = &mut self.widgets {
+                        w.on_chat();
+                    }
+                    self.mark_settings_dirty();
+                    self.animate();
                 }
                 WM_APP_INDEX_READY => {
                     if let Ok(idx) = self.index.lock() {
@@ -4717,6 +4833,11 @@ impl App {
         }
         if self.about.as_ref().is_some_and(|a| a.hwnd == hwnd) {
             let r = self.on_about_message(hwnd, msg, wp, lp);
+            self.flush_input(msg);
+            return r;
+        }
+        if self.docky_chat.as_ref().is_some_and(|c| c.hwnd == hwnd) {
+            let r = self.on_docky_chat_message(hwnd, msg, wp, lp);
             self.flush_input(msg);
             return r;
         }
@@ -4934,6 +5055,77 @@ impl App {
             AboutEvent::Action(act) => push(act),
             AboutEvent::Close => self.close_about(),
         }
+        Some(LRESULT(0))
+    }
+
+    fn on_docky_chat_message(&mut self, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        let c = self.docky_chat.as_mut()?;
+        let scale = c.scale();
+        let (x, y) = mouse_pt(lp, scale);
+        let event = match msg {
+            WM_NCHITTEST => {
+                // lParam is in screen coordinates here.
+                let mut rc = RECT::default();
+                unsafe {
+                    let _ = GetWindowRect(hwnd, &mut rc);
+                }
+                let sx = (lp.0 & 0xFFFF) as u16 as i16 as i32;
+                let sy = ((lp.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                let (lx, ly) = ((sx - rc.left) as f32 / scale, (sy - rc.top) as f32 / scale);
+                let hit = if c.is_caption(lx, ly) { HTCAPTION } else { HTCLIENT };
+                return Some(LRESULT(hit as isize));
+            }
+            WM_MOUSEMOVE => {
+                if !c.tracking {
+                    c.tracking = true;
+                    track_leave(hwnd);
+                }
+                c.on_move(x, y);
+                ChatEvent::None
+            }
+            WM_MOUSELEAVE => {
+                c.on_leave();
+                ChatEvent::None
+            }
+            WM_LBUTTONDOWN => {
+                c.on_down(x, y);
+                unsafe { SetCapture(hwnd) };
+                ChatEvent::None
+            }
+            WM_LBUTTONUP => {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                c.on_up(x, y)
+            }
+            WM_MOUSEWHEEL => {
+                c.on_wheel(((wp.0 >> 16) & 0xFFFF) as u16 as i16 as i32);
+                ChatEvent::None
+            }
+            WM_KEYDOWN => {
+                let (ctrl, shift) = unsafe { (GetKeyState(VK_CONTROL.0 as i32) < 0, GetKeyState(VK_SHIFT.0 as i32) < 0) };
+                c.on_key(wp.0 as u16, ctrl, shift)
+            }
+            WM_CHAR => {
+                if let Some(ch) = char::from_u32(wp.0 as u32) {
+                    c.on_char(ch);
+                }
+                ChatEvent::None
+            }
+            WM_CLOSE => ChatEvent::Close,
+            WM_SIZE => {
+                c.on_size();
+                return None;
+            }
+            _ => return None,
+        };
+        match event {
+            ChatEvent::None => {}
+            ChatEvent::Action(act) => push(act),
+            ChatEvent::Close => self.close_docky_chat(),
+        }
+        self.animate();
         Some(LRESULT(0))
     }
 
@@ -5346,6 +5538,10 @@ impl App {
             WidgetEvent::Focus(h) => unsafe {
                 let _ = SetForegroundWindow(h);
             },
+        }
+        // Docky, clicked, has something to do.
+        if self.widgets.as_ref().is_some_and(|w| w.animating()) {
+            self.animate();
         }
         Some(LRESULT(0))
     }

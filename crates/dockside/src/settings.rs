@@ -76,11 +76,13 @@ pub enum Page {
     Widgets,
     Calendars,
     Spotlight,
+    Docky,
 }
 
-const PAGES: [(Page, &str); 13] = [
+const PAGES: [(Page, &str); 14] = [
     (Page::General, "General"),
     (Page::Appearance, "Appearance"),
+    (Page::Docky, "Docky"),
     (Page::MenuBar, "Menu Bar"),
     (Page::ControlCenter, "Control Center"),
     (Page::Island, "Dynamic Island"),
@@ -96,7 +98,7 @@ const PAGES: [(Page, &str); 13] = [
 
 /// Where the sidebar's sections start (indices into `PAGES`): DockSide itself,
 /// the desktop's furniture, windows and files, then what's on the desktop.
-const SECTIONS: [usize; 3] = [2, 8, 11];
+const SECTIONS: [usize; 3] = [3, 9, 12];
 
 /// The line under a page's title, saying what's there.
 fn page_blurb(page: Page) -> &'static str {
@@ -114,6 +116,7 @@ fn page_blurb(page: Page) -> &'static str {
         Page::Finder => "Choose how Finder windows look and what they show.",
         Page::Widgets => "Add widgets to the desktop and choose how they look.",
         Page::Calendars => "Connect your calendars to see events in the menu bar and the Dynamic Island.",
+        Page::Docky => "Meet Docky, DockSide’s little friend. Give him a spot on your desktop and choose how he spends his day.",
     }
 }
 
@@ -647,6 +650,22 @@ pub(crate) enum Key {
     WidgetsUnit,
     WidgetsAudio,
     WidgetsClocks,
+    DockySleep,
+    DockyNap,
+    DockyEnergy,
+    DockyIsland,
+    /// Kept encrypted in docky.dat (see `docky_ai`), not config.toml.
+    DockyApiKey,
+    DockyCustomKey,
+    DockyModel,
+    DockyProvider,
+    DockyChatGptModel,
+    DockyCustomUrl,
+    DockyCustomModel,
+    DockyCfAccount,
+    /// Kept encrypted in docky.dat.
+    DockyCfToken,
+    DockyCfModel,
 }
 
 impl Key {
@@ -741,6 +760,19 @@ impl Key {
             Key::WidgetsUnit => ("widgets", "temperature_unit"),
             Key::WidgetsAudio => ("widgets", "audio_device"),
             Key::WidgetsClocks => ("widgets", "world_clocks"),
+            Key::DockySleep => ("docky", "sleep_at_night"),
+            Key::DockyNap => ("docky", "nap_when_away"),
+            Key::DockyEnergy => ("docky", "energy"),
+            Key::DockyIsland => ("docky", "island"),
+            Key::DockyApiKey | Key::DockyCustomKey => ("", ""),
+            Key::DockyModel => ("docky", "model"),
+            Key::DockyProvider => ("docky", "provider"),
+            Key::DockyChatGptModel => ("docky", "chatgpt_model"),
+            Key::DockyCustomUrl => ("docky", "custom_url"),
+            Key::DockyCustomModel => ("docky", "custom_model"),
+            Key::DockyCfAccount => ("docky", "cloudflare_account"),
+            Key::DockyCfToken => ("", ""),
+            Key::DockyCfModel => ("docky", "cloudflare_model"),
         }
     }
 
@@ -794,6 +826,18 @@ pub(crate) enum Hit {
     DiscordPortal,
     AddWidget(crate::config::WidgetKind),
     ResetWidgets,
+    /// Docky's preview: clicking him says hi.
+    Docky,
+    /// Add a Docky widget with this look.
+    AddDocky(&'static str),
+    /// Pin Docky to the Dock, or take him off it.
+    DockyDock,
+    /// Sign in with ChatGPT (true), or out.
+    DockyChatGpt(bool),
+    /// Cloudflare setup pages: sign up (0), Workers AI (1).
+    DockyLink(u8),
+    /// Ask a quick hello with the current settings.
+    DockyTest,
     Onboarding,
     RunAsAdmin,
     NotificationSettings,
@@ -1148,6 +1192,8 @@ pub(crate) struct RowCtx<'a> {
     pub motion: Option<&'a Motion<Anim>>,
     /// Badges before the switches that have one (see `row_icon`).
     pub icons: bool,
+    /// Docky's page: where he is in what he's doing.
+    pub docky: Option<crate::docky::Pose>,
 }
 
 impl RowCtx<'_> {
@@ -1268,6 +1314,8 @@ pub struct SettingsWindow {
     drawn_part: Option<RECT>,
     pub tracking: bool,
     pub dirty: bool,
+    /// Docky, in the Docky page's preview.
+    pet: crate::docky::Pet,
 }
 
 impl SettingsWindow {
@@ -1315,6 +1363,7 @@ impl SettingsWindow {
             drawn_part: None,
             tracking: false,
             dirty: true,
+            pet: crate::docky::Pet::new(),
         })
     }
 
@@ -1330,7 +1379,8 @@ impl SettingsWindow {
         // The page scrolling or a sidebar highlight gliding repaints only its own
         // area; anything else (or a redraw already asked for) repaints it all.
         let was_dirty = self.dirty;
-        let full = self.window.tick(dt, self.hwnd) | self.motion.tick(dt);
+        let docky = self.page == Page::Docky && !self.searching() && (self.pet.update(std::time::Instant::now()) | self.pet.ease(dt));
+        let full = self.window.tick(dt, self.hwnd) | self.motion.tick(dt) | docky;
         let mut part: Option<Rect> = None;
         if self.scroll.tick(dt) {
             part = Some(Self::viewport());
@@ -1362,7 +1412,22 @@ impl SettingsWindow {
     }
 
     pub fn animating(&self) -> bool {
-        self.window.moving() || self.motion.moving() || self.scroll.moving() || self.side_glide.moving() || self.sel_glide.moving()
+        self.window.moving() || self.motion.moving() || self.scroll.moving() || self.side_glide.moving() || self.sel_glide.moving() || self.docky_busy()
+    }
+
+    /// Whether Docky is on screen (his page, not search results) and doing something.
+    fn docky_busy(&self) -> bool {
+        self.page == Page::Docky && !self.searching() && (self.pet.moving(std::time::Instant::now()) || self.pet.settling())
+    }
+
+    /// The one-second tick: Docky may start doing something. True when he has.
+    pub fn on_tick(&mut self) -> bool {
+        if self.page != Page::Docky || self.searching() {
+            return false;
+        }
+        let moving = self.pet.update(std::time::Instant::now());
+        self.dirty |= moving;
+        moving
     }
 
     fn go_to(&mut self, page: Page) {
@@ -1964,6 +2029,106 @@ impl SettingsWindow {
                 },
             ],
             Page::Calendars => calendar_groups(),
+            Page::Docky => vec![
+                Group {
+                    title: None,
+                    rows: vec![
+                        Row::Toggle("Sleep at night (11 pm to 7 am)", Key::DockySleep),
+                        Row::Toggle("Nap when you’re away for 10 minutes", Key::DockyNap),
+                        Row::Segmented("Energy", Key::DockyEnergy),
+                        Row::Toggle("Show him in the Dynamic Island while Claude Code works", Key::DockyIsland),
+                        Row::Buttons(
+                            "Keep Docky in the Dock",
+                            vec![if cfg.dock.apps.iter().any(|a| a.path == crate::dock::DOCKY_PATH) {
+                                ("Remove from Dock", Hit::DockyDock)
+                            } else {
+                                ("Add to Dock", Hit::DockyDock)
+                            }],
+                        ),
+                    ],
+                },
+                Group {
+                    title: Some("On your desktop"),
+                    rows: vec![
+                        Row::Buttons(
+                            "Add Docky, living his own life",
+                            crate::docky::STYLES.iter().filter(|(k, _)| k.ends_with("auto")).map(|&(key, label)| (label, Hit::AddDocky(key))).collect(),
+                        ),
+                        Row::Buttons(
+                            "Add Docky in one look",
+                            crate::docky::STYLES.iter().filter(|(k, _)| !k.ends_with("auto")).map(|&(key, label)| (label, Hit::AddDocky(key))).collect(),
+                        ),
+                        Row::Note(
+                            "While he’s on screen Docky follows your pointer, even over other apps. He nods along as you type, glances at apps you switch to, dances to music, gets dizzy if you shake the pointer at him, and waves when you come back. On Auto he lives his own life: he walks about, has a coffee, reads with his glasses on, naps, puts on headphones when music plays, works at a laptop while you type, plays hide and seek, and chats now and then. Pixel Auto does it all in pixels. Click him to say hi; right-click to change his look.",
+                        ),
+                    ],
+                },
+                Group {
+                    title: Some("Chat with Docky"),
+                    rows: {
+                        let mut rows = vec![Row::Note(
+                            "Ask him anything from Spotlight: type ? or \u{201C}docky\u{201D} and your question. Keys and sign-ins are stored encrypted on this PC.",
+                        )];
+                        rows.extend((0..crate::docky_ai::PROVIDERS.len()).map(|i| Row::Choice(Key::DockyProvider, i)));
+                        match cfg.docky.provider.as_str() {
+                            "chatgpt" => {
+                                let (busy, err) = crate::docky_ai::chatgpt_status();
+                                let state = if busy {
+                                    "Finish signing in in your browser\u{2026}".to_string()
+                                } else if crate::docky_ai::chatgpt_signed_in() {
+                                    "Signed in: answers use your ChatGPT plan".to_string()
+                                } else if let Some(e) = err {
+                                    format!("Sign-in didn\u{2019}t finish: {e}")
+                                } else {
+                                    "Not signed in".to_string()
+                                };
+                                rows.push(Row::Info("ChatGPT", state));
+                                rows.push(if crate::docky_ai::chatgpt_signed_in() {
+                                    Row::Buttons("Sign out of ChatGPT on this PC", vec![("Sign Out", Hit::DockyChatGpt(false))])
+                                } else {
+                                    Row::Buttons("Sign in, and allow plan usage", vec![("Continue with ChatGPT", Hit::DockyChatGpt(true))])
+                                });
+                                rows.push(Row::Text("Model", Key::DockyChatGptModel, "Automatic (your plan\u{2019}s first)"));
+                            }
+                            "cloudflare" => {
+                                rows.push(Row::Note(
+                                    "Free: 10,000 neurons a day, plenty for chatting with Docky. Cloudflare keeps nothing you send and doesn\u{2019}t train on it. 1. Make a free account. 2. On the Workers AI page, choose Use REST API, then Create a Workers AI API Token, and copy the token and your Account ID into the boxes below.",
+                                ));
+                                rows.push(Row::Buttons("Step 1: a free Cloudflare account", vec![("Sign Up", Hit::DockyLink(0))]));
+                                rows.push(Row::Buttons("Step 2: Use REST API \u{203A} Create a Workers AI API Token", vec![("Open Workers AI", Hit::DockyLink(1))]));
+                                rows.push(Row::Text("Account ID", Key::DockyCfAccount, "32 letters and numbers"));
+                                rows.push(Row::Text("API token", Key::DockyCfToken, "Paste the token"));
+                                rows.extend((0..crate::docky_ai::CLOUDFLARE_MODELS.len()).map(|i| Row::Choice(Key::DockyCfModel, i)));
+                                rows.push(Row::Text("Model ID", Key::DockyCfModel, crate::docky_ai::CLOUDFLARE_MODELS[0].0));
+                                let (testing, result) = crate::docky_ai::test_status();
+                                let said = match (testing, result) {
+                                    (true, _) => "Asking Docky\u{2026}".to_string(),
+                                    (false, Some(Ok(hi))) => format!("Works! Docky says: {hi}"),
+                                    (false, Some(Err(e))) => e,
+                                    (false, None) => "Check that everything\u{2019}s set up".to_string(),
+                                };
+                                rows.push(Row::Info("Step 3: try it", said));
+                                rows.push(Row::Buttons("Ask Docky a quick hello", vec![("Test", Hit::DockyTest)]));
+                            }
+                            "openai" => {
+                                rows.push(Row::Text("API address", Key::DockyCustomUrl, "http://localhost:11434/v1"));
+                                rows.push(Row::Text("API key", Key::DockyCustomKey, "Optional"));
+                                rows.push(Row::Text("Model", Key::DockyCustomModel, "llama3.2"));
+                            }
+                            "anthropic-compatible" => {
+                                rows.push(Row::Text("API address", Key::DockyCustomUrl, "https://api.example.com"));
+                                rows.push(Row::Text("API key", Key::DockyCustomKey, "Optional"));
+                                rows.push(Row::Text("Model", Key::DockyModel, crate::docky_ai::DEFAULT_MODEL));
+                            }
+                            _ => {
+                                rows.push(Row::Text("Anthropic API key", Key::DockyApiKey, "sk-ant-\u{2026}"));
+                                rows.push(Row::Text("Model", Key::DockyModel, crate::docky_ai::DEFAULT_MODEL));
+                            }
+                        }
+                        rows
+                    },
+                },
+            ],
             Page::Widgets => {
                 let count = cfg.widgets.items.len();
                 vec![
@@ -2056,6 +2221,9 @@ impl SettingsWindow {
             Key::WinRestore => cfg.windows.animate_restore,
             Key::SpotlightEnabled => cfg.spotlight.enabled,
             Key::WidgetsEnabled => cfg.widgets.enabled,
+            Key::DockySleep => cfg.docky.sleep_at_night,
+            Key::DockyNap => cfg.docky.nap_when_away,
+            Key::DockyIsland => cfg.docky.island,
             _ => false,
         }
     }
@@ -2171,6 +2339,21 @@ impl SettingsWindow {
                 }
                 let sel = values.iter().position(|v| v == current);
                 (labels, values, sel)
+            }
+            Key::DockyCfModel => {
+                let m = &crate::docky_ai::CLOUDFLARE_MODELS;
+                let sel = m.iter().position(|(v, _)| *v == cfg.docky.cloudflare_model);
+                (m.iter().map(|x| x.1.to_string()).collect(), m.iter().map(|x| x.0.to_string()).collect(), sel)
+            }
+            Key::DockyProvider => {
+                let p = &crate::docky_ai::PROVIDERS;
+                let sel = p.iter().position(|(v, _)| *v == cfg.docky.provider).or(Some(0));
+                (p.iter().map(|x| x.1.to_string()).collect(), p.iter().map(|x| x.0.to_string()).collect(), sel)
+            }
+            Key::DockyEnergy => {
+                const ENERGY: [(&str, &str); 3] = [("Calm", "calm"), ("Normal", "normal"), ("Playful", "playful")];
+                let current = cfg.docky.energy.to_lowercase();
+                fixed(&ENERGY, Some(ENERGY.iter().position(|u| u.1 == current).unwrap_or(1)))
             }
             Key::WidgetsUnit => {
                 const UNITS: [(&str, &str); 3] = [("Automatic", "auto"), ("\u{B0}C", "c"), ("\u{B0}F", "f")];
@@ -2337,6 +2520,15 @@ impl SettingsWindow {
             Key::DiscordSecret => cfg.island.discord_client_secret.clone(),
             Key::WidgetsLocation => cfg.widgets.location.clone(),
             Key::WidgetsClocks => cfg.widgets.world_clocks.join(", "),
+            Key::DockyApiKey => crate::docky_ai::key_hint("anthropic"),
+            Key::DockyCustomKey => crate::docky_ai::key_hint("custom"),
+            Key::DockyModel => cfg.docky.model.clone(),
+            Key::DockyChatGptModel => cfg.docky.chatgpt_model.clone(),
+            Key::DockyCustomUrl => cfg.docky.custom_url.clone(),
+            Key::DockyCustomModel => cfg.docky.custom_model.clone(),
+            Key::DockyCfAccount => cfg.docky.cloudflare_account.clone(),
+            Key::DockyCfToken => crate::docky_ai::key_hint("cloudflare"),
+            Key::DockyCfModel => cfg.docky.cloudflare_model.clone(),
             _ => String::new(),
         }
     }
@@ -2359,6 +2551,18 @@ impl SettingsWindow {
         self.dirty = true;
         if let Key::CalDraft(f) = key {
             crate::calsync::set_draft(f, text);
+            return SettingsEvent::None;
+        }
+        // API keys go into docky.dat, encrypted (unchanged: still their hint).
+        if matches!(key, Key::DockyApiKey | Key::DockyCustomKey | Key::DockyCfToken) {
+            let slot = match key {
+                Key::DockyApiKey => "anthropic",
+                Key::DockyCfToken => "cloudflare",
+                _ => "custom",
+            };
+            if text != Self::text_value(key, cfg) && !crate::docky_ai::save_key(slot, &text) {
+                log!("docky: couldn't store the API key");
+            }
             return SettingsEvent::None;
         }
         if text == Self::text_value(key, cfg) {
@@ -2495,6 +2699,17 @@ impl SettingsWindow {
             self.dirty |= s.drag(x);
             return;
         }
+        if self.page == Page::Docky && !self.searching() {
+            if let Some((preview, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Docky) {
+                let (ex, ey) = (preview.cx() - 108.0, preview.bottom() - 28.0);
+                let (dx, dy) = (x - ex, y - ey);
+                let d = dx.hypot(dy).max(1.0);
+                let m = (d / 160.0).min(1.0);
+                if self.pet.aim(Some((dx / d * m, dy / d * m * 0.85))) {
+                    self.dirty = true;
+                }
+            }
+        }
         let h = self.hit_at(x, y);
         if h != self.hover {
             self.hover = h;
@@ -2504,6 +2719,9 @@ impl SettingsWindow {
 
     pub fn on_leave(&mut self) {
         self.tracking = false;
+        if self.pet.aim(None) {
+            self.dirty = true;
+        }
         if self.hover.take().is_some() {
             self.dirty = true;
         }
@@ -2688,6 +2906,19 @@ impl SettingsWindow {
             ),
             Hit::AddWidget(kind) => Action::Widget(crate::widgets::WidgetCmd::Add(kind)),
             Hit::ResetWidgets => Action::Widget(crate::widgets::WidgetCmd::Reset),
+            Hit::AddDocky(style) => Action::Widget(crate::widgets::WidgetCmd::AddDocky(style)),
+            Hit::DockyChatGpt(sign_in) => Action::DockyChatGpt(sign_in),
+            Hit::DockyLink(i) => Action::Open(if i == 0 { crate::docky_ai::CLOUDFLARE_SIGN_UP } else { crate::docky_ai::CLOUDFLARE_WORKERS_AI }.into()),
+            Hit::DockyTest => Action::DockyTest,
+            Hit::DockyDock => {
+                let pinned = cfg.dock.apps.iter().any(|a| a.path == crate::dock::DOCKY_PATH);
+                Action::TogglePin { path: crate::dock::DOCKY_PATH.into(), name: "Docky".into(), pin: !pinned }
+            }
+            Hit::Docky => {
+                self.pet.poke();
+                self.dirty = true;
+                return SettingsEvent::None;
+            }
             Hit::Slider(_) => return SettingsEvent::None,
         };
         SettingsEvent::Action(action)
@@ -2719,6 +2950,7 @@ impl SettingsWindow {
                         (FINDER_PATH, None) => icons.builtin(finder_icon::KEY, || finder_icon::render(gfx)),
                         (START_PATH, None) => icons.builtin(start_icon::KEY, || start_icon::render(gfx)),
                         (LAUNCHPAD_PATH, None) => icons.builtin(launchpad_icon::KEY, || launchpad_icon::render(gfx)),
+                        (crate::dock::DOCKY_PATH, None) => icons.builtin(crate::docky::ICON_KEY, || crate::docky::icon_pixels(gfx, 256)),
                         (CALENDAR_PATH, None) => {
                             let day = chrono::Local::now().date_naive();
                             icons.builtin(&calendar_icon::key(day), || calendar_icon::render(gfx, day))
@@ -2818,6 +3050,7 @@ impl SettingsWindow {
             recording: self.recording.as_ref(),
             motion: Some(motion),
             icons: true,
+            docky: (page == Page::Docky).then(|| self.pet.pose(std::time::Instant::now())),
         };
 
         let r = {
@@ -2912,7 +3145,11 @@ impl SettingsWindow {
                             p.stroke_round(card.inset(0.25, 0.25), CARD_RADIUS, style.card_border, 0.5);
                             let name = Rect::new(card.x, card.y + name_y, card.w, 26.0);
                             if art::has_preview(page) {
-                                art::preview(p, page, Rect::new(card.x + 12.0, card.y + 12.0, card.w - 24.0, PREVIEW_H), &ctx);
+                                let preview = Rect::new(card.x + 12.0, card.y + 12.0, card.w - 24.0, PREVIEW_H);
+                                art::preview(p, page, preview, &ctx);
+                                if page == Page::Docky {
+                                    hits.push((preview, Hit::Docky));
+                                }
                                 // Its icon and name side by side, centred as one.
                                 let tw = gfx.measure(page_name, &name_font);
                                 let x = card.cx() - (24.0 + 9.0 + tw) / 2.0;
@@ -3250,7 +3487,7 @@ fn draw_row(p: &Painter, row: &Row, r: Rect, indent: f32, ctx: &RowCtx, hits: &m
             match ed {
                 Some(e) => {
                     // Passwords show as dots, even while typing.
-                    let masked = *key == Key::CalDraft(crate::calsync::Field::Password);
+                    let masked = *key == Key::CalDraft(crate::calsync::Field::Password) || matches!(*key, Key::DockyApiKey | Key::DockyCustomKey | Key::DockyCfToken);
                     let shown = |n: usize| -> String {
                         if masked {
                             "\u{2022}".repeat(n)
@@ -3522,6 +3759,9 @@ pub(crate) fn draw_page_icon(p: &Painter, page: Page, r: Rect, glyph_font: &wind
             let f = p.gfx.format("Segoe UI", r.h * 0.48, Weight::SemiBold, Align::Center);
             let day = chrono::Local::now().format("%-d").to_string();
             p.text(&day, &f, Rect::new(r.x, r.y + r.h * 0.26, r.w, r.h * 0.74), Color::gray(0, 0.86));
+        }
+        Page::Docky => {
+            crate::docky::draw_tile(p, r, &crate::docky::Pose::IDLE);
         }
         Page::Widgets => {
             p.fill_round(r, 5.0, Color::rgba(255, 149, 0, 1.0));

@@ -52,6 +52,12 @@ pub struct Ctx<'a> {
     pub pictures: &'a [(u64, ID2D1Bitmap)],
     /// Photo / Video: why nothing's showing.
     pub error: Option<&'a str>,
+    /// Docky: where he is in what he's doing (none: at rest).
+    pub docky: Option<crate::docky::Pose>,
+    /// Docky (Auto): the look he's chosen and what he's saying.
+    pub docky_scene: Option<crate::docky::Scene>,
+    /// Docky: his reply to what you said in his speech box (or that he's thinking).
+    pub docky_say: Option<(String, f32)>,
 }
 
 impl Ctx<'_> {
@@ -103,6 +109,7 @@ pub fn draw(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
         WidgetKind::Photo | WidgetKind::Video => picture(p, r, c, hits),
         WidgetKind::Notifications => notifications(p, r, c, hits),
         WidgetKind::User => user(p, r, c, hits),
+        WidgetKind::Docky => docky(p, r, c),
     }
 }
 
@@ -1546,4 +1553,277 @@ fn user(p: &Painter, r: Rect, c: &Ctx, hits: &mut Vec<(Rect, Hit)>) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Docky
+// ---------------------------------------------------------------------------
+
+/// The concept's widget blues, top to bottom, with a soft stage floor.
+const DOCKY_TOP: Color = Color::rgba(130, 162, 250, 1.0);
+const DOCKY_BOTTOM: Color = Color::rgba(102, 136, 236, 1.0);
+const DOCKY_FLOOR: Color = Color::rgba(86, 118, 220, 1.0);
+const PIXEL_BG_TOP: Color = Color::rgba(38, 41, 56, 1.0);
+const PIXEL_BG: Color = Color::rgba(31, 34, 46, 1.0);
+const PIXEL_INK: Color = Color::rgba(212, 222, 252, 1.0);
+const PIXEL_ACCENT: Color = Color::rgba(168, 194, 255, 1.0);
+const BUBBLE_INK: Color = Color::rgba(26, 36, 86, 1.0);
+
+fn docky(p: &Painter, r: Rect, c: &Ctx) {
+    let style = c.item.docky_style();
+    // A reply to you comes before anything he'd say on his own.
+    let chat = c.docky_say.as_ref();
+    match &c.docky_scene {
+        // Auto: whichever look he's chosen, fading over from the last one.
+        Some(scene) => {
+            let say = chat.or(scene.say.as_ref());
+            if let Some((from, k)) = scene.from {
+                docky_look(p, r, c, from, None);
+                p.faded_in(r, k, || docky_look(p, r, c, scene.look, say));
+            } else {
+                docky_look(p, r, c, scene.look, say);
+            }
+        }
+        None => {
+            let look = match style {
+                "auto" => "classic",
+                "pixel-auto" => "pixel",
+                s => s,
+            };
+            docky_look(p, r, c, look, chat);
+        }
+    }
+}
+
+/// A long reply: a wrapped speech bubble across the top of his card (the
+/// chat window has the whole thing if it runs over).
+fn long_bubble(p: &Painter, r: Rect, c: &Ctx, said: &str, a: f32, cx: f32) {
+    let inner_w = r.w - 24.0 - 22.0;
+    let f = p.gfx.format_block(&c.theme.font, 12.0, Weight::SemiBold, Align::Leading);
+    let mut met = DWRITE_TEXT_METRICS::default();
+    let (tw, th) = match p.gfx.layout(said, &f, inner_w, 2000.0) {
+        Some(l) if unsafe { l.GetMetrics(&mut met) }.is_ok() => (met.widthIncludingTrailingWhitespace.ceil(), met.height.ceil()),
+        _ => (inner_w, 16.0),
+    };
+    let (bw, bh) = ((tw + 22.0).min(r.w - 24.0), (th + 14.0).min(r.h * 0.58));
+    let bx = (cx - bw / 2.0).clamp(r.x + 12.0, r.right() - 12.0 - bw);
+    let b = Rect::new(bx, r.y + 10.0 + 5.0 * (1.0 - a), bw, bh);
+    let tail = cx.clamp(b.x + 16.0, b.right() - 16.0);
+    p.faded_in(b.inset(-8.0, -14.0), a, || {
+        bubble(p, b, tail, 13.0, 1.0);
+        let inner = Rect::new(b.x + 11.0, b.y + 7.0, b.w - 22.0, b.h - 14.0);
+        p.clipped(inner, || {
+            if let Some(l) = p.gfx.layout(said, &f, inner_w, 2000.0) {
+                p.text_layout(&l, inner.x, inner.y, BUBBLE_INK);
+            }
+        });
+    });
+}
+
+/// Whether what he's saying needs the wrapped bubble.
+fn is_long(said: &str) -> bool {
+    said.chars().count() > 24
+}
+
+/// Docky in one of his looks, and (Auto) what he's saying with how far it's faded in.
+fn docky_look(p: &Painter, r: Rect, c: &Ctx, style: &str, say: Option<&(String, f32)>) {
+    use crate::docky::{self as d, Palette, Pose};
+    let medium = c.item.size != WidgetSize::Small;
+    let mut pose = c.docky.unwrap_or(if style == "sleepy" { Pose::ASLEEP } else { Pose::IDLE });
+    let asleep = pose.sleepy > 0.45;
+    let auto = c.docky_scene.is_some();
+
+    if style == "pixel" {
+        p.fill_round_gradient(r, RADIUS, PIXEL_BG_TOP, PIXEL_BG);
+        p.stroke_round(r.inset(0.5, 0.5), RADIUS, Color::gray(255, 0.09), 1.0);
+        let area = r.inset(r.w * 0.11, r.h * 0.16);
+        d::draw_pixel(p, area.offset(0.0, if say.is_some() { 8.0 } else { 0.0 }), &pose, PIXEL_INK, PIXEL_ACCENT, PIXEL_BG);
+        // Said as lines on a terminal (a long reply wraps over a few).
+        if let Some((text, a)) = say {
+            let font = if p.gfx.font_exists("Cascadia Mono") { "Cascadia Mono" } else { "Consolas" };
+            let line = if text.starts_with('>') { text.clone() } else { format!("> {}", text.to_lowercase()) };
+            let f = p.gfx.format(font, 12.0, Weight::Bold, Align::Leading);
+            let per = ((r.w - 2.0 * PAD) / 7.3).max(10.0) as usize;
+            let rows = 5;
+            for (i, l) in crate::docky_ai::wrap(&line, per).into_iter().take(rows).enumerate() {
+                p.text(&l, &f, Rect::new(r.x + PAD, r.y + 10.0 + 15.0 * i as f32, r.w - 2.0 * PAD, 16.0), PIXEL_INK.alpha(*a));
+            }
+        }
+        return;
+    }
+
+    p.fill_round_gradient(r, RADIUS, DOCKY_TOP, DOCKY_BOTTOM);
+    let look = style;
+    let (cx, ground, s) = d::place(r, medium && !auto, look);
+    let cx = if look == "classic" { cx + pose.walk * d::walk_room(r, s) } else { cx };
+
+    // Cozy grounded stage floor across the bottom of Normal and Sleepy cards.
+    if look != "peek" {
+        let floor_y = ground - 0.04 * s;
+        p.clipped(Rect::new(r.x, floor_y, r.w, r.bottom() - floor_y), || {
+            p.fill_round_gradient(r, RADIUS, DOCKY_FLOOR.alpha(0.42), Color::rgba(74, 106, 214, 0.86));
+        });
+    }
+
+    if look == "peek" {
+        // Peeking over the bottom edge: big, bold, with bright dashes off his top-left shoulder.
+        let s = if medium && !auto { 0.84 * r.h } else { 0.64 * r.h };
+        let cx = r.cx();
+        let ground = r.bottom() + 0.085 * s;
+        if !asleep {
+            pose.sparkle = pose.sparkle.max(1.0);
+            pose.sparkle_bright = 1.0;
+            pose.side = -1.0;
+        }
+        p.clipped(r, || {
+            // Subtle contact shadow along the bottom ledge beside his gripping paws.
+            p.fill_round(Rect::new(cx - 0.64 * s, r.bottom() - 5.0, 1.28 * s, 10.0), 5.0, Color::rgba(28, 52, 156, 0.24));
+            d::draw(p, cx, ground, s, &pose, &Palette::CARD.shadowless());
+        });
+    } else {
+        d::draw(p, cx, ground, s, &pose, &Palette::CARD);
+    }
+    p.stroke_round(r.inset(0.5, 0.5), RADIUS, Color::gray(255, 0.22), 1.0);
+
+    let head = d::body_rect(cx, ground, s, &pose);
+
+    if look == "classic" && medium && !auto && say.is_none_or(|(t, _)| !is_long(t)) {
+        // Speech bubble cleanly beside his head, with a side pointer towards his cheek.
+        let x = (cx + 0.62 * s).max(r.x + 0.40 * r.w);
+        let b = Rect::new(x, r.cy() - 33.0, r.right() - PAD - x, 62.0);
+        bubble_side(p, b, b.cy() + 6.0, 16.0);
+        let hs = 18.0 * (1.0 + 0.16 * pose.happy);
+        d::heart(p, b.x + 23.0 - hs / 2.0, b.cy() - hs / 2.0 + 1.0, hs, Palette::CARD.heart);
+        let (greeting, line) = docky_lines(c);
+        let tx = b.x + 43.0;
+        let w = (b.right() - 14.0 - tx).max(20.0);
+        let title = say.map_or(greeting, |(t, _)| t.clone());
+        let a = say.map_or(1.0, |(_, a)| 0.35 + 0.65 * a);
+        let ts = fitted(p, c, &title, 15.0, Weight::Bold, w);
+        text(p, c, &title, ts, Weight::Bold, Align::Leading, Rect::new(tx, b.y + 10.0, w, 22.0), BUBBLE_INK.alpha(a));
+        let ls = fitted(p, c, &line, 12.0, Weight::Regular, w);
+        text(p, c, &line, ls, Weight::Regular, Align::Leading, Rect::new(tx, b.y + 33.0, w, 20.0), BUBBLE_INK.alpha(0.62));
+        return;
+    }
+
+    // Small (and Auto / Peeking): what he's saying pops up over his head;
+    // a classic Docky with nothing to say shows his signature heart bubble slightly upper-right.
+    match say {
+        Some((said, a)) if is_long(said) => long_bubble(p, r, c, said, *a, cx),
+        Some((said, a)) => {
+            let f = p.gfx.format(&c.theme.font, 12.5, Weight::Bold, Align::Center);
+            let tw = p.gfx.measure(said, &f).min(r.w - 2.0 * PAD - 20.0);
+            let bw = (tw + 22.0).max(42.0);
+            let top = if look == "peek" { r.y + 12.0 } else { (head.y - 42.0).max(r.y + 8.0) };
+            let bx = (cx - bw / 2.0).clamp(r.x + PAD - 6.0, r.right() - PAD + 6.0 - bw);
+            let b = Rect::new(bx, top + 5.0 * (1.0 - a), bw, 28.0);
+            let tail = cx.clamp(b.x + 14.0, b.right() - 14.0);
+            p.faded_in(b.inset(-8.0, -14.0), *a, || {
+                p.scaled_about(tail, b.bottom() + 6.0, 0.90 + 0.10 * a, || {
+                    bubble(p, b, tail, 13.0, 1.0);
+                    let size = fitted(p, c, said, 12.5, Weight::Bold, tw);
+                    text(p, c, said, size, Weight::Bold, Align::Center, b, BUBBLE_INK);
+                });
+            });
+        }
+        None if look == "classic" && !auto => {
+            // Positioned slightly upper-right of his crown, matching the concept's Normal Widget.
+            let (bw, bh) = (44.0, 32.0);
+            let bx = (cx - bw * 0.18).clamp(r.x + 12.0, r.right() - 12.0 - bw);
+            let by = (head.y - bh - 12.0).max(r.y + 9.0);
+            let b = Rect::new(bx, by, bw, bh);
+            bubble(p, b, b.x + 18.0, 12.5, 1.0);
+            let hs = 17.5 * (1.0 + 0.16 * pose.happy);
+            d::heart(p, b.cx() - hs / 2.0, b.cy() - hs / 2.0 + 0.5, hs, Palette::CARD.heart);
+        }
+        None => {}
+    }
+}
+
+/// A white speech bubble with a soft shadow and its tail at `tail_x`, pointing down.
+fn bubble(p: &Painter, b: Rect, tail_x: f32, radius: f32, opacity: f32) {
+    if opacity > 0.5 {
+        p.soft_shadow(b, radius, 4, 1.3, 0.12 * opacity, 2.0, Color::rgba(22, 44, 138, 1.0));
+    }
+    let c = Color::gray(255, opacity);
+    p.fill_round(b, radius, c);
+    let tail = p.gfx.path(|sink| unsafe {
+        sink.BeginFigure(pt(tail_x - 6.0, b.bottom() - 1.5), D2D1_FIGURE_BEGIN_FILLED);
+        sink.AddLine(pt(tail_x - 1.5, b.bottom() + 7.0));
+        sink.AddLine(pt(tail_x + 5.5, b.bottom() - 1.5));
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = tail {
+        p.fill_geometry(&g, c);
+    }
+}
+
+/// A white speech bubble whose tail points left towards Docky on a Medium card.
+fn bubble_side(p: &Painter, b: Rect, tail_y: f32, radius: f32) {
+    p.soft_shadow(b, radius, 4, 1.4, 0.13, 2.0, Color::rgba(22, 44, 138, 1.0));
+    p.fill_round(b, radius, Color::WHITE);
+    let tail = p.gfx.path(|sink| unsafe {
+        sink.BeginFigure(pt(b.x + 1.5, tail_y - 6.0), D2D1_FIGURE_BEGIN_FILLED);
+        sink.AddLine(pt(b.x - 7.0, tail_y + 1.5));
+        sink.AddLine(pt(b.x + 1.5, tail_y + 5.5));
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+    });
+    if let Some(g) = tail {
+        p.fill_geometry(&g, Color::WHITE);
+    }
+}
+
+/// What Docky says on a medium widget: a greeting, and the date (or the battery, when it's low).
+fn docky_lines(c: &Ctx) -> (String, String) {
+    let now = Local::now();
+    let (hi, mark) = match now.hour() {
+        5..=11 => ("mornin'", '!'),
+        12..=16 => ("hiya", '!'),
+        17..=21 => ("evenin'", '!'),
+        _ => ("up late", '?'),
+    };
+    let title = match c.data.user.as_ref().map(|u| u.first.as_str()).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{hi}, {}{mark}", n.to_lowercase()),
+        None => format!("{hi}{mark}"),
+    };
+    let line = match c.data.battery {
+        Some(b) if b.percent <= 20 && !b.charging => format!("hungry\u{2026} battery\u{2019}s at {}%", b.percent),
+        _ => now.format("%A, %-d %B").to_string(),
+    };
+    (title, line)
+}
+
+/// Where Docky's eyes are in widget body `r` in `look`, walked `walk` (-1..1)
+/// across it (for him to look at the pointer).
+pub fn docky_eyes(r: Rect, item: &WidgetItem, look: &str, walk: f32, auto: bool) -> (f32, f32) {
+    if look == "pixel" {
+        let area = r.inset(r.w * 0.11, r.h * 0.16);
+        let u = crate::docky::pixel_cell(area);
+        let room = ((area.w / u - 21.0) / 2.0).floor().max(0.0);
+        return (r.cx() + (walk * room).round() * u - 2.0 * u, r.cy());
+    }
+    if look == "peek" {
+        let medium = item.size != WidgetSize::Small && !auto;
+        let s = if medium { 0.84 * r.h } else { 0.64 * r.h };
+        return crate::docky::eyes_at(r.cx(), r.bottom() + 0.085 * s, s);
+    }
+    let (cx, ground, s) = crate::docky::place(r, item.size != WidgetSize::Small && !auto, look);
+    let cx = if look == "classic" { cx + walk * crate::docky::walk_room(r, s) } else { cx };
+    crate::docky::eyes_at(cx, ground, s)
+}
+
+/// The part of a Docky widget (body `r`) that his motion touches in `look`,
+/// walked `walk` across it: him, plus what floats off him (Zs, notes, a heart,
+/// dashes). None when the whole card must be redrawn (pixel art fills it).
+pub fn docky_part(r: Rect, item: &WidgetItem, look: &str, walk: f32, auto: bool) -> Option<Rect> {
+    if look == "pixel" {
+        return None;
+    }
+    let (cx, ground, s) = crate::docky::place(r, item.size != WidgetSize::Small && !auto, look);
+    let cx = if look == "classic" { cx + walk * crate::docky::walk_room(r, s) } else { cx };
+    let x0 = (cx - 0.95 * s).max(r.x);
+    let x1 = (cx + 1.15 * s).min(r.right());
+    let y0 = (ground - 1.6 * s).max(r.y);
+    let y1 = (ground + 0.22 * s).min(r.bottom());
+    (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
 }

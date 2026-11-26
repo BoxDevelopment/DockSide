@@ -998,6 +998,31 @@ impl Painter<'_> {
         self.transformed(cx * (1.0 - scale), cy * (1.0 - scale), scale, f)
     }
 
+    /// Draws `f` rotated `degrees` clockwise about (`cx`, `cy`), on top of any
+    /// transform already in effect.
+    pub fn rotated(&self, cx: f32, cy: f32, degrees: f32, f: impl FnOnce()) {
+        if degrees.abs() < 0.01 {
+            return f();
+        }
+        let (s, c) = degrees.to_radians().sin_cos();
+        let m = Matrix3x2 { M11: c, M12: s, M21: -s, M22: c, M31: cx - c * cx + s * cy, M32: cy - s * cx - c * cy };
+        unsafe {
+            let mut o = Matrix3x2::default();
+            self.rt.GetTransform(&mut o);
+            let t = Matrix3x2 {
+                M11: m.M11 * o.M11 + m.M12 * o.M21,
+                M12: m.M11 * o.M12 + m.M12 * o.M22,
+                M21: m.M21 * o.M11 + m.M22 * o.M21,
+                M22: m.M21 * o.M12 + m.M22 * o.M22,
+                M31: m.M31 * o.M11 + m.M32 * o.M21 + o.M31,
+                M32: m.M31 * o.M12 + m.M32 * o.M22 + o.M32,
+            };
+            self.rt.SetTransform(&t);
+            f();
+            self.rt.SetTransform(&o);
+        }
+    }
+
     /// Runs `f` with a translate + uniform scale transform applied.
     /// Draws `f` translated then scaled, on top of any transform already in effect.
     pub fn transformed(&self, x: f32, y: f32, scale: f32, f: impl FnOnce()) {

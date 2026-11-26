@@ -117,6 +117,8 @@ enum RowAction {
     Latex { code: &'static str, symbol: &'static str },
     /// Puts a clipboard history entry back, and pastes it.
     Paste(usize),
+    /// Asks Docky the question.
+    AskDocky(String),
     ClearClipboard,
 }
 
@@ -131,6 +133,8 @@ enum Badge {
     Symbol(&'static str),
     /// A text clipping.
     Text,
+    /// Docky himself.
+    Docky,
 }
 
 #[derive(Clone, Debug)]
@@ -150,6 +154,30 @@ pub enum SpotlightEvent {
     Run(Action),
     /// Close, then run these in order (paste needs the app focused again first).
     RunAll(Vec<Action>),
+    /// Ask Docky this (Spotlight stays open for his answer).
+    AskDocky(String),
+}
+
+/// A question for Docky and (once it's in) his answer.
+struct DockyChat {
+    question: String,
+    id: u64,
+    answer: Option<std::result::Result<String, String>>,
+}
+
+/// What follows "?" or "docky" at the start of a search: a question for Docky.
+fn docky_query(raw: &str) -> Option<String> {
+    let t = raw.trim_start();
+    if let Some(rest) = t.strip_prefix('?') {
+        return Some(rest.trim().to_string());
+    }
+    let lower = t.to_lowercase();
+    for p in ["docky,", "docky:", "docky "] {
+        if lower.starts_with(p) {
+            return Some(t[p.len()..].trim().to_string());
+        }
+    }
+    (lower == "docky").then(String::new)
 }
 
 /// What the panel last showed, kept to draw while it closes: by then the
@@ -251,6 +279,8 @@ pub struct Spotlight {
     /// See `Shown`; `rows_changed` says it's out of date.
     shown: Option<Shown>,
     rows_changed: bool,
+    /// The question asked of Docky, and his answer.
+    docky: Option<DockyChat>,
     /// The Apps panel's selection, gliding like the list's.
     app_glide: Glide,
     apps: AppsView,
@@ -379,6 +409,7 @@ impl Spotlight {
             held: PILL_H,
             shown: None,
             rows_changed: true,
+            docky: None,
             app_glide: Glide::default(),
             apps: AppsView::default(),
             app_hits: Vec::new(),
@@ -611,6 +642,9 @@ impl Spotlight {
         if q.is_empty() {
             return;
         }
+        if self.docky_rows() {
+            return;
+        }
 
         let top_n = |items: &[Item], n: usize| -> Vec<(i32, Item)> {
             let mut scored: Vec<(i32, &Item)> = items.iter().filter_map(|it| index::score(it, &q).map(|s| (s, it))).collect();
@@ -769,6 +803,69 @@ impl Spotlight {
         }
     }
 
+    /// Fills the rows for a question to Docky ("?" or "docky" first): asking,
+    /// thinking, or his answer. False when the search isn't one.
+    fn docky_rows(&mut self) -> bool {
+        let Some(q) = docky_query(&self.query()) else { return false };
+        let row = |section: &'static str, title: String, subtitle: &str, action: RowAction| Row {
+            section,
+            title,
+            subtitle: subtitle.into(),
+            action,
+            icon: None,
+            badge: Some(Badge::Docky),
+        };
+        let chat = self.docky.as_ref().filter(|c| c.question == q);
+        match chat.map(|c| &c.answer) {
+            Some(Some(Ok(answer))) => {
+                let lines = crate::docky_ai::wrap(answer, 64);
+                let more = lines.len() > 8;
+                for (i, line) in lines.into_iter().take(8).enumerate() {
+                    let sub = if i == 0 { "Enter copies his answer" } else { "" };
+                    self.rows.push(row("Docky", line, sub, RowAction::Copy(answer.clone())));
+                }
+                if more {
+                    self.rows.push(row("Docky", "\u{2026}".into(), "", RowAction::Copy(answer.clone())));
+                }
+            }
+            Some(Some(Err(said))) => self.rows.push(row("Docky", said.clone(), "Enter to try again", RowAction::AskDocky(q))),
+            Some(None) => self.rows.push(row("Docky", "*thinking* mrrp\u{2026}".into(), "", RowAction::Copy(String::new()))),
+            None if q.is_empty() => self.rows.push(row("Docky", "ask me anything!".into(), "type your question", RowAction::Copy(String::new()))),
+            None if crate::docky_ai::ready().is_err() => self.rows.push(row(
+                "Docky",
+                crate::docky_ai::ready().err().unwrap_or_default(),
+                "Press Enter to open Settings \u{203A} Docky",
+                RowAction::Run(Action::OpenSettings(Some(crate::settings::Page::Docky))),
+            )),
+            None => self.rows.push(row("Docky", format!("ask docky: \u{201C}{q}\u{201D}"), "Press Enter to ask", RowAction::AskDocky(q))),
+        }
+        true
+    }
+
+    /// A question went off to Docky: show him thinking.
+    pub fn docky_asked(&mut self, question: String, id: u64) {
+        self.docky = Some(DockyChat { question, id, answer: None });
+        self.refresh_docky();
+    }
+
+    /// His answer may be in: show it.
+    pub fn docky_answered(&mut self) {
+        let Some(chat) = self.docky.as_mut() else { return };
+        if let Some(a) = crate::docky_ai::take(chat.id) {
+            chat.answer = Some(a);
+            self.refresh_docky();
+        }
+    }
+
+    fn refresh_docky(&mut self) {
+        self.rows.clear();
+        self.selected = 0;
+        self.glide.reset();
+        self.rows_changed = true;
+        self.dirty = true;
+        self.docky_rows();
+    }
+
     fn run(&self, i: usize, reveal: bool, shift: bool) -> SpotlightEvent {
         let Some(row) = self.rows.get(i) else { return SpotlightEvent::None };
         let action = match &row.action {
@@ -783,10 +880,12 @@ impl Spotlight {
             RowAction::OpenFolder(p) => Action::OpenFinder(Some(PathBuf::from(p))),
             RowAction::Url(u) => Action::Open(u.clone()),
             RowAction::Run(a) => a.clone(),
+            RowAction::Copy(text) if text.is_empty() => return SpotlightEvent::None,
             RowAction::Copy(text) => {
                 crate::finder::fs::copy_text(text);
                 return SpotlightEvent::Close;
             }
+            RowAction::AskDocky(q) => return SpotlightEvent::AskDocky(q.clone()),
             RowAction::Latex { code, symbol } => {
                 crate::finder::fs::copy_text(if shift { symbol } else { code });
                 return SpotlightEvent::Close;
@@ -1430,6 +1529,12 @@ impl Spotlight {
                             let ink = if sel || !theme.dark { Color::gray(0, 0.88) } else { Color::WHITE };
                             let font = if sym.chars().count() > 2 { &symbol_small } else { &symbol_font };
                             p.text(sym, font, icon_r.inset(-6.0, 0.0), ink);
+                        }
+                        Some(Badge::Docky) => {
+                            let tile = Rect::new(icon_r.cx() - 12.0, icon_r.cy() - 12.0, 24.0, 24.0);
+                            p.fill_round_gradient(tile, 6.0, Color::rgba(133, 164, 249, 1.0), Color::rgba(102, 134, 228, 1.0));
+                            let pal = crate::docky::Palette::CARD.shadowless();
+                            crate::docky::draw(p, tile.cx(), tile.bottom() - 3.5, 15.0, &crate::docky::Pose::IDLE, &pal);
                         }
                         Some(Badge::Web) | None => {
                             // Web: a globe.

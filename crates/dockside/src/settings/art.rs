@@ -651,7 +651,7 @@ fn launcher(p: &Painter, r: Rect, tahoe: bool, dark: bool) {
 
 /// Whether `page` opens with a live preview.
 pub(super) fn has_preview(page: Page) -> bool {
-    matches!(page, Page::Dock | Page::MenuBar | Page::Island)
+    matches!(page, Page::Dock | Page::MenuBar | Page::Island | Page::Docky)
 }
 
 /// The live preview heading `page`, filling `r`.
@@ -660,6 +660,7 @@ pub(super) fn preview(p: &Painter, page: Page, r: Rect, ctx: &RowCtx) {
     p.clipped(r, || match page {
         Page::Dock => dock_preview(p, r, ctx),
         Page::MenuBar => menubar_preview(p, r, ctx),
+        Page::Docky => docky_preview(p, r, ctx),
         _ => island_preview(p, r, ctx),
     });
     p.stroke_round(r.inset(0.25, 0.25), PREVIEW_RADIUS, Color::gray(0, 0.14), 0.5);
@@ -686,6 +687,131 @@ fn context_bar(p: &Painter, r: Rect, ctx: &RowCtx) -> f32 {
     let bar = top_bar(p, r, PREVIEW_RADIUS, 13.0, kind, ctx.theme.dark);
     bar_marks(p, bar, ink(kind, ctx.theme.dark));
     bar.h
+}
+
+/// The concept's "In Action": Docky's live tile first in the Dock, saying hi.
+fn docky_preview(p: &Painter, r: Rect, ctx: &RowCtx) {
+    use crate::docky::{self as d, Pose};
+    let pose = ctx.docky.unwrap_or(Pose::IDLE);
+    // Deep macOS indigo-cobalt wallpaper with sweeping light waves, as in "In Action".
+    p.fill_round_gradient(r, PREVIEW_RADIUS, rgb(58, 86, 206), rgb(34, 52, 158));
+    if let Some(wave) = p.gfx.path(|s| unsafe {
+        s.BeginFigure(pt(r.x + r.w * 0.34, r.y), D2D1_FIGURE_BEGIN_FILLED);
+        s.AddLine(pt(r.right(), r.y));
+        s.AddLine(pt(r.right(), r.y + r.h * 0.68));
+        s.AddBezier(&D2D1_BEZIER_SEGMENT {
+            point1: pt(r.x + r.w * 0.78, r.y + r.h * 0.62),
+            point2: pt(r.x + r.w * 0.58, r.y + r.h * 0.18),
+            point3: pt(r.x + r.w * 0.34, r.y),
+        });
+        s.EndFigure(D2D1_FIGURE_END_CLOSED);
+    }) {
+        p.fill_geometry(&wave, Color::rgba(92, 118, 236, 0.28));
+    }
+    context_bar(p, r, ctx);
+
+    // The Dock: Docky's live tile, a divider, then four companion macOS-style app icons.
+    let (tile, gap, n) = (46.0, 10.0, 4usize);
+    let w = gap + tile + 2.0 * gap + 1.0 + n as f32 * (tile + gap);
+    let shelf = Rect::new(r.cx() - w / 2.0, r.bottom() - tile - 2.0 * gap - 8.0, w, tile + 2.0 * gap);
+    p.soft_shadow(shelf, 18.0, 5, 1.5, 0.18, 2.5, Color::rgba(10, 18, 68, 1.0));
+    p.fill_round(shelf, 18.0, Color::rgba(218, 226, 255, 0.22));
+    p.stroke_round(shelf.inset(0.35, 0.35), 18.0, Color::gray(255, 0.36), 0.7);
+
+    // Docky's tile gently bobs when he jumps, while Docky inside it animates in full!
+    let tile_lift = (pose.lift * tile * 0.35).clamp(-8.0, 2.0);
+    let dt = Rect::new(shelf.x + gap, shelf.y + gap + tile_lift, tile, tile);
+    p.rotated(dt.cx(), dt.bottom(), pose.tilt * 0.25, || d::draw_tile(p, dt, &pose));
+    p.fill_circle(dt.cx(), shelf.bottom() - 4.2, 1.9, Color::gray(255, 0.92));
+
+    let div = shelf.x + gap + tile + gap;
+    p.line(div, shelf.y + 10.0, div, shelf.bottom() - 10.0, Color::gray(255, 0.32), 1.0);
+    for i in 0..n {
+        docky_companion_icon(p, Rect::new(div + gap + i as f32 * (tile + gap), shelf.y + gap, tile, tile), i);
+    }
+
+    // "Hi! ♥" floating over his tile, bobbing lightly with him.
+    let f = p.gfx.format(&ctx.theme.font, 13.5, Weight::Bold, Align::Leading);
+    let label = "Hi!";
+    let bw = p.gfx.measure(label, &f) + 42.0;
+    let b = Rect::new(dt.x + tile * 0.18, dt.y - 38.0, bw, 29.0);
+    p.soft_shadow(b, 12.0, 4, 1.3, 0.16, 2.0, Color::rgba(14, 26, 92, 1.0));
+    p.fill_round(b, 12.0, Color::WHITE);
+    fill_shape(p, &[vec![(b.x + 10.0, b.bottom() - 1.5), (b.x + 12.5, b.bottom() + 7.0), (b.x + 21.0, b.bottom() - 1.5)]], Color::WHITE);
+    p.text(label, &f, Rect::new(b.x + 12.0, b.y, bw, b.h), rgb(36, 50, 112));
+    let hs = 14.5 * (1.0 + 0.18 * pose.happy.max(pose.heart.min(1.0)));
+    d::heart(p, b.right() - 12.5 - hs, b.cy() - hs / 2.0 + 0.5, hs, rgb(66, 108, 238));
+}
+
+/// Companion Dock icons matching the concept's "In Action" (Finder, Safari, Music/Spotify, Chat/Discord).
+fn docky_companion_icon(p: &Painter, r: Rect, i: usize) {
+    let rad = r.w * 0.225;
+    p.soft_shadow(r, rad, 3, 1.0, 0.14, 1.5, Color::rgba(10, 18, 68, 1.0));
+    match i {
+        0 => {
+            // Finder two-tone smiling face (right half keeps the squircle corners).
+            p.fill_round_gradient(r, rad, rgb(96, 198, 255), rgb(34, 122, 244));
+            p.clipped(Rect::new(r.cx() + 0.5, r.y, r.w * 0.5, r.h), || {
+                p.fill_round_gradient(r, rad, rgb(236, 244, 255), rgb(214, 228, 250));
+            });
+            let navy = rgb(26, 42, 78);
+            p.fill_round(Rect::new(r.x + r.w * 0.30, r.y + r.h * 0.30, 3.0, 6.0), 1.5, navy);
+            p.fill_round(Rect::new(r.x + r.w * 0.64, r.y + r.h * 0.30, 3.0, 6.0), 1.5, navy);
+            if let Some(nose) = p.gfx.path(|s| unsafe {
+                s.BeginFigure(pt(r.cx() + 1.0, r.y + r.h * 0.26), D2D1_FIGURE_BEGIN_HOLLOW);
+                s.AddLine(pt(r.cx() - 2.2, r.y + r.h * 0.53));
+                s.AddLine(pt(r.cx() + 2.0, r.y + r.h * 0.53));
+                s.EndFigure(D2D1_FIGURE_END_OPEN);
+            }) {
+                p.stroke_geometry(&nose, Color::rgba(26, 42, 78, 0.35), 1.4);
+            }
+            if let Some(smile) = p.gfx.path(|s| unsafe {
+                s.BeginFigure(pt(r.x + r.w * 0.26, r.y + r.h * 0.63), D2D1_FIGURE_BEGIN_HOLLOW);
+                s.AddBezier(&D2D1_BEZIER_SEGMENT {
+                    point1: pt(r.x + r.w * 0.38, r.y + r.h * 0.78),
+                    point2: pt(r.x + r.w * 0.62, r.y + r.h * 0.78),
+                    point3: pt(r.x + r.w * 0.74, r.y + r.h * 0.63),
+                });
+                s.EndFigure(D2D1_FIGURE_END_OPEN);
+            }) {
+                p.stroke_geometry(&smile, navy, 2.2);
+            }
+        }
+        1 => {
+            // Safari compass.
+            p.fill_round_gradient(r, rad, Color::WHITE, rgb(232, 238, 248));
+            let cr = r.w * 0.40;
+            p.fill_circle(r.cx(), r.cy(), cr, rgb(32, 138, 248));
+            fill_shape(p, &[vec![(r.cx(), r.cy()), (r.cx() - 3.0, r.cy() - 2.5), (r.cx() + cr * 0.62, r.cy() - cr * 0.62), (r.cx() + 2.5, r.cy() + 3.0)]], rgb(250, 68, 58));
+            fill_shape(p, &[vec![(r.cx(), r.cy()), (r.cx() + 2.5, r.cy() + 3.0), (r.cx() - cr * 0.62, r.cy() + cr * 0.62), (r.cx() - 3.0, r.cy() - 2.5)]], Color::WHITE);
+        }
+        2 => {
+            // Green soundwave circle/tile.
+            p.fill_circle(r.cx(), r.cy(), r.w * 0.48, rgb(46, 212, 106));
+            for (k, dy, hw) in [(0, -5.5, 10.5), (1, 0.0, 9.0), (2, 5.5, 7.2)] {
+                let y = r.cy() + dy;
+                if let Some(arc) = p.gfx.path(|s| unsafe {
+                    s.BeginFigure(pt(r.cx() - hw, y + 0.8), D2D1_FIGURE_BEGIN_HOLLOW);
+                    s.AddBezier(&D2D1_BEZIER_SEGMENT {
+                        point1: pt(r.cx() - hw * 0.4, y - 2.4),
+                        point2: pt(r.cx() + hw * 0.4, y - 1.8),
+                        point3: pt(r.cx() + hw, y + 1.8),
+                    });
+                    s.EndFigure(D2D1_FIGURE_END_OPEN);
+                }) {
+                    p.stroke_geometry(&arc, rgb(20, 32, 24), 2.6 - k as f32 * 0.25);
+                }
+            }
+        }
+        _ => {
+            // Indigo chat/controller squircle.
+            p.fill_round_gradient(r, rad, rgb(104, 118, 248), rgb(82, 94, 232));
+            let body = Rect::new(r.cx() - 12.5, r.cy() - 8.5, 25.0, 17.0);
+            p.fill_round(body, 7.5, Color::WHITE);
+            p.fill_circle(r.cx() - 5.0, r.cy() + 0.5, 2.4, rgb(88, 101, 242));
+            p.fill_circle(r.cx() + 5.0, r.cy() + 0.5, 2.4, rgb(88, 101, 242));
+        }
+    }
 }
 
 fn dock_preview(p: &Painter, r: Rect, ctx: &RowCtx) {
@@ -1014,6 +1140,10 @@ pub(super) fn widget(p: &Painter, kind: WidgetKind, r: Rect, theme: &Theme) {
                 bar(8.0, y, 30.0, 4.0, dim);
                 bar(8.0, y, 30.0 * level, 4.0, c);
             }
+        }
+        WidgetKind::Docky => {
+            plate(rgb(130, 162, 250), rgb(96, 130, 232));
+            crate::docky::draw(p, cx, cy + 13.5, 25.0, &crate::docky::Pose::HAPPY, &crate::docky::Palette::CARD);
         }
         WidgetKind::User => {
             plate(bg, bg);

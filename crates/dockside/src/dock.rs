@@ -43,6 +43,8 @@ const SPRING_DELAY: f32 = 0.7;
 pub const START_PATH: &str = "dockside:start";
 /// A pinned item that opens Launchpad (or Tahoe's Apps, as set).
 pub const LAUNCHPAD_PATH: &str = "dockside:launchpad";
+/// Docky, kept in the Dock: hover to hear from him, click and he hops.
+pub const DOCKY_PATH: &str = "dockside:docky";
 /// Icon-store keys for the Trash's shell icon, empty and full.
 /// Seconds an icon takes to fade in once it has loaded.
 const ICON_FADE: f32 = 0.25;
@@ -141,7 +143,7 @@ impl Item {
             .or_else(|| {
                 lower.ends_with(".lnk").then(|| apps::resolve_lnk(&app.path)).flatten().map(|t| apps::exe_name(&t))
             });
-        let name = app.name.clone().or_else(|| (app.path == START_PATH).then(|| "Start".into())).or_else(|| (app.path == LAUNCHPAD_PATH).then(|| "Launchpad".into())).unwrap_or_else(|| {
+        let name = app.name.clone().or_else(|| (app.path == START_PATH).then(|| "Start".into())).or_else(|| (app.path == LAUNCHPAD_PATH).then(|| "Launchpad".into())).or_else(|| (app.path == DOCKY_PATH).then(|| "Docky".into())).unwrap_or_else(|| {
             Path::new(&app.path).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
         });
         Item {
@@ -366,6 +368,7 @@ fn icon_source(path: &str) -> String {
         FINDER_PATH => finder_icon::KEY.to_string(),
         START_PATH => start_icon::KEY.to_string(),
         LAUNCHPAD_PATH => launchpad_icon::KEY.to_string(),
+        DOCKY_PATH => crate::docky::ICON_KEY.to_string(),
         CALENDAR_PATH => calendar_icon::key(chrono::Local::now().date_naive()),
         SETTINGS_PATH | PICKER_PATH | ONBOARDING_PATH | ABOUT_PATH => {
             std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
@@ -376,7 +379,7 @@ fn icon_source(path: &str) -> String {
 
 /// Our drawn icons are already tiles.
 fn is_drawn_icon(key: &str) -> bool {
-    key == finder_icon::KEY || key == start_icon::KEY || key == launchpad_icon::KEY || key.starts_with(calendar_icon::PREFIX)
+    key == finder_icon::KEY || key == start_icon::KEY || key == launchpad_icon::KEY || key == crate::docky::ICON_KEY || key.starts_with(calendar_icon::PREFIX)
 }
 
 /// Names for DockSide's own windows, which show in the Dock like apps.
@@ -388,6 +391,8 @@ fn own_app_name(path: &str) -> Option<&'static str> {
         ONBOARDING_PATH => Some("Setup Assistant"),
         ABOUT_PATH => Some(crate::about::TITLE),
         CALENDAR_PATH => Some(crate::calapp::TITLE),
+        // His chat window belongs to his tile (not a second icon).
+        DOCKY_PATH => Some(crate::docky_chat::TITLE),
         _ => None,
     }
 }
@@ -467,6 +472,10 @@ pub struct Dock {
     app_icons: BTreeMap<String, String>,
     /// The Recycle Bin has something in it.
     trash_full: bool,
+    /// Which of `docky::DOCK_LINES` Docky's tile says when hovered, and when
+    /// he'll next answer a click (faster clicks are ignored).
+    docky_line: usize,
+    docky_after: std::time::Instant,
     pub dirty: bool,
 }
 
@@ -530,6 +539,8 @@ impl Dock {
             reserved,
             app_icons: cfg.app_icons.clone(),
             trash_full,
+            docky_line: 0,
+            docky_after: std::time::Instant::now(),
             dirty: true,
         };
         dock.fit_window()?;
@@ -823,6 +834,21 @@ impl Dock {
         Some((left + cx, top + self.icon_bottom() - tallest))
     }
 
+    /// Docky's tile was clicked: a single hop, and something new to say.
+    pub fn docky_hello(&mut self) {
+        let now = std::time::Instant::now();
+        if now < self.docky_after {
+            return;
+        }
+        self.docky_after = now + std::time::Duration::from_millis(1600);
+        if let Some(item) = self.items.iter_mut().find(|i| i.kind == Kind::App && i.launch == DOCKY_PATH) {
+            item.bounce = Some(Bounce { t: 0.0, until: Some(BOUNCE_PERIOD) });
+            let skip = 1 + (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos()) as usize % 3);
+            self.docky_line = (self.docky_line + skip) % crate::docky::DOCK_LINES.len();
+            self.dirty = true;
+        }
+    }
+
     /// Starts the launch bounce on the item that launches `path`.
     pub fn bounce(&mut self, path: &str) -> bool {
         match self.items.iter_mut().find(|i| i.kind == Kind::App && i.launch.eq_ignore_ascii_case(path)) {
@@ -1048,7 +1074,7 @@ impl Dock {
             Kind::App if item.launch == FINDER_PATH => {
                 if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
             }
-            Kind::App if [START_PATH, LAUNCHPAD_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH, ABOUT_PATH, CALENDAR_PATH].contains(&item.launch.as_str()) => FileDrop::None,
+            Kind::App if [START_PATH, LAUNCHPAD_PATH, DOCKY_PATH, SETTINGS_PATH, PICKER_PATH, ONBOARDING_PATH, ABOUT_PATH, CALENDAR_PATH].contains(&item.launch.as_str()) => FileDrop::None,
             Kind::App => FileDrop::Open,
         }
     }
@@ -1306,6 +1332,11 @@ impl Dock {
                     v.push(Entry::item("Launchpad Settings…", Action::OpenSettings(Some(crate::settings::Page::Launchpad))));
                     v.push(Entry::Separator);
                 }
+                if item.launch == DOCKY_PATH {
+                    v.push(Entry::item("Add Docky to the Desktop", Action::Widget(crate::widgets::WidgetCmd::AddDocky("auto"))));
+                    v.push(Entry::item("Docky Settings…", Action::OpenSettings(Some(crate::settings::Page::Docky))));
+                    v.push(Entry::Separator);
+                }
                 if pinnable(&item.launch) {
                     v.push(
                         Entry::item(
@@ -1375,6 +1406,7 @@ impl Dock {
                 (finder_icon::KEY, None) => icons.builtin(key, || finder_icon::render(gfx)),
                 (start_icon::KEY, None) => icons.builtin(key, || start_icon::render(gfx)),
                 (launchpad_icon::KEY, None) => icons.builtin(key, || launchpad_icon::render(gfx)),
+                (crate::docky::ICON_KEY, None) => icons.builtin(key, || crate::docky::icon_pixels(gfx, 256)),
                 (k, None) if k.starts_with(calendar_icon::PREFIX) => icons.builtin(k, || calendar_icon::render(gfx, calendar_icon::day_of(k)?)),
                 // The shell's Recycle Bin icon follows its state: cache one per state.
                 (TRASH_EMPTY | TRASH_FULL, custom) => icons.request(bitmap_key, RECYCLE_BIN, custom),
@@ -1412,7 +1444,11 @@ impl Dock {
         let label: Option<(usize, String)> = if let Some(d) = drag {
             d.out.then(|| (d.from, "Remove".to_string()))
         } else if self.hovering && self.pressed.is_none() && self.menu_item.is_none() && self.previewing.is_none() && self.hide_t < 0.01 {
-            self.item_at(self.mouse.0, self.mouse.1).map(|i| (i, self.items[i].name.clone()))
+            self.item_at(self.mouse.0, self.mouse.1).map(|i| {
+                // Docky says something instead of his name.
+                let text = if self.items[i].launch == DOCKY_PATH { crate::docky::DOCK_LINES[self.docky_line].to_string() } else { self.items[i].name.clone() };
+                (i, text)
+            })
         } else {
             None
         };

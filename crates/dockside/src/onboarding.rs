@@ -611,6 +611,7 @@ fn paint(p: &Painter, gfx: &Gfx, theme: &Theme, cfg: &Config, f: &Frame) -> Vec<
             recording: f.recording,
             motion: f.motion,
             icons: false,
+            docky: None,
         };
         let mut hits: Vec<(Rect, Target)> = Vec::new();
         let content = if theme.dark { Color::rgba(30, 30, 30, 1.0) } else { Color::rgba(250, 250, 250, 1.0) };

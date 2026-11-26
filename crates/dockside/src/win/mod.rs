@@ -267,5 +267,7 @@ pub const WM_APP_QUICKLOOK: u32 = WM_APP + 37;
 pub const WM_APP_PHOTO_EDIT: u32 = WM_APP + 38;
 /// The app-menus worker has replies (see `appmenu`).
 pub const WM_APP_APP_MENUS: u32 = WM_APP + 39;
+/// Docky's answer to a question is in (see `docky_ai`).
+pub const WM_APP_DOCKY: u32 = WM_APP + 40;
 pub const DESKTOP_LEFT: usize = 100;
 pub const DESKTOP_RIGHT: usize = 101;

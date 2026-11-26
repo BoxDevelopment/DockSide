@@ -117,6 +117,20 @@ fn spark_angle(v: &View) -> f32 {
     }
 }
 
+/// Claude Code's mark: Docky at his laptop (or waving when it needs you), or the spark.
+fn claude_mark(p: &Painter, cx: f32, cy: f32, s: f32, v: &View, a: f32) {
+    if crate::docky::on_island() {
+        let mood = match v.claude.map(|s| &s.state) {
+            Some(State::Waiting(_)) => crate::docky::Mood::Waiting,
+            Some(State::Idle) => crate::docky::Mood::Done,
+            _ => crate::docky::Mood::Working,
+        };
+        crate::docky::island(p, cx, cy, s * 1.25, mood, v.time, a);
+    } else {
+        g::spark(p, cx, cy, s, spark_angle(v), CLAUDE.alpha(a));
+    }
+}
+
 type Hits = Vec<(Rect, Hit)>;
 
 // ---------------------------------------------------------------------------
@@ -176,7 +190,7 @@ pub fn compact(p: &Painter, r: Rect, which: Persist, v: &View, a: f32, hits: &mu
         Persist::Claude => {
             let Some(s) = v.claude else { return };
             let waiting = matches!(s.state, State::Waiting(_));
-            g::spark(p, icon_cx, r.cy(), h * 0.72, spark_angle(v), CLAUDE.alpha(a));
+            claude_mark(p, icon_cx, r.cy(), h * 0.72, v, a);
             let time = fmt_time(s.elapsed());
             let tw = p.gfx.measure(&time, &v.fonts.small_r) + 6.0;
             let color = if waiting { ORANGE } else { WHITE };
@@ -232,7 +246,7 @@ pub fn bubble(p: &Painter, c: Rect, which: Persist, v: &View, a: f32) {
         Persist::Calendar => g::calendar(p, cx, cy, d * 0.6, WHITE.alpha(a), RED.alpha(a)),
         Persist::Shelf => g::tray(p, cx, cy, d * 0.6, WHITE.alpha(a)),
         Persist::Discord => voice_icon(p, cx, cy, d * 0.58, v.discord, a),
-        Persist::Claude => g::spark(p, cx, cy, d * 0.62, spark_angle(v), CLAUDE.alpha(a)),
+        Persist::Claude => claude_mark(p, cx, cy, d * 0.62, v, a),
         Persist::Live(k) => {
             if let Some(act) = v.live.get(k) {
                 live_icon(p, act, v, cx, cy, d * 0.62, a);
@@ -442,7 +456,11 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             hits.push((r, Hit::AlertBody));
         }
         Alert::ClaudeDone { project, secs, tools } => {
-            g::spark(p, icon_cx, cy, h * 0.72, 0.0, CLAUDE.alpha(a));
+            if crate::docky::on_island() {
+                crate::docky::island(p, icon_cx, cy, h * 0.8, crate::docky::Mood::Done, 0.0, a);
+            } else {
+                g::spark(p, icon_cx, cy, h * 0.72, 0.0, CLAUDE.alpha(a));
+            }
             let what = if project.is_empty() { "Claude finished".to_string() } else { format!("{project} is done") };
             p.text(&what, &f.alert, Rect::new(text_x, r.y, r.w - (text_x - r.x) - 110.0, r.h), WHITE.alpha(a));
             let stat = if *tools > 0 { format!("{} · {} tools", fmt_time(*secs), tools) } else { fmt_time(*secs) };
@@ -450,7 +468,11 @@ pub fn alert(p: &Painter, r: Rect, alert: &Alert, v: &View, a: f32, hits: &mut H
             hits.push((r, Hit::AlertBody));
         }
         Alert::ClaudeNeeds { project, message } => {
-            g::spark(p, icon_cx, cy, h * 0.72, 0.0, ORANGE.alpha(a));
+            if crate::docky::on_island() {
+                crate::docky::island(p, icon_cx, cy, h * 0.8, crate::docky::Mood::Waiting, 0.0, a);
+            } else {
+                g::spark(p, icon_cx, cy, h * 0.72, 0.0, ORANGE.alpha(a));
+            }
             let msg = if message.is_empty() { "Claude needs your input" } else { message };
             let pw = if project.is_empty() { 0.0 } else { p.gfx.measure(project, &f.alert_r) + 10.0 };
             p.text(msg, &f.alert, Rect::new(text_x, r.y, r.w - (text_x - r.x) - pw - right_inset, r.h), WHITE.alpha(a));

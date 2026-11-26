@@ -34,6 +34,8 @@ pub const WM_APP_FRAME: u32 = WM_APP + 1;
 pub const WM_APP_RELOAD: u32 = WM_APP + 2;
 /// A config parsed off the UI thread is ready to apply (see `App::reload_async`).
 pub const WM_APP_RELOAD_APPLY: u32 = WM_APP + 41;
+/// A clear menu bar's wallpaper darkness check landed (0 light, 1 dark, 2 unknown).
+pub const WM_APP_MENUBAR_DARK: u32 = WM_APP + 42;
 pub const WM_APP_CLOSE_MENU: u32 = WM_APP + 3;
 pub const WM_APP_MENU_KEY: u32 = WM_APP + 4;
 pub const WM_APP_FOREGROUND: u32 = WM_APP + 5;

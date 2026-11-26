@@ -55,7 +55,7 @@ use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
 use crate::win::displays::{self, Display};
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
-    WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD, WM_APP_RELOAD_APPLY,
+    WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD, WM_APP_RELOAD_APPLY, WM_APP_MENUBAR_DARK,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_CLOSE_LAUNCHPAD, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
@@ -4642,6 +4642,13 @@ impl App {
                 }
                 WM_APP_RELOAD => self.timer(TIMER_RELOAD, 150),
                 WM_APP_RELOAD_APPLY => self.apply_parsed(),
+                WM_APP_MENUBAR_DARK => {
+                    // A clear menu bar's wallpaper check landed: recolor it.
+                    if let Some(mb) = self.menubars.iter_mut().find(|mb| mb.surface.content.0 as isize == wp.0 as isize) {
+                        mb.set_on_dark((wp.0 != 2).then(|| wp.0 == 1));
+                        self.animate();
+                    }
+                }
                 win::WM_APP_APP_MENUS => {
                     self.on_app_menus();
                     self.flush();

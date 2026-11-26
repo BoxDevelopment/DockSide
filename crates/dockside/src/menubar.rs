@@ -142,22 +142,35 @@ impl MenuBar {
         // With its space reserved, only the desktop is ever behind the menu bar.
         let source = if m.reserve_space { crate::win::glass::Source::Wallpaper } else { crate::win::glass::Source::Screen };
         let surface = Surface::with_layer(gfx, rect, monitor.scale, m.backdrop, theme.menubar_tint, true, source)?;
-        // Both steps talk to Explorer (SHAppBarMessage, IDesktopWallpaper) and the
-        // dark check decodes the wallpaper: time them so a slow one shows in the log.
+        // The appbar registration talks to Explorer (SHAppBarMessage) and is timed
+        // so a slow one shows in the log. The wallpaper's darkness decides the
+        // clear bar's colors, but reading it means COM to Explorer plus a decode:
+        // that runs on a thread, with the bar starting on the theme's look.
         let appbar_at = Instant::now();
         if m.reserve_space {
             appbar::register(surface.content, WM_APP_APPBAR, ABE_TOP, monitor.rect, height);
         }
         let appbar = appbar_at.elapsed();
-        let dark_at = Instant::now();
-        let on_dark = (m.backdrop == Backdrop::Clear)
-            .then(|| monitor_top_is_dark(&monitor).or_else(|| wallpaper_top_is_dark(gfx)).unwrap_or(theme.dark));
-        let dark = dark_at.elapsed();
         if appbar >= SLOW_STEP {
             log!("menu bar: appbar register took {appbar:?}");
         }
-        if dark >= SLOW_STEP {
-            log!("menu bar: dark check took {dark:?}");
+        let on_dark = (m.backdrop == Backdrop::Clear).then(|| theme.dark);
+        if m.backdrop == Backdrop::Clear {
+            let rect = monitor.rect;
+            let hwnd = surface.content.0 as isize;
+            let spawned = std::thread::Builder::new().name("menubar dark".into()).spawn(move || {
+                let started = Instant::now();
+                let dark = monitor_top_is_dark(rect).or_else(wallpaper_top_is_dark);
+                let took = started.elapsed();
+                if took >= SLOW_STEP {
+                    log!("menu bar: dark check took {took:?} (on a thread)");
+                }
+                // 0 = light wallpaper, 1 = dark, 2 = unreadable (keep the theme's look).
+                crate::win::post_wp(hwnd, crate::win::WM_APP_MENUBAR_DARK, dark.map(|d| d as usize).unwrap_or(2));
+            });
+            if let Err(e) = spawned {
+                log!("menu bar dark check didn't start: {e}");
+            }
         }
         let mut bar = Self {
             surface,
@@ -209,6 +222,15 @@ impl MenuBar {
     pub fn set_active(&mut self, active: bool) {
         if active != self.active {
             self.active = active;
+            self.dirty = true;
+        }
+    }
+
+    /// The wallpaper darkness the clear bar's colors follow, once its check
+    /// lands (see `new`); `None` keeps the theme's look.
+    pub fn set_on_dark(&mut self, dark: Option<bool>) {
+        if dark != self.on_dark {
+            self.on_dark = dark;
             self.dirty = true;
         }
     }
@@ -463,10 +485,10 @@ impl Drop for MenuBar {
 /// luminance. `None` without a readable wallpaper image.
 /// Whether the wallpaper as laid out on `monitor` is dark along its top (each
 /// display may have its own picture, or its own part of a spanned one).
-fn monitor_top_is_dark(monitor: &Monitor) -> Option<bool> {
-    let px = crate::win::wallpaper::render(monitor.rect).ok()?;
-    let w = (monitor.rect.right - monitor.rect.left) as usize;
-    let h = (monitor.rect.bottom - monitor.rect.top) as usize;
+fn monitor_top_is_dark(rect: RECT) -> Option<bool> {
+    let px = crate::win::wallpaper::render(rect).ok()?;
+    let w = (rect.right - rect.left) as usize;
+    let h = (rect.bottom - rect.top) as usize;
     let rows = (h / 16).max(1);
     let (mut sum, mut n) = (0.0f64, 0u32);
     for y in (0..rows).step_by((rows / 24).max(1)) {
@@ -480,7 +502,9 @@ fn monitor_top_is_dark(monitor: &Monitor) -> Option<bool> {
     (n > 0).then(|| sum / (n as f64) < 150.0)
 }
 
-fn wallpaper_top_is_dark(gfx: &Gfx) -> Option<bool> {
+fn wallpaper_top_is_dark() -> Option<bool> {
+    use windows::Win32::Graphics::Imaging::{CLSID_WICImagingFactory, IWICImagingFactory};
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETDESKWALLPAPER, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
     let mut buf = [0u16; 520];
     unsafe {
@@ -490,7 +514,8 @@ fn wallpaper_top_is_dark(gfx: &Gfx) -> Option<bool> {
     if path.is_empty() {
         return None;
     }
-    let img = crate::gfx::icons::load_image_file(&gfx.wic, &path)?;
+    let wic: IWICImagingFactory = unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()? };
+    let img = crate::gfx::icons::load_image_file(&wic, &path)?;
     let (w, h) = (img.width as usize, img.height as usize);
     let rows = (h / 16).max(1);
     let (mut sum, mut n) = (0.0f64, 0u32);

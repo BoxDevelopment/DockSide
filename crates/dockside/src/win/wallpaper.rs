@@ -7,7 +7,7 @@ use windows::core::{w, Result, HSTRING, PWSTR};
 use windows::Win32::Foundation::{BOOL, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, GENERIC_READ, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL, CLSCTX_INPROC_SERVER};
-use windows::Win32::System::Registry::{RegEnumValueW, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET};
+use windows::Win32::System::Registry::{RegEnumValueW, RegGetValueW, RRF_RT_REG_SZ, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY, KEY_READ, REG_NOTIFY_CHANGE_LAST_SET};
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcessId, WaitForSingleObject, INFINITE};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, FindWindowExW, FindWindowW, GetWindowThreadProcessId, IsWindowVisible};
@@ -22,6 +22,27 @@ unsafe fn take(p: PWSTR) -> String {
 /// Premultiplied BGRA pixels (top-down) of the wallpaper behind `monitor`, a
 /// screen rect. A solid-color background, or a missing image, gives that color.
 pub fn render(monitor: RECT) -> Result<Vec<u8>> {
+    render_checked(monitor).map(|(px, _)| px)
+}
+
+/// The picture path `Control Panel\Desktop\WallPaper` names, if any.
+fn registry_path() -> String {
+    let mut buf = [0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let r = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, w!("Control Panel\\Desktop"), w!("WallPaper"), RRF_RT_REG_SZ, None, Some(buf.as_mut_ptr() as _), Some(&mut len))
+    };
+    if r.is_err() {
+        return String::new();
+    }
+    let n = (len as usize / 2).min(buf.len());
+    String::from_utf16_lossy(&buf[..n]).trim_end_matches('\0').to_string()
+}
+
+/// `render`, and whether Explorer knew the picture: just after sign-in it may
+/// not list the monitors or name the picture yet, and the result is only the
+/// background color (glass over it then looks flat). Callers can try again.
+pub fn render_checked(monitor: RECT) -> Result<(Vec<u8>, bool)> {
     let (mw, mh) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
     let dw: IDesktopWallpaper = unsafe { CoCreateInstance(&DesktopWallpaper, None, CLSCTX_ALL)? };
     // COLORREF is 0x00BBGGRR.
@@ -32,6 +53,7 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
     }
 
     let mut path = String::new();
+    let mut matched = false;
     let mut span = monitor;
     unsafe {
         for i in 0..dw.GetMonitorDevicePathCount()? {
@@ -44,14 +66,24 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
                     bottom: span.bottom.max(r.bottom),
                 };
                 if r == monitor {
+                    matched = true;
                     path = dw.GetWallpaper(id).map(|p| take(p)).unwrap_or_default();
                 }
             }
             take(id);
         }
     }
+    // Explorer not up yet: the registry still names the picture.
+    let mut settled = matched;
     if path.is_empty() {
-        return Ok(px);
+        let saved = registry_path();
+        if !saved.is_empty() {
+            settled = false;
+            path = saved;
+        }
+    }
+    if path.is_empty() {
+        return Ok((px, settled));
     }
     let position = unsafe { dw.GetPosition()? };
 
@@ -72,7 +104,7 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
     unsafe { image.GetSize(&mut iw, &mut ih)? };
     let (iw, ih) = (iw as i32, ih as i32);
     if iw == 0 || ih == 0 {
-        return Ok(px);
+        return Ok((px, settled));
     }
 
     if position == DWPOS_TILE {
@@ -81,7 +113,7 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
                 blit(&wic, &image, (iw, ih), (iw, ih), (x, y), (mw, mh), &mut px)?;
             }
         }
-        return Ok(px);
+        return Ok((px, settled));
     }
     // Spanned wallpapers fill the bounds of every monitor together.
     let area = if position == DWPOS_SPAN { span } else { monitor };
@@ -104,7 +136,7 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
     let x = area.left + (aw as i32 - sw) / 2 - monitor.left;
     let y = area.top + (ah as i32 - sh) / 2 - monitor.top;
     blit(&wic, &image, (iw, ih), (sw, sh), (x, y), (mw, mh), &mut px)?;
-    Ok(px)
+    Ok((px, settled))
 }
 
 /// Copies `image`, scaled to `size` with its top-left at `at`, into the part
@@ -236,7 +268,8 @@ mod tests {
             let _ = GetMonitorInfoW(MonitorFromPoint(Default::default(), MONITOR_DEFAULTTOPRIMARY), &mut info);
         }
         let r = info.rcMonitor;
-        let px = super::render(r).unwrap();
+        let (px, settled) = super::render_checked(r).unwrap();
+        println!("settled: {settled}");
         let (w, h) = ((r.right - r.left) as usize, (r.bottom - r.top) as usize);
         assert_eq!(px.len(), w * h * 4);
         let mut colors = std::collections::HashSet::new();

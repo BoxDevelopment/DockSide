@@ -66,6 +66,10 @@ const FADE_IN: Duration = Duration::from_millis(160);
 /// How often to check whether a live wallpaper app started or stopped (they
 /// don't announce it).
 const LIVE_POLL: Duration = Duration::from_secs(2);
+/// How often, and how many times, to ask again for a wallpaper Explorer
+/// can't name yet (just after sign-in).
+const WALLPAPER_RETRY: Duration = Duration::from_millis(1000);
+const WALLPAPER_TRIES: u32 = 20;
 
 fn min_interval() -> Duration {
     if crate::win::controls::low_power_mode() { LOW_POWER_INTERVAL } else { MIN_INTERVAL }
@@ -673,11 +677,25 @@ impl Engine {
                 let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
             }
             let started = Instant::now();
-            let mut pixels = Some(wallpaper::render(rect));
+            // Just after sign-in Explorer may not know the picture yet (or not
+            // answer at all): glass over a bare background color shows no
+            // refraction, only its rim. Ask again for a while before settling.
+            let mut tries = 0;
+            let result = loop {
+                tries += 1;
+                let r = wallpaper::render_checked(rect);
+                if matches!(r, Ok((_, true))) || tries >= WALLPAPER_TRIES {
+                    break r;
+                }
+                std::thread::sleep(WALLPAPER_RETRY);
+            };
             let took = started.elapsed();
-            if took > Duration::from_millis(200) {
-                log!("glass wallpaper: rendered in {took:?}");
+            match &result {
+                Ok((_, true)) if tries == 1 && took <= Duration::from_millis(200) => {}
+                Ok((_, settled)) => log!("glass wallpaper: rendered in {took:?} after {tries} tries{}", if *settled { "" } else { ", Explorer never named the picture" }),
+                Err(e) => log!("glass wallpaper: failed after {tries} tries: {e}"),
             }
+            let mut pixels = Some(result.map(|(px, _)| px));
             let handler = windows::System::DispatcherQueueHandler::new(move || {
                 if let Some(px) = pixels.take() {
                     with_running(|e| e.wallpaper_loaded(monitor, rect, generation, px));
@@ -971,9 +989,27 @@ impl Engine {
     /// Flushes a refresh from now, for the next step of a fade.
     fn fade_step(&mut self) {
         if self.fader.is_none() {
-            self.fader = engine_timer(false, Engine::flush);
+            self.fader = engine_timer(false, Engine::fade);
         }
         Self::arm(&self.fader, self.refresh);
+    }
+
+    /// Renders the next step of every pane fading in, whatever it refracts:
+    /// one that started fading over the screen and switched to the wallpaper
+    /// once it loaded (`resource_all`) isn't a screen pane any more, and
+    /// `flush` alone would leave it stuck part-way, mostly plain blur.
+    fn fade(&mut self) {
+        let panes: Vec<_> = self.panes.iter().filter_map(|p| p.upgrade()).collect();
+        for pane in panes {
+            let Ok(mut s) = pane.try_borrow_mut() else { continue };
+            if s.appear.is_some() {
+                s.stale = true;
+                if let Err(e) = self.render(&mut s) {
+                    log!("glass render failed: {e}");
+                }
+            }
+        }
+        self.flush();
     }
 
     /// Starts a one-shot timer unless it's already counting down.

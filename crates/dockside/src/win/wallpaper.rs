@@ -3,6 +3,9 @@
 //! the desktop refracts this instead of a screen capture, so it never has to
 //! hide from capture and shows up in screenshots and recordings.
 
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
+
 use windows::core::{w, Result, HSTRING, PWSTR};
 use windows::Win32::Foundation::{BOOL, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, GENERIC_READ, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Imaging::*;
@@ -17,6 +20,16 @@ unsafe fn take(p: PWSTR) -> String {
     let s = p.to_string().unwrap_or_default();
     CoTaskMemFree(Some(p.0 as *const _));
     s
+}
+
+/// The last render, kept by (monitor, wallpaper path, mtime): rebuilds (theme
+/// changes, config applies) ask for the same pixels again and needn't decode.
+static LAST: Mutex<Option<((i32, i32, i32, i32, String, u64), Vec<u8>)>> = Mutex::new(None);
+
+fn cache_put(key: &(i32, i32, i32, i32, String, u64), px: &[u8]) {
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((key.clone(), px.to_vec()));
+    }
 }
 
 /// Premultiplied BGRA pixels (top-down) of the wallpaper behind `monitor`, a
@@ -50,7 +63,24 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
             take(id);
         }
     }
+    // Rebuilds ask for the same pixels again: keep the last render by
+    // (monitor, wallpaper path, mtime) and skip the WIC decode on a hit.
+    let mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let key = (monitor.left, monitor.top, monitor.right, monitor.bottom, path.clone(), mtime);
+    if let Ok(last) = LAST.lock() {
+        if let Some((k, px)) = last.as_ref() {
+            if *k == key {
+                return Ok(px.clone());
+            }
+        }
+    }
     if path.is_empty() {
+        cache_put(&key, &px);
         return Ok(px);
     }
     let position = unsafe { dw.GetPosition()? };
@@ -72,6 +102,7 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
     unsafe { image.GetSize(&mut iw, &mut ih)? };
     let (iw, ih) = (iw as i32, ih as i32);
     if iw == 0 || ih == 0 {
+        cache_put(&key, &px);
         return Ok(px);
     }
 
@@ -104,6 +135,7 @@ pub fn render(monitor: RECT) -> Result<Vec<u8>> {
     let x = area.left + (aw as i32 - sw) / 2 - monitor.left;
     let y = area.top + (ah as i32 - sh) / 2 - monitor.top;
     blit(&wic, &image, (iw, ih), (sw, sh), (x, y), (mw, mh), &mut px)?;
+    cache_put(&key, &px);
     Ok(px)
 }
 

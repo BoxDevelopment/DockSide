@@ -7,7 +7,8 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
@@ -54,7 +55,7 @@ use crate::widgets::{WidgetCmd, WidgetEvent, Widgets};
 use crate::win::displays::{self, Display};
 use crate::win::{self, apps, startup, system, taskbar, Monitor};
 use crate::win::{
-    WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD,
+    WM_APP_APPBAR, WM_APP_CLOSE_MENU, WM_APP_OPEN_SETTINGS, WM_APP_FOREGROUND, WM_APP_FRAME, WM_APP_MENU_KEY, WM_APP_RELOAD, WM_APP_RELOAD_APPLY,
     WM_APP_WINDOWS_CHANGED, WM_APP_ICONS, WM_APP_FINDER_CHANGED, WM_APP_CLOSE_SPOTLIGHT, WM_APP_CLOSE_LAUNCHPAD, WM_APP_INDEX_READY, WM_APP_MEDIA,
     WM_APP_ISLAND, WM_APP_ISLAND_KEY, WM_APP_DESKTOP, WM_APP_DESKTOP_KEY, DESKTOP_LEFT, DESKTOP_RIGHT, WM_APP_PING,
     WM_APP_UPDATE, WM_APP_WIDGETS, WM_APP_FG_MOVED, WM_APP_ICON_PICKER, WM_APP_CLOSE_PICKER, WM_APP_ADMIN_TASK,
@@ -1271,6 +1272,11 @@ pub struct App {
     /// Edit Photo… for a Photo widget.
     photo_edit: Option<PhotoEditor>,
     index: spotlight::index::Shared,
+    /// The config a worker parsed (see `reload_async`), waiting to be applied.
+    parsed: Arc<Mutex<Option<Result<Config, String>>>>,
+    /// Whether a parse is running, and whether another is wanted once it lands.
+    parsing: Arc<AtomicBool>,
+    reparse: Arc<AtomicBool>,
     hooks: Vec<HHOOK>,
     island_hook: Option<HHOOK>,
     /// Watches for drags while the island's shelf is on (its drop zone).
@@ -1455,6 +1461,9 @@ impl App {
             rename: None,
             photo_edit: None,
             index: Default::default(),
+            parsed: Arc::new(Mutex::new(None)),
+            parsing: Arc::new(AtomicBool::new(false)),
+            reparse: Arc::new(AtomicBool::new(false)),
             hooks: Vec::new(),
             island_hook: None,
             drag_watch_hook: None,
@@ -1551,13 +1560,67 @@ impl App {
         );
     }
 
-    /// Applies a changed config with the least disruption: unchanged surfaces
-    /// stay put, and a pinned-apps change updates the Dock in place.
+    /// Reads and applies the config right here (the callers that just saved it).
     fn reload(&mut self) {
         let cfg = match config::load(&self.cfg_path) {
             Ok(cfg) => cfg,
             Err(e) => return log!("config not applied: {e:#}"),
         };
+        self.apply_config(cfg);
+    }
+
+    /// Answers the config watcher: parses the changed file off the UI thread and
+    /// applies it when `WM_APP_RELOAD_APPLY` comes back. Editing config.toml (by
+    /// hand or by our own saves) must never cost the UI thread a parse.
+    fn reload_async(&mut self) {
+        if self.parsing.swap(true, Ordering::AcqRel) {
+            // A write landed while a parse was running: go once more after it applies.
+            self.reparse.store(true, Ordering::Release);
+            return;
+        }
+        let slot = self.parsed.clone();
+        let path = self.cfg_path.clone();
+        let hwnd = self.msg_hwnd.0 as isize;
+        let spawned = std::thread::Builder::new().name("config parse".into()).spawn(move || {
+            let started = Instant::now();
+            let cfg = config::load(&path).map_err(|e| format!("{e:#}"));
+            let took = started.elapsed();
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(cfg);
+            }
+            if took >= std::time::Duration::from_millis(50) {
+                log!("config parse took {took:?}");
+            }
+            crate::win::post(hwnd, win::WM_APP_RELOAD_APPLY);
+        });
+        if spawned.is_err() {
+            self.parsing.store(false, Ordering::Release);
+            self.reload();
+        }
+    }
+
+    /// Applies the config a worker parsed (see `reload_async`).
+    fn apply_parsed(&mut self) {
+        let parsed = self.parsed.lock().ok().and_then(|mut s| s.take());
+        self.parsing.store(false, Ordering::Release);
+        let Some(cfg) = parsed else { return };
+        let started = Instant::now();
+        match cfg {
+            Ok(cfg) => self.apply_config(cfg),
+            Err(e) => log!("config not applied: {e}"),
+        }
+        let took = started.elapsed();
+        if took >= SLOW_MESSAGE {
+            log!("slow: applying config took {took:?}");
+        }
+        if self.reparse.swap(false, Ordering::AcqRel) {
+            self.reload_async();
+        }
+    }
+
+    /// Applies a changed config with the least disruption: unchanged surfaces
+    /// stay put, and a pinned-apps change updates the Dock in place.
+    fn apply_config(&mut self, cfg: Config) {
         if cfg == self.cfg {
             return;
         }
@@ -4487,7 +4550,7 @@ impl App {
                                 m.read_bar(HWND(self.app_menu_target as _), true);
                             }
                         }
-                        TIMER_RELOAD => self.reload(),
+                        TIMER_RELOAD => self.reload_async(),
                         TIMER_REBUILD => {
                             log!("rebuilding: dark mode set");
                             self.build()
@@ -4554,6 +4617,7 @@ impl App {
                     }
                 }
                 WM_APP_RELOAD => self.timer(TIMER_RELOAD, 150),
+                WM_APP_RELOAD_APPLY => self.apply_parsed(),
                 win::WM_APP_APP_MENUS => {
                     self.on_app_menus();
                     self.flush();

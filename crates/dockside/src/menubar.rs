@@ -1,6 +1,7 @@
 //! The top menu bar: logo menu, bold app name, standard menus, and status items.
 
 use std::fmt::Write as _;
+use std::time::{Duration, Instant};
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -19,6 +20,9 @@ use crate::surface::Surface;
 use crate::theme::Theme;
 use crate::win::system::{self, Battery, Shortcut};
 use crate::win::{appbar, Monitor, WM_APP_APPBAR};
+
+/// A setup step taking this long is worth a log line.
+const SLOW_STEP: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hit {
@@ -138,8 +142,22 @@ impl MenuBar {
         // With its space reserved, only the desktop is ever behind the menu bar.
         let source = if m.reserve_space { crate::win::glass::Source::Wallpaper } else { crate::win::glass::Source::Screen };
         let surface = Surface::with_layer(gfx, rect, monitor.scale, m.backdrop, theme.menubar_tint, true, source)?;
+        // Both steps talk to Explorer (SHAppBarMessage, IDesktopWallpaper) and the
+        // dark check decodes the wallpaper: time them so a slow one shows in the log.
+        let appbar_at = Instant::now();
         if m.reserve_space {
             appbar::register(surface.content, WM_APP_APPBAR, ABE_TOP, monitor.rect, height);
+        }
+        let appbar = appbar_at.elapsed();
+        let dark_at = Instant::now();
+        let on_dark = (m.backdrop == Backdrop::Clear)
+            .then(|| monitor_top_is_dark(&monitor).or_else(|| wallpaper_top_is_dark(gfx)).unwrap_or(theme.dark));
+        let dark = dark_at.elapsed();
+        if appbar >= SLOW_STEP {
+            log!("menu bar: appbar register took {appbar:?}");
+        }
+        if dark >= SLOW_STEP {
+            log!("menu bar: dark check took {dark:?}");
         }
         let mut bar = Self {
             surface,
@@ -156,8 +174,7 @@ impl MenuBar {
             pressed: None,
             logo: None,
             reserved: m.reserve_space,
-            on_dark: (m.backdrop == Backdrop::Clear)
-                .then(|| monitor_top_is_dark(&monitor).or_else(|| wallpaper_top_is_dark(gfx)).unwrap_or(theme.dark)),
+            on_dark,
             motion: Motion::default(),
             pill_last: None,
             active: true,

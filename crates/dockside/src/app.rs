@@ -226,6 +226,7 @@ pub fn run() -> anyhow::Result<()> {
     phases.mark("calendar+power");
     log!("startup: {}", phases.summary());
     crate::cpu_watch::start();
+    crate::uiwatch::start();
     with_app(|app| {
         app.build();
         if !app.cfg.general.onboarding_done {
@@ -901,7 +902,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         _ => {}
     }
     let started = Instant::now();
+    // Names the message the UI thread is in, so a frozen shell can say where.
+    crate::uiwatch::enter(hwnd.0 as isize, msg, wp.0);
     let handled = with_app(|app| app.on_message(hwnd, msg, wp, lp)).flatten();
+    crate::uiwatch::leave();
     drain_actions();
     // Anything holding up the UI thread (a CPU spike, or a modal dialog) shows in the log.
     let took = started.elapsed();
@@ -937,6 +941,11 @@ unsafe extern "system" fn win_event(
 
 /// While a menu is open: clicks outside our windows close it.
 unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _watch = crate::uiwatch::hook(crate::uiwatch::Kind::Mouse);
+    mouse_hook_inner(code, wp, lp)
+}
+
+unsafe extern "system" fn mouse_hook_inner(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 && matches!(wp.0 as u32, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
         let info = &*(lp.0 as *const MSLLHOOKSTRUCT);
         let target = WindowFromPoint(info.pt);
@@ -959,6 +968,11 @@ unsafe extern "system" fn mouse_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESU
 /// While the island runs: volume keys become the island's HUD (swallowed so the
 /// Windows flyout stays away), and Caps Lock presses are reported.
 unsafe extern "system" fn island_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _watch = crate::uiwatch::hook(crate::uiwatch::Kind::IslandKeys);
+    island_key_hook_inner(code, wp, lp)
+}
+
+unsafe extern "system" fn island_key_hook_inner(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     const VK_VOLUME_MUTE: u16 = 0xAD;
     const VK_VOLUME_UP: u16 = 0xAF;
     const VK_CAPITAL: u16 = 0x14;
@@ -1011,6 +1025,11 @@ unsafe extern "system" fn island_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> 
 /// start of any drag, file or not) and its release, so the island can lay its
 /// drop zone along the top of the screen for the length of the drag.
 unsafe extern "system" fn drag_watch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _watch = crate::uiwatch::hook(crate::uiwatch::Kind::DragWatch);
+    drag_watch_hook_inner(code, wp, lp)
+}
+
+unsafe extern "system" fn drag_watch_hook_inner(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     use std::sync::atomic::{AtomicBool, AtomicI32};
     /// Pixels the pointer travels with a button held before it counts as a drag.
     const TRAVEL: i32 = 8;
@@ -1050,6 +1069,11 @@ unsafe extern "system" fn drag_watch_hook(code: i32, wp: WPARAM, lp: LPARAM) -> 
 /// with a masking key so releasing Alt / Win doesn't open an app's menu or Start.
 /// (Explorer owns Win+E, so RegisterHotKey can't take it.)
 unsafe extern "system" fn desktop_key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _watch = crate::uiwatch::hook(crate::uiwatch::Kind::DesktopKeys);
+    desktop_key_hook_inner(code, wp, lp)
+}
+
+unsafe extern "system" fn desktop_key_hook_inner(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     if code >= 0 {
         let info = &*(lp.0 as *const KBDLLHOOKSTRUCT);
@@ -1100,6 +1124,11 @@ unsafe extern "system" fn desktop_key_hook(code: i32, wp: WPARAM, lp: LPARAM) ->
 
 /// While a menu is open: arrows / Enter / Esc drive the menu instead of the focused app.
 unsafe extern "system" fn key_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let _watch = crate::uiwatch::hook(crate::uiwatch::Kind::Keys);
+    key_hook_inner(code, wp, lp)
+}
+
+unsafe extern "system" fn key_hook_inner(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if code >= 0 {
         let info = &*(lp.0 as *const KBDLLHOOKSTRUCT);
         let vk = info.vkCode as u16;
@@ -2425,17 +2454,12 @@ impl App {
     }
 
     fn on_appbar_change(&mut self) {
-        let edge = taskbar::edge();
-        if edge != self.taskbar_edge {
-            log!("taskbar edge: {:?} -> {:?}", self.taskbar_edge, edge);
-            self.taskbar_edge = edge;
-        }
-        if self.hides_taskbar() {
-            // Moving the taskbar can turn auto-hide back off and re-show it.
-            taskbar::enforce();
-            taskbar::reapply();
-        }
-        crate::win::appbar::refresh();
+        // Everything this used to do (taskbar edge, enforce, reapply, appbar
+        // refresh) talks to Explorer with SHAppBarMessage: a synchronous
+        // cross-process call with no timeout. On the UI thread it froze the
+        // whole shell whenever Explorer was busy, so it all runs on the shell
+        // worker now; this only asks it to.
+        crate::win::appbar::sync_taskbar();
     }
 
     fn on_tick(&mut self) {

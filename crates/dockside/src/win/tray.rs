@@ -16,6 +16,8 @@
 //! and re-checked often.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, Result, PCWSTR};
@@ -27,6 +29,16 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::gfx::icons::IconPixels;
 
 const CLASS: PCWSTR = w!("Shell_TrayWnd");
+
+/// The tray host's window, readable from any thread: `explorer_first` runs
+/// shell calls on worker threads now, and those still have to lower and raise
+/// the host around them (HOST itself stays on the thread that made the window).
+static HOST_HWND: AtomicUsize = AtomicUsize::new(0);
+/// How many nested `explorer_first` calls are running; the host is lowered
+/// while this is above zero.
+static LOWERED: AtomicUsize = AtomicUsize::new(0);
+/// Set while Explorer's tray is ahead of ours, for the "missed adds" logic.
+static BEHIND: Mutex<Option<Instant>> = Mutex::new(None);
 /// `SHELLTRAYDATA` header before the 32-bit `NOTIFYICONDATA`.
 const TRAY_SIGNATURE: u32 = 0x3475_3423;
 
@@ -184,6 +196,7 @@ pub fn start() -> Result<()> {
         HOST.with(|h| {
             *h.borrow_mut() = Some(Host { hwnd, icons: Vec::new(), lowered: 0, behind_since: None, last_click: None })
         });
+        HOST_HWND.store(hwnd.0 as usize, Ordering::Release);
         keep_on_top();
         // Explorer's taskbar re-asserts itself topmost now and then; win back first place quickly.
         SetTimer(hwnd, RAISE_TIMER, RAISE_MS, None);
@@ -210,6 +223,7 @@ fn ask_for_icons() {
 
 /// Stops hosting; apps keep talking to Explorer's tray.
 pub fn stop() {
+    HOST_HWND.store(0, Ordering::Release);
     if let Some(host) = HOST.with(|h| h.borrow_mut().take()) {
         unsafe {
             let _ = DestroyWindow(host.hwnd);
@@ -218,25 +232,30 @@ pub fn stop() {
 }
 
 /// `FindWindow` returns the first match in z-order: stay above Explorer's tray.
+/// Runs on the UI thread (the RAISE timer) and after shell work on the worker;
+/// everything it touches is global, so both are fine.
 pub fn keep_on_top() {
-    let host = HOST.with(|h| h.try_borrow().ok()?.as_ref().filter(|h| h.lowered == 0).map(|h| h.hwnd));
-    let Some(hwnd) = host else { return };
-    let (first, err) = raise(hwnd);
+    if LOWERED.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let hwnd = HOST_HWND.load(Ordering::Acquire);
+    if hwnd == 0 {
+        return;
+    }
+    let (first, err) = raise(HWND(hwnd as _));
     let now = Instant::now();
-    let rebroadcast = HOST.with(|h| {
-        let mut h = h.try_borrow_mut().ok()?;
-        let host = h.as_mut()?;
-        match (first, host.behind_since) {
+    let rebroadcast = BEHIND.lock().ok().and_then(|mut behind| {
+        match (first, *behind) {
             (true, None) => None,
             (true, Some(since)) => {
-                host.behind_since = None;
                 let missed = now - since > MISSED_ADDS_AFTER;
                 log!("tray: our tray host is first again after {} ms", (now - since).as_millis());
+                *behind = None;
                 Some(missed)
             }
             (false, None) => {
-                host.behind_since = Some(now);
                 log!("tray: Explorer's tray is ahead of ours, so new icons go to Explorer only ({err})");
+                *behind = Some(now);
                 None
             }
             (false, Some(_)) => None,
@@ -270,33 +289,25 @@ fn raise(hwnd: HWND) -> (bool, String) {
 /// but doesn't reserve their space, so DockSide's own appbars go around us.
 /// Nested calls lower us once and raise us when the outermost one ends.
 pub fn explorer_first<R>(f: impl FnOnce() -> R) -> R {
-    let lowered = HOST.with(|h| {
-        let mut h = h.try_borrow_mut().ok()?;
-        let host = h.as_mut()?;
-        host.lowered += 1;
-        Some((host.hwnd, host.lowered == 1))
-    });
-    if let Some((hwnd, true)) = lowered {
+    // Global state, not HOST: shell work now runs on a worker thread, and this
+    // must lower and raise the host from there too. The counter makes nested
+    // calls lower once and raise when the outermost one ends.
+    let hwnd = HOST_HWND.load(Ordering::Acquire);
+    let outer = hwnd != 0 && LOWERED.fetch_add(1, Ordering::AcqRel) == 0;
+    if outer {
         // Just behind Explorer's tray, staying in the topmost band: an elevated
         // DockSide's window that leaves the band (HWND_NOTOPMOST / HWND_BOTTOM)
         // never gets back in, though SetWindowPos(HWND_TOPMOST) reports success.
         if let Some(explorer) = explorer_tray() {
             unsafe {
-                let _ = SetWindowPos(hwnd, explorer, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                let _ = SetWindowPos(HWND(hwnd as _), explorer, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
     }
     let r = f();
-    if lowered.is_some() {
-        let outermost = HOST.with(|h| {
-            let mut h = h.try_borrow_mut().ok()?;
-            let host = h.as_mut()?;
-            host.lowered = host.lowered.saturating_sub(1);
-            Some(host.lowered == 0)
-        });
-        if outermost == Some(true) {
-            keep_on_top();
-        }
+    let outermost = LOWERED.fetch_sub(1, Ordering::AcqRel) == 1;
+    if outermost {
+        keep_on_top();
     }
     r
 }

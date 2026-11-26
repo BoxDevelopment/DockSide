@@ -43,6 +43,7 @@ mod spotlight;
 mod surface;
 mod theme;
 mod update;
+mod uiwatch;
 mod widgets;
 mod win;
 mod genie;

@@ -5,6 +5,8 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use std::sync::Mutex;
+
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::Shell::*;
@@ -96,6 +98,17 @@ pub fn edge() -> Option<u32> {
 }
 
 /// Explorer re-shows the taskbar on some events (Win key, explorer restart); call periodically.
+/// Logs a taskbar edge change (the UI used to; the shell worker calls this now).
+pub fn note_edge(edge: Option<u32>) {
+    static LAST: Mutex<Option<u32>> = Mutex::new(None);
+    if let Ok(mut last) = LAST.lock() {
+        if edge != *last {
+            log!("taskbar edge: {:?} -> {:?}", *last, edge);
+            *last = edge;
+        }
+    }
+}
+
 pub fn reapply() {
     if !HIDDEN.load(Ordering::SeqCst) {
         return;

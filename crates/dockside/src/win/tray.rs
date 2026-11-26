@@ -293,7 +293,13 @@ pub fn explorer_first<R>(f: impl FnOnce() -> R) -> R {
     // must lower and raise the host from there too. The counter makes nested
     // calls lower once and raise when the outermost one ends.
     let hwnd = HOST_HWND.load(Ordering::Acquire);
-    let outer = hwnd != 0 && LOWERED.fetch_add(1, Ordering::AcqRel) == 0;
+    if hwnd == 0 {
+        // No host yet (or gone): nothing to lower, and the count must stay
+        // balanced - decrementing without the increment above wraps it and
+        // disables the lowering for good.
+        return f();
+    }
+    let outer = LOWERED.fetch_add(1, Ordering::AcqRel) == 0;
     if outer {
         // Just behind Explorer's tray, staying in the topmost band: an elevated
         // DockSide's window that leaves the band (HWND_NOTOPMOST / HWND_BOTTOM)

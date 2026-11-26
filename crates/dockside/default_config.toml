@@ -88,6 +88,12 @@ reserve_space = true
 # With more than one display: "all" puts a menu bar on each (dimmed on the
 # displays without the focused window, like macOS), "main" only on the main one.
 displays = "all"
+# Color of the bar's text: "auto" follows the theme (and, on a clear bar, the
+# wallpaper), or "black", "white", "accent" (the [general] accent), or a hex
+# color like "#RRGGBB" / "#RRGGBBAA".
+text_color = "auto"
+# The same for the bar's icons alone (logo, status items, tray).
+icon_color = "auto"
 
 [control_center]
 # The controls Control Center shows (Settings > Control Center).

@@ -379,13 +379,18 @@ impl MenuBar {
         let (app_name, clock, battery, logo, titles) = (&self.app_name, &self.clock, self.battery, &self.logo, &self.titles);
         let show_pct = self.cfg.show_battery_percent;
         // A clear bar takes its colours from the wallpaper, not the app theme.
-        let (c, highlight) = match self.on_dark {
+        let (auto, highlight) = match self.on_dark {
             Some(true) => (Color::gray(255, 0.96), Color::gray(255, 0.22)),
             Some(false) => (Color::rgba(18, 18, 22, 0.92), Color::gray(0, 0.10)),
             None => (theme.text, theme.menubar_highlight),
         };
+        // The bar's text and icons can be pinned to a color of their own
+        // ([menubar] text_color / icon_color); each defaults to `auto`.
+        let text = pick_color(&self.cfg.text_color, theme, auto);
+        let icon = pick_color(&self.cfg.icon_color, theme, auto);
         // A bar on a display without the focused window fades back, like macOS.
-        let c = if self.active { c } else { c.alpha(c.a * 0.5) };
+        let fade = |c: Color| if self.active { c } else { c.alpha(c.a * 0.5) };
+        let (c, ic) = (fade(text), fade(icon));
 
         let r = self.surface.render(gfx, |p| p.transformed(0.0, 0.0, k, || {
             // Paint every pixel so the whole bar hit-tests.
@@ -397,22 +402,22 @@ impl MenuBar {
             for &(r, hit) in hits {
                 match hit {
                     Hit::Logo => match (logo_kind.as_str(), logo) {
-                        ("apple", _) => draw_apple(p, r, c),
-                        ("windows", _) => draw_windows_logo(p, r, c),
+                        ("apple", _) => draw_apple(p, r, ic),
+                        ("windows", _) => draw_windows_logo(p, r, ic),
                         (_, Some(bmp)) => p.bitmap(bmp, Rect::new(r.cx() - 8.0, r.cy() - 8.0, 16.0, 16.0), 1.0),
-                        _ => draw_apple(p, r, c),
+                        _ => draw_apple(p, r, ic),
                     },
                     Hit::AppName => p.text(app_name, &bold, r, c),
                     Hit::Title(i) => p.text(titles.get(i).map_or("", Title::label), &regular, r, c),
                     Hit::Clock => p.text(clock, &regular, r, c),
-                    Hit::ControlCenter => draw_control_center(p, r, c),
-                    Hit::Tray => draw_tray(p, r, c, tray_turn),
-                    Hit::Search => draw_search(p, r, c),
-                    Hit::Wifi => draw_wifi(p, r, c),
-                    Hit::Private => draw_private(p, r, c),
+                    Hit::ControlCenter => draw_control_center(p, r, ic),
+                    Hit::Tray => draw_tray(p, r, ic, tray_turn),
+                    Hit::Search => draw_search(p, r, ic),
+                    Hit::Wifi => draw_wifi(p, r, ic),
+                    Hit::Private => draw_private(p, r, ic),
                     Hit::Battery => {
                         if let Some(b) = battery {
-                            draw_battery(p, r, b, c);
+                            draw_battery(p, r, b, ic);
                             if show_pct {
                                 p.text(&format!("{}%", b.percent), &trailing, Rect::new(r.x, r.y, r.w - 40.0, r.h), c);
                             }
@@ -439,6 +444,18 @@ impl MenuBar {
 impl Drop for MenuBar {
     fn drop(&mut self) {
         self.release_space();
+    }
+}
+
+/// One of "auto", "black", "white", "accent" or a hex color, over what the bar
+/// would use anyway (`auto`). Unknown values fall back to `auto`.
+fn pick_color(spec: &str, theme: &Theme, auto: Color) -> Color {
+    match spec.trim().to_lowercase().as_str() {
+        "" | "auto" => auto,
+        "black" => Color::rgba(18, 18, 22, 0.92),
+        "white" => Color::gray(255, 0.96),
+        "accent" => theme.accent,
+        other => Color::parse(other).unwrap_or(auto),
     }
 }
 

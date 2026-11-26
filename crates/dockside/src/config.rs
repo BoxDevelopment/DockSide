@@ -241,6 +241,11 @@ pub struct MenuBarCfg {
     pub reserve_space: bool,
     /// "main" or "all" ("follow" means "main").
     pub displays: DisplayMode,
+    /// The bar's text color: "auto" (theme, or the wallpaper on a clear bar),
+    /// "black", "white", "accent" or a hex color.
+    pub text_color: String,
+    /// The same for the bar's icons alone.
+    pub icon_color: String,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]

@@ -597,6 +597,8 @@ pub(crate) enum Key {
     MbTray,
     MbAppMenus,
     MbDisplays,
+    MbTextColor,
+    MbIconColor,
     /// An on/off setting in `[island]`, by name.
     Island(&'static str),
     /// Whether Control Center shows a control (`[control_center]`), by name.
@@ -709,6 +711,8 @@ impl Key {
             Key::MbTray => ("menubar", "show_tray"),
             Key::MbAppMenus => ("menubar", "app_menus"),
             Key::MbDisplays => ("menubar", "displays"),
+            Key::MbTextColor => ("menubar", "text_color"),
+            Key::MbIconColor => ("menubar", "icon_color"),
             Key::IslandDisplay => ("island", "display"),
             Key::DockDisplays => ("dock", "displays"),
             Key::DockPerDisplay => ("dock", "per_display_apps"),
@@ -1701,6 +1705,9 @@ impl SettingsWindow {
                         Row::Slider("Size", Key::MbHeight),
                         Row::Picker("Logo", Key::MbLogo),
                         Row::Segmented("Clock", Key::MbClock),
+                        Row::Segmented("Text", Key::MbTextColor),
+                        Row::Segmented("Icons", Key::MbIconColor),
+                        Row::Note("Text and Icons follow the theme (and, on a clear bar, the wallpaper). Black, White and Accent pin them; a hex color like #RRGGBB can be set in config.toml."),
                     ],
                 },
                 Group {
@@ -2307,6 +2314,15 @@ impl SettingsWindow {
                 }),
             ),
             Key::MbBackdrop => fixed(&MB_BACKDROPS, Some(backdrop(cfg.menubar.backdrop))),
+            Key::MbTextColor | Key::MbIconColor => {
+                const COLORS: [(&str, &str); 4] =
+                    [("Auto", "auto"), ("Black", "black"), ("White", "white"), ("Accent", "accent")];
+                let current = match key {
+                    Key::MbTextColor => cfg.menubar.text_color.to_lowercase(),
+                    _ => cfg.menubar.icon_color.to_lowercase(),
+                };
+                fixed(&COLORS, COLORS.iter().position(|(_, v)| *v == current))
+            }
             Key::SpotlightBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.spotlight.backdrop.for_panels())).filter(|&i| i < BACKDROPS.len())),
             Key::DockBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.dock.backdrop)).filter(|&i| i < BACKDROPS.len())),
             Key::WidgetsBackdrop => fixed(&BACKDROPS, Some(backdrop(cfg.widgets.backdrop)).filter(|&i| i < BACKDROPS.len())),

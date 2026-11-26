@@ -259,6 +259,10 @@ pub struct DockCfg {
     pub show_running: bool,
     /// Resting the pointer on a running app's icon shows its windows' live previews.
     pub window_previews: bool,
+    /// Minimized windows go into their app's icon instead of a tile of their
+    /// own after the Trash (macOS's "Minimize windows into application icon").
+    #[serde(default)]
+    pub minimize_to_app: bool,
     pub show_trash: bool,
     /// Custom Trash icons (.png / .ico) for when it's empty and full ("" = the Recycle Bin's own).
     pub trash_icon: String,

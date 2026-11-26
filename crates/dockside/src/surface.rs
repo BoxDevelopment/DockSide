@@ -14,7 +14,7 @@
 
 use windows::core::Result;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{MonitorFromRect, MONITOR_DEFAULTTONULL};
+use windows::Win32::Graphics::Gdi::{CreateRectRgn, MonitorFromRect, SetWindowRgn, MONITOR_DEFAULTTONULL};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::Backdrop;
@@ -44,6 +44,9 @@ pub struct Surface {
     applied: f32,
     /// The backdrop stays whole while the content fades (see `keep_backdrop_solid`).
     solid_backdrop: bool,
+    /// A see-through window between backdrop and content that DWM thumbnails
+    /// are drawn into (see `thumb_layer`).
+    thumbs: Option<HWND>,
 }
 
 /// Something built on a [`Surface`] that can fade away after it's closed.
@@ -138,13 +141,13 @@ impl Surface {
         let content = create_window(ex | WS_EX_LAYERED, WS_POPUP, rect, backdrop.unwrap_or_default())?;
         accent::prepare(content);
         let canvas = Canvas::new(gfx, w, h, scale)?;
-        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, drawn: false, shadow: None, opacity: 1.0, applied: 1.0, solid_backdrop: false })
+        Ok(Self { content, backdrop, composition, canvas, rect, scale, shape: None, shown: false, hidden: false, drawn: false, shadow: None, opacity: 1.0, applied: 1.0, solid_backdrop: false, thumbs: None })
     }
 
     /// Casts a soft drop shadow under the backdrop shape. `strength` is the
     /// ambient shadow's peak opacity.
     pub fn set_shadow(&mut self, gfx: &Gfx, strength: f32) -> Result<()> {
-        let owned = self.backdrop.unwrap_or(self.content);
+        let owned = self.backdrop.or(self.thumbs).unwrap_or(self.content);
         let topmost = unsafe { GetWindowLongW(owned, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0;
         let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT | WINDOW_EX_STYLE(topmost);
         let hwnd = create_window(ex, WS_POPUP, RECT { left: 0, top: 0, right: 1, bottom: 1 }, HWND::default())?;
@@ -205,6 +208,9 @@ impl Surface {
         }
         self.rect = rect;
         let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+        if let Some(t) = self.thumbs {
+            unsafe { SetWindowPos(t, None, rect.left, rect.top, w, h, SWP_NOACTIVATE | SWP_NOZORDER)? };
+        }
         match (self.backdrop, self.shape) {
             (Some(bd), None) => {
                 unsafe { SetWindowPos(bd, None, rect.left, rect.top, w, h, SWP_NOACTIVATE | SWP_NOZORDER)? };
@@ -244,6 +250,9 @@ impl Surface {
         let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
         unsafe {
             let _ = SetWindowPos(self.content, None, left, top, 0, 0, flags);
+            if let Some(t) = self.thumbs {
+                let _ = SetWindowPos(t, None, left, top, 0, 0, flags);
+            }
             if let Some(bd) = self.backdrop {
                 let (x, y) = match &mut self.shape {
                     Some(k) => {
@@ -265,7 +274,40 @@ impl Surface {
 
     /// The window that carries the surface's z-order (the rest are owned by it).
     pub fn root(&self) -> HWND {
-        self.shadow.as_ref().map(|s| s.hwnd).or(self.backdrop).unwrap_or(self.content)
+        self.shadow.as_ref().map(|s| s.hwnd).or(self.backdrop).or(self.thumbs).unwrap_or(self.content)
+    }
+
+    /// A window the size of the surface, under the content and over the
+    /// backdrop, for DWM thumbnails (`DwmRegisterThumbnail`): DWM draws them
+    /// over their window's own pixels, so in a window of their own the content
+    /// can still draw on top of them. It has no pixels of its own and is only
+    /// as big as its window region (empty at first): set the region to where
+    /// the thumbnails are, or it swallows clicks meant for what's underneath.
+    pub fn thumb_layer(&mut self) -> Option<HWND> {
+        if self.thumbs.is_none() {
+            let topmost = unsafe { GetWindowLongW(self.content, GWL_EXSTYLE) } as u32 & WS_EX_TOPMOST.0;
+            let ex = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP | WINDOW_EX_STYLE(topmost);
+            let owner = self.backdrop.or(self.shadow.as_ref().map(|s| s.hwnd)).unwrap_or_default();
+            let hwnd = match create_window(ex, WS_POPUP, self.rect, owner) {
+                Ok(h) => h,
+                Err(e) => {
+                    log!("thumbnail layer failed: {e}");
+                    return None;
+                }
+            };
+            accent::prepare(hwnd);
+            unsafe {
+                let _ = SetWindowRgn(hwnd, CreateRectRgn(0, 0, 0, 0), false);
+                // Owned windows stay above their owner: the content goes on top.
+                SetWindowLongPtrW(self.content, GWLP_HWNDPARENT, hwnd.0 as isize);
+                let _ = SetWindowPos(hwnd, self.content, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if self.shown && !self.hidden {
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                }
+            }
+            self.thumbs = Some(hwnd);
+        }
+        self.thumbs
     }
 
     /// Fits the backdrop to a rounded rect given in surface-local points.
@@ -467,6 +509,9 @@ impl Surface {
                 let faded_out = self.composition.is_none() && self.opacity <= 0.4;
                 let _ = ShowWindow(bd, if faded_out { SW_HIDE } else { cmd });
             }
+            if let Some(t) = self.thumbs {
+                let _ = ShowWindow(t, cmd);
+            }
             let _ = ShowWindow(self.content, cmd);
         }
         // Glass stops capturing behind hidden panes; showing again starts it back up.
@@ -481,6 +526,9 @@ impl Drop for Surface {
         self.composition = None;
         unsafe {
             let _ = DestroyWindow(self.content);
+            if let Some(t) = self.thumbs {
+                let _ = DestroyWindow(t);
+            }
             if let Some(bd) = self.backdrop {
                 let _ = DestroyWindow(bd);
             }

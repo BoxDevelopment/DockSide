@@ -70,7 +70,8 @@ pub struct Server {
     pub settings: Settings,
     /// The window's Dock icon on screen, if it has one. None too while DockSide is
     /// busy elsewhere (the request arrived in the middle of other work).
-    pub dock_icon: fn(HWND) -> Option<RECT>,
+    /// Where a window's Dock icon is; `true` while it is minimizing into it.
+    pub dock_icon: fn(HWND, bool) -> Option<RECT>,
     /// Each window's icon as last seen, for when `dock_icon` can't tell.
     pub last_icon: RefCell<HashMap<isize, RECT>>,
 }
@@ -271,7 +272,7 @@ impl Server {
 
         // Into the window's Dock icon, on the Dock's monitor. A window the Dock doesn't
         // show (or a Dock that is off) goes where a taskbar button would be.
-        let icon = match (self.dock_icon)(hwnd) {
+        let icon = match (self.dock_icon)(hwnd, r.kind == ANIM_MINIMIZE) {
             Some(icon) => {
                 let mut last = self.last_icon.borrow_mut();
                 if last.len() > 256 {

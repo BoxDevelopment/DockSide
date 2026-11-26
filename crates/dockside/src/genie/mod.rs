@@ -300,7 +300,7 @@ unsafe extern "system" fn ipc_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
 impl Genie {
     /// None when it can't run (no graphics device, no DLL, ...): windows then keep
     /// Windows' own animations.
-    pub fn new(cfg: &WindowsCfg, dock_icon: fn(HWND) -> Option<RECT>) -> Option<Genie> {
+    pub fn new(cfg: &WindowsCfg, dock_icon: fn(HWND, bool) -> Option<RECT>) -> Option<Genie> {
         let settings = Settings::from_cfg(cfg);
         let instance = unsafe { GetCurrentProcessId() }.wrapping_mul(2_654_435_761) ^ render::qpc() as u32;
         let elevated = crate::win::elevation::is_elevated();

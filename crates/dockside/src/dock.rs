@@ -6,7 +6,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use windows::core::Result;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{BOOL, HWND, RECT};
+use windows::Win32::Graphics::Dwm::{
+    DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES,
+    DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+};
+use windows::Win32::Graphics::Gdi::{CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, SetWindowRgn, RGN_OR};
 use windows::Win32::UI::Shell::ABE_BOTTOM;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -50,6 +55,16 @@ pub const DOCKY_PATH: &str = "dockside:docky";
 const ICON_FADE: f32 = 0.25;
 const TRASH_EMPTY: &str = "dockside:trash-empty";
 const TRASH_FULL: &str = "dockside:trash-full";
+/// The separators' keys: before the running apps that aren't kept in the
+/// Dock, before the Trash, and before the minimized windows after it.
+const RECENT_SEPARATOR: &str = "|separator:recent|";
+const END_SEPARATOR: &str = "|separator:end|";
+const MINIMIZED_SEPARATOR: &str = "|separator:minimized|";
+/// How long a slot opened for a window that's minimizing (the genie heading
+/// into it) waits for the window to be minimized before closing again.
+const MINIMIZING_GRACE: std::time::Duration = std::time::Duration::from_secs(4);
+/// A minimized window's app icon, over its thumbnail's corner, as a share of the tile.
+const BADGE: f32 = 0.42;
 
 /// What dropping the dragged files at the pointer would do.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -83,6 +98,9 @@ enum Kind {
     App,
     Separator,
     Trash,
+    /// A minimized window (its only entry in `windows`), shown as a live
+    /// thumbnail with its app's icon on it, after the Trash (and a separator).
+    Minimized,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,6 +142,18 @@ struct Item {
     pinned: Option<DockApp>,
     windows: Vec<AppWindow>,
     bounce: Option<Bounce>,
+    /// A minimized window's slot opened while it's still minimizing: kept
+    /// until then, even though the window isn't minimized yet.
+    pending: Option<Instant>,
+}
+
+/// A minimized window's DWM thumbnail in the Dock's thumbnail layer.
+struct Thumb {
+    id: isize,
+    /// The source's size, pixels.
+    src: (i32, i32),
+    /// Destination, opacity and visibility last given to DWM.
+    shown: Option<(RECT, u8, bool)>,
 }
 
 /// A custom icon from `[app_icons]` for an exe file name.
@@ -162,6 +192,7 @@ impl Item {
             pinned: Some(app.clone()),
             windows: Vec::new(),
             bounce: None,
+            pending: None,
         }
     }
 
@@ -177,6 +208,7 @@ impl Item {
             pinned: None,
             windows: vec![w.clone()],
             bounce: None,
+            pending: None,
         }
     }
 
@@ -202,11 +234,11 @@ impl Item {
         self.custom_icon.as_deref().unwrap_or(&self.icon_key)
     }
 
-    fn separator() -> Item {
+    fn separator(key: &str) -> Item {
         Item {
             kind: Kind::Separator,
             name: String::new(),
-            launch: "|separator|".into(),
+            launch: key.into(),
             args: None,
             icon_key: String::new(),
             custom_icon: None,
@@ -214,6 +246,7 @@ impl Item {
             pinned: None,
             windows: Vec::new(),
             bounce: None,
+            pending: None,
         }
     }
 
@@ -231,7 +264,13 @@ impl Item {
             pinned: None,
             windows: Vec::new(),
             bounce: None,
+            pending: None,
         }
+    }
+
+    /// The minimized window a `Minimized` item stands for.
+    fn minimized_hwnd(&self) -> Option<HWND> {
+        (self.kind == Kind::Minimized).then(|| self.windows.first().map(|w| w.hwnd)).flatten()
     }
 
     fn bounce_height(&self, tile: f32) -> f32 {
@@ -408,6 +447,34 @@ fn pin_exists(app: &DockApp) -> bool {
     !(p.is_absolute() && !app.path.contains("::") && !p.exists())
 }
 
+/// Puts items in the Dock's sections: the apps kept in the Dock; the running
+/// apps that aren't; the Trash; then the minimized windows. A separator goes
+/// between sections that have something in them. Each item keeps its order
+/// within its section.
+fn arrange(items: Vec<Item>) -> Vec<Item> {
+    let (mut pinned, mut running, mut minimized, mut trash) = (Vec::new(), Vec::new(), Vec::new(), None);
+    for item in items {
+        match item.kind {
+            Kind::Separator => {}
+            Kind::Trash => trash = Some(item),
+            Kind::Minimized => minimized.push(item),
+            Kind::App if item.pinned.is_some() => pinned.push(item),
+            Kind::App => running.push(item),
+        }
+    }
+    let mut out = pinned;
+    for (key, mut section) in [(RECENT_SEPARATOR, running), (END_SEPARATOR, trash.into_iter().collect()), (MINIMIZED_SEPARATOR, minimized)] {
+        if section.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(Item::separator(key));
+        }
+        out.append(&mut section);
+    }
+    out
+}
+
 /// Display order of item indices: the dragged item moves to its drop slot,
 /// or disappears while it's dragged out of the Dock.
 fn display_order(n: usize, drag: Option<&Drag>) -> Vec<usize> {
@@ -476,6 +543,10 @@ pub struct Dock {
     /// he'll next answer a click (faster clicks are ignored).
     docky_line: usize,
     docky_after: std::time::Instant,
+    /// Minimized windows' thumbnails, by window, and the layer's window region
+    /// (their rects, pixels) last set.
+    thumbs: HashMap<isize, Thumb>,
+    thumb_region: Vec<RECT>,
     pub dirty: bool,
 }
 
@@ -486,9 +557,9 @@ impl Dock {
         let mut items: Vec<Item> = d.apps.iter().filter(|a| pin_exists(a)).map(|a| Item::pinned(a, &cfg.app_icons)).collect();
         let trash_full = d.show_trash && crate::win::system::trash_full();
         if d.show_trash {
-            items.push(Item::separator());
             items.push(Item::trash(d, trash_full));
         }
+        let items = arrange(items);
         phases.mark("items");
 
         let metrics = Metrics::new(d);
@@ -541,6 +612,8 @@ impl Dock {
             trash_full,
             docky_line: 0,
             docky_after: std::time::Instant::now(),
+            thumbs: HashMap::new(),
+            thumb_region: Vec::new(),
             dirty: true,
         };
         dock.fit_window()?;
@@ -570,7 +643,14 @@ impl Dock {
         self.pressed = None;
         self.menu_item = None;
 
-        let mut old: Vec<Item> = std::mem::take(&mut self.items).into_iter().filter(|i| i.kind == Kind::App).collect();
+        let (mut old, mut minimized) = (Vec::new(), Vec::new());
+        for item in std::mem::take(&mut self.items) {
+            match item.kind {
+                Kind::App => old.push(item),
+                Kind::Minimized => minimized.push(item),
+                _ => {}
+            }
+        }
         let mut items: Vec<Item> = Vec::new();
         for app in apps.iter().filter(|a| pin_exists(a)) {
             let mut item = Item::pinned(app, &self.app_icons);
@@ -587,11 +667,11 @@ impl Dock {
             item.windows = prev.windows;
             items.push(item);
         }
+        items.append(&mut minimized);
         if self.cfg.show_trash {
-            items.push(Item::separator());
             items.push(Item::trash(&self.cfg, self.trash_full));
         }
-        self.items = items;
+        self.items = arrange(items);
         if let Err(e) = self.fit_window() {
             log!("dock resize failed: {e}");
         }
@@ -720,7 +800,7 @@ impl Dock {
         }
         self.snapshot_positions();
         let before: Vec<(String, bool)> = self.items.iter().map(|i| (i.launch.clone(), !i.windows.is_empty())).collect();
-        for item in &mut self.items {
+        for item in self.items.iter_mut().filter(|i| i.kind == Kind::App) {
             item.windows.clear();
         }
         for w in windows {
@@ -743,12 +823,13 @@ impl Dock {
             {
                 item.windows.push(w.clone());
             } else {
-                let at = self.items.iter().position(|i| i.kind != Kind::App).unwrap_or(self.items.len());
                 let name = own_app_name(&w.exe).map(String::from).unwrap_or_else(|| names.name_for(&w.exe, &cfg.app_names));
-                self.items.insert(at, Item::running(w, name, &cfg.app_icons));
+                self.items.push(Item::running(w, name, &cfg.app_icons));
             }
         }
         self.items.retain(|i| i.kind != Kind::App || i.pinned.is_some() || !i.windows.is_empty() || i.bounce.is_some());
+        self.update_minimized(windows);
+        self.items = arrange(std::mem::take(&mut self.items));
         for item in &mut self.items {
             if let Some(b) = &mut item.bounce {
                 if !item.windows.is_empty() && b.until.is_none() {
@@ -770,6 +851,56 @@ impl Dock {
             self.dirty = true;
         }
         self.ease_left > 0.0
+    }
+
+    /// Gives each minimized window a tile of its own (unless they go into their
+    /// app's icon), newest last; tiles of windows that came back go.
+    fn update_minimized(&mut self, windows: &[AppWindow]) {
+        let now = Instant::now();
+        let minimized: Vec<&AppWindow> =
+            if self.cfg.minimize_to_app { Vec::new() } else { windows.iter().filter(|w| apps::is_minimized(w.hwnd)).collect() };
+        self.items.retain(|i| {
+            let Some(h) = i.minimized_hwnd() else { return true };
+            minimized.iter().any(|w| w.hwnd == h) || i.pending.is_some_and(|until| until > now)
+        });
+        for w in minimized {
+            match self.items.iter_mut().find(|i| i.minimized_hwnd() == Some(w.hwnd)) {
+                Some(item) => {
+                    if !w.title.is_empty() {
+                        item.name = w.title.clone();
+                    }
+                    item.windows = vec![w.clone()];
+                    item.pending = None;
+                }
+                None => {
+                    let tile = self.minimized_tile(w, None);
+                    self.items.push(tile);
+                }
+            }
+        }
+    }
+
+    /// A tile for minimized window `w`, with its app's icon (as the Dock shows it) on it.
+    fn minimized_tile(&self, w: &AppWindow, pending: Option<Instant>) -> Item {
+        let app = self.items.iter().find(|i| i.kind == Kind::App && i.windows.iter().any(|x| x.hwnd == w.hwnd));
+        let (icon_key, custom_icon) = match app {
+            Some(a) => (a.icon_key.clone(), a.custom_icon.clone()),
+            None => (icon_source(&w.exe), exe_icon(&self.app_icons, &w.exe_name())),
+        };
+        let name = if w.title.is_empty() { app.map(|a| a.name.clone()).unwrap_or_default() } else { w.title.clone() };
+        Item {
+            kind: Kind::Minimized,
+            name,
+            launch: format!("|minimized:{:x}|", w.hwnd.0 as usize),
+            args: None,
+            icon_key,
+            custom_icon,
+            match_name: None,
+            pinned: None,
+            windows: vec![w.clone()],
+            bounce: None,
+            pending,
+        }
     }
 
     /// The running app under the pointer whose window previews may show (by
@@ -863,8 +994,27 @@ impl Dock {
     /// Where the icon of the app owning `hwnd` is on screen, in physical pixels
     /// (under the screen's bottom edge while auto-hidden), for windows minimizing into it.
     /// A window the Dock hasn't listed yet (one just opening) gets its app's icon.
-    pub fn icon_rect(&self, hwnd: HWND) -> Option<RECT> {
-        let i = self.items.iter().position(|it| it.windows.iter().any(|w| w.hwnd == hwnd)).or_else(|| {
+    /// A window `minimizing` into a tile of its own gets that tile now, so the
+    /// genie heads for a slot that opens as it goes.
+    pub fn icon_rect(&mut self, hwnd: HWND, minimizing: bool) -> Option<RECT> {
+        let tile = |d: &Self| d.items.iter().position(|it| it.minimized_hwnd() == Some(hwnd));
+        if minimizing && !self.cfg.minimize_to_app && self.drag.is_none() && tile(self).is_none() {
+            let listed = self.items.iter().filter(|i| i.kind == Kind::App).find_map(|i| i.windows.iter().find(|w| w.hwnd == hwnd)).cloned();
+            if let Some(w) = listed {
+                self.snapshot_positions();
+                let item = self.minimized_tile(&w, Some(Instant::now() + MINIMIZING_GRACE));
+                self.items.push(item);
+                self.items = arrange(std::mem::take(&mut self.items));
+                self.pressed = None;
+                self.menu_item = None;
+                if let Err(e) = self.fit_window() {
+                    log!("dock resize failed: {e}");
+                }
+                self.ease_left = EASE_TIME;
+                self.dirty = true;
+            }
+        }
+        let i = tile(self).or_else(|| self.items.iter().position(|it| it.kind == Kind::App && it.windows.iter().any(|w| w.hwnd == hwnd))).or_else(|| {
             let exe = apps::exe_name(&apps::process_path(apps::effective_pid(hwnd))?);
             self.items.iter().position(|it| it.kind == Kind::App && it.match_name.as_deref() == Some(exe.as_str()))
         })?;
@@ -996,6 +1146,7 @@ impl Dock {
 
         if self.items.iter().any(|i| i.kind == Kind::App && i.pinned.is_none() && i.windows.is_empty() && i.bounce.is_none()) {
             self.items.retain(|i| i.kind != Kind::App || i.pinned.is_some() || !i.windows.is_empty() || i.bounce.is_some());
+            self.items = arrange(std::mem::take(&mut self.items));
             let _ = self.fit_window();
         }
         animating
@@ -1070,7 +1221,7 @@ impl Dock {
         match item.kind {
             _ if paths.is_empty() => FileDrop::None,
             Kind::Trash => FileDrop::Trash,
-            Kind::Separator => FileDrop::None,
+            Kind::Separator | Kind::Minimized => FileDrop::None,
             Kind::App if item.launch == FINDER_PATH => {
                 if paths.len() == 1 && paths[0].is_dir() { FileDrop::Open } else { FileDrop::None }
             }
@@ -1241,9 +1392,9 @@ impl Dock {
             let item = self.items.remove(d.from);
             if !d.out {
                 self.items.insert(d.to, item);
-            } else {
-                let _ = self.fit_window();
             }
+            self.items = arrange(std::mem::take(&mut self.items));
+            let _ = self.fit_window();
             let apps: Vec<DockApp> = self.items.iter().filter_map(|i| i.pinned.clone()).collect();
             return Some(Action::SetDockApps(apps));
         }
@@ -1253,6 +1404,8 @@ impl Dock {
         match item.kind {
             Kind::Trash => Some(Action::Open(item.launch.clone())),
             Kind::Separator => None,
+            // Restores it (and brings it forward).
+            Kind::Minimized => Some(Action::BringToFront(item.windows.iter().map(|w| w.hwnd).collect())),
             Kind::App if item.windows.is_empty() => {
                 Some(Action::Launch { path: item.launch.clone(), args: item.args.clone() })
             }
@@ -1306,6 +1459,14 @@ impl Dock {
         let item = &self.items[idx];
         let entries = match item.kind {
             Kind::Separator => return None,
+            Kind::Minimized => {
+                let hwnds: Vec<HWND> = item.windows.iter().map(|w| w.hwnd).collect();
+                vec![
+                    Entry::item("Open", Action::BringToFront(hwnds.clone())),
+                    Entry::Separator,
+                    Entry::item("Close", Action::CloseWindows(hwnds)),
+                ]
+            }
             Kind::Trash => {
                 // Sets the icon for the state the Trash is in now (empty or full).
                 let target = IconTarget { pinned: None, exe: None, trash: Some(self.trash_full) };
@@ -1463,6 +1624,12 @@ impl Dock {
         let win_w = self.surface.width_pt();
         let (items, bitmaps, pressed, menu_item) = (&self.items, &self.bitmaps, self.pressed, self.menu_item);
         let fade_in = &self.fade_in;
+        // Minimized windows' thumbnails show once they're really minimized
+        // (not while the genie is still taking them into their slot).
+        let thumb_shown: Vec<bool> = items
+            .iter()
+            .map(|it| !fully_hidden && it.pending.is_none() && it.minimized_hwnd().is_some_and(apps::is_minimized))
+            .collect();
 
         let draw_icon = |p: &crate::gfx::Painter, item: &Item, rect: Rect, opacity: f32, darken: bool| {
             // Not loaded yet: nothing, until it fades in.
@@ -1531,6 +1698,15 @@ impl Dock {
                 }
                 let lift = item.bounce_height(m.tile);
                 let rect = Rect::new(cx - size / 2.0, icon_bottom - size - lift, size, size);
+                if item.kind == Kind::Minimized {
+                    // The thumbnail is DWM's, under this window; its app's icon goes on its corner.
+                    if thumb_shown[i] {
+                        let b = size * BADGE;
+                        let badge = Rect::new(rect.right() - b, rect.bottom() - b, b, b);
+                        draw_icon(p, item, badge, 1.0, pressed == Some(i) || menu_item == Some(i));
+                    }
+                    continue;
+                }
                 draw_icon(p, item, rect, 1.0, pressed == Some(i) || menu_item == Some(i));
                 if !item.windows.is_empty() {
                     let dot = (m.tile / 48.0 * 2.0).max(1.5);
@@ -1564,6 +1740,97 @@ impl Dock {
         if let Err(e) = r {
             log!("dock render failed: {e}");
         }
+
+        let tiles: Vec<(HWND, Option<Rect>)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                let hwnd = it.minimized_hwnd()?;
+                let rect = centers[i].filter(|_| thumb_shown[i]).map(|(cx, size)| Rect::new(cx - size / 2.0, icon_bottom - size, size, size));
+                Some((hwnd, rect))
+            })
+            .collect();
+        self.sync_thumbs(&tiles);
+    }
+
+    /// Puts each minimized window's DWM thumbnail in its tile (`rect`, points;
+    /// `None` hides it), fitted to the window's shape, and cuts the thumbnail
+    /// layer's window region to them so it only takes clicks there.
+    fn sync_thumbs(&mut self, tiles: &[(HWND, Option<Rect>)]) {
+        if tiles.is_empty() && self.thumbs.is_empty() {
+            return;
+        }
+        let Some(layer) = self.surface.thumb_layer() else { return };
+        self.thumbs.retain(|h, t| {
+            let keep = tiles.iter().any(|(w, _)| w.0 as isize == *h);
+            if !keep {
+                unsafe {
+                    let _ = DwmUnregisterThumbnail(t.id as _);
+                }
+            }
+            keep
+        });
+        let s = self.surface.scale;
+        let alpha = (self.surface.opacity() * 255.0).round() as u8;
+        let mut region = Vec::new();
+        for &(hwnd, rect) in tiles {
+            let key = hwnd.0 as isize;
+            if !self.thumbs.contains_key(&key) {
+                if rect.is_none() {
+                    continue; // registered once it shows
+                }
+                let Ok(id) = (unsafe { DwmRegisterThumbnail(layer, hwnd) }) else {
+                    log!("dock: no thumbnail for minimized {hwnd:?}");
+                    continue;
+                };
+                let src = unsafe { DwmQueryThumbnailSourceSize(id) }.map(|z| (z.cx, z.cy)).unwrap_or((0, 0));
+                self.thumbs.insert(key, Thumb { id: id as isize, src, shown: None });
+            }
+            let Some(t) = self.thumbs.get_mut(&key) else { continue };
+            let (sw, sh) = (t.src.0.max(1) as f32, t.src.1.max(1) as f32);
+            let dest = rect.filter(|_| t.src.0 > 0 && t.src.1 > 0).map(|r| {
+                // Fitted inside the tile, keeping the window's shape, centred.
+                let inner = r.inset(r.w * 0.06, r.w * 0.06);
+                let k = (inner.w / sw).min(inner.h / sh);
+                let (w, h) = (sw * k, sh * k);
+                let (x, y) = (inner.x + (inner.w - w) / 2.0, inner.y + (inner.h - h) / 2.0);
+                RECT { left: (x * s).round() as i32, top: (y * s).round() as i32, right: ((x + w) * s).round() as i32, bottom: ((y + h) * s).round() as i32 }
+            });
+            let want = (dest.unwrap_or_default(), alpha, dest.is_some());
+            if let Some(d) = dest {
+                region.push(d);
+            }
+            if t.shown == Some(want) {
+                continue;
+            }
+            t.shown = Some(want);
+            let props = DWM_THUMBNAIL_PROPERTIES {
+                dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
+                rcDestination: want.0,
+                opacity: want.1,
+                fVisible: BOOL::from(want.2),
+                fSourceClientAreaOnly: BOOL::from(false),
+                ..Default::default()
+            };
+            unsafe {
+                let _ = DwmUpdateThumbnailProperties(t.id as _, &props);
+            }
+        }
+        if region != self.thumb_region {
+            unsafe {
+                let rgn = CreateRectRgn(0, 0, 0, 0);
+                // A little rounding, like the windows themselves.
+                let c = (4.0 * s).round() as i32;
+                for r in &region {
+                    let part = CreateRoundRectRgn(r.left, r.top, r.right + 1, r.bottom + 1, c, c);
+                    CombineRgn(rgn, rgn, part, RGN_OR);
+                    let _ = DeleteObject(part);
+                }
+                let _ = SetWindowRgn(layer, rgn, true);
+            }
+            self.thumb_region = region;
+        }
     }
 }
 
@@ -1578,6 +1845,11 @@ impl Dock {
 
 impl Drop for Dock {
     fn drop(&mut self) {
+        for t in self.thumbs.values() {
+            unsafe {
+                let _ = DwmUnregisterThumbnail(t.id as _);
+            }
+        }
         crate::dock_drop::revoke(self.surface.content);
         self.release_space();
     }
@@ -1618,6 +1890,41 @@ mod tests {
         let base = compute_layout(&w, &s, 80.0, 4.0, 5.0, 1000.0, 0.0, 0.0);
         let lay = compute_layout(&w, &s, 80.0, 4.0, 5.0, 1000.0, base.items[1].0, 1.0);
         assert_eq!(lay.items[1].1, 10.0);
+    }
+
+    fn item(kind: Kind, key: &str, pinned: bool) -> Item {
+        let mut it = Item::separator(key);
+        it.kind = kind;
+        it.pinned = pinned.then(|| DockApp { name: None, path: key.into(), args: None, icon: None, match_exe: None });
+        it
+    }
+
+    fn keys(items: &[Item]) -> Vec<&str> {
+        items.iter().map(|i| i.launch.as_str()).collect()
+    }
+
+    #[test]
+    fn sections_are_split_by_separators_like_macos() {
+        let items = vec![
+            item(Kind::Trash, "trash", false),
+            item(Kind::App, "running", false),
+            item(Kind::Minimized, "min", false),
+            item(Kind::App, "a", true),
+            item(Kind::Separator, "old", false),
+            item(Kind::App, "b", true),
+        ];
+        assert_eq!(
+            keys(&arrange(items)),
+            ["a", "b", RECENT_SEPARATOR, "running", END_SEPARATOR, "trash", MINIMIZED_SEPARATOR, "min"]
+        );
+        // No running apps: no separator for them.
+        let items = vec![item(Kind::App, "a", true), item(Kind::Trash, "trash", false)];
+        assert_eq!(keys(&arrange(items)), ["a", END_SEPARATOR, "trash"]);
+        // Trash off: the minimized windows still get their separator.
+        let items = vec![item(Kind::Minimized, "min", false), item(Kind::App, "a", true)];
+        assert_eq!(keys(&arrange(items)), ["a", MINIMIZED_SEPARATOR, "min"]);
+        // Nothing before a section: nothing to separate it from.
+        assert_eq!(keys(&arrange(vec![item(Kind::Trash, "trash", false)])), ["trash"]);
     }
 
     #[test]

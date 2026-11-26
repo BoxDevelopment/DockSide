@@ -132,6 +132,9 @@ show_running = true
 # Rest the pointer on a running app's icon to see live previews of its windows
 # and pick one (handy with two terminals or several browser windows open).
 window_previews = true
+# Minimized windows go into their app's icon; false gives each one a tile of its
+# own (a live thumbnail) at the end of the Dock, after the Trash.
+minimize_to_app = false
 show_trash = true
 # Custom Trash icons (.png / .ico) for when it's empty and when it's full; "" uses
 # the Recycle Bin's own. Right-click the Trash > Change Icon… sets the current one.

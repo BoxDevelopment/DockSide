@@ -259,13 +259,18 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
     APP.with(|cell| cell.try_borrow_mut().ok().and_then(|mut guard| guard.as_mut().map(f)))
 }
 
-/// Where `hwnd`'s Dock icon is on screen, for the genie to go into.
-fn dock_icon(hwnd: HWND) -> Option<RECT> {
+/// Where `hwnd`'s Dock icon is on screen, for the genie to go into. A window
+/// `minimizing` into a tile of its own has its slot opened for it.
+fn dock_icon(hwnd: HWND, minimizing: bool) -> Option<RECT> {
     // With a Dock on each display, the one on the window's own display.
     with_app(|app| {
         let mon = window_monitor(hwnd).rect;
-        let here = app.docks.iter().find(|d| d.monitor().rect == mon);
-        here.or(app.docks.first()).and_then(|d| d.icon_rect(hwnd))
+        let i = app.docks.iter().position(|d| d.monitor().rect == mon).or((!app.docks.is_empty()).then_some(0))?;
+        let rect = app.docks[i].icon_rect(hwnd, minimizing);
+        if app.docks[i].dirty {
+            app.animate();
+        }
+        rect
     })
     .flatten()
 }

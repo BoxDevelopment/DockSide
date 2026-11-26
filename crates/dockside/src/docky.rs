@@ -2514,10 +2514,20 @@ pub fn icon_pixels(gfx: &crate::gfx::Gfx, px: u32) -> Option<crate::gfx::icons::
             .Initialize(&decoder.GetFrame(0).ok()?, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom)
             .ok()?;
         let px = px.clamp(1, 256);
+        // The logo fills its whole canvas; Dock icons leave a margin round
+        // their tile (Finder's and the squircle tiles' 6% a side), so he's
+        // shrunk into the same tile and centred, to sit the same size as them.
+        let inner = ((px as f32 * 0.88).round() as u32).clamp(1, px);
         let scaler = gfx.wic.CreateBitmapScaler().ok()?;
-        scaler.Initialize(&converter, px, px, WICBitmapInterpolationModeHighQualityCubic).ok()?;
+        scaler.Initialize(&converter, inner, inner, WICBitmapInterpolationModeHighQualityCubic).ok()?;
+        let mut tile = vec![0u8; (inner * inner * 4) as usize];
+        scaler.CopyPixels(std::ptr::null(), inner * 4, &mut tile).ok()?;
+        let at = (px - inner) / 2;
         let mut data = vec![0u8; (px * px * 4) as usize];
-        scaler.CopyPixels(std::ptr::null(), px * 4, &mut data).ok()?;
+        for (y, row) in tile.chunks_exact((inner * 4) as usize).enumerate() {
+            let start = (((at + y as u32) * px + at) * 4) as usize;
+            data[start..start + row.len()].copy_from_slice(row);
+        }
         Some(crate::gfx::icons::IconPixels { width: px, height: px, data })
     }
 }

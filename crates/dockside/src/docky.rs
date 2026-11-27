@@ -2644,6 +2644,45 @@ mod tests {
         crate::gfx::write_png(&gfx, w as u32, h as u32, &canvas.pixels(), &format!("{out}/activities.png"));
     }
 
+    /// Frames of Docky in his widget tile, 60 per second, for videos: one folder
+    /// per sequence of acts. `DOCKSIDE_DOCKY_FRAMES=<dir> cargo test docky_video_frames -- --ignored`.
+    #[test]
+    #[ignore]
+    fn docky_video_frames() {
+        let Ok(out) = std::env::var("DOCKSIDE_DOCKY_FRAMES") else { return };
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let gfx = crate::gfx::Gfx::new().unwrap();
+        let size = 640;
+        let s = size as f32;
+        let seqs: [(&str, &[Act]); 3] = [
+            ("hello", &[Act::Jump, Act::Happy, Act::Blink, Act::Wave, Act::Look]),
+            ("outro", &[Act::Wave, Act::Love, Act::Blink, Act::Happy]),
+            ("idle", &[Act::Blink, Act::Look, Act::Blink]),
+        ];
+        for (name, acts) in seqs {
+            let dir = format!("{out}/{name}");
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut frame = 0;
+            for act in acts.iter() {
+                let n = (act.secs() * 60.0).round() as i32;
+                for k in 0..n {
+                    let pose = act.pose(k as f32 / 60.0, Pose::IDLE);
+                    let mut canvas = crate::gfx::Canvas::new(&gfx, size, size, 1.0).unwrap();
+                    canvas
+                        .draw(&gfx, |p| {
+                            p.fill_round_gradient(Rect::new(0.0, 0.0, s, s), 0.0, Color::rgba(130, 162, 250, 1.0), Color::rgba(98, 130, 228, 1.0));
+                            draw(p, s / 2.0, s * 0.8, s * 0.47, &pose, &Palette::CARD);
+                        })
+                        .unwrap();
+                    crate::gfx::write_png(&gfx, size as u32, size as u32, &canvas.pixels(), &format!("{dir}/{frame:04}.png"));
+                    frame += 1;
+                }
+            }
+        }
+    }
+
     /// Docky's island faces (on black, at island and zoomed sizes) and Hot:
     /// `cargo test docky_island -- --ignored`.
     #[test]
